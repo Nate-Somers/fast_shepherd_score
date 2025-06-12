@@ -11,20 +11,22 @@ import rdkit.Chem as Chem
 from rdkit.Geometry.rdGeometry import Point3D
 import torch
 
-from shepherd_score.score.constants import COULOMB_SCALING, LAM_SCALING, ALPHA
+from .score.constants import COULOMB_SCALING, LAM_SCALING, ALPHA
 
-from shepherd_score.generate_point_cloud import get_atom_coords, get_atomic_vdw_radii, get_molecular_surface, get_molecular_surface_const_density
-from shepherd_score.score.gaussian_overlap_np import get_overlap_np
-from shepherd_score.score.gaussian_overlap import get_overlap
-from shepherd_score.score.electrostatic_scoring import get_overlap_esp
-from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
-from shepherd_score.pharm_utils.pharmacophore import get_pharmacophores
-from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
-from shepherd_score.score.pharmacophore_scoring import _SIM_TYPE, get_overlap_pharm
-from shepherd_score.alignment import optimize_ROCS_overlay, optimize_ROCS_esp_overlay, optimize_esp_combo_score_overlay
-from shepherd_score.alignment import optimize_pharm_overlay
-from shepherd_score.alignment_utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
-
+from .generate_point_cloud import get_atom_coords, get_atomic_vdw_radii, get_molecular_surface, get_molecular_surface_const_density
+from .score.gaussian_overlap_np import get_overlap_np
+from .score.gaussian_overlap import get_overlap
+from .score.electrostatic_scoring import get_overlap_esp
+from .score.electrostatic_scoring_np import get_overlap_esp_np
+from .pharm_utils.pharmacophore import get_pharmacophores
+from .score.pharmacophore_scoring_np import get_overlap_pharm_np
+from .score.pharmacophore_scoring import _SIM_TYPE, get_overlap_pharm
+from .alignment import optimize_ROCS_overlay, optimize_ROCS_esp_overlay, optimize_esp_combo_score_overlay
+from .alignment import optimize_pharm_overlay
+from .alignment_utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
+from .alignment_utils.fast_se3 import coarse_fine_align, coarse_fine_align_many
+from .alignment_utils.se3 import quaternion_to_SE3
+from .score.gaussian_overlap_triton import gaussian_self_overlap
 
 def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) -> Chem.Mol:
     """
@@ -141,6 +143,25 @@ class Molecule:
                     scale=1.
                 )
 
+        self._shape_cache: dict[float, float] = {}
+
+    def shape_self(self,
+                   alpha: float = 0.81,
+                   device: str | torch.device = "cuda") -> float:
+            """
+            Return VAA (second-order Gaussian volume overlap of *this* molecule
+            with itself).  Result is cached per α to avoid launching the kernel
+            more than once per molecule.
+            """
+            if alpha in self._shape_cache:
+                return self._shape_cache[alpha]
+
+            pts = torch.as_tensor(self.atom_pos,
+                                dtype=torch.float32,
+                                device=device)
+            val = gaussian_self_overlap(pts, alpha).item()
+            self._shape_cache[alpha] = val
+            return val
 
     def get_partial_charges(self) -> np.ndarray:
         """
@@ -269,6 +290,14 @@ class MoleculePair:
         else:
             self.fit_molec = Molecule(fit_mol, num_surf_points=num_surf_points, density=density)
 
+        # ----  pre-convert atomic coordinates to torch on the target device  ----
+        self._ref_xyz_t = torch.as_tensor(self.ref_molec.atom_pos,
+                                          dtype=torch.float32,
+                                          device=device)          # (N,3)
+        self._fit_xyz_t = torch.as_tensor(self.fit_molec.atom_pos,
+                                          dtype=torch.float32,
+                                          device=device)          # (M,3)
+
         self.num_surf_points = num_surf_points
         self.density = density
         if density is not None and num_surf_points is None:
@@ -307,93 +336,133 @@ class MoleculePair:
         self.sim_aligned_pharm = None
 
 
-    def align_with_vol(self,
-                       no_H: bool = True,
-                       num_repeats: int = 50,
-                       trans_init: bool = False,
-                       lr: float = 0.1,
-                       max_num_steps: int = 200,
-                       use_jax: bool = False,
-                       verbose: bool = False) -> np.ndarray:
+    def align_with_vol_single(self,
+                    no_H: bool = True,
+                    num_repeats: int = 50,      # kept for signature-compat; ignored
+                    trans_init: bool = False,   # ignored (coarse grid always on)
+                    lr: float = 0.1,            # ignored (internal optimiser picks lr)
+                    max_num_steps: int = 200,   # ignored
+                    use_jax: bool = False,      # ignored (fast path is Triton/Torch only)
+                    verbose: bool = False) -> np.ndarray:
         """
-        Align fit_molec to ref_molec using volumetric similarity.
-
-        Optimally aligned score found in `self.sim_aligned_vol` and the optimal SE(3)
-        transformation is at `self.transform_vol`. If `no_H` is True, append '_noH' to them.
-
-        Arguments
-        ---------
-        no_H : bool (default = True) to not include hydrogens in volumetric similarity.
-        num_repeats : int (default=50)
-            Number of different random initializations of SO(3) transformation parameters.
-        trans_init : bool (default = False)
-            Apply translation initializiation for alignment. `fit_molec`'s COM is translated to
-            each `ref_molecs`'s atoms, with 10 rotations for each translation. So the
-            number of initializations scales as (# translation centers * 10 + 5) where 5 is from
-            the identity and 4 PCA with aligned COM's.
-            If None, then num_repeats rotations are done with aligned COM's.
-        lr : float (default=0.1) Learning rate or step-size for optimization
-        max_num_steps : int (default=200) Maximum number of steps to optimize over.
-        use_jax : bool (default = False) toggle to use Jax instead of PyTorch
-        verbose : bool (False) Print initial and final similarity scores with scores every 100 steps.
-
-        Returns
-        -------
-        aligned_fit_points : np.ndarray (N, 3) coordinates of transformed atoms
+        Fast shape-only alignment (Triton + analytic gradient).
+        Interface compatible with the legacy method.
         """
+        if use_jax:
+            raise NotImplementedError("fast path is PyTorch/Triton only")
+
+        # 1.  pick atom coordinates (w/ or w/o H)
         if no_H:
-            ref_atom_pos = self.ref_molec.atom_pos
-            fit_atom_pos = self.fit_molec.atom_pos
+            ref_xyz = self._ref_xyz_t
+            fit_xyz = self._fit_xyz_t
         else:
-            ref_atom_pos = self.ref_molec.mol.GetConformer().GetPositions()
-            # ref_atom_pos -= ref_atom_pos.mean(0)
-            fit_atom_pos = self.fit_molec.mol.GetConformer().GetPositions()
-            # fit_atom_pos -= fit_atom_pos.mean(0)
-        if use_jax: # Use Jax optimization implementation
-            if 'jax' not in sys.modules or 'jax.numpy' not in sys.modules:
-                try:
-                    import jax.numpy as jnp
-                except ImportError:
-                    raise ImportError('jax.numpy and torch is required for this function. Install Jax or just use Torch.')
-            import jax.numpy as jnp
-            from .alignment_jax import optimize_ROCS_overlay_jax, optimize_ROCS_esp_overlay_jax, optimize_esp_combo_score_overlay_jax
-            aligned_fit_points, se3_transform, score = optimize_ROCS_overlay_jax(
-                ref_points=jnp.array(ref_atom_pos),
-                fit_points=jnp.array(fit_atom_pos),
-                alpha=0.81,
-                num_repeats=num_repeats,
-                trans_centers = self.ref_molec.atom_pos if trans_init else None,
-                lr=lr,
-                max_num_steps=max_num_steps,
-                verbose=verbose
+            ref_xyz = torch.as_tensor(
+                self.ref_molec.mol.GetConformer().GetPositions(),
+                dtype=torch.float32, device=self.device
             )
-            se3_transform = np.array(se3_transform)
-            score = np.array(score)
-            aligned_fit_points = np.array(aligned_fit_points)
-        else:
-            # PyTorch
-            aligned_fit_points, se3_transform, score = optimize_ROCS_overlay(
-                ref_points=torch.from_numpy(ref_atom_pos).to(torch.float32).to(self.device),
-                fit_points=torch.from_numpy(fit_atom_pos).to(torch.float32).to(self.device),
-                alpha=0.81,
-                num_repeats=num_repeats,
-                trans_centers = torch.from_numpy(self.ref_molec.atom_pos).to(torch.float32).to(self.device) if trans_init else None,
-                lr=lr,
-                max_num_steps=max_num_steps,
-                verbose=verbose
+            fit_xyz = torch.as_tensor(
+                self.fit_molec.mol.GetConformer().GetPositions(),
+                dtype=torch.float32, device=self.device
             )
 
-            se3_transform = se3_transform.numpy()
-            score = score.numpy()
-            aligned_fit_points = aligned_fit_points.numpy()
-        if no_H:
-            self.transform_vol_noH = se3_transform
-            self.sim_aligned_vol_noH = score
-        else:
-            self.transform_vol = se3_transform
-            self.sim_aligned_vol = score
-        return aligned_fit_points
+        # 2. run optimiser ---------------------------------------------------
+        score, q_opt, t_opt = coarse_fine_align(ref_xyz, fit_xyz, alpha=0.81)
 
+        # 3. build SE(3) and transform on Torch
+        SE3_torch   = quaternion_to_SE3(q_opt, t_opt)           # (4,4) torch
+        fit_aligned = (SE3_torch[:3, :3] @ fit_xyz.T).T + SE3_torch[:3, 3]
+        fit_aligned = fit_aligned.cpu().numpy()                 # legacy return type
+
+        # 4. store bookkeeping fields      (attributes stay NumPy as before)
+        SE3_np = SE3_torch.cpu().numpy()
+        if no_H:
+            self.transform_vol_noH   = SE3_np
+            self.sim_aligned_vol_noH = float(score)
+        else:
+            self.transform_vol       = SE3_np
+            self.sim_aligned_vol     = float(score)
+
+        if verbose:
+            print(f"[fast] shape score = {score:.4f}")
+
+        return fit_aligned
+
+    def align_with_vol(self, *, batch_objs=None, **kw):
+        """
+        • If batch_objs is None –> call the original single-pair routine and
+        return one np.ndarray (exact legacy behaviour).
+        • If batch_objs is an iterable of *other* MoleculePair instances,
+        align every pair in one Python call and return a list[np.ndarray].
+        """
+        if batch_objs is None:
+            # ---- legacy path ----
+            return self.align_with_vol_single(**kw)
+
+        pairs = [self] + list(batch_objs)
+
+        ref_stack = torch.stack([p._ref_xyz_t for p in pairs], 0)
+        fit_stack = torch.stack([p._fit_xyz_t for p in pairs], 0)
+
+        scores, q_all, t_all = [], [], []
+        for A_i, B_i in zip(ref_stack, fit_stack):
+            s, q, t = coarse_fine_align(A_i, B_i, alpha=0.81)
+            scores.append(s); q_all.append(q); t_all.append(t)
+
+        outs = []
+        for p, s, q, t in zip(pairs, scores, q_all, t_all):
+            SE3 = quaternion_to_SE3(q, t).cpu().numpy()
+            fit_aligned = (SE3[:3, :3] @ p._fit_xyz_t.cpu().T).T + SE3[:3, 3]
+            p.transform_vol_noH   = SE3
+            p.sim_aligned_vol_noH = float(s)
+            outs.append(fit_aligned.numpy())
+
+        return outs[0] if batch_objs is None else outs
+
+    @staticmethod
+    @torch.no_grad()
+    def align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81):
+        """
+        Fast batched shape alignment for MANY pairs.
+
+        * Groups pairs that share the same (#ref atoms, #fit atoms)
+          so that each group can be processed in **one** GPU call.
+        * Uses the cached self-overlap (Molecule.shape_self) so no
+          extra kernels are launched per pair.
+        * Writes the optimal SE(3) and score back into each object.
+        """
+        if not pairs:
+            return
+
+        # -------- group by (N_ref, N_fit) ---------------------------------
+        buckets: dict[tuple[int, int], list[MoleculePair]] = {}
+        for p in pairs:
+            key = (p._ref_xyz_t.shape[0], p._fit_xyz_t.shape[0])
+            buckets.setdefault(key, []).append(p)
+
+        device = pairs[0].device
+
+        for (N, M), bucket in buckets.items():
+            # ---- stack coordinates in this bucket -----------------------
+            ref_stack = torch.stack([p._ref_xyz_t for p in bucket], 0).to(device)
+            fit_stack = torch.stack([p._fit_xyz_t for p in bucket], 0).to(device)
+
+            # ---- cached self-overlap (no kernels) ------------------------
+            VAA = torch.tensor([p.ref_molec.shape_self(alpha, device)
+                                for p in bucket],
+                               device=device, dtype=torch.float32)
+            VBB = torch.tensor([p.fit_molec.shape_self(alpha, device)
+                                for p in bucket],
+                               device=device, dtype=torch.float32)
+
+            # ---- one GPU call for the whole bucket ----------------------
+            scores, q_batch, t_batch = coarse_fine_align_many(
+                ref_stack, fit_stack, VAA, VBB, alpha=alpha)
+
+            # ---- write results back to each MoleculePair ---------------
+            for p, s, q, t in zip(bucket, scores, q_batch, t_batch):
+                SE3 = quaternion_to_SE3(q, t).cpu().numpy()
+                p.transform_vol_noH   = SE3
+                p.sim_aligned_vol_noH = float(s)
 
     def align_with_vol_esp(self,
                            lam: float,
@@ -487,8 +556,8 @@ class MoleculePair:
             )
 
             se3_transform = se3_transform.numpy()
-            score = score.numpy()
-            aligned_fit_points = aligned_fit_points.numpy()
+            score = float(score)
+            aligned_fit_points = aligned_fit_points.detach().numpy()
         
         if no_H:
             self.transform_vol_esp_noH = se3_transform
@@ -773,7 +842,7 @@ class MoleculePair:
             )
             self.transform_esp_combo = se3_transform.numpy()
             self.sim_aligned_esp_combo = score.numpy()
-            return aligned_fit_points.numpy()
+            return aligned_fit_points.detach().numpy()
 
 
     def align_with_pharm(self,

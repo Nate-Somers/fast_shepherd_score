@@ -13,7 +13,7 @@ import torch
 
 from shepherd_score.container import Molecule, MoleculePair
 from shepherd_score.score.gaussian_overlap_np import get_overlap_np
-from shepherd_score.score.gaussian_overlap import get_overlap
+from shepherd_score.score import gaussian_tanimoto as get_overlap # CHANGED
 from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
 from shepherd_score.score.electrostatic_scoring import get_overlap_esp
 from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
