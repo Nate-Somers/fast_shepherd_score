@@ -1,46 +1,44 @@
-# codex_startup.sh  
 #!/usr/bin/env bash
 
 ###############################################################################
-# 1) bootstrap micromamba (≈2 MB static binary, no root needed)               #
+# 1) bootstrap micromamba (≈2 MB static binary, no root needed)               #
 ###############################################################################
-MAMBA_ROOT="${HOME}/.mamba"            # everything lives here, keeps $HOME tidy
-MAMBA_BIN="${MAMBA_ROOT}/bin/micromamba"
-
-if [ ! -x "${MAMBA_BIN}" ]; then
-  echo "[startup] installing micromamba → ${MAMBA_ROOT}"
-  curl -Ls https://micro.mamba.pm/install.sh | bash -s -- -b -p "${MAMBA_ROOT}"  # :contentReference[oaicite:0]{index=0}
+# Install micromamba to the default ~/.local/bin if it isn't present.
+if ! command -v micromamba &>/dev/null; then
+  echo "[startup] installing micromamba → ${HOME}/.local/bin"
+  curl -Ls https://micro.mamba.pm/install.sh | bash -s -- -b
 fi
 
-# put micromamba *function* into this shell
-eval "$("${MAMBA_BIN}" shell hook -s bash -p "${MAMBA_ROOT}")"
+# Discover the actual binary path that the installer created
+MAMBA_BIN="$(command -v micromamba)"
+
+# Bring the micromamba shell function into the current shell
+eval "$("${MAMBA_BIN}" shell hook -s bash)"
 
 ###############################################################################
-# 2) make sure Conda-Forge is first in line (fewer licence blocks, faster)    #
+# 2) make sure Conda‑Forge is first in line (fewer licence blocks, faster)    #
 ###############################################################################
 cat <<'EOF' > "${HOME}/.condarc"
 channels:
   - conda-forge
   - defaults
 channel_priority: strict
-# (feel free to add bioconda, pytorch, etc. if your YAML needs them)
 EOF
 
 ###############################################################################
 # 3) create / update the env from environment.yml                             #
 ###############################################################################
-ENV_FILE="environment.yml"             # change if your file has another name
-ENV_NAME="codex-env"                   # or read `name:` from the YAML
+ENV_FILE="environment.yml"   # change if your file has another name
+ENV_NAME="codex-env"         # or read `name:` from the YAML
 
-if [ -f "${ENV_FILE}" ]; then
+if [[ -f "${ENV_FILE}" ]]; then
   echo "[startup] creating/updating ${ENV_NAME} from ${ENV_FILE}"
-  # first try “create”; if it already exists fall back to “update”
-  if ! micromamba env create -n "${ENV_NAME}" -f "${ENV_FILE}" --yes; then
-      micromamba env update  -n "${ENV_NAME}" -f "${ENV_FILE}" --yes
+  if ! micromamba env create -n "${ENV_NAME}" -f "${ENV_FILE}" -y; then
+    micromamba env update -n "${ENV_NAME}" -f "${ENV_FILE}" -y
   fi
 else
   echo "[startup] WARNING: ${ENV_FILE} not found – making bare python env"
-  micromamba create -n "${ENV_NAME}" python=3.10 --yes
+  micromamba create -n "${ENV_NAME}" python=3.10 -y
 fi
 
 ###############################################################################
