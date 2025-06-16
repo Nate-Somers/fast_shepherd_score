@@ -1,5 +1,5 @@
 import torch, math
-from ..score.gaussian_overlap_triton import overlap_score_grad_se3, gaussian_self_overlap, overlap_score_grad_se3_batch
+from ..score.gaussian_overlap_triton import overlap_score_grad_se3, gaussian_self_overlap, overlap_score_grad_se3_batch, fused_adam_qt
 from typing import Optional
 
 torch.backends.cuda.matmul.allow_tf32 = True 
@@ -178,16 +178,24 @@ def coarse_fine_align(A: torch.Tensor,
     m_q = torch.zeros_like(q); v_q = torch.zeros_like(q)
     m_t = torch.zeros_like(t); v_t = torch.zeros_like(t)
 
-    A_k = A.unsqueeze(0).expand(keep, -1, -1)
-    B_k = B.unsqueeze(0).expand(keep, -1, -1)
+    A_k = A.unsqueeze(0).expand(keep, -1, -1).contiguous()
+    B_k = B.unsqueeze(0).expand(keep, -1, -1).contiguous()
 
     for _ in range(steps_fine):
+        # analytic score + gradients for all k orientations in one call
         VAB, dQ, dT = overlap_score_grad_se3_batch(A_k, B_k, q, t, alpha=alpha)
-        denom = (Vsum - VAB).unsqueeze(1)               # (k,1)
-        scale = Vsum / (denom * denom)                  # (k,1)
-        adam_step(q, dQ * scale, m_q, v_q, lr)
-        adam_step(t, dT * scale, m_t, v_t, lr)
-        q = torch.nn.functional.normalize(q, dim=1)
+
+        # denominator  (VAA + VBB − VAB)   — broadcast to (k,1)
+        denom = (Vsum - VAB).unsqueeze(1)
+
+        # fused Adam update (handles renormalising q internally)
+        fused_adam_qt(
+            q, t,
+            dQ / denom,                # scale grads exactly as in the batched path
+            dT / denom,
+            m_q, v_q, m_t, v_t,
+            lr
+        )
 
     VAB_final, _, _ = overlap_score_grad_se3_batch(A_k, B_k, q, t, alpha=alpha)
     final_score = VAB_final / (Vsum - VAB_final)
@@ -195,108 +203,172 @@ def coarse_fine_align(A: torch.Tensor,
 
     return final_score[best].item(), q[best], t[best]          # ▲ return unchanged
 
-_MAX_Z = 65_535          # CUDA grid-z limit
-
 @torch.no_grad()
-def _overlap_in_chunks(A, B, q, t, *, alpha=0.81):
+def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81,
+                       N_real: torch.Tensor | None = None,
+                       M_real: torch.Tensor | None = None):
     """
-    A,B : (K,N,3)/(K,M,3)   q : (K,4)   t : (K,3)
+    Evaluate the fused overlap kernel on an arbitrary-long list of
+    orientations, slicing the list so that each launch respects the
+    CUDA `grid.z ≤ 65 535` limit.
+
+    Parameters
+    ----------
+    A, B : (K,N,3) / (K,M,3)   – padded coordinate blocks
+    q, t : (K,4) / (K,3)       – quaternions & translations
+    N_real, M_real : (K,) int32 tensors holding the *true* atom counts
+                     (rows beyond those indices are padding).  If None,
+                     we assume no padding.
     Returns
-      VAB : (K,)   dQ : (K,4)   dT : (K,3)
+    -------
+    VAB : (K,)    dQ : (K,4)    dT : (K,3)     — all contiguous on GPU
     """
     K = A.shape[0]
-    out_V = torch.empty(K,  device=A.device, dtype=A.dtype)
+    if N_real is None:
+        N_real = A.new_full((K,), A.shape[1], dtype=torch.int32)
+    if M_real is None:
+        M_real = B.new_full((K,), B.shape[1], dtype=torch.int32)
+
+    out_V  = torch.empty(K,        device=A.device, dtype=A.dtype)
     out_dQ = torch.empty_like(q)
     out_dT = torch.empty_like(t)
 
-    for s in range(0, K, _MAX_Z):
-        e = min(s + _MAX_Z, K)
+    CHUNK = 65_535                         # CUDA grid-z hard limit
+
+    for start in range(0, K, CHUNK):
+        end = min(start + CHUNK, K)
+
         V, dQ, dT = overlap_score_grad_se3_batch(
-            A[s:e], B[s:e], q[s:e], t[s:e], alpha=alpha)
-        out_V[s:e]  = V
-        out_dQ[s:e] = dQ
-        out_dT[s:e] = dT
+            A[start:end], B[start:end],
+            q[start:end], t[start:end],
+            alpha=alpha,
+            N_real=N_real[start:end],
+            M_real=M_real[start:end])
+
+        out_V[start:end]  = V
+        out_dQ[start:end] = dQ
+        out_dT[start:end] = dT
+
     return out_V, out_dQ, out_dT
 
+
 @torch.no_grad()
-def coarse_fine_align_many(A_batch, B_batch, VAA, VBB, *,
-                           alpha=0.81,
-                           coarse_rots=512,
-                           coarse_trans=32,
-                           topk=8,
-                           steps_fine=15,
-                           lr=0.08):
+def coarse_fine_align_many(
+        A_batch, B_batch, VAA, VBB, *,
+        alpha: float = 0.81,
+        coarse_rots: int = 512,
+        coarse_trans: int = 32,
+        topk: int = 8,
+        steps_fine: int = 15,
+        lr: float = 0.08,
+        N_real: torch.Tensor | None = None,
+        M_real: torch.Tensor | None = None):
     """
-    Vectorised version for a whole bucket of pairs with same (N,M).
-      A_batch : (B,N,3)
-      B_batch : (B,M,3)
-      VAA,VBB : (B,)  self-overlap scalars already cached
-    Returns
-      score : (B,)    q_best : (B,4)    t_best : (B,3)
+    Padding-aware vectorised alignment for a bucket of pairs.
+
+    A_batch, B_batch : (BATCH, N_pad, 3) / (BATCH, M_pad, 3)
+    VAA, VBB         : (BATCH,)  Gaussian self-overlaps
+    N_real, M_real   : (BATCH,)  true atom counts (optional when not padded)
     """
     device = A_batch.device
-    BATCH, N, _ = A_batch.shape
-    _,     M, _ = B_batch.shape
+    BATCH, N_pad, _ = A_batch.shape
+    _,     M_pad, _ = B_batch.shape
 
-    # ---------- coarse grid shared across pairs ---------------------
+    if N_real is None:
+        N_real = A_batch.new_full((BATCH,), N_pad, dtype=torch.int32)
+    if M_real is None:
+        M_real = B_batch.new_full((BATCH,), M_pad, dtype=torch.int32)
+
+    # ---------- coarse grid (shared for the whole bucket) -----------------
     quats = _get_points_fibonacci(coarse_rots, device=device)
     quats = torch.nn.functional.normalize(quats, dim=1)        # (R,4)
 
-    n_trans = min(coarse_trans, N)
-    trans   = A_batch[:, :n_trans, :] - B_batch.mean(1, keepdim=True)  # (B,n_trans,3)
+    n_trans = int(torch.minimum(
+        torch.tensor(coarse_trans, device=device, dtype=torch.int32),
+        N_real).min())
 
-    # Cartesian product   ---->   (B,R·n_trans,4) / (B,R·n_trans,3)
-    q_grid = quats.repeat_interleave(n_trans, 0)                # (R·n_trans,4)
-    q_grid = q_grid.unsqueeze(0).expand(BATCH, -1, -1)          # (B,G,4)
+    B_cent = (B_batch.sum(1) / M_real.float().unsqueeze(1)).unsqueeze(1)  # (B,1,3)
+    trans  = A_batch[:, :n_trans] - B_cent                                # (B,n_trans,3)
 
-    t_grid = trans.repeat(1, coarse_rots, 1)                    # (B,G,3)
-
+    q_grid = quats.repeat_interleave(n_trans, 0)                 # (G,4)
+    q_grid = q_grid.unsqueeze(0).expand(BATCH, -1, -1)           # (B,G,4)
+    t_grid = trans.repeat(1, coarse_rots, 1)                     # (B,G,3)
     G = q_grid.size(1)
 
-    # Broadcast coordinates
-    A_rep = A_batch.unsqueeze(1).expand(-1, G, -1, -1).contiguous().view(-1, N, 3)
-    B_rep = B_batch.unsqueeze(1).expand(-1, G, -1, -1).contiguous().view(-1, M, 3)
-    q_rep = q_grid.contiguous().view(-1, 4)   # SAFE reshape
-    t_rep = t_grid.contiguous().view(-1, 3)
+    # --------- double micro-batch: orientations × pairs -------------------
+    ORI_CHUNK  = 25_000                 # orientations per slice
+    PAIR_CHUNK = 4_096                  # pairs per slice  (≈ 400 × 4 096 × 3 × 4 ≈ 19 MB)
 
-    # ----- score the whole coarse grid in CUDA-safe chunks ----------
-    VAB_flat, _, _ = _overlap_in_chunks(A_rep, B_rep, q_rep, t_rep, alpha=alpha)
-    VAB = VAB_flat.view(BATCH, G)
+    coarse_score = torch.empty(BATCH, G, device=device, dtype=A_batch.dtype)
 
-    coarse_score = VAB / (VAA[:, None] + VBB[:, None] - VAB)
+    for o0 in range(0, G, ORI_CHUNK):
+        o1    = min(o0 + ORI_CHUNK, G)
+        g_len = o1 - o0
 
-    best_idx = torch.topk(coarse_score, k=topk, dim=1).indices      # (B,topk)
+        # --- loop over pair slices so the contiguous copy stays small ----
+        for p0 in range(0, BATCH, PAIR_CHUNK):          ##### NEW pair-chunk #####
+            p1 = min(p0 + PAIR_CHUNK, BATCH)
+            slice_len = p1 - p0
 
-    # gather top-k orientations
-    gather = best_idx + (torch.arange(BATCH, device=device) * G)[:, None]
-    q_best = q_rep[gather.view(-1)].view(BATCH, topk, 4).clone()
-    t_best = t_rep[gather.view(-1)].view(BATCH, topk, 3).clone()
+            A_rep = A_batch[p0:p1].unsqueeze(1) \
+                               .expand(-1, g_len, -1, -1) \
+                               .reshape(-1, N_pad, 3)
+            B_rep = B_batch[p0:p1].unsqueeze(1) \
+                               .expand(-1, g_len, -1, -1) \
+                               .reshape(-1, M_pad, 3)
 
-    # Adam state
-    m_q = torch.zeros_like(q_best); v_q = torch.zeros_like(q_best)
-    m_t = torch.zeros_like(t_best); v_t = torch.zeros_like(t_best)
+            q_rep = q_grid[p0:p1, o0:o1, :].reshape(-1, 4).contiguous()
+            t_rep = t_grid[p0:p1, o0:o1, :].reshape(-1, 3).contiguous()
 
-    A_k = A_batch.unsqueeze(1).expand(-1, topk, -1, -1).contiguous().view(-1, N, 3)
-    B_k = B_batch.unsqueeze(1).expand(-1, topk, -1, -1).contiguous().view(-1, M, 3)
+            N_rep = N_real[p0:p1].repeat_interleave(g_len)
+            M_rep = M_real[p0:p1].repeat_interleave(g_len)
 
-    q_k = q_best.view(-1,4); t_k = t_best.view(-1,3)
-    m_q = m_q.view_as(q_k); v_q = v_q.view_as(q_k)
-    m_t = m_t.view_as(t_k); v_t = v_t.view_as(t_k)
+            VAB_slice, _, _ = _overlap_in_chunks(
+                A_rep, B_rep, q_rep, t_rep,
+                alpha=alpha, N_real=N_rep, M_real=M_rep)
+
+            coarse_score[p0:p1, o0:o1] = VAB_slice.view(slice_len, g_len)
+
+    # ---------- pick top-k and continue exactly as before -----------------
+    coarse_score = coarse_score / (VAA[:, None] + VBB[:, None] - coarse_score)
+    best_idx = coarse_score.topk(k=topk, dim=1).indices           # (B,topk)
+
+    q_best = torch.gather(
+        q_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 4)).clone()
+    t_best = torch.gather(
+        t_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 3)).clone()
+
+    # ------------- fine polishing (unchanged) -----------------------------
+    A_k = A_batch.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, N_pad, 3)
+    B_k = B_batch.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, M_pad, 3)
+    q_k = q_best.view(-1, 4)
+    t_k = t_best.view(-1, 3)
+
+    N_k = N_real.repeat_interleave(topk)
+    M_k = M_real.repeat_interleave(topk)
+
+    m_q = torch.zeros_like(q_k); v_q = torch.zeros_like(q_k)
+    m_t = torch.zeros_like(t_k); v_t = torch.zeros_like(t_k)
 
     for _ in range(steps_fine):
-        VAB, dq, dt = _overlap_in_chunks(A_k, B_k, q_k, t_k, alpha=alpha)
-        denom = VAA.repeat_interleave(topk) + VBB.repeat_interleave(topk) - VAB
-        adam_step(q_k, dq / denom[:, None], m_q, v_q, lr)
-        adam_step(t_k, dt / denom[:, None], m_t, v_t, lr)
-        q_k = torch.nn.functional.normalize(q_k, dim=1)
+        VAB, dQ, dT = _overlap_in_chunks(
+            A_k, B_k, q_k, t_k,
+            alpha=alpha, N_real=N_k, M_real=M_k)
 
-    final_VAB, _, _ = _overlap_in_chunks(A_k, B_k, q_k, t_k, alpha=alpha)
+        denom = VAA.repeat_interleave(topk) + VBB.repeat_interleave(topk) - VAB
+        fused_adam_qt(q_k, t_k, dQ / denom[:, None], dT / denom[:, None],
+                      m_q, v_q, m_t, v_t, lr)
+
+    final_VAB, _, _ = _overlap_in_chunks(
+        A_k, B_k, q_k, t_k,
+        alpha=alpha, N_real=N_k, M_real=M_k)
+
     final_score = final_VAB / (VAA.repeat_interleave(topk) +
                                VBB.repeat_interleave(topk) - final_VAB)
     final_score = final_score.view(BATCH, topk)
-    best = torch.argmax(final_score, dim=1)                       # (B,)
+    best = final_score.argmax(dim=1)
 
-    idx = best + torch.arange(BATCH, device=device) * topk
-    return final_score.view(-1)[idx], q_k.view(BATCH, topk, 4)[torch.arange(BATCH), best], \
+    sel = best + torch.arange(BATCH, device=device) * topk
+    return final_score.flatten()[sel], \
+           q_k.view(BATCH, topk, 4)[torch.arange(BATCH), best], \
            t_k.view(BATCH, topk, 3)[torch.arange(BATCH), best]
-

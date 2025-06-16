@@ -28,6 +28,17 @@ from .alignment_utils.fast_se3 import coarse_fine_align, coarse_fine_align_many
 from .alignment_utils.se3 import quaternion_to_SE3
 from .score.gaussian_overlap_triton import gaussian_self_overlap
 
+### BEGIN size_bucketing #####################################################
+# Every heavy-atom count 3‒150 is mapped to a “band” of 8 atoms
+# (   1-8, 9-16, 17-24, … ).  Pairs that fall in the same band
+# share a common padded tensor size → one GPU launch.
+_BAND = 16                     # change to 16/32 if you want larger bands
+
+def _band_key(n: int) -> int:
+    "return the *upper* bound of the 8-atom band this n falls into"
+    return ((n + _BAND - 1) // _BAND) * _BAND
+### END size_bucketing #######################################################
+
 def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) -> Chem.Mol:
     """
     Updates the coordinates of a 3D RDKit mol object with a new set of coordinates
@@ -156,7 +167,7 @@ class Molecule:
             if alpha in self._shape_cache:
                 return self._shape_cache[alpha]
 
-            pts = torch.as_tensor(self.atom_pos,
+            pts = torch.tensor(self.atom_pos,
                                 dtype=torch.float32,
                                 device=device)
             val = gaussian_self_overlap(pts, alpha).item()
@@ -422,31 +433,41 @@ class MoleculePair:
     @torch.no_grad()
     def align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81):
         """
-        Fast batched shape alignment for MANY pairs.
-
-        * Groups pairs that share the same (#ref atoms, #fit atoms)
-          so that each group can be processed in **one** GPU call.
-        * Uses the cached self-overlap (Molecule.shape_self) so no
-          extra kernels are launched per pair.
-        * Writes the optimal SE(3) and score back into each object.
+        One launch per *band* instead of one per exact (N,M).
+        A band is an 8-atom step (3-8, 9-16, … 145-152).
+        Padding with 0-vectors is safe because every kernel masks
+        out indices >= real_N / real_M.
         """
         if not pairs:
             return
 
-        # -------- group by (N_ref, N_fit) ---------------------------------
+        ### band_bucketing ###########################################
         buckets: dict[tuple[int, int], list[MoleculePair]] = {}
         for p in pairs:
-            key = (p._ref_xyz_t.shape[0], p._fit_xyz_t.shape[0])
-            buckets.setdefault(key, []).append(p)
+            n_band = _band_key(p._ref_xyz_t.shape[0])
+            m_band = _band_key(p._fit_xyz_t.shape[0])
+            buckets.setdefault((n_band, m_band), []).append(p)
 
         device = pairs[0].device
 
-        for (N, M), bucket in buckets.items():
-            # ---- stack coordinates in this bucket -----------------------
-            ref_stack = torch.stack([p._ref_xyz_t for p in bucket], 0).to(device)
-            fit_stack = torch.stack([p._fit_xyz_t for p in bucket], 0).to(device)
+        for (N_pad, M_pad), bucket in buckets.items():
+            # real sizes for every pair in this bucket
+            N_real = torch.tensor([p._ref_xyz_t.shape[0] for p in bucket],
+                                  device=device)
+            M_real = torch.tensor([p._fit_xyz_t.shape[0] for p in bucket],
+                                  device=device)
 
-            # ---- cached self-overlap (no kernels) ------------------------
+            # ---------------- stack & pad ------------------------------
+            ref_pad = torch.zeros(len(bucket), N_pad, 3,
+                                  device=device, dtype=torch.float32)
+            fit_pad = torch.zeros(len(bucket), M_pad, 3,
+                                  device=device, dtype=torch.float32)
+
+            for i, p in enumerate(bucket):
+                ref_pad[i, :N_real[i]] = p._ref_xyz_t.to(device)
+                fit_pad[i, :M_real[i]] = p._fit_xyz_t.to(device)
+
+            # self-overlap cache ---------------------------------------
             VAA = torch.tensor([p.ref_molec.shape_self(alpha, device)
                                 for p in bucket],
                                device=device, dtype=torch.float32)
@@ -454,11 +475,13 @@ class MoleculePair:
                                 for p in bucket],
                                device=device, dtype=torch.float32)
 
-            # ---- one GPU call for the whole bucket ----------------------
+            # ---------------- alignment -------------------------------
             scores, q_batch, t_batch = coarse_fine_align_many(
-                ref_stack, fit_stack, VAA, VBB, alpha=alpha)
+                ref_pad, fit_pad, VAA, VBB,
+                N_real=N_real, M_real=M_real,   
+                alpha=alpha)
 
-            # ---- write results back to each MoleculePair ---------------
+            # ---------------- write back ------------------------------
             for p, s, q, t in zip(bucket, scores, q_batch, t_batch):
                 SE3 = quaternion_to_SE3(q, t).cpu().numpy()
                 p.transform_vol_noH   = SE3
@@ -916,6 +939,91 @@ class MoleculePair:
         self.sim_aligned_pharm = score.numpy()
         return aligned_fit_anchors.numpy(), aligned_fit_vectors.numpy()
     
+
+    def score_with_vol(
+        self,
+        alpha: float,
+        *,
+        no_H: bool = True,
+        use: str = "torch",
+    ) -> np.ndarray:
+        """
+        Shape (volume) Tanimoto similarity between *ref_molec* and *fit_molec*
+        given their **current alignment**.
+
+        Parameters
+        ----------
+        alpha : float
+            Gaussian width parameter used for the overlap calculation.
+        no_H : bool (default = True)
+            When True, hydrogens are ignored for both molecules.
+        use : str (default = 'torch')
+            Pick the backend implementation:
+              'np'/'numpy'   → NumPy
+              'torch'/'pytorch' → PyTorch (recommended, fastest)
+              'jax'/'jnp'    → JAX  (if installed)
+
+        Returns
+        -------
+        score : np.ndarray shape (1,)
+            Tanimoto-style similarity score.
+        """
+        use = use.lower()
+        accepted = ("jax", "jnp", "torch", "pytorch", "np", "numpy")
+        if use not in accepted:
+            raise ValueError(f"`use` must be one of {accepted}, got {use!r}")
+
+        # Choose which atomic coordinates to feed to the overlap kernels.
+        def _coords(mol):
+            if no_H:
+                # Fast path if the class already pre-computed non-H indices
+                if hasattr(mol, "_nonH_atoms_idx"):
+                    return mol.atom_pos[mol._nonH_atoms_idx]
+            return mol.atom_pos
+
+        # -------------------------- JAX -------------------------------------
+        if use in ("jax", "jnp"):
+            try:
+                import jax.numpy as jnp
+            except ImportError:
+                raise ImportError(
+                    "JAX is not installed.  Use `use='torch'` or `use='np'`."
+                )
+            from shepherd_score.score.gaussian_overlap_jax import (
+                get_overlap_jax,
+            )
+
+            score = get_overlap_jax(
+                centers_1=jnp.array(_coords(self.ref_molec)),
+                centers_2=jnp.array(_coords(self.fit_molec)),
+                alpha=alpha,
+            )
+            return np.array(score)  # keep return type consistent
+
+        # -------------------------- PyTorch---------------------------------
+        elif use in ("torch", "pytorch"):
+            import torch
+            from shepherd_score.score.gaussian_overlap import get_overlap
+
+            score = get_overlap(
+                centers_1=torch.as_tensor(_coords(self.ref_molec), dtype=torch.float32, device=self.device),
+                centers_2=torch.as_tensor(_coords(self.fit_molec), dtype=torch.float32, device=self.device),
+                alpha=alpha,
+            )
+            return score.cpu().numpy()
+
+        # -------------------------- NumPy -----------------------------------
+        else:  # 'np' / 'numpy'
+            import numpy as np
+            from shepherd_score.score.gaussian_overlap_np import get_overlap_np
+
+            score = get_overlap_np(
+                centers_1=_coords(self.ref_molec),
+                centers_2=_coords(self.fit_molec),
+                alpha=alpha,
+            )
+            return score
+
 
     def score_with_surf(self,
                         alpha: float,
