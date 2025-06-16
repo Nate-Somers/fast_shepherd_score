@@ -1,19 +1,45 @@
-name: shepherd_score
+name: GNNenv
 channels:
-  - conda-forge
+  - conda-forge       
+  - defaults
 dependencies:
-  - python=3.8.13
-  - numpy>=1.2,<2.0
-  - torchaudio==0.12.1
-  - pytorch==1.12.1
-  - cudatoolkit==11.3.1
-  - torchvision==0.13.1
+  - python=3.10
+  - mamba
   - xtb
-  - mkl==2024.0
+  - xyz2mol
+  - cmake
   - pip:
-    - open3d>=0.18
-    - meeko
-    - vina==1.2.5
-    - py3dmol>=2.1.0
-    - scipy>=1.10
-    - pandas>=2.0
+      - --find-links https://data.pyg.org/whl/torch-2.5.1+cu124.html
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+
+      - torch==2.5.1+cu124
+      - torchvision==0.20.1+cu124
+      - torchaudio==2.5.1+cu124
+      
+      - pyg_lib
+      - torch_scatter
+      - torch_sparse
+      - torch_cluster
+      - torch_spline_conv
+      - molvoxel
+      - lightning
+      - git+https://github.com/maurerv/pyzernike
+      - e3fp
+      - psutil
+      - pandas
+      - scikit-learn
+      - mdanalysis
+      - prolif
+      - biopython
+      - py3dmol
+      - pyyaml
+      - optax
+      - jax
+      - scipy
+      - numpy
+      - open3d
+      - umap-learn
+      - plotly
+      - rdkit
+      - torch_geometric
+      - tensorboard
