@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-set -euo pipefail           # fail fast if anything goes wrong
 
 ###############################################################################
 # 1) bootstrap micromamba (≈2 MB static binary, no root needed)               #
