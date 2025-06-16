@@ -1,3 +1,4 @@
+# codex_startup.sh  
 #!/usr/bin/env bash
 
 ###############################################################################
@@ -6,7 +7,7 @@
 MAMBA_ROOT="${HOME}/.mamba"            # everything lives here, keeps $HOME tidy
 MAMBA_BIN="${MAMBA_ROOT}/bin/micromamba"
 
-if [[ ! -x "${MAMBA_BIN}" ]]; then
+if [ ! -x "${MAMBA_BIN}" ]; then
   echo "[startup] installing micromamba → ${MAMBA_ROOT}"
   curl -Ls https://micro.mamba.pm/install.sh | bash -s -- -b -p "${MAMBA_ROOT}"  # :contentReference[oaicite:0]{index=0}
 fi
@@ -31,7 +32,7 @@ EOF
 ENV_FILE="environment.yml"             # change if your file has another name
 ENV_NAME="codex-env"                   # or read `name:` from the YAML
 
-if [[ -f "${ENV_FILE}" ]]; then
+if [ -f "${ENV_FILE}" ]; then
   echo "[startup] creating/updating ${ENV_NAME} from ${ENV_FILE}"
   # first try “create”; if it already exists fall back to “update”
   if ! micromamba env create -n "${ENV_NAME}" -f "${ENV_FILE}" --yes; then
