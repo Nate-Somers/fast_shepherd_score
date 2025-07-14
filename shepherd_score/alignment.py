@@ -11,7 +11,7 @@ from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors, rdMolAlign
 
 from .generate_point_cloud import _get_points_fibonacci
-from .score.gaussian_overlap_triton import get_overlap, gaussian_self_overlap
+from .score.gaussian_overlap import get_overlap
 from .score.electrostatic_scoring import get_overlap_esp, esp_combo_score
 from .score.pharmacophore_scoring import get_overlap_pharm, _SIM_TYPE
 from .alignment_utils.se3 import get_SE3_transform, apply_SE3_transform, quaternions_to_rotation_matrix, apply_SO3_transform
@@ -64,7 +64,7 @@ def objective_ROCS_overlay(se3_params: torch.Tensor,
         
     se3_matrix = get_SE3_transform(se3_params)
     fit_points = apply_SE3_transform(fit_points, se3_matrix)
-    score = get_overlap(ref_points, fit_points, alpha, VAA_const)
+    score = get_overlap(ref_points, fit_points, alpha)
     
     # Single instance
     if len(se3_params.shape) == 1:
@@ -365,41 +365,27 @@ def optimize_ROCS_overlay(ref_points: torch.Tensor,
             trans_centers=trans_centers,
             num_repeats_per_trans=10)
     
-    if se3_params.dim() == 1:          # rare: only 1 restart returned
-        se3_params = se3_params.unsqueeze(0)
-
-    se3_params  = se3_params.to(fit_points.device)
-    se3_params.requires_grad_(True)    # single leaf for Adam
-    num_repeats = se3_params.shape[0]  # R
-
-
-    optimizer   = optim.Adam([se3_params], lr=lr, fused=True)
-
-    with torch.no_grad():
-        VAA_const = gaussian_self_overlap(ref_points, alpha)
+    num_repeats = len(se3_params) if len(se3_params.shape) == 2 else 1
+    # Create optimizer
+    optimizer = optim.Adam([se3_params], lr=lr)
 
     # Optimization loop
     if verbose:
         print(f'Initial shape similarity score: {get_overlap(ref_points, fit_points, alpha):.3}')
     last_loss = 1
     counter = 0
-
-    with torch.no_grad():
-        VAA_const = gaussian_self_overlap(ref_points.to(ref_points.device),
-                                          alpha=alpha)      # (1,) CUDA
-
-    ref_points_rep = ref_points.unsqueeze(0).expand(num_repeats, -1, -1)
-    fit_points_rep = fit_points.unsqueeze(0).expand(num_repeats, -1, -1)
+    # ref_points will be broadcast by the objective/scoring function
+    if num_repeats == 1:
+        fit_points_to_transform = fit_points 
+    else: 
+        fit_points_to_transform = fit_points.repeat((num_repeats,1,1))
 
     for step in range(max_num_steps):
         # Forward pass: compute objective function and gradients
-        loss = objective_ROCS_overlay(
-            se3_params = se3_params,
-            ref_points = ref_points_rep,
-            fit_points = fit_points_rep,
-            alpha      = alpha,
-            VAA_const  = VAA_const,
-        )
+        loss = objective_ROCS_overlay(se3_params=se3_params,
+                                      ref_points=ref_points,
+                                      fit_points=fit_points_to_transform,
+                                      alpha=alpha)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -420,13 +406,10 @@ def optimize_ROCS_overlay(ref_points: torch.Tensor,
     # Extract optimized SE(3) parameters
     optimized_se3_params = se3_params.detach()
     SE3_transform = get_SE3_transform(optimized_se3_params)
-    aligned_points = apply_SE3_transform(fit_points_rep, se3_params)
-    scores = get_overlap(
-        centers_1 = ref_points_rep,     # <- use the correct keyword
-        centers_2 = aligned_points,
-        alpha     = alpha,
-        VAA_const = VAA_const,
-    )
+    aligned_points = apply_SE3_transform(fit_points_to_transform, SE3_transform)
+    scores = get_overlap(centers_1=ref_points,
+                         centers_2=aligned_points,
+                         alpha=alpha)
     if num_repeats == 1:
         if verbose:
             print(f'Optimized shape similarity score: {scores:.3}')
@@ -437,12 +420,11 @@ def optimize_ROCS_overlay(ref_points: torch.Tensor,
         if verbose:
             print(f'Optimized shape similarity score -- max: {scores.max():3} | mean: {scores.mean():.3} | min: {scores.min():3}')
         best_idx = torch.argmax(scores.detach().cpu())
-        best_alignment = aligned_points[best_idx]     # still GPU
-        best_transform = SE3_transform[best_idx]
-        best_score     = scores[best_idx]
-    return (best_alignment.detach().cpu(),        # single D→H copy each
-        best_transform.detach().cpu(),
-        best_score.detach().cpu())
+        best_alignment = aligned_points.cpu()[best_idx]
+        best_transform = SE3_transform.cpu()[best_idx]
+        best_score = scores.cpu()[best_idx]
+
+    return best_alignment, best_transform, best_score
 
 
 def objective_ROCS_esp_overlay(se3_params: torch.Tensor,

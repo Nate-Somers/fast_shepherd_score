@@ -24,9 +24,9 @@ from .score.pharmacophore_scoring import _SIM_TYPE, get_overlap_pharm
 from .alignment import optimize_ROCS_overlay, optimize_ROCS_esp_overlay, optimize_esp_combo_score_overlay
 from .alignment import optimize_pharm_overlay
 from .alignment_utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
-from .alignment_utils.fast_se3 import coarse_fine_align, coarse_fine_align_many
+from .alignment_utils.fast_se3 import coarse_fine_align_many
 from .alignment_utils.se3 import quaternion_to_SE3
-from .score.gaussian_overlap_triton import gaussian_self_overlap
+from .score.gaussian_overlap_triton import _batch_self_overlap
 
 ### BEGIN size_bucketing #####################################################
 # Every heavy-atom count 3‒150 is mapped to a “band” of 8 atoms
@@ -156,23 +156,23 @@ class Molecule:
 
         self._shape_cache: dict[float, float] = {}
 
-    def shape_self(self,
-                   alpha: float = 0.81,
-                   device: str | torch.device = "cuda") -> float:
-            """
-            Return VAA (second-order Gaussian volume overlap of *this* molecule
-            with itself).  Result is cached per α to avoid launching the kernel
-            more than once per molecule.
-            """
-            if alpha in self._shape_cache:
-                return self._shape_cache[alpha]
-
-            pts = torch.tensor(self.atom_pos,
-                                dtype=torch.float32,
-                                device=device)
-            val = gaussian_self_overlap(pts, alpha).item()
-            self._shape_cache[alpha] = val
-            return val
+    def shape_self(self, alpha: float = 0.81,
+                device: torch.device | str | None = None,
+                include_H: bool = True) -> float:
+        """
+        Gaussian self-overlap VPP(P,P).
+        `include_H` **must** match whatever atom subset will be used in VAB.
+        """
+        key = (alpha, include_H)
+        if key in self._shape_cache:
+            return self._shape_cache[key]
+        coords = (self.atom_pos if include_H
+                else self.atom_pos[self._nonH_atoms_idx])
+        # --- GPU or CPU implementation exactly as before ------------------
+        val = gaussian_self_overlap(torch.as_tensor(coords, dtype=torch.float32,
+                                                    device=device or "cpu"), alpha)
+        self._shape_cache[key] = float(val)
+        return float(val)
 
     def get_partial_charges(self) -> np.ndarray:
         """
@@ -301,14 +301,6 @@ class MoleculePair:
         else:
             self.fit_molec = Molecule(fit_mol, num_surf_points=num_surf_points, density=density)
 
-        # ----  pre-convert atomic coordinates to torch on the target device  ----
-        self._ref_xyz_t = torch.as_tensor(self.ref_molec.atom_pos,
-                                          dtype=torch.float32,
-                                          device=device)          # (N,3)
-        self._fit_xyz_t = torch.as_tensor(self.fit_molec.atom_pos,
-                                          dtype=torch.float32,
-                                          device=device)          # (M,3)
-
         self.num_surf_points = num_surf_points
         self.density = density
         if density is not None and num_surf_points is None:
@@ -321,6 +313,14 @@ class MoleculePair:
         if do_center:
             self.ref_molec.center_to(self.ref_molec.atom_pos.mean(0))
             self.fit_molec.center_to(self.fit_molec.atom_pos.mean(0))
+
+        # ----  pre-convert atomic coordinates to torch on the target device  ----
+        self._ref_xyz_t = torch.as_tensor(self.ref_molec.atom_pos,
+                                          dtype=torch.float32,
+                                          device=device)          # (N,3)
+        self._fit_xyz_t = torch.as_tensor(self.fit_molec.atom_pos,
+                                          dtype=torch.float32,
+                                          device=device)          # (M,3)
 
         self.transform_vol = np.eye(4)
         self.sim_aligned_vol = None
@@ -424,13 +424,12 @@ class MoleculePair:
             SE3 = quaternion_to_SE3(q, t).cpu().numpy()
             fit_aligned = (SE3[:3, :3] @ p._fit_xyz_t.cpu().T).T + SE3[:3, 3]
             p.transform_vol_noH   = SE3
-            p.sim_aligned_vol_noH = float(s)
+            p.sim_aligned_vol_noH = s.cpu().item()
             outs.append(fit_aligned.numpy())
 
         return outs[0] if batch_objs is None else outs
 
     @staticmethod
-    @torch.no_grad()
     def align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81):
         """
         One launch per *band* instead of one per exact (N,M).
@@ -441,7 +440,7 @@ class MoleculePair:
         if not pairs:
             return
 
-        ### band_bucketing ###########################################
+        # -------- band bucketing ---------------------------------
         buckets: dict[tuple[int, int], list[MoleculePair]] = {}
         for p in pairs:
             n_band = _band_key(p._ref_xyz_t.shape[0])
@@ -453,27 +452,21 @@ class MoleculePair:
         for (N_pad, M_pad), bucket in buckets.items():
             # real sizes for every pair in this bucket
             N_real = torch.tensor([p._ref_xyz_t.shape[0] for p in bucket],
-                                  device=device)
+                                device=device, dtype=torch.int32)
             M_real = torch.tensor([p._fit_xyz_t.shape[0] for p in bucket],
-                                  device=device)
+                                device=device, dtype=torch.int32)
 
             # ---------------- stack & pad ------------------------------
-            ref_pad = torch.zeros(len(bucket), N_pad, 3,
-                                  device=device, dtype=torch.float32)
-            fit_pad = torch.zeros(len(bucket), M_pad, 3,
-                                  device=device, dtype=torch.float32)
+            ref_pad = torch.zeros(len(bucket), N_pad, 3, device=device, dtype=torch.float32)
+            fit_pad = torch.zeros(len(bucket), M_pad, 3, device=device, dtype=torch.float32)
 
             for i, p in enumerate(bucket):
                 ref_pad[i, :N_real[i]] = p._ref_xyz_t.to(device)
                 fit_pad[i, :M_real[i]] = p._fit_xyz_t.to(device)
 
-            # self-overlap cache ---------------------------------------
-            VAA = torch.tensor([p.ref_molec.shape_self(alpha, device)
-                                for p in bucket],
-                               device=device, dtype=torch.float32)
-            VBB = torch.tensor([p.fit_molec.shape_self(alpha, device)
-                                for p in bucket],
-                               device=device, dtype=torch.float32)
+            # ------------- *batched* self-overlaps ---------------------
+            VAA = _batch_self_overlap(ref_pad, N_real, alpha)   # (K,)
+            VBB = _batch_self_overlap(fit_pad, M_real, alpha)   # (K,)
 
             # ---------------- alignment -------------------------------
             scores, q_batch, t_batch = coarse_fine_align_many(
@@ -485,7 +478,7 @@ class MoleculePair:
             for p, s, q, t in zip(bucket, scores, q_batch, t_batch):
                 SE3 = quaternion_to_SE3(q, t).cpu().numpy()
                 p.transform_vol_noH   = SE3
-                p.sim_aligned_vol_noH = float(s)
+                p.sim_aligned_vol_noH = s.cpu().item()
 
     def align_with_vol_esp(self,
                            lam: float,

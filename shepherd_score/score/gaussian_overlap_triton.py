@@ -1,27 +1,11 @@
 # shepherd_score/score/gaussian_overlap_triton.py
 # A fused (forward + backward) Gaussian‐Tanimoto kernel using Triton.
 #
-import math
+import math, sys
 import triton
 import triton.language as tl
 import torch
 import numpy as np
-
-# ---------------------------------------------------------------------------#
-#  Scratch-buffer pool to avoid   torch.zeros_like()   every kernel launch   #
-# ---------------------------------------------------------------------------#
-_buffer_pool = {}                #  { (shape,dtype,device) : tensor }
-
-def _pool_key(t: torch.Tensor):
-    return (t.shape, t.dtype, t.device)
-
-def acquire_like(t: torch.Tensor) -> torch.Tensor:
-    """return a reusable buffer with   t.shape / t.dtype / t.device"""
-    k = _pool_key(t)
-    if k not in _buffer_pool:
-        _buffer_pool[k] = torch.empty_like(t)      # one-off allocation
-    return _buffer_pool[k]
-
 
 @triton.jit
 def _load_xyz(ptr, idx, mask):
@@ -29,328 +13,13 @@ def _load_xyz(ptr, idx, mask):
     Safe load of a (K,3) array.  Any thread with mask=False uses a clamped
     pointer (index 0) so no out-of-bounds address is ever formed.
     """
-    idx_safe = tl.where(mask, idx, 0)           # ← NEW
+    idx_safe = tl.where(mask, idx, 0)           
     x = tl.load(ptr + idx_safe * 3 + 0, mask=mask)
     y = tl.load(ptr + idx_safe * 3 + 1, mask=mask)
     z = tl.load(ptr + idx_safe * 3 + 2, mask=mask)
     return x, y, z
 
-
-@triton.jit
-def _gauss_overlap_fwd(
-    # ----------- existing args ----------------------------------
-    A_ptr, B_ptr,                  # coordinates (flat (K*3,) buffers)
-    VAB_ptr,                       # (1,)   – accumulate VAB
-    dVAB_ptr,                      # (M*3,) – ∂VAB/∂B
-    # ----------- NEW args ---------------------------------------
-    VBB_ptr,                       # (1,)   – accumulate VBB   (can be nullptr)
-    dVBB_ptr,                      # (M*3,) – ∂VBB/∂B          (can be nullptr)
-    # ------------------------------------------------------------
-    N, M,
-    half_alpha, k_const,
-    BLOCK_N: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    want_grad: tl.constexpr,       # bool – do we need any gradients?
-    want_self: tl.constexpr,       # bool – does this launch also compute BB?
-):
-    pid_r = tl.program_id(0)          # batch
-    pid_n = tl.program_id(1)          # tiles in A
-    pid_m = tl.program_id(2)          # tiles in B
-
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_n = offs_n < N
-    mask_m = offs_m < M
-
-    # Load (x,y,z) for all A[i] in this tile
-    ax, ay, az = _load_xyz(A_ptr + pid_r*N*3, offs_n, mask_n)
-    # Load (x,y,z) for all B[j] in this tile
-    bx, by, bz = _load_xyz(B_ptr + pid_r*M*3, offs_m, mask_m)
-
-    # Compute pairwise squared distances between each tile of A and tile of B
-    dx = ax[:, None] - bx[None, :]
-    dy = ay[:, None] - by[None, :]
-    dz = az[:, None] - bz[None, :]
-    r2 = dx * dx + dy * dy + dz * dz
-
-    # Gaussian kernel: g_{ij} = exp( −(alpha/2) * r2 ) * (π^{1.5} / ((2 α)^{1.5}))
-    g = tl.exp(-half_alpha * r2) * k_const   # shape (BLOCK_N, BLOCK_M)
-
-    # Accumulate VAB tile-wise
-    v_tile = tl.sum(g)
-    # Write into V_out[0]
-    tl.atomic_add(VAB_ptr + pid_r, v_tile)
-
-    if want_self and (pid_n == pid_m):
-        # this tile is on B×B; add symmetric contribution
-        # vbb_tile = 2*sum(g) - sum(diag(g))
-        diag_mask = tl.arange(0, BLOCK_N)[:,None] == tl.arange(0,BLOCK_M)[None,:]
-        diag_sum  = tl.sum(tl.where(diag_mask, g, 0.0))
-        vbb_tile  = tl.sum(g)*2.0 - diag_sum
-        tl.atomic_add(VBB_ptr + pid_r, vbb_tile)
-
-    # Gradient wrt B_j:  ∂VAB/∂B_j = Σ_i [ α·g_{ij}·(B_j − A_i) ]
-    # But since half_alpha = 0.5·alpha, α = 2·half_alpha.
-    if want_grad:
-        # (a) allocate *register* buffers, one element per B-atom in the tile
-        gradbx = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        gradby = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        gradbz = tl.zeros((BLOCK_M,), dtype=tl.float32)
-
-        # (b) accumulate this tile’s contribution **into registers**
-        coeff = (2.0 * half_alpha) * g
-        gradbx += tl.sum(coeff * (-dx), 0)          # (BLOCK_M,)
-        gradby += tl.sum(coeff * (-dy), 0)
-        gradbz += tl.sum(coeff * (-dz), 0)
-
-        # add the ½-symmetric term if this is a B×B tile
-        if want_self and (pid_n == pid_m):
-            coeff_self = coeff * 0.5
-            gradbx += tl.sum(coeff_self * (-dx), 0)
-            gradby += tl.sum(coeff_self * (-dy), 0)
-            gradbz += tl.sum(coeff_self * (-dz), 0)
-
-        # (c)  **single** atomic write-back per B-atom for this block
-        tl.atomic_add(dVAB_ptr + (pid_r*M + offs_m)*3 + 0, gradbx, mask=mask_m)
-        tl.atomic_add(dVAB_ptr + (pid_r*M + offs_m)*3 + 1, gradby, mask=mask_m)
-        tl.atomic_add(dVAB_ptr + (pid_r*M + offs_m)*3 + 2, gradbz, mask=mask_m)
-
-        if want_self and (pid_n == pid_m):
-            tl.atomic_add(dVBB_ptr + (pid_r*M + offs_m)*3 + 0, gradbx, mask=mask_m)
-            tl.atomic_add(dVBB_ptr + (pid_r*M + offs_m)*3 + 1, gradby, mask=mask_m)
-            tl.atomic_add(dVBB_ptr + (pid_r*M + offs_m)*3 + 2, gradbz, mask=mask_m)
-
-@triton.jit
-def _self_overlap_fwd(
-    P_ptr, V_out, dVdP_ptr,     # P has shape (K,3)
-    K, half_alpha,              # 0.5 * alpha
-    k_const,                    # π^{3/2} / ( (2·α)^{3/2} ), α = 2·half_alpha
-    BLOCK: tl.constexpr,
-):
-    """
-    Compute a tile of VAA / VBB and its gradient.
-
-    The program is launched on a 2-D grid:
-        pid_row = tl.program_id(0)   ← rows  (i-tile)
-        pid_col = tl.program_id(1)   ← cols  (j-tile)
-
-    Only tiles with pid_row ≥ pid_col are evaluated; the others return
-    immediately, so every ordered pair (i,j) is visited exactly once.
-    """
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-
-    # Skip upper-triangular tiles – they are handled by the symmetric one.
-    if pid_row < pid_col:
-        return
-
-    # ------------------------------------------------------------------
-    #  indices & masks for this tile
-    # ------------------------------------------------------------------
-    offs_i   = pid_row * BLOCK + tl.arange(0, BLOCK)
-    offs_j   = pid_col * BLOCK + tl.arange(0, BLOCK)
-    row_mask = offs_i < K
-    col_mask = offs_j < K
-
-    # ------------------------------------------------------------------
-    #  load coordinates
-    # ------------------------------------------------------------------
-    xi, yi, zi = _load_xyz(P_ptr, offs_i, row_mask)
-    xj, yj, zj = _load_xyz(P_ptr, offs_j, col_mask)
-
-    dx = xi[:, None] - xj[None, :]
-    dy = yi[:, None] - yj[None, :]
-    dz = zi[:, None] - zj[None, :]
-    r2 = dx * dx + dy * dy + dz * dz
-
-    # Gaussian kernel 
-    g = tl.exp(-half_alpha * r2) * k_const
-
-    # mask out rows / cols beyond K
-    valid = row_mask[:, None] & col_mask[None, :]
-    g = tl.where(valid, g, 0.0)
-
-    # ------------------------------------------------------------------
-    #  keep only lower-triangle inside *diagonal* tiles
-    # ------------------------------------------------------------------
-    if pid_row == pid_col:
-        tri_mask = offs_i[:, None] >= offs_j[None, :]        # i ≥ j
-        g = tl.where(tri_mask, g, 0.0)
-
-    # ------------------------------------------------------------------
-    #  accumulate VAA / VBB
-    #     • off-diag tiles   :  2·Σ g_ij
-    #     • diagonal tile    :  2·Σ_{i>j} g_ij  +  Σ_i g_ii
-    #                          = 2·Σ g_ij − Σ_i g_ii
-    # ------------------------------------------------------------------
-    tile_sum = tl.sum(g)
-
-    if pid_row == pid_col:
-        diag_sum = tl.sum(tl.where(offs_i[:, None] == offs_j[None, :], g, 0.0))
-        v_tile   = tile_sum * 2.0 - diag_sum
-    else:
-        v_tile   = tile_sum * 2.0     # off-diag
-
-    tl.atomic_add(V_out, v_tile)
-
-    # ------------------------------------------------------------------
-    #  gradient   ∂V/∂P_i  = 2 · Σ_{j<i} α g_ij (P_i − P_j)
-    # ------------------------------------------------------------------
-    coeff = (2.0 * half_alpha) * g
-    gradx = tl.sum(coeff * dx, 1) * 2.0
-    grady = tl.sum(coeff * dy, 1) * 2.0
-    gradz = tl.sum(coeff * dz, 1) * 2.0
-
-    # write-back
-    tl.atomic_add(dVdP_ptr + offs_i * 3 + 0, gradx, mask=row_mask)
-    tl.atomic_add(dVdP_ptr + offs_i * 3 + 1, grady, mask=row_mask)
-    tl.atomic_add(dVdP_ptr + offs_i * 3 + 2, gradz, mask=row_mask)
-
-
-class _GaussianTanimotoAutograd(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, A, B, alpha: float = 0.81, VAA_const=None):
-        """
-        A: (N,3) float32 CUDA tensor
-        B: (M,3) float32 CUDA tensor
-        alpha: Python float
-        """
-        assert A.is_cuda and B.is_cuda and A.dtype == torch.float32 and B.dtype == torch.float32
-
-        R     = A.shape[0]              # R = 50 for your optimiser
-        N, M  = A.shape[1], B.shape[1]  
-        SMALL  = max(N, M) <= 64
-        BLOCK  = 32 if SMALL else 128
-
-        # Precompute “half_alpha” and “k_const” on the Python side:
-        half_alpha = 0.5 * alpha
-        k_const    = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
-        k_self     = math.pi**1.5 / ((4.0 * half_alpha) ** 1.5)  # python float
-
-        want_grad = ctx.needs_input_grad[1]      # only B needs grads
-        want_self = (N == M)                           # fuse VBB into the same kernel
-
-        if want_grad:
-            dVAB = torch.zeros_like(B)      
-            dVBB = torch.zeros_like(B)
-        else:
-            dVAB = acquire_like(B); dVAB.zero_()
-            dVBB = acquire_like(B); dVBB.zero_()
-
-        VAB  = torch.zeros(R, device=A.device, dtype=A.dtype)   
-        VBB  = torch.zeros(R, device=A.device, dtype=A.dtype)
-        VAA  = torch.zeros(R, device=A.device, dtype=A.dtype)
-
-        if VAA_const is not None:
-            # broadcast scalar(s) to the R-vector and skip kernel launch
-            VAA.copy_(VAA_const.to(VAA.device).expand_as(VAA))
-            skip_vaa = True
-        else:
-            skip_vaa = False
-
-        grid = (R, triton.cdiv(N,BLOCK), triton.cdiv(M,BLOCK))
-        _gauss_overlap_fwd[grid](
-            A, B,
-            VAB,  dVAB,            #  --- VAB outputs
-            VBB,  dVBB,            #  --- VBB outputs (nullptr on A×B tiles)
-            N, M, half_alpha, k_const,
-            BLOCK, BLOCK,
-            want_grad = want_grad,     # name=val to mark const-expr
-            want_self = want_self,
-        )
-
-        if not skip_vaa:
-            # allocate a *small, legal* dummy gradient buffer (no atomics crash)
-            dummy_grad = torch.zeros_like(A)        # (R, N, 3) contiguous
-            grid_aa   = (triton.cdiv(N, BLOCK), triton.cdiv(N, BLOCK))
-            _self_overlap_fwd[grid_aa](A, VAA, dummy_grad,
-                N, half_alpha, k_self, BLOCK=BLOCK)
-
-        denom = VAA + VBB - VAB
-        score = VAB / denom
-
-        # Save tensors for backward
-        ctx.save_for_backward(dVAB, dVBB, VAA, VBB, VAB, denom)
-        return score
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        dVdB, dVBBdB, VAA, VBB, VAB, denom = ctx.saved_tensors
-
-        VAA   = VAA.view(-1, 1, 1)
-        VBB   = VBB.view(-1, 1, 1)
-        VAB   = VAB.view(-1, 1, 1)
-        denom = denom.view(-1, 1, 1)
-        grad_out = grad_out.view(-1, 1, 1)
-
-        # ∂S/∂B = [(VAA + VBB)·dVAB/dB – VAB·dVBB/dB] / (denom²)
-        num   = (VAA + VBB) * dVdB - VAB * dVBBdB
-        gradB = grad_out * (num / (denom * denom))
-        return None, gradB, None, None
-
-
-def gaussian_tanimoto(A, B, alpha=0.81, VAA_const=None):
-    """
-    GPU-only fused Tanimoto score (forward & analytic grad) using Triton.
-    - A: (N,3) float32 CUDA tensor
-    - B: (M,3) float32 CUDA tensor
-    - alpha: Python float
-    Returns a scalar tensor [1] with gradient wrt B.
-    """
-    return _GaussianTanimotoAutograd.apply(A, B, alpha, VAA_const)
-
-@torch.no_grad()
-def gaussian_self_overlap(P: torch.Tensor, alpha: float = 0.81) -> torch.Tensor:
-    """
-    Fast VPP(P,P) without gradients (1-scalar CUDA tensor).
-    """
-    N = P.shape[0]
-    # Re-use the existing self-overlap kernel but pass a dummy grad ptr
-    BLOCK = 128 if N > 64 else 32
-    half_a, k_self = 0.5*alpha, math.pi**1.5 / ((4*0.5*alpha)**1.5)
-    VPP = torch.zeros(1, device=P.device, dtype=P.dtype)
-    _self_overlap_fwd[(triton.cdiv(N,BLOCK),)*2](
-        P, VPP, torch.empty((N, 3), device=P.device, dtype=P.dtype),
-        N, half_a, k_self, BLOCK=BLOCK
-    )
-    return VPP
-
-# ------------------------------------------------------------
-# Compatibility wrapper so existing code keeps working
-# ------------------------------------------------------------
-def get_overlap(centers_1, centers_2, alpha=0.81, VAA_const=None):
-    """
-    Back-compatible front end that accepts the old keyword names
-    (`centers_1`, `centers_2`) **and** batched input.
-
-    • works on CUDA via Triton kernel
-    • falls back to the legacy PyTorch path on CPU
-    """
-
-    if VAA_const is not None and centers_1.data_ptr() == centers_2.data_ptr():
-        # caller already has VAA
-        return VAA_const
-
-    # Allow ndarray inputs
-    if isinstance(centers_1, np.ndarray):
-        centers_1 = torch.as_tensor(centers_1, dtype=torch.float32)
-    if isinstance(centers_2, np.ndarray):
-        centers_2 = torch.as_tensor(centers_2, dtype=torch.float32)
-
-    # -------- CPU fallback --------
-    # if not centers_1.is_cuda or not centers_2.is_cuda:
-    #     from .gaussian import get_overlap as _cpu_overlap   # legacy version
-    #     return _cpu_overlap(centers_1, centers_2, alpha)
-
-    # -------- GPU / Triton path --------
-    if centers_1.dim() == 3:                       # batched (R,N,3)
-        return gaussian_tanimoto(centers_1, centers_2, alpha, VAA_const)          # ONE call
-    else:                                          # single pair (N, 3)
-        return gaussian_tanimoto(centers_1, centers_2, alpha, VAA_const)
-    
-# --------------------------------------------------------------------------- #
-# Fast path: score **and** gradients wrt quaternion q and translation t      #
-# --------------------------------------------------------------------------- #
+# ----------------- score and gradients wrt quaternion q and translation t -----------------     
 @triton.jit
 def _gauss_overlap_se3(
     A_ptr, B_ptr,                 # (B·N_pad·3,) (B·M_pad·3,)
@@ -375,10 +44,9 @@ def _gauss_overlap_se3(
     mask_m = offs_m < realM
 
     # detect if this entire tile is inactive (no valid ref OR no valid fit)
-    if tl.sum(mask_n) == 0 or tl.sum(mask_m) == 0:
-        # nothing to do – but write a sentinel very negative value
-        if pid_n == 0 and pid_m == 0:                # only once per orientation
-            tl.store(S_ptr, -1e30)
+    # If the whole tile is padding, skip it entirely.
+    #   (No write-back.  Leaving VAB untouched == add 0.)
+    if (tl.sum(mask_n.to(tl.int32)) == 0) | (tl.sum(mask_m.to(tl.int32)) == 0):
         return
 
     # -------- advance base pointers to this pair --------------------------
@@ -421,100 +89,86 @@ def _gauss_overlap_se3(
     dy = ay[:, None] - by[None, :]
     dz = az[:, None] - bz[None, :]
     r2 = dx*dx + dy*dy + dz*dz
-    g  = tl.exp(-half_alpha * r2) * k_const      # Gaussian
+    g  = tl.exp(-half_alpha * r2) * k_const
+    g  = tl.where(mask_n[:, None] & mask_m[None, :], g, 0.0)
 
     # accumulate VAA, VBB, VAB   (each thread-block works on a small slice;
     # atomic adds are fine b/c N,M ≤ 400)
-    Vab_tile = tl.sum(g)
+    Vab_tile = tl.sum(g)                   # ordered pairs (i,j) and (j,i) are identical
     tl.atomic_add(S_ptr, Vab_tile)               # we’ll finish formula in epilogue
 
     if NEED_GRAD:
-        # force (negative gradient) wrt moved point B_j
+        #   GRADIENT w.r.t. TRANSLATION
         coeff = (2.*half_alpha) * g              # shape (BLOCK_N,BLOCK_M)
-        fx = tl.sum(coeff * (-dx), 0)
-        fy = tl.sum(coeff * (-dy), 0)
-        fz = tl.sum(coeff * (-dz), 0)
+        fx = tl.sum(coeff *  dx , 0)    
+        fy = tl.sum(coeff *  dy , 0)
+        fz = tl.sum(coeff *  dz , 0)
 
-        # ∂S/∂t  just   Σ_j f_j
-        tl.atomic_add(dT_ptr + 0, tl.sum(fx))
-        tl.atomic_add(dT_ptr + 1, tl.sum(fy))
-        tl.atomic_add(dT_ptr + 2, tl.sum(fz))
+        # ∂VAB/∂t =  Σ_j f_j         ( because  B′ = R·B + t )
+        tl.atomic_add(dT_ptr + 0,  tl.sum(fx))   
+        tl.atomic_add(dT_ptr + 1,  tl.sum(fy))
+        tl.atomic_add(dT_ptr + 2,  tl.sum(fz))
 
-        # ∂S/∂q  = Σ_j (f_j  ×  (R·B_j))  mapped to quaternion tangent
-        # R·B_j coords are (bx,by,bz)
-        txq = fy*bz - fz*by
-        tyq = fz*bx - fx*bz
-        tzq = fx*by - fy*bx
-        tl.atomic_add(dQ_ptr + 0, tl.sum(txq))
-        tl.atomic_add(dQ_ptr + 1, tl.sum(tyq))
-        tl.atomic_add(dQ_ptr + 2, tl.sum(tzq))
-        # (we ignore d/∂qr; we renormalise q each step so tangent is enough)
+        #   GRADIENT w.r.t. QUATERNION 
+        # Original (body-frame) B-coordinates are bx0,by0,bz0     (shape BLOCK_M)
+        # Forces (in body frame) are  fx,fy,fz                    (shape BLOCK_M)
+        # Current quaternion components
+        wq = qr;    xq = qi;    yq = qj;    zq = qk
+        two  = 2.0
+        four = 4.0
 
-@torch.no_grad()
-def overlap_score_grad_se3(A: torch.Tensor,
-                           B: torch.Tensor,
-                           q: torch.Tensor,
-                           t: torch.Tensor,
-                           *,
-                           alpha: float = 0.81):
-    """
-    Single-pair SE(3) Gaussian-Tanimoto overlap *with analytic gradients*.
+        # --- helper to zero-out padded atoms -------------------------------
+        valid_m = mask_m                       # (BLOCK_M,) bool
+        zeros   = 0.0
 
-    Parameters
-    ----------
-    A : (N,3)  CUDA - ref coordinates  (float32)
-    B : (M,3)  CUDA - fit coordinates  (float32)
-    q : (4,)   CUDA - unit quaternion  (float32)
-    t : (3,)   CUDA - translation      (float32)
+        # ---------------- ∂V/∂w  ------------------------------------------
+        dw_contrib = (
+            fx * (-two*zq*by0 + two*yq*bz0)
+            + fy * ( two*zq*bx0 - two*xq*bz0)
+            + fz * (-two*yq*bx0 + two*xq*by0)
+        )
+        dw_contrib = tl.where(valid_m, dw_contrib, zeros)
+        dw_tile = tl.sum(dw_contrib)
 
-    Returns
-    -------
-    VAB : (1,)      dQ : (4,)      dT : (3,)
-        • VAB is the **overlap numerator** (not the final Tanimoto score);
-          the caller keeps the old “add self-overlaps later” contract.
-    """
-    assert A.is_cuda and B.is_cuda, "inputs must already live on the GPU"
-    N, M   = A.shape[0], B.shape[0]
-    BLOCK  = 64 if max(N, M) <= 64 else 128
-    device = A.device
-    dtype  = A.dtype
+        # ---------------- ∂V/∂x  ------------------------------------------
+        dx_contrib = (
+            fx * ( two*yq*by0 + two*zq*bz0)
+            + fy * ( two*yq*bx0 - four*xq*by0 - two*wq*bz0)
+            + fz * ( two*zq*bx0 + two*wq*by0 - four*xq*bz0)
+        )
+        dx_contrib = tl.where(valid_m, dx_contrib, zeros)
+        dx_tile = tl.sum(dx_contrib)
 
-    half_alpha = 0.5 * alpha
-    k_const    = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
+        # ---------------- ∂V/∂y  ------------------------------------------
+        dy_contrib = (
+            fx * (-four*yq*bx0 + two*xq*by0 + two*wq*bz0)
+            + fy * ( two*xq*bx0                 + two*zq*bz0)
+            + fz * (-two*wq*bx0 + two*zq*by0 - four*yq*bz0)
+        )
+        dy_contrib = tl.where(valid_m, dy_contrib, zeros)
+        dy_tile = tl.sum(dy_contrib)
 
-    N_real = torch.tensor([N], device=device, dtype=torch.int32)
-    M_real = torch.tensor([M], device=device, dtype=torch.int32)
+        # ---------------- ∂V/∂z  ------------------------------------------
+        dz_contrib = (
+            fx * (-four*zq*bx0 - two*wq*by0 + two*xq*bz0)
+            + fy * ( two*wq*bx0 - four*zq*by0 + two*yq*bz0)
+            + fz * ( two*xq*bx0 + two*yq*by0                )
+        )
+        dz_contrib = tl.where(valid_m, dz_contrib, zeros)
+        dz_tile = tl.sum(dz_contrib)
 
-    VAB = torch.zeros(1,  device=device, dtype=dtype)
-    dQ  = torch.zeros(4,  device=device, dtype=dtype)
-    dT  = torch.zeros(3,  device=device, dtype=dtype)
-
-    grid = (triton.cdiv(N, BLOCK),          #   blocks over ref atoms
-            triton.cdiv(M, BLOCK),          #   blocks over fit atoms
-            1)                              #   single orientation
-
-    _gauss_overlap_se3[grid](
-        A.contiguous().view(-1),            # A_ptr
-        B.contiguous().view(-1),            # B_ptr
-        q.contiguous().view(-1),            # Q_ptr
-        t.contiguous().view(-1),            # T_ptr
-        N_real,                             # NEW  (B,) int32
-        M_real,                             # NEW  (B,) int32
-        1,                                  # BATCH
-        M, N,                               # padded sizes = real sizes
-        half_alpha, k_const,
-        VAB, dQ, dT,
-        BLOCK, BLOCK,
-        NEED_GRAD=True,
-    )
-
-    return VAB, dQ, dT          #  unchanged public contract
+        # ---------------- ATOMIC WRITE-BACK  ------------------------------
+        tl.atomic_add(dQ_ptr + 0, dw_tile)    # ∂V/∂q_w
+        tl.atomic_add(dQ_ptr + 1, dx_tile)    # ∂V/∂q_x
+        tl.atomic_add(dQ_ptr + 2, dy_tile)    # ∂V/∂q_y
+        tl.atomic_add(dQ_ptr + 3, dz_tile)    # ∂V/∂q_z
 
 def overlap_score_grad_se3_batch(A, B, q, t, *,
                                  alpha: float = 0.81,
                                  N_real: torch.Tensor | None = None,
                                  M_real: torch.Tensor | None = None,
-                                 custom_grid=None):
+                                 custom_grid=None,
+                                 NEED_GRAD=True):
     """
     A,B : (K,N_pad,3)/(K,M_pad,3)   q,t : (K,4)/(K,3)
     N_real/M_real : (K,) int32 - number of *valid* atoms per orientation.
@@ -525,9 +179,9 @@ def overlap_score_grad_se3_batch(A, B, q, t, *,
     BLOCK = 64 if max(N_pad, M_pad) <= 64 else 128
 
     if N_real is None:
-        N_real = A.new_full((K,), N_pad, dtype=torch.int32)
+        N_real = A.new_full((K,), N_pad, dtype=torch.float32)
     if M_real is None:
-        M_real = B.new_full((K,), M_pad, dtype=torch.int32)
+        M_real = B.new_full((K,), M_pad, dtype=torch.float32)
 
     half_alpha = 0.5 * alpha
     k_const    = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
@@ -544,19 +198,18 @@ def overlap_score_grad_se3_batch(A, B, q, t, *,
         B.contiguous().view(-1),
         q.contiguous().view(-1),
         t.contiguous().view(-1),
-        N_real.contiguous(),          # NEW
-        M_real.contiguous(),          # NEW
+        N_real.contiguous(),          
+        M_real.contiguous(),          
         K, M_pad, N_pad,
         half_alpha, k_const,
         score, dQ.view(-1), dT.view(-1),
         BLOCK, BLOCK,
-        NEED_GRAD=True,
+        NEED_GRAD=NEED_GRAD,
     )
+
     return score, dQ, dT
 
-# ----------------------------------------------------------------------
 #  Fused Adam update for (q,t)     – 1 thread-block = 1..256 orientations
-# ----------------------------------------------------------------------
 @triton.jit
 def _adam_qt(
     Q_ptr, T_ptr,
@@ -615,7 +268,7 @@ def _adam_qt(
     vt1 = tl.load(Vt_ptr + offs*3 + 1, mask=mask)
     vt2 = tl.load(Vt_ptr + offs*3 + 2, mask=mask)
 
-    # ---------------- Adam update (each component) ------------------------
+    # ---------------- Adam update (each component) ------------------------     
     mq0 = beta1*mq0 + (1-beta1)*dq0;  vq0 = beta2*vq0 + (1-beta2)*dq0*dq0
     mq1 = beta1*mq1 + (1-beta1)*dq1;  vq1 = beta2*vq1 + (1-beta2)*dq1*dq1
     mq2 = beta1*mq2 + (1-beta1)*dq2;  vq2 = beta2*vq2 + (1-beta2)*dq2*dq2
@@ -666,23 +319,18 @@ def _adam_qt(
     tl.store(Vt_ptr + offs*3 + 1, vt1, mask=mask)
     tl.store(Vt_ptr + offs*3 + 2, vt2, mask=mask)
 
-
 def fused_adam_qt(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr):
     K = q.shape[0]
-    grid = (triton.cdiv(K, 256),)
+    grid = (triton.cdiv(K, 256),)                       
 
     _adam_qt[grid](
         q.contiguous().view(-1),  t.contiguous().view(-1),
         dQ.contiguous().view(-1), dT.contiguous().view(-1),
         m_q.view(-1), v_q.view(-1), m_t.view(-1), v_t.view(-1),
-        K, lr=lr,            #  ← constexpr keyword
-
-        # beta1 / beta2 / eps / BLOCK keep their defaults
+        K, lr=lr       
     )
 
-# ------------------------------------------------------------------ #
 #  One-time warm-up so the first real call doesn't pay for PTX build #
-# ------------------------------------------------------------------ #
 if torch.cuda.is_available():
     dummy = torch.zeros(512, 4, device="cuda", dtype=torch.float32)
     _adam_qt[(2,)](                         # 512 // 256 = 2 blocks
@@ -690,6 +338,237 @@ if torch.cuda.is_available():
         dummy.view(-1), dummy.view(-1),
         dummy.view(-1), dummy.view(-1),
         dummy.view(-1), dummy.view(-1),
-        512, lr=0.001                      # K=512, any lr
+        512, lr=0.001,                    # K=512, any lr
     )
     torch.cuda.synchronize()
+
+# ---------------------------------------------------------------------
+# helper: batched self-overlap   VPP(P,P)  for a padded tensor
+# ---------------------------------------------------------------------
+@torch.no_grad()
+def _batch_self_overlap(P_pad: torch.Tensor,
+                        N_real: torch.Tensor,
+                        alpha: float = 0.81) -> torch.Tensor:
+    """
+    P_pad : (K, N_pad, 3)   – padded coordinates (zeros beyond N_real)
+    N_real: (K,) int32      – true atom counts per molecule
+    Returns
+    -------
+    VPP : (K,)  self-overlap scalars on the same device / dtype as P_pad
+    """
+    K, N_pad, _ = P_pad.shape
+    device, dtype = P_pad.device, P_pad.dtype
+    BLOCK = 64 if N_pad <= 64 else 128           # match the SE3 wrapper
+
+    half_alpha = 0.5 * alpha
+    k_const    = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
+
+    # identity quaternion + zero translation  (broadcasted to K)
+    q_id = torch.tensor([1.,0.,0.,0.], device=device, dtype=dtype)\
+          .expand(K, 4).contiguous()
+    t_0  = torch.zeros(K, 3, device=device, dtype=dtype)
+
+    score = torch.zeros(K,  device=device, dtype=dtype)      # VPP output
+    dummy = torch.empty_like(q_id)                           # unused grads
+
+    # Same kernel, but A == B and NEED_GRAD=False
+    grid = (triton.cdiv(N_pad, BLOCK), triton.cdiv(N_pad, BLOCK), K)
+    _gauss_overlap_se3[grid](
+        P_pad.contiguous().view(-1),   # A_ptr
+        P_pad.contiguous().view(-1),   # B_ptr  ← identical
+        q_id.view(-1),                 # identity quats
+        t_0.view(-1),                  # zero translations
+        N_real.contiguous(),           # real atom counts
+        N_real.contiguous(),           # same for B
+        K, N_pad, N_pad,
+        half_alpha, k_const,
+        score, dummy.view(-1), dummy.view(-1),
+        BLOCK, BLOCK,
+        NEED_GRAD=False,               # no dQ/dT needed
+    )
+    return score
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+#  QUATERNION-TORQUE CHAIN –  COMPLETE TRACE
+#      run with:  python gaussian_overlap_triton.py --trace-quat-grad
+# ---------------------------------------------------------------------------
+if __name__ == "__main__" and "--trace-quat-grad" in sys.argv:
+    import torch, math
+
+    torch.manual_seed(0)
+    dev, dt = "cuda", torch.float32
+    α         = 0.81
+    half_α    = 0.5 * α
+    k_const   = math.pi**1.5 / ((2.0 * α) ** 1.5)
+
+    # ---------- tiny system so the kernel is a single tile -----------------
+    N, M = 32, 17
+    A   = torch.randn(N, 3, device=dev, dtype=dt) 
+    B0  = torch.randn(N, 3, device=dev, dtype=dt) 
+    q    = torch.randn(4,  device=dev, dtype=dt);  q /= q.norm()
+    t    = torch.randn(3,  device=dev, dtype=dt)
+
+    # ----------------------------------------------------------------------
+    #  1)  AUTOGRAD REFERENCE  (CPU, double-checked ground truth)
+    # ----------------------------------------------------------------------
+    A_cpu, B_cpu = A.cpu(), B0.cpu()
+    q_unit = q.cpu().clone().detach()          # copy from CUDA → CPU
+    q_unit /= q_unit.norm()                    # ensure unit length (out-of-graph)
+    q_unit.requires_grad_(True)
+    t_ref = t.cpu().clone().detach().requires_grad_(True)
+
+    def quat_to_mat(q):
+        w, x, y, z = q.unbind(-1)
+        two = 2.0
+        return torch.stack([
+            torch.stack([1-two*(y*y+z*z), two*(x*y-z*w),   two*(x*z+y*w)]),
+            torch.stack([two*(x*y+z*w),   1-two*(x*x+z*z), two*(y*z-x*w)]),
+            torch.stack([two*(x*z-y*w),   two*(y*z+x*w),   1-two*(x*x+y*y)])
+        ])
+
+    R_ref  = quat_to_mat(q_unit)                        #   ⇒ gradient is tangent
+
+    Bp    = (R_ref @ B_cpu.T).T + t_ref                 # (M,3)
+    Bp.retain_grad()                   #  ← keep ∂V/∂Bp after backward()
+
+    d     = A_cpu[:, None, :] - Bp[None, :, :]  
+    d_0     = A_cpu[:, None, :] - B_cpu[None, :, :]        # (N,M,3)
+    g_ref_0 = torch.exp(-half_α * (d_0*d_0).sum(-1)) * k_const
+    g_ref = torch.exp(-half_α * (d*d).sum(-1)) * k_const
+    VAB   = g_ref.sum()
+    VAB.backward()
+
+    dQ_autograd = q_unit.grad.detach()          # gradient in the same space as the kernel
+    dT_autograd = t_ref.grad.detach()
+
+    F_autograd = Bp.grad.detach()
+    R_B_autograd      = Bp.detach() - t_ref.detach()
+    tau_autograd   = torch.cross(R_B_autograd, F_autograd).sum(0)
+    Sigma_d_autograd = (F_autograd * R_B_autograd).sum() + (dT_autograd * t_ref).sum()
+
+    # ----------------------------------------------------------------------
+    #  2)  BUILD EVERY “ATOMISTIC” PIECE ON THE CPU (no autograd)
+    # ----------------------------------------------------------------------
+    coeff  = (2*half_α) * g_ref
+    F     = torch.sum(coeff.unsqueeze(-1) * d, 0)  # (M,3)
+    dT_handwritten = F.sum(0)
+
+    # (2) rotated B-coordinates   r_j = R(q) · B_j
+    R_B  = (R_ref @ B_cpu.T).T                          # (M, 3)
+
+    # torque   τ = Σ r_j × F_j
+    tau_B = torch.linalg.cross(R_B, F).sum(0)          # (3,)  
+
+    #  **TANGENT-SPACE** gradient  
+
+    def dR_dq(q: torch.Tensor):
+        """
+        Return ∂R/∂w, ∂R/∂x, ∂R/∂y, ∂R/∂z  (each 3 × 3) for a unit quaternion q.
+        Shapes: input  (4,)  →  tuple of 4 tensors, each (3,3)
+        """
+        w, x, y, z = q           # all are 0-D tensors
+        two   = q.new_tensor(2.0)
+        zero  = q.new_tensor(0.0)  # 0-D, same dtype/device as q
+
+        dR_dw = torch.stack([
+            torch.stack([  zero,   -two*z,   +two*y ]),
+            torch.stack([ +two*z,   zero,    -two*x ]),
+            torch.stack([ -two*y,  +two*x,    zero  ])
+        ])
+
+        dR_dx = torch.stack([
+            torch.stack([  zero,     two*y,     two*z ]),
+            torch.stack([  two*y,  -4*x,     -two*w ]),
+            torch.stack([  two*z,   two*w,   -4*x  ])
+        ])
+
+        dR_dy = torch.stack([
+            torch.stack([ -4*y,     two*x,     two*w ]),
+            torch.stack([  two*x,    zero,     two*z ]),
+            torch.stack([ -two*w,   two*z,   -4*y  ])
+        ])
+
+        dR_dz = torch.stack([
+            torch.stack([ -4*z,    -two*w,    two*x ]),
+            torch.stack([  two*w,   -4*z,     two*y ]),
+            torch.stack([  two*x,    two*y,    zero  ])
+        ])
+
+        return dR_dw, dR_dx, dR_dy, dR_dz
+
+    dR_dw, dR_dx, dR_dy, dR_dz = dR_dq(q_unit)          # matrices from the formulas
+    B_body = B_cpu                                       # (M,3) in body frame
+
+    def dVdq_component(dR):
+        return torch.sum(F * (torch.matmul(dR, B_body.T).T))  # scalar
+
+    dQ_handwritten = torch.tensor([
+        dVdq_component(dR_dw),
+        dVdq_component(dR_dx),
+        dVdq_component(dR_dy),
+        dVdq_component(dR_dz)
+    ], dtype=torch.float32)
+
+    # ----------------------------------------------------------------------
+    #  4)  GRAB REAL KERNEL OUTPUT
+    # ----------------------------------------------------------------------
+    V_buf, dQ_buf, dT_buf = overlap_score_grad_se3_batch(A, B0, q, t, alpha=α)
+    torch.cuda.synchronize()
+    dQ_kernel = dQ_buf.cpu()
+    dT_kernel = dT_buf.cpu()
+
+    # ----------------------------------------------------------------------
+    #  5)  REPORT
+    # ----------------------------------------------------------------------
+    def show(name, ref, test):
+        Δ = (test - ref).abs()
+        print(f"{name:<18s}  max|Δ| = {Δ.max():+.3e}   "
+              f"{'✅' if torch.allclose(ref, test, rtol=1e-5, atol=1e-6) else '❌'}")
+
+    print("\n================  TORQUE / QUATERNION CHAIN TRACE  ================")
+    print("-------------------------------------------------------------------")
+    print("dQ_autograd          :", dQ_autograd.numpy())
+    print("dQ_handwritten       :", dQ_handwritten.detach().numpy())
+    print("dQ_kernel            :", dQ_kernel.numpy())
+    print("dT_autograd          :", dT_autograd.numpy())
+    print("dT_handwritten       :", dT_handwritten.detach().numpy())
+    print("dT_kernel            :", dT_kernel.detach().numpy())
+    print("===================================================================")
+    print("F_autograd           :", F_autograd.detach().numpy())
+    print("F_handwritten        :", F.detach().numpy())
+    print("RB_autograd          :", R_B_autograd.detach().numpy())
+    print("RB_handwritten       :", R_B.detach().numpy())
+    print("tau_autograd         :", tau_autograd.detach().numpy())
+    print("tau_handwritten      :", tau_B.detach().numpy())
+    print("Sigma_d_autograd     :", Sigma_d_autograd.detach().numpy())
+    print("-------------------------------------------------------------------")
+    print("g_ref_0              :", g_ref_0.numpy())
+    print("g_ref                :", g_ref.detach().numpy())
+    print("q_unit               :", q_unit.detach().numpy())
+    print("R_ref                :", R_ref.detach().numpy())
+    print("B                    :", B_cpu.numpy())
+    print("d                    :", d.detach().numpy())
+    print("===================================================================")
+
+
+
