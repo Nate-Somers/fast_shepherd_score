@@ -24,9 +24,8 @@ from .score.pharmacophore_scoring import _SIM_TYPE, get_overlap_pharm
 from .alignment import optimize_ROCS_overlay, optimize_ROCS_esp_overlay, optimize_esp_combo_score_overlay
 from .alignment import optimize_pharm_overlay
 from .alignment_utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
-from .alignment_utils.fast_se3 import coarse_fine_align_many
+from .alignment_utils.fast_se3 import coarse_fine_align_many, _self_overlap_in_chunks
 from .alignment_utils.se3 import quaternion_to_SE3
-from .score.gaussian_overlap_triton import _batch_self_overlap
 
 ### BEGIN size_bucketing #####################################################
 # Every heavy-atom count 3‒150 is mapped to a “band” of 8 atoms
@@ -465,8 +464,8 @@ class MoleculePair:
                 fit_pad[i, :M_real[i]] = p._fit_xyz_t.to(device)
 
             # ------------- *batched* self-overlaps ---------------------
-            VAA = _batch_self_overlap(ref_pad, N_real, alpha)   # (K,)
-            VBB = _batch_self_overlap(fit_pad, M_real, alpha)   # (K,)
+            VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)   # (K,)
+            VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)   # (K,)
 
             # ---------------- alignment -------------------------------
             scores, q_batch, t_batch = coarse_fine_align_many(

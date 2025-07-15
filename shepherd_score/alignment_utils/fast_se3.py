@@ -59,6 +59,20 @@ def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81,
 
     return out_V, out_dQ, out_dT
 
+
+def _self_overlap_in_chunks(P_pad, N_real, *, alpha=0.81):
+    K = P_pad.size(0)
+    CHUNK = 65_535                     # hardware limit
+    V_all = torch.empty(K,
+                        device=P_pad.device,
+                        dtype=P_pad.dtype)
+    for s in range(0, K, CHUNK):
+        e = min(s + CHUNK, K)
+        V_all[s:e] = _batch_self_overlap(
+            P_pad[s:e], N_real[s:e], alpha)   # ← original function
+    return V_all
+
+
 @torch.no_grad()
 def _legacy_seeds_torch(ref_xyz: torch.Tensor,
                         fit_xyz: torch.Tensor,
