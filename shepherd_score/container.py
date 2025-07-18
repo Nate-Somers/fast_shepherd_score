@@ -155,24 +155,6 @@ class Molecule:
 
         self._shape_cache: dict[float, float] = {}
 
-    def shape_self(self, alpha: float = 0.81,
-                device: torch.device | str | None = None,
-                include_H: bool = True) -> float:
-        """
-        Gaussian self-overlap VPP(P,P).
-        `include_H` **must** match whatever atom subset will be used in VAB.
-        """
-        key = (alpha, include_H)
-        if key in self._shape_cache:
-            return self._shape_cache[key]
-        coords = (self.atom_pos if include_H
-                else self.atom_pos[self._nonH_atoms_idx])
-        # --- GPU or CPU implementation exactly as before ------------------
-        val = gaussian_self_overlap(torch.as_tensor(coords, dtype=torch.float32,
-                                                    device=device or "cpu"), alpha)
-        self._shape_cache[key] = float(val)
-        return float(val)
-
     def get_partial_charges(self) -> np.ndarray:
         """
         Get the partial charges on each atom using MMFF.
