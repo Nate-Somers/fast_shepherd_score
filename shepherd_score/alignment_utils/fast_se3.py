@@ -1,5 +1,5 @@
 import torch, math
-from ..score.gaussian_overlap_triton import overlap_score_grad_se3_batch, fused_adam_qt
+from ..score.gaussian_overlap_triton import overlap_score_grad_se3_batch, fused_adam_qt, _batch_self_overlap
 from ..alignment import objective_ROCS_overlay
 from typing import Optional
 from ..alignment import _initialize_se3_params as _legacy_init
@@ -60,7 +60,7 @@ def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81,
     return out_V, out_dQ, out_dT
 
 
-def _self_overlap_in_chunks(P_pad, N_real, *, alpha=0.81):
+def _self_overlap_in_chunks(P_pad, N_real, alpha=0.81):
     K = P_pad.size(0)
     CHUNK = 65_535                     # hardware limit
     V_all = torch.empty(K,
