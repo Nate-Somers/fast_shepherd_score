@@ -339,45 +339,65 @@ class MoleculePair:
         if not pairs:
             return
 
-        # -------- band bucketing ---------------------------------
+        # ----------- move raw coords to GPU once -----------------------------
+        device = pairs[0].device
+        for p in pairs:
+            p._ref_xyz_t = p._ref_xyz_t.to(device, non_blocking=True)
+            p._fit_xyz_t = p._fit_xyz_t.to(device, non_blocking=True)
+
+        # ---------------------------------------------------------------------
+        # bookkeeping containers so we can copy to CPU only once
+        # ---------------------------------------------------------------------
+        all_pairs:  list[MoleculePair] = []
+        all_scores: list[torch.Tensor] = []
+        all_q:      list[torch.Tensor] = []
+        all_t:      list[torch.Tensor] = []
+
+        # -------- band bucketing ---------------------------------------------
         buckets: dict[tuple[int, int], list[MoleculePair]] = {}
         for p in pairs:
             n_band = _band_key(p._ref_xyz_t.shape[0])
             m_band = _band_key(p._fit_xyz_t.shape[0])
             buckets.setdefault((n_band, m_band), []).append(p)
 
-        device = pairs[0].device
-
+        # ------------------- main GPU work -----------------------------------
         for (N_pad, M_pad), bucket in buckets.items():
-            # real sizes for every pair in this bucket
+            K = len(bucket)
+
             N_real = torch.tensor([p._ref_xyz_t.shape[0] for p in bucket],
                                 device=device, dtype=torch.int32)
             M_real = torch.tensor([p._fit_xyz_t.shape[0] for p in bucket],
                                 device=device, dtype=torch.int32)
 
-            # ---------------- stack & pad ------------------------------
-            ref_pad = torch.zeros(len(bucket), N_pad, 3, device=device, dtype=torch.float32)
-            fit_pad = torch.zeros(len(bucket), M_pad, 3, device=device, dtype=torch.float32)
+            ref_pad = torch.zeros(K, N_pad, 3, device=device, dtype=torch.float32)
+            fit_pad = torch.zeros(K, M_pad, 3, device=device, dtype=torch.float32)
 
             for i, p in enumerate(bucket):
-                ref_pad[i, :N_real[i]] = p._ref_xyz_t.to(device)
-                fit_pad[i, :M_real[i]] = p._fit_xyz_t.to(device)
+                ref_pad[i, :N_real[i]] = p._ref_xyz_t        # already on GPU
+                fit_pad[i, :M_real[i]] = p._fit_xyz_t
 
-            # ------------- *batched* self-overlaps ---------------------
-            VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)   # (K,)
-            VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)   # (K,)
+            VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
+            VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
 
-            # ---------------- alignment -------------------------------
             scores, q_batch, t_batch = coarse_fine_align_many(
                 ref_pad, fit_pad, VAA, VBB,
-                N_real=N_real, M_real=M_real,   
-                alpha=alpha)
+                N_real=N_real, M_real=M_real, alpha=alpha)
 
-            # ---------------- write back ------------------------------
-            for p, s, q, t in zip(bucket, scores, q_batch, t_batch):
-                SE3 = quaternion_to_SE3(q, t).cpu().numpy()
-                p.transform_vol_noH   = SE3
-                p.sim_aligned_vol_noH = s.cpu().item()
+            # --------- keep everything on GPU; append to lists ---------------
+            all_pairs.extend(bucket)
+            all_scores.append(scores);   all_q.append(q_batch);   all_t.append(t_batch)
+
+        # ---------------------------------------------------------------------
+        # single host sync + copy
+        # ---------------------------------------------------------------------
+        scores_cpu = torch.cat(all_scores).cpu()
+        q_cpu      = torch.cat(all_q).cpu()
+        t_cpu      = torch.cat(all_t).cpu()
+
+        # ---------------- final write‑back -----------------------------------
+        for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
+            p.transform_vol_noH   = quaternion_to_SE3(q, t)
+            p.sim_aligned_vol_noH = float(s)                   
 
     def align_with_vol_esp(self,
                            lam: float,

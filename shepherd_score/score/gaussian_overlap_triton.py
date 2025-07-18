@@ -14,13 +14,13 @@ def _load_xyz(ptr, idx, mask):
     pointer (index 0) so no out-of-bounds address is ever formed.
     """
     idx_safe = tl.where(mask, idx, 0)           
-    x = tl.load(ptr + idx_safe * 3 + 0, mask=mask)
-    y = tl.load(ptr + idx_safe * 3 + 1, mask=mask)
-    z = tl.load(ptr + idx_safe * 3 + 2, mask=mask)
+    x = tl.load(ptr + idx_safe * 3 + 0, mask=mask, cache_modifier=".ca")
+    y = tl.load(ptr + idx_safe * 3 + 1, mask=mask, cache_modifier=".ca")
+    z = tl.load(ptr + idx_safe * 3 + 2, mask=mask, cache_modifier=".ca")
     return x, y, z
 
 # ----------------- score and gradients wrt quaternion q and translation t -----------------     
-@triton.jit
+@triton.jit()
 def _gauss_overlap_se3(
     A_ptr, B_ptr,                 # (B·N_pad·3,) (B·M_pad·3,)
     Q_ptr, T_ptr,                 # (B·4,) (B·3,)
@@ -42,12 +42,6 @@ def _gauss_overlap_se3(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     mask_n = offs_n < realN                     # ← ONLY true atoms
     mask_m = offs_m < realM
-
-    # detect if this entire tile is inactive (no valid ref OR no valid fit)
-    # If the whole tile is padding, skip it entirely.
-    #   (No write-back.  Leaving VAB untouched == add 0.)
-    if (tl.sum(mask_n.to(tl.int32)) == 0) | (tl.sum(mask_m.to(tl.int32)) == 0):
-        return
 
     # -------- advance base pointers to this pair --------------------------
     A_ptr  = A_ptr + pid_b * N_pad * 3
@@ -75,7 +69,7 @@ def _gauss_overlap_se3(
     bx0, by0, bz0 = _load_xyz(B_ptr, offs_m, mask_m)
 
     # quaternion to rotation matrix rows (r00 … r22) in registers
-    two = 2.0
+    two  = 2.0
     r00 = 1 - two*(qj*qj + qk*qk); r01 = two*(qi*qj - qk*qr); r02 = two*(qi*qk + qj*qr)
     r10 = two*(qi*qj + qk*qr);     r11 = 1 - two*(qi*qi + qk*qk); r12 = two*(qj*qk - qi*qr)
     r20 = two*(qi*qk - qj*qr);     r21 = two*(qj*qk + qi*qr);     r22 = 1 - two*(qi*qi + qj*qj)
@@ -89,7 +83,9 @@ def _gauss_overlap_se3(
     dy = ay[:, None] - by[None, :]
     dz = az[:, None] - bz[None, :]
     r2 = dx*dx + dy*dy + dz*dz
-    g  = tl.exp(-half_alpha * r2) * k_const
+    inv_ln2 = 1.4426950408889634          # 1 / ln(2)
+    exp_arg  = (-half_alpha * r2) * inv_ln2
+    g  = tl.exp2(exp_arg) * k_const
     g  = tl.where(mask_n[:, None] & mask_m[None, :], g, 0.0)
 
     # accumulate VAA, VBB, VAB   (each thread-block works on a small slice;
@@ -114,12 +110,11 @@ def _gauss_overlap_se3(
         # Forces (in body frame) are  fx,fy,fz                    (shape BLOCK_M)
         # Current quaternion components
         wq = qr;    xq = qi;    yq = qj;    zq = qk
-        two  = 2.0
-        four = 4.0
 
         # --- helper to zero-out padded atoms -------------------------------
         valid_m = mask_m                       # (BLOCK_M,) bool
         zeros   = 0.0
+        four = 4.0
 
         # ---------------- ∂V/∂w  ------------------------------------------
         dw_contrib = (
@@ -176,7 +171,7 @@ def overlap_score_grad_se3_batch(A, B, q, t, *,
     """
     K, N_pad, _ = A.shape
     _, M_pad, _ = B.shape
-    BLOCK = 64 if max(N_pad, M_pad) <= 64 else 128
+    BLOCK = 64 
 
     if N_real is None:
         N_real = A.new_full((K,), N_pad, dtype=torch.float32)

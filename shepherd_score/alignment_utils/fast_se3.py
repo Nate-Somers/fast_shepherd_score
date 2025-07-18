@@ -171,7 +171,7 @@ def coarse_fine_align_many(
     # 2) coarse evaluation (micro-batched for memory)
     # ------------------------------------------------------------------
     ORI_CHUNK  = 25_000
-    PAIR_CHUNK = 4_096
+    PAIR_CHUNK = 65_535
     coarse_score = torch.empty(BATCH, G, device=device, dtype=A_batch.dtype)
 
     for o0 in range(0, G, ORI_CHUNK):
