@@ -327,77 +327,106 @@ class MoleculePair:
         self.transform_pharm = np.eye(4)
         self.sim_aligned_pharm = None
 
-
     @staticmethod
     def align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81):
         """
-        One launch per *band* instead of one per exact (N,M).
-        A band is an 8-atom step (3-8, 9-16, … 145-152).
-        Padding with 0-vectors is safe because every kernel masks
-        out indices >= real_N / real_M.
+        Batched alignment with workspace reuse & reduced per-pair transfers.
         """
+
+                # --- workspace caches keyed by (N_pad, M_pad) ---
+        _ALIGN_WORKSPACES = {}    # (N_pad, M_pad) -> dict(ref=..., fit=...)
+        _INT_BUFFER_CACHE = {}    # length -> {'N': tensor, 'M': tensor}
+        
         if not pairs:
             return
 
-        # ----------- move raw coords to GPU once -----------------------------
         device = pairs[0].device
+        # --- move coords once (skip if already there & right dtype) -------------
         for p in pairs:
-            p._ref_xyz_t = p._ref_xyz_t.to(device, non_blocking=True)
-            p._fit_xyz_t = p._fit_xyz_t.to(device, non_blocking=True)
+            rx = p._ref_xyz_t
+            fx = p._fit_xyz_t
+            if rx.device != device:
+                p._ref_xyz_t = rx.to(device, non_blocking=True)
+            if fx.device != device:
+                p._fit_xyz_t = fx.to(device, non_blocking=True)
 
-        # ---------------------------------------------------------------------
-        # bookkeeping containers so we can copy to CPU only once
-        # ---------------------------------------------------------------------
-        all_pairs:  list[MoleculePair] = []
+        # --- result accumulators (GPU first; host copy only once) ---------------
+        all_pairs: list[MoleculePair] = []
         all_scores: list[torch.Tensor] = []
-        all_q:      list[torch.Tensor] = []
-        all_t:      list[torch.Tensor] = []
+        all_q: list[torch.Tensor] = []
+        all_t: list[torch.Tensor] = []
 
-        # -------- band bucketing ---------------------------------------------
+        # --- band bucketing -----------------------------------------------------
         buckets: dict[tuple[int, int], list[MoleculePair]] = {}
         for p in pairs:
             n_band = _band_key(p._ref_xyz_t.shape[0])
             m_band = _band_key(p._fit_xyz_t.shape[0])
             buckets.setdefault((n_band, m_band), []).append(p)
 
-        # ------------------- main GPU work -----------------------------------
         for (N_pad, M_pad), bucket in buckets.items():
             K = len(bucket)
 
-            N_real = torch.tensor([p._ref_xyz_t.shape[0] for p in bucket],
-                                device=device, dtype=torch.int32)
-            M_real = torch.tensor([p._fit_xyz_t.shape[0] for p in bucket],
-                                device=device, dtype=torch.int32)
+            # ---- integer buffers (reuse) ---------------------------------------
+            ib_key = K
+            int_buf = _INT_BUFFER_CACHE.get(ib_key)
+            if int_buf is None:
+                int_buf = {
+                    'N': torch.empty(K, dtype=torch.int32, device=device),
+                    'M': torch.empty(K, dtype=torch.int32, device=device),
+                }
+                _INT_BUFFER_CACHE[ib_key] = int_buf
+            N_real = int_buf['N']
+            M_real = int_buf['M']
 
-            ref_pad = torch.zeros(K, N_pad, 3, device=device, dtype=torch.float32)
-            fit_pad = torch.zeros(K, M_pad, 3, device=device, dtype=torch.float32)
-
+            # Fill in-place (no new tensor creation)
             for i, p in enumerate(bucket):
-                ref_pad[i, :N_real[i]] = p._ref_xyz_t        # already on GPU
-                fit_pad[i, :M_real[i]] = p._fit_xyz_t
+                N_real[i] = p._ref_xyz_t.shape[0]
+                M_real[i] = p._fit_xyz_t.shape[0]
 
+            # ---- workspaces (reuse & grow) -------------------------------------
+            ws_key = (N_pad, M_pad)
+            ws = _ALIGN_WORKSPACES.get(ws_key)
+            if ws is None or ws['ref'].shape[0] < K:
+                # allocate at least K; allow some headroom (optional)
+                ref_pad = torch.empty(K, N_pad, 3, device=device, dtype=torch.float32)
+                fit_pad = torch.empty(K, M_pad, 3, device=device, dtype=torch.float32)
+                _ALIGN_WORKSPACES[ws_key] = {'ref': ref_pad, 'fit': fit_pad}
+            ref_pad = _ALIGN_WORKSPACES[ws_key]['ref'][:K]
+            fit_pad = _ALIGN_WORKSPACES[ws_key]['fit'][:K]
+
+            # We only write the valid prefix; no need to .zero_ entire array
+            # but we do clear the padding slices for deterministic results.
+            ref_pad.zero_()
+            fit_pad.zero_()
+            for i, p in enumerate(bucket):
+                n = N_real[i].item()  # small scalar read (host OK once per pair)
+                m = M_real[i].item()
+                ref_pad[i, :n] = p._ref_xyz_t
+                fit_pad[i, :m] = p._fit_xyz_t
+
+            # ---- self-overlaps (reused kernel) ---------------------------------
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
             VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
 
+            # ---- coarse + fine alignment ---------------------------------------
             scores, q_batch, t_batch = coarse_fine_align_many(
                 ref_pad, fit_pad, VAA, VBB,
                 N_real=N_real, M_real=M_real, alpha=alpha)
 
-            # --------- keep everything on GPU; append to lists ---------------
             all_pairs.extend(bucket)
-            all_scores.append(scores);   all_q.append(q_batch);   all_t.append(t_batch)
+            all_scores.append(scores)
+            all_q.append(q_batch)
+            all_t.append(t_batch)
 
-        # ---------------------------------------------------------------------
-        # single host sync + copy
-        # ---------------------------------------------------------------------
+        # ---- final host transfer (single) --------------------------------------
         scores_cpu = torch.cat(all_scores).cpu()
-        q_cpu      = torch.cat(all_q).cpu()
-        t_cpu      = torch.cat(all_t).cpu()
+        q_cpu = torch.cat(all_q).cpu()
+        t_cpu = torch.cat(all_t).cpu()
 
-        # ---------------- final write‑back -----------------------------------
         for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
-            p.transform_vol_noH   = quaternion_to_SE3(q, t)
-            p.sim_aligned_vol_noH = float(s)                   
+            # quaternion_to_SE3 unchanged
+            p.transform_vol_noH = quaternion_to_SE3(q, t)
+            p.sim_aligned_vol_noH = float(s)       
 
     def align_with_vol_esp(self,
                            lam: float,

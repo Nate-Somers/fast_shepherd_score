@@ -218,37 +218,43 @@ def coarse_fine_align_many(
     M_k = M_real.repeat_interleave(topk)
     VAA_rep = VAA.repeat_interleave(topk)
     VBB_rep = VBB.repeat_interleave(topk)
+    VAA_plus_VBB = VAA_rep + VBB_rep        # invariant in loop
 
     m_q = torch.zeros_like(q_k); v_q = torch.zeros_like(q_k)
     m_t = torch.zeros_like(t_k); v_t = torch.zeros_like(t_k)
 
     best_score = torch.full((len(q_k),), -float('inf'), device=device)
-    best_q     = torch.empty_like(q_k)
-    best_t     = torch.empty_like(t_k)
+    best_q = q_k.clone()
+    best_t = t_k.clone()
 
     for _ in range(steps_fine):
         VAB, dQ, dT = _overlap_in_chunks(
             A_k, B_k, q_k, t_k,
             alpha=alpha, N_real=N_k, M_real=M_k)
-        
-        denom  = VAA_rep + VBB_rep - VAB
-        score  = VAB / denom
-        scale  = (VAA_rep + VBB_rep) / (denom * denom)
 
-        # ----- build tangent-space gradient once -----
+        denom = VAA_plus_VBB - VAB
+        score = VAB / denom
+        scale = VAA_plus_VBB / (denom * denom)
+
+        # Tangent-space projection
         radial = (dQ * q_k).sum(dim=1, keepdim=True)
-        dQ_tan = dQ - q_k * radial          # (K,4)
+        dQ_tan = dQ - q_k * radial
 
-        better = score > best_score
-        if better.any():
-            best_score[better] = score[better]
-            best_q[better]     = q_k[better]
-            best_t[better]     = t_k[better]
+        better = score > best_score  # boolean mask, no .any()
 
-        fused_adam_qt(q_k, t_k,
-                      -dQ_tan * scale[:, None],
-                      -dT * scale[:, None],
-                      m_q, v_q, m_t, v_t, lr)
+        # Masked assignment (no host branch)
+        best_score = torch.where(better, score, best_score)
+        # Expand mask for vector components
+        mask_q = better.unsqueeze(1)
+        best_q = torch.where(mask_q, q_k, best_q)
+        best_t = torch.where(mask_q, t_k, best_t)
+
+        fused_adam_qt(
+            q_k, t_k,
+            -dQ_tan * scale.unsqueeze(1),
+            -dT * scale.unsqueeze(1),
+            m_q, v_q, m_t, v_t, lr
+        )
 
     # ------------------------------------------------------------------
     # 5) gather final results

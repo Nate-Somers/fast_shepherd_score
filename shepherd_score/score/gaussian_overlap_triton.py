@@ -20,189 +20,205 @@ def _load_xyz(ptr, idx, mask):
     return x, y, z
 
 # ----------------- score and gradients wrt quaternion q and translation t -----------------     
-@triton.jit()
-def _gauss_overlap_se3(
-    A_ptr, B_ptr,                 # (B·N_pad·3,) (B·M_pad·3,)
-    Q_ptr, T_ptr,                 # (B·4,) (B·3,)
-    Nreal_ptr, Mreal_ptr,         # NEW  (B,) int32 – real atom counts
-    BATCH, M_pad, N_pad,          # padded sizes (int32)
+@triton.jit
+def _gauss_overlap_se3_tiled(
+    A_ptr, B_ptr,                 # flat (B * N_pad * 3), (B * M_pad * 3)
+    Q_ptr, T_ptr,                 # (B * 4), (B * 3)
+    Nreal_ptr, Mreal_ptr,         # (B,)
+    BATCH, M_pad, N_pad,          # ints
     half_alpha, k_const,          # scalars
-    S_ptr, dQ_ptr, dT_ptr,        # outputs
-    BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr,
-    NEED_GRAD: tl.constexpr,
+    S_ptr, dQ_ptr, dT_ptr,        # outputs (S: (B,), dQ: (B*4), dT: (B*3))
+    BLOCK: tl.constexpr,          # single tile edge (e.g. 64)
+    NEED_GRAD: tl.constexpr
 ):
-    pid_b = tl.program_id(2)        # ← NEW batch index
-    pid_n = tl.program_id(0)
-    pid_m = tl.program_id(1)
+    # -------- which alignment (one CTA per pair) --------
+    pid = tl.program_id(0)
+    realN = tl.load(Nreal_ptr + pid)
+    realM = tl.load(Mreal_ptr + pid)
 
-    realN = tl.load(Nreal_ptr + pid_b)        
-    realM = tl.load(Mreal_ptr + pid_b)
+    # -------- base pointers for this pair ---------------
+    A_ptr  = A_ptr  + pid * N_pad * 3
+    B_ptr  = B_ptr  + pid * M_pad * 3
+    Q_ptr  = Q_ptr  + pid * 4
+    T_ptr  = T_ptr  + pid * 3
+    dQ_ptr = dQ_ptr + pid * 4
+    dT_ptr = dT_ptr + pid * 3
+    S_ptr  = S_ptr  + pid
 
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_n = offs_n < realN                     # ← ONLY true atoms
-    mask_m = offs_m < realM
+    # -------- quaternion / translation ------------------
+    qr = tl.load(Q_ptr + 0); qi = tl.load(Q_ptr + 1)
+    qj = tl.load(Q_ptr + 2); qk = tl.load(Q_ptr + 3)
+    tx = tl.load(T_ptr + 0); ty = tl.load(T_ptr + 1); tz = tl.load(T_ptr + 2)
 
-    # -------- advance base pointers to this pair --------------------------
-    A_ptr  = A_ptr + pid_b * N_pad * 3
-    B_ptr  = B_ptr + pid_b * M_pad * 3
-    Q_ptr  = Q_ptr + pid_b * 4
-    T_ptr  = T_ptr + pid_b * 3
-    dQ_ptr = dQ_ptr + pid_b * 4
-    dT_ptr = dT_ptr + pid_b * 3
-    S_ptr  = S_ptr  + pid_b
-
-    # ---------------- quaternion, translation -----------------
-    qr = tl.load(Q_ptr + 0)
-    qi = tl.load(Q_ptr + 1)
-    qj = tl.load(Q_ptr + 2)
-    qk = tl.load(Q_ptr + 3)
-
-    tx = tl.load(T_ptr + 0)
-    ty = tl.load(T_ptr + 1)
-    tz = tl.load(T_ptr + 2)
-
-    # --- load A points ------------------------------------------------------
-    ax, ay, az = _load_xyz(A_ptr, offs_n, mask_n)
-
-    # --- load B points & rotate on the fly ----------------------------------
-    bx0, by0, bz0 = _load_xyz(B_ptr, offs_m, mask_m)
-
-    # quaternion to rotation matrix rows (r00 … r22) in registers
-    two  = 2.0
+    # rotation matrix (registers)
+    two = 2.0
     r00 = 1 - two*(qj*qj + qk*qk); r01 = two*(qi*qj - qk*qr); r02 = two*(qi*qk + qj*qr)
     r10 = two*(qi*qj + qk*qr);     r11 = 1 - two*(qi*qi + qk*qk); r12 = two*(qj*qk - qi*qr)
     r20 = two*(qi*qk - qj*qr);     r21 = two*(qj*qk + qi*qr);     r22 = 1 - two*(qi*qi + qj*qj)
 
-    bx = r00*bx0 + r01*by0 + r02*bz0 + tx
-    by = r10*bx0 + r11*by0 + r12*bz0 + ty
-    bz = r20*bx0 + r21*by0 + r22*bz0 + tz
+    # -------- accumulators (register) -------------------
+    Vab_acc = 0.0
+    dTx = 0.0; dTy = 0.0; dTz = 0.0
+    dQw = 0.0; dQx = 0.0; dQy = 0.0; dQz = 0.0
 
-    # pairwise distances in tile
-    dx = ax[:, None] - bx[None, :]
-    dy = ay[:, None] - by[None, :]
-    dz = az[:, None] - bz[None, :]
-    r2 = dx*dx + dy*dy + dz*dz
-    inv_ln2 = 1.4426950408889634          # 1 / ln(2)
-    exp_arg  = (-half_alpha * r2) * inv_ln2
-    g  = tl.exp2(exp_arg) * k_const
-    g  = tl.where(mask_n[:, None] & mask_m[None, :], g, 0.0)
+    inv_ln2 = 1.4426950408889634
 
-    # accumulate VAA, VBB, VAB   (each thread-block works on a small slice;
-    # atomic adds are fine b/c N,M ≤ 400)
-    Vab_tile = tl.sum(g)                   # ordered pairs (i,j) and (j,i) are identical
-    tl.atomic_add(S_ptr, Vab_tile)               # we’ll finish formula in epilogue
+    # NOTE: outer loop over A tiles, inner loop over B tiles
+    # Each tile load is once per loop -> reuse inside nested loops.
+    for n0 in range(0, N_pad, BLOCK):
+        offs_n = n0 + tl.arange(0, BLOCK)
+        mask_n = offs_n < realN
+
+        # load A tile (x,y,z) into registers
+        a_idx = tl.where(mask_n, offs_n, 0)
+        ax = tl.load(A_ptr + a_idx * 3 + 0, mask=mask_n, other=0.0)
+        ay = tl.load(A_ptr + a_idx * 3 + 1, mask=mask_n, other=0.0)
+        az = tl.load(A_ptr + a_idx * 3 + 2, mask=mask_n, other=0.0)
+
+        for m0 in range(0, M_pad, BLOCK):
+            offs_m = m0 + tl.arange(0, BLOCK)
+            mask_m = offs_m < realM
+
+            b_idx = tl.where(mask_m, offs_m, 0)
+            bx0 = tl.load(B_ptr + b_idx * 3 + 0, mask=mask_m, other=0.0)
+            by0 = tl.load(B_ptr + b_idx * 3 + 1, mask=mask_m, other=0.0)
+            bz0 = tl.load(B_ptr + b_idx * 3 + 2, mask=mask_m, other=0.0)
+
+            # rotate + translate B tile
+            bx = r00*bx0 + r01*by0 + r02*bz0 + tx
+            by = r10*bx0 + r11*by0 + r12*bz0 + ty
+            bz = r20*bx0 + r21*by0 + r22*bz0 + tz
+
+            # broadcast differences (BLOCK x BLOCK)
+            dx = ax[:, None] - bx[None, :]
+            dy = ay[:, None] - by[None, :]
+            dz = az[:, None] - bz[None, :]
+            r2 = dx*dx + dy*dy + dz*dz
+
+            g = tl.exp2((-half_alpha * r2) * inv_ln2) * k_const
+            pair_mask = mask_n[:, None] & mask_m[None, :]
+            g = tl.where(pair_mask, g, 0.0)
+
+            # overlap accumulation
+            Vab_acc += tl.sum(g)
+
+            if NEED_GRAD:
+                coeff = (2.0 * half_alpha) * g
+                # forces sum over i for each j (axis 0)
+                fx = tl.sum(coeff * dx, 0)
+                fy = tl.sum(coeff * dy, 0)
+                fz = tl.sum(coeff * dz, 0)
+
+                # translation grads (sum over valid j)
+                dTx += tl.sum(fx)
+                dTy += tl.sum(fy)
+                dTz += tl.sum(fz)
+
+                # quaternion grads (reuse original body-frame coords bx0,by0,bz0)
+                # NOTE: mask_m already applied via fx,fy,fz sums above (masked zeros)
+                wq = qr; xq = qi; yq = qj; zq = qk
+                four = 4.0
+
+                # contributions per j
+                dw = (
+                    fx * (-two*zq*by0 + two*yq*bz0) +
+                    fy * ( two*zq*bx0 - two*xq*bz0) +
+                    fz * (-two*yq*bx0 + two*xq*by0)
+                )
+                dxq = (
+                    fx * ( two*yq*by0 + two*zq*bz0) +
+                    fy * ( two*yq*bx0 - four*xq*by0 - two*wq*bz0) +
+                    fz * ( two*zq*bx0 + two*wq*by0 - four*xq*bz0)
+                )
+                dyq = (
+                    fx * (-four*yq*bx0 + two*xq*by0 + two*wq*bz0) +
+                    fy * (  two*xq*bx0                 + two*zq*bz0) +
+                    fz * (-two*wq*bx0 + two*zq*by0 - four*yq*bz0)
+                )
+                dzq = (
+                    fx * (-four*zq*bx0 - two*wq*by0 + two*xq*bz0) +
+                    fy * ( two*wq*bx0 - four*zq*by0 + two*yq*bz0) +
+                    fz * ( two*xq*bx0 + two*yq*by0                )
+                )
+
+                # mask again (safer if any fx,fy,fz lanes picked noise)
+                dw  = tl.where(mask_m, dw,  0.0)
+                dxq = tl.where(mask_m, dxq, 0.0)
+                dyq = tl.where(mask_m, dyq, 0.0)
+                dzq = tl.where(mask_m, dzq, 0.0)
+
+                dQw += tl.sum(dw)
+                dQx += tl.sum(dxq)
+                dQy += tl.sum(dyq)
+                dQz += tl.sum(dzq)
+
+    # -------- single final write (no atomics needed) -------
+    tl.store(S_ptr, Vab_acc)
 
     if NEED_GRAD:
-        #   GRADIENT w.r.t. TRANSLATION
-        coeff = (2.*half_alpha) * g              # shape (BLOCK_N,BLOCK_M)
-        fx = tl.sum(coeff *  dx , 0)    
-        fy = tl.sum(coeff *  dy , 0)
-        fz = tl.sum(coeff *  dz , 0)
+        tl.store(dT_ptr + 0, dTx)
+        tl.store(dT_ptr + 1, dTy)
+        tl.store(dT_ptr + 2, dTz)
+        tl.store(dQ_ptr + 0, dQw)
+        tl.store(dQ_ptr + 1, dQx)
+        tl.store(dQ_ptr + 2, dQy)
+        tl.store(dQ_ptr + 3, dQz)
 
-        # ∂VAB/∂t =  Σ_j f_j         ( because  B′ = R·B + t )
-        tl.atomic_add(dT_ptr + 0,  tl.sum(fx))   
-        tl.atomic_add(dT_ptr + 1,  tl.sum(fy))
-        tl.atomic_add(dT_ptr + 2,  tl.sum(fz))
 
-        #   GRADIENT w.r.t. QUATERNION 
-        # Original (body-frame) B-coordinates are bx0,by0,bz0     (shape BLOCK_M)
-        # Forces (in body frame) are  fx,fy,fz                    (shape BLOCK_M)
-        # Current quaternion components
-        wq = qr;    xq = qi;    yq = qj;    zq = qk
-
-        # --- helper to zero-out padded atoms -------------------------------
-        valid_m = mask_m                       # (BLOCK_M,) bool
-        zeros   = 0.0
-        four = 4.0
-
-        # ---------------- ∂V/∂w  ------------------------------------------
-        dw_contrib = (
-            fx * (-two*zq*by0 + two*yq*bz0)
-            + fy * ( two*zq*bx0 - two*xq*bz0)
-            + fz * (-two*yq*bx0 + two*xq*by0)
-        )
-        dw_contrib = tl.where(valid_m, dw_contrib, zeros)
-        dw_tile = tl.sum(dw_contrib)
-
-        # ---------------- ∂V/∂x  ------------------------------------------
-        dx_contrib = (
-            fx * ( two*yq*by0 + two*zq*bz0)
-            + fy * ( two*yq*bx0 - four*xq*by0 - two*wq*bz0)
-            + fz * ( two*zq*bx0 + two*wq*by0 - four*xq*bz0)
-        )
-        dx_contrib = tl.where(valid_m, dx_contrib, zeros)
-        dx_tile = tl.sum(dx_contrib)
-
-        # ---------------- ∂V/∂y  ------------------------------------------
-        dy_contrib = (
-            fx * (-four*yq*bx0 + two*xq*by0 + two*wq*bz0)
-            + fy * ( two*xq*bx0                 + two*zq*bz0)
-            + fz * (-two*wq*bx0 + two*zq*by0 - four*yq*bz0)
-        )
-        dy_contrib = tl.where(valid_m, dy_contrib, zeros)
-        dy_tile = tl.sum(dy_contrib)
-
-        # ---------------- ∂V/∂z  ------------------------------------------
-        dz_contrib = (
-            fx * (-four*zq*bx0 - two*wq*by0 + two*xq*bz0)
-            + fy * ( two*wq*bx0 - four*zq*by0 + two*yq*bz0)
-            + fz * ( two*xq*bx0 + two*yq*by0                )
-        )
-        dz_contrib = tl.where(valid_m, dz_contrib, zeros)
-        dz_tile = tl.sum(dz_contrib)
-
-        # ---------------- ATOMIC WRITE-BACK  ------------------------------
-        tl.atomic_add(dQ_ptr + 0, dw_tile)    # ∂V/∂q_w
-        tl.atomic_add(dQ_ptr + 1, dx_tile)    # ∂V/∂q_x
-        tl.atomic_add(dQ_ptr + 2, dy_tile)    # ∂V/∂q_y
-        tl.atomic_add(dQ_ptr + 3, dz_tile)    # ∂V/∂q_z
-
-def overlap_score_grad_se3_batch(A, B, q, t, *,
-                                 alpha: float = 0.81,
-                                 N_real: torch.Tensor | None = None,
-                                 M_real: torch.Tensor | None = None,
-                                 custom_grid=None,
-                                 NEED_GRAD=True):
+def overlap_score_grad_se3_batch(
+    A, B, q, t, *,
+    alpha: float = 0.81,
+    N_real: torch.Tensor | None = None,
+    M_real: torch.Tensor | None = None,
+    NEED_GRAD: bool = True,
+    BLOCK: int = 64
+):
     """
-    A,B : (K,N_pad,3)/(K,M_pad,3)   q,t : (K,4)/(K,3)
-    N_real/M_real : (K,) int32 - number of *valid* atoms per orientation.
-                    If None, assume all N_pad / M_pad are valid.
+    One CTA per alignment (pair). Internal tile loops over A,B.
+    Shapes:
+      A : (K, N_pad, 3)
+      B : (K, M_pad, 3)
+      q : (K, 4)
+      t : (K, 3)
     """
     K, N_pad, _ = A.shape
     _, M_pad, _ = B.shape
-    BLOCK = 64 
+    device = A.device
+    dtype  = A.dtype
 
     if N_real is None:
-        N_real = A.new_full((K,), N_pad, dtype=torch.float32)
+        N_real = torch.full((K,), N_pad, device=device, dtype=torch.int32)
+    else:
+        N_real = N_real.to(device=device, dtype=torch.int32, copy=False)
     if M_real is None:
-        M_real = B.new_full((K,), M_pad, dtype=torch.float32)
+        M_real = torch.full((K,), M_pad, device=device, dtype=torch.int32)
+    else:
+        M_real = M_real.to(device=device, dtype=torch.int32, copy=False)
 
     half_alpha = 0.5 * alpha
     k_const    = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
 
-    score = torch.zeros(K,  device=A.device, dtype=A.dtype)
-    dQ    = torch.zeros_like(q)
-    dT    = torch.zeros_like(t)
+    out_S  = torch.zeros(K, device=device, dtype=dtype)
+    out_dQ = torch.zeros_like(q)
+    out_dT = torch.zeros_like(t)
 
-    grid = custom_grid if custom_grid is not None else \
-           (triton.cdiv(N_pad, BLOCK), triton.cdiv(M_pad, BLOCK), K)
+    grid = (K,)    # 1-D launch: one CTA per alignment
 
-    _gauss_overlap_se3[grid](
+    _gauss_overlap_se3_tiled[grid](
         A.contiguous().view(-1),
         B.contiguous().view(-1),
         q.contiguous().view(-1),
         t.contiguous().view(-1),
-        N_real.contiguous(),          
-        M_real.contiguous(),          
+        N_real.contiguous(),
+        M_real.contiguous(),
         K, M_pad, N_pad,
         half_alpha, k_const,
-        score, dQ.view(-1), dT.view(-1),
-        BLOCK, BLOCK,
+        out_S, out_dQ.view(-1), out_dT.view(-1),
+        BLOCK,
         NEED_GRAD=NEED_GRAD,
     )
+    return out_S, out_dQ, out_dT
 
-    return score, dQ, dT
 
 #  Fused Adam update for (q,t)     – 1 thread-block = 1..256 orientations
 @triton.jit
@@ -342,46 +358,18 @@ if torch.cuda.is_available():
 # ---------------------------------------------------------------------
 @torch.no_grad()
 def _batch_self_overlap(P_pad: torch.Tensor,
-                        N_real: torch.Tensor,
-                        alpha: float = 0.81) -> torch.Tensor:
-    """
-    P_pad : (K, N_pad, 3)   – padded coordinates (zeros beyond N_real)
-    N_real: (K,) int32      – true atom counts per molecule
-    Returns
-    -------
-    VPP : (K,)  self-overlap scalars on the same device / dtype as P_pad
-    """
+                              N_real: torch.Tensor,
+                              alpha: float = 0.81) -> torch.Tensor:
     K, N_pad, _ = P_pad.shape
-    device, dtype = P_pad.device, P_pad.dtype
-    BLOCK = 64 if N_pad <= 64 else 128           # match the SE3 wrapper
+    q_id = torch.tensor([1.,0.,0.,0.], device=P_pad.device, dtype=P_pad.dtype).expand(K,4)
+    t_0  = torch.zeros(K,3, device=P_pad.device, dtype=P_pad.dtype)
+    V, _, _ = overlap_score_grad_se3_batch(
+        P_pad, P_pad, q_id, t_0,
+        alpha=alpha,
+        N_real=N_real, M_real=N_real,
+        NEED_GRAD=False)
+    return V
 
-    half_alpha = 0.5 * alpha
-    k_const    = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
-
-    # identity quaternion + zero translation  (broadcasted to K)
-    q_id = torch.tensor([1.,0.,0.,0.], device=device, dtype=dtype)\
-          .expand(K, 4).contiguous()
-    t_0  = torch.zeros(K, 3, device=device, dtype=dtype)
-
-    score = torch.zeros(K,  device=device, dtype=dtype)      # VPP output
-    dummy = torch.empty_like(q_id)                           # unused grads
-
-    # Same kernel, but A == B and NEED_GRAD=False
-    grid = (triton.cdiv(N_pad, BLOCK), triton.cdiv(N_pad, BLOCK), K)
-    _gauss_overlap_se3[grid](
-        P_pad.contiguous().view(-1),   # A_ptr
-        P_pad.contiguous().view(-1),   # B_ptr  ← identical
-        q_id.view(-1),                 # identity quats
-        t_0.view(-1),                  # zero translations
-        N_real.contiguous(),           # real atom counts
-        N_real.contiguous(),           # same for B
-        K, N_pad, N_pad,
-        half_alpha, k_const,
-        score, dummy.view(-1), dummy.view(-1),
-        BLOCK, BLOCK,
-        NEED_GRAD=False,               # no dQ/dT needed
-    )
-    return score
 
 
 
