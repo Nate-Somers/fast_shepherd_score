@@ -426,7 +426,139 @@ class MoleculePair:
         for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
             # quaternion_to_SE3 unchanged
             p.transform_vol_noH = quaternion_to_SE3(q, t)
-            p.sim_aligned_vol_noH = float(s)       
+            p.sim_aligned_vol_noH = float(s)   
+
+    @staticmethod
+    def align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81):
+        """
+        Batched alignment over *surface point clouds* using Gaussian-overlap
+        surface similarity (ROCS-style), modeled after `align_batch_vol`.
+
+        Inputs
+        ------
+        pairs : list[MoleculePair]
+            Each pair must provide surface point clouds for reference/fit:
+            • prefer:   _ref_surf_t, _fit_surf_t  (torch.float32, (N/M, 3))
+            • fallback: ref_molec.surf_pos, fit_molec.surf_pos (numpy, (N/M, 3))
+        alpha : float
+            Gaussian width parameter (same meaning as in `align_with_surf`).
+
+        Side effects
+        ------------
+        Writes:
+        • p.transform_surf      ← best SE(3) as 4×4 (via quaternion_to_SE3)
+        • p.sim_aligned_surf    ← best Tanimoto surface score (float)
+        """
+
+        # --- workspace caches keyed by (N_pad, M_pad) ---
+        _ALIGN_WORKSPACES: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+        _INT_BUFFER_CACHE: dict[int, dict[str, torch.Tensor]] = {}
+
+        if not pairs:
+            return
+
+        device = pairs[0].device
+
+        # --- ensure/prepare surface tensors on the right device --------------------
+        for p in pairs:
+            # Prefer already-prepared torch tensors
+            r = getattr(p, "_ref_surf_t", None)
+            f = getattr(p, "_fit_surf_t", None)
+
+            if r is None or f is None:
+                # Fallback: build from numpy surface arrays if present
+                if not hasattr(p, "ref_molec") or not hasattr(p.ref_molec, "surf_pos"):
+                    raise ValueError(
+                        "Surface points missing: MoleculePair must have _ref/_fit_surf_t "
+                        "or ref_molec/fit_molec with .surf_pos."
+                    )
+                r_np = p.ref_molec.surf_pos
+                f_np = p.fit_molec.surf_pos
+                if r_np is None or f_np is None:
+                    raise ValueError("Surface points are None; cannot run align_batch_surf.")
+                p._ref_surf_t = torch.as_tensor(r_np, dtype=torch.float32, device=device)
+                p._fit_surf_t = torch.as_tensor(f_np, dtype=torch.float32, device=device)
+            else:
+                # move to target device if needed
+                if r.device != device:
+                    p._ref_surf_t = r.to(device, non_blocking=True)
+                if f.device != device:
+                    p._fit_surf_t = f.to(device, non_blocking=True)
+
+        # --- result accumulators (GPU first; host copy only once) ------------------
+        all_pairs: list[MoleculePair] = []
+        all_scores: list[torch.Tensor] = []
+        all_q: list[torch.Tensor] = []
+        all_t: list[torch.Tensor] = []
+
+        # --- band bucketing (by padded N/M) ---------------------------------------
+        buckets: dict[tuple[int, int], list[MoleculePair]] = {}
+        for p in pairs:
+            n_band = _band_key(p._ref_surf_t.shape[0])
+            m_band = _band_key(p._fit_surf_t.shape[0])
+            buckets.setdefault((n_band, m_band), []).append(p)
+
+        for (N_pad, M_pad), bucket in buckets.items():
+            K = len(bucket)
+
+            # ---- integer buffers (reuse) ------------------------------------------
+            ib_key = K
+            int_buf = _INT_BUFFER_CACHE.get(ib_key)
+            if int_buf is None:
+                int_buf = {
+                    'N': torch.empty(K, dtype=torch.int32, device=device),
+                    'M': torch.empty(K, dtype=torch.int32, device=device),
+                }
+                _INT_BUFFER_CACHE[ib_key] = int_buf
+            N_real = int_buf['N']
+            M_real = int_buf['M']
+
+            # Fill in-place
+            for i, p in enumerate(bucket):
+                N_real[i] = p._ref_surf_t.shape[0]
+                M_real[i] = p._fit_surf_t.shape[0]
+
+            # ---- workspaces (reuse & grow) ----------------------------------------
+            ws_key = (N_pad, M_pad)
+            ws = _ALIGN_WORKSPACES.get(ws_key)
+            if ws is None or ws['ref'].shape[0] < K:
+                ref_pad = torch.empty(K, N_pad, 3, device=device, dtype=torch.float32)
+                fit_pad = torch.empty(K, M_pad, 3, device=device, dtype=torch.float32)
+                _ALIGN_WORKSPACES[ws_key] = {'ref': ref_pad, 'fit': fit_pad}
+            ref_pad = _ALIGN_WORKSPACES[ws_key]['ref'][:K]
+            fit_pad = _ALIGN_WORKSPACES[ws_key]['fit'][:K]
+
+            # Clear padding slices for determinism; write valid prefixes
+            ref_pad.zero_()
+            fit_pad.zero_()
+            for i, p in enumerate(bucket):
+                n = int(N_real[i].item())
+                m = int(M_real[i].item())
+                ref_pad[i, :n] = p._ref_surf_t
+                fit_pad[i, :m] = p._fit_surf_t
+
+            # ---- self-overlaps on surface point clouds ----------------------------
+            VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
+            VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
+
+            # ---- coarse + fine alignment (same engine as volumetric) --------------
+            scores, q_batch, t_batch = coarse_fine_align_many(
+                ref_pad, fit_pad, VAA, VBB,
+                N_real=N_real, M_real=M_real, alpha=alpha)
+
+            all_pairs.extend(bucket)
+            all_scores.append(scores)
+            all_q.append(q_batch)
+            all_t.append(t_batch)
+
+        # ---- final host transfer (single) -----------------------------------------
+        scores_cpu = torch.cat(all_scores).cpu()
+        q_cpu = torch.cat(all_q).cpu()
+        t_cpu = torch.cat(all_t).cpu()
+
+        for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
+            p.transform_surf = quaternion_to_SE3(q, t)
+            p.sim_aligned_surf = float(s)
 
     def align_with_vol_esp(self,
                            lam: float,
