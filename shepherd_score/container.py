@@ -38,6 +38,10 @@ def _band_key(n: int) -> int:
     return ((n + _BAND - 1) // _BAND) * _BAND
 ### END size_bucketing #######################################################
 
+# ---- persistent, per-process caches (reused across calls) -------------------
+_ALIGN_WORKSPACES: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+_INT_BUFFER_CACHE: dict[int, dict[str, torch.Tensor]] = {}
+
 def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) -> Chem.Mol:
     """
     Updates the coordinates of a 3D RDKit mol object with a new set of coordinates
@@ -333,9 +337,7 @@ class MoleculePair:
         Batched alignment with workspace reuse & reduced per-pair transfers.
         """
 
-                # --- workspace caches keyed by (N_pad, M_pad) ---
-        _ALIGN_WORKSPACES = {}    # (N_pad, M_pad) -> dict(ref=..., fit=...)
-        _INT_BUFFER_CACHE = {}    # length -> {'N': tensor, 'M': tensor}
+        global _ALIGN_WORKSPACES, _INT_BUFFER_CACHE
         
         if not pairs:
             return

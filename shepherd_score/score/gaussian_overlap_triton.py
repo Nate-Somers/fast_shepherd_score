@@ -115,7 +115,7 @@ def _gauss_overlap_se3_tiled(
                 dTz += tl.sum(fz)
 
                 # quaternion grads (reuse original body-frame coords bx0,by0,bz0)
-                # NOTE: mask_m already applied via fx,fy,fz sums above (masked zeros)
+                # mask_m already applied via fx,fy,fz sums above (masked zeros)
                 wq = qr; xq = qi; yq = qj; zq = qk
                 four = 4.0
 
