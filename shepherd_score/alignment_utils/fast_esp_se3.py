@@ -8,7 +8,8 @@ from typing import Tuple, Optional
 from ..score.gaussian_overlap_esp_triton import (
     overlap_score_grad_esp_se3_batch,
     _batch_self_overlap_esp,
-    fused_adam_qt
+    fused_adam_qt,
+    fused_adam_qt_with_tangent_proj
 )
 from .fast_common import (
     check_gpu_available,
@@ -109,6 +110,9 @@ def coarse_fine_esp_align_many(
         *,
         alpha: float = 0.81,
         lam: float = 0.3,
+        trans_centers: Optional[torch.Tensor] = None,
+        trans_centers_real: Optional[torch.Tensor] = None,
+        num_repeats_per_trans: int = 10,
         topk: int = 30,
         steps_fine: int = 75,
         lr: float = 0.075,
@@ -167,7 +171,16 @@ def coarse_fine_esp_align_many(
     # ------------------------------------------------------------------
     # 1) Build coarse grid of 500 poses
     # ------------------------------------------------------------------
-    q_grid, t_grid = build_coarse_grid(A_batch, B_batch, N_real, M_real, num_seeds=50)
+    q_grid, t_grid = build_coarse_grid(
+        A_batch,
+        B_batch,
+        N_real,
+        M_real,
+        num_seeds=50,
+        trans_centers_batch=trans_centers,
+        trans_centers_real=trans_centers_real,
+        num_repeats_per_trans=num_repeats_per_trans,
+    )
     G = q_grid.size(1)  # 500 orientations
 
     # ------------------------------------------------------------------
@@ -241,7 +254,7 @@ def coarse_fine_esp_align_many(
     prev_max_score = -float('inf')
     no_improve_count = 0
 
-    for _ in range(steps_fine):
+    for step in range(steps_fine):
         VAB, dQ, dT = _overlap_in_chunks_esp(
             A_k, B_k, CA_k, CB_k, q_k, t_k,
             alpha=alpha, lam=lam, N_real=N_k, M_real=M_k)
@@ -250,10 +263,6 @@ def coarse_fine_esp_align_many(
         score = VAB / denom
         scale = VAA_plus_VBB / (denom * denom)
 
-        # Tangent-space projection for quaternion gradients
-        radial = (dQ * q_k).sum(dim=1, keepdim=True)
-        dQ_tan = dQ - q_k * radial
-
         # Track best
         better = score > best_score
         best_score = torch.where(better, score, best_score)
@@ -261,20 +270,21 @@ def coarse_fine_esp_align_many(
         best_q = torch.where(mask_q, q_k, best_q)
         best_t = torch.where(mask_q, t_k, best_t)
 
-        # Early stopping check
-        current_max = best_score.max().item()
-        if current_max - prev_max_score < early_stop_tol:
-            no_improve_count += 1
-            if no_improve_count >= early_stop_patience:
-                break
-        else:
-            no_improve_count = 0
-            prev_max_score = current_max
+        # Early stopping check every 5 iterations to reduce GPU→CPU sync overhead
+        if step % 5 == 0:
+            current_max = best_score.max().item()
+            if current_max - prev_max_score < early_stop_tol:
+                no_improve_count += 1
+                if no_improve_count >= early_stop_patience:
+                    break
+            else:
+                no_improve_count = 0
+                prev_max_score = current_max
 
-        # Fused Adam update
-        fused_adam_qt(
+        # Fused Adam with tangent-space projection (avoids intermediate dQ_tan tensor)
+        fused_adam_qt_with_tangent_proj(
             q_k, t_k,
-            -dQ_tan * scale.unsqueeze(1),
+            -dQ * scale.unsqueeze(1),
             -dT * scale.unsqueeze(1),
             m_q, v_q, m_t, v_t, lr)
 
@@ -298,6 +308,8 @@ def fast_optimize_ROCS_esp_overlay(
         alpha: float,
         lam: float,
         num_repeats: int = 50,
+        trans_centers: Optional[torch.Tensor] = None,
+        num_repeats_per_trans: int = 10,
         topk: int = 30,
         steps_fine: int = 75,
         lr: float = 0.075,
@@ -360,6 +372,12 @@ def fast_optimize_ROCS_esp_overlay(
     CB = fit_c.unsqueeze(0)
     N_real = torch.tensor([ref_gpu.shape[0]], device=device, dtype=torch.int32)
     M_real = torch.tensor([fit_gpu.shape[0]], device=device, dtype=torch.int32)
+    trans_centers_batch = None
+    trans_centers_real = None
+    if trans_centers is not None:
+        tc = trans_centers.to(device, dtype=torch.float32)
+        trans_centers_batch = tc.unsqueeze(0)
+        trans_centers_real = torch.tensor([tc.shape[0]], device=device, dtype=torch.int32)
 
     # Precompute self-overlaps
     VAA = _self_overlap_esp_chunks(A, CA, N_real, alpha, lam)
@@ -370,6 +388,9 @@ def fast_optimize_ROCS_esp_overlay(
         A, B, CA, CB, VAA, VBB,
         alpha=alpha,
         lam=lam,
+        trans_centers=trans_centers_batch,
+        trans_centers_real=trans_centers_real,
+        num_repeats_per_trans=num_repeats_per_trans,
         topk=topk,
         steps_fine=steps_fine,
         lr=lr,
@@ -397,6 +418,9 @@ def fast_optimize_ROCS_esp_overlay_batch(
         lam: float,
         N_real: Optional[torch.Tensor] = None,
         M_real: Optional[torch.Tensor] = None,
+        trans_centers_batch: Optional[torch.Tensor] = None,
+        trans_centers_real: Optional[torch.Tensor] = None,
+        num_repeats_per_trans: int = 10,
         topk: int = 30,
         steps_fine: int = 75,
         lr: float = 0.075) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -456,6 +480,9 @@ def fast_optimize_ROCS_esp_overlay_batch(
         ref_batch, fit_batch, ref_charges_batch, fit_charges_batch, VAA, VBB,
         alpha=alpha,
         lam=lam,
+        trans_centers=trans_centers_batch,
+        trans_centers_real=trans_centers_real,
+        num_repeats_per_trans=num_repeats_per_trans,
         topk=topk,
         steps_fine=steps_fine,
         lr=lr,

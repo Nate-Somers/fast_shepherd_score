@@ -9,6 +9,7 @@ from typing import Tuple, Optional
 from ..score.gaussian_overlap_triton import (
     overlap_score_grad_se3_batch,
     fused_adam_qt,
+    fused_adam_qt_with_tangent_proj,
     _batch_self_overlap
 )
 from ..score.constants import COULOMB_SCALING, LAM_SCALING
@@ -78,6 +79,8 @@ def _batch_esp_comparison(points_1: torch.Tensor,
                           partial_charges_2: torch.Tensor,
                           points_charges_1: torch.Tensor,
                           radii_2: torch.Tensor,
+                          M_real_atoms: torch.Tensor,
+                          N_real_surf: torch.Tensor,
                           probe_radius: float = 1.0,
                           lam: float = 0.001) -> torch.Tensor:
     """
@@ -116,11 +119,26 @@ def _batch_esp_comparison(points_1: torch.Tensor,
 
     # mask: surface points outside molecule 2's volume
     # mask = (all distances >= radii + probe) -> 1.0, else 0.0
-    mask = (distances >= radii_2.unsqueeze(1) + probe_radius).all(dim=2).float()
+    BATCH, N_surf_pad, M_atoms_pad = distances.shape
+    atom_mask = (
+        torch.arange(M_atoms_pad, device=distances.device).view(1, 1, M_atoms_pad)
+        < M_real_atoms.view(BATCH, 1, 1)
+    )
+    cond = distances >= (radii_2.unsqueeze(1) + probe_radius)
+    cond = cond | (~atom_mask)  # padded atoms are non-blocking
+    mask = cond.all(dim=2).float()
+
+    surf_mask = (
+        torch.arange(N_surf_pad, device=distances.device).view(1, N_surf_pad)
+        < N_real_surf.view(BATCH, 1)
+    ).float()
+    mask = mask * surf_mask
 
     # ESP at surface points due to molecule 2's partial charges
     # Use reciprocal distances, clamp to avoid division by zero
     inv_distances = 1.0 / distances.clamp(min=1e-6)  # (B, N_surf, M_atoms)
+    inv_distances = inv_distances * atom_mask.to(inv_distances.dtype)
+    partial_charges_2 = partial_charges_2 * atom_mask[:, 0, :].to(partial_charges_2.dtype)
     esp_at_surf_1 = torch.einsum('bm,bnm->bn', partial_charges_2, inv_distances) * COULOMB_SCALING
 
     # ESP similarity
@@ -151,7 +169,11 @@ def _batch_esp_combo_score(
         VAA: torch.Tensor,
         VBB: torch.Tensor,
         N_real_centers: torch.Tensor,
-        M_real_centers: torch.Tensor) -> torch.Tensor:
+        M_real_centers: torch.Tensor,
+        N_real_atoms_w_H_1: torch.Tensor,
+        M_real_atoms_w_H_2: torch.Tensor,
+        N_real_surf_1: torch.Tensor,
+        M_real_surf_2: torch.Tensor) -> torch.Tensor:
     """
     Compute batched ESP combo score (shape + ESP similarity).
 
@@ -161,8 +183,8 @@ def _batch_esp_combo_score(
         Combined similarity scores
     """
     BATCH = centers_1.shape[0]
-    N_surf = points_1.shape[1]
-    M_surf = points_2.shape[1]
+    N_surf = N_real_surf_1.to(dtype=centers_1.dtype)
+    M_surf = M_real_surf_2.to(dtype=centers_1.dtype)
 
     # Shape similarity using volumetric kernel
     VAB, _, _ = _overlap_in_chunks_volumetric(
@@ -179,10 +201,14 @@ def _batch_esp_combo_score(
     # ESP similarity
     esp_1 = _batch_esp_comparison(
         points_1, centers_w_H_2, partial_charges_2,
-        point_charges_1, radii_2, probe_radius, lam)
+        point_charges_1, radii_2,
+        M_real_atoms_w_H_2, N_real_surf_1,
+        probe_radius, lam)
     esp_2 = _batch_esp_comparison(
         points_2, centers_w_H_1, partial_charges_1,
-        point_charges_2, radii_1, probe_radius, lam)
+        point_charges_2, radii_1,
+        N_real_atoms_w_H_1, M_real_surf_2,
+        probe_radius, lam)
 
     electrostatic_sim = (esp_1 + esp_2) / (N_surf + M_surf)
 
@@ -212,11 +238,18 @@ def coarse_fine_esp_combo_align_many(
         lam: float = 0.001,
         probe_radius: float = 1.0,
         esp_weight: float = 0.5,
+        trans_centers: Optional[torch.Tensor] = None,
+        trans_centers_real: Optional[torch.Tensor] = None,
+        num_repeats_per_trans: int = 10,
         topk: int = 30,
         steps_fine: int = 75,
         lr: float = 0.075,
         N_real_centers: Optional[torch.Tensor] = None,
         M_real_centers: Optional[torch.Tensor] = None,
+        N_real_atoms_w_H_1: Optional[torch.Tensor] = None,
+        M_real_atoms_w_H_2: Optional[torch.Tensor] = None,
+        N_real_surf_1: Optional[torch.Tensor] = None,
+        M_real_surf_2: Optional[torch.Tensor] = None,
         early_stop_patience: int = 5,
         early_stop_tol: float = 1e-5) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -246,12 +279,28 @@ def coarse_fine_esp_combo_align_many(
         N_real_centers = centers_1.new_full((BATCH,), N_pad_centers, dtype=torch.int32)
     if M_real_centers is None:
         M_real_centers = centers_2.new_full((BATCH,), M_pad_centers, dtype=torch.int32)
+    if N_real_atoms_w_H_1 is None:
+        N_real_atoms_w_H_1 = centers_w_H_1.new_full((BATCH,), N_pad_w_H, dtype=torch.int32)
+    if M_real_atoms_w_H_2 is None:
+        M_real_atoms_w_H_2 = centers_w_H_2.new_full((BATCH,), M_pad_w_H, dtype=torch.int32)
+    if N_real_surf_1 is None:
+        N_real_surf_1 = points_1.new_full((BATCH,), N_surf, dtype=torch.int32)
+    if M_real_surf_2 is None:
+        M_real_surf_2 = points_2.new_full((BATCH,), M_surf, dtype=torch.int32)
 
     # ------------------------------------------------------------------
     # 1) Build coarse grid of 500 poses
     # ------------------------------------------------------------------
     q_grid, t_grid = build_coarse_grid(
-        centers_1, centers_2, N_real_centers, M_real_centers, num_seeds=50)
+        points_1,
+        points_2,
+        N_real_surf_1,
+        M_real_surf_2,
+        num_seeds=50,
+        trans_centers_batch=trans_centers,
+        trans_centers_real=trans_centers_real,
+        num_repeats_per_trans=num_repeats_per_trans,
+    )
     G = q_grid.size(1)
 
     # ------------------------------------------------------------------
@@ -293,6 +342,10 @@ def coarse_fine_esp_combo_align_many(
         VBB_exp = VBB.unsqueeze(1).expand(-1, g_len).reshape(-1)
         N_real_exp = N_real_centers.repeat_interleave(g_len)
         M_real_exp = M_real_centers.repeat_interleave(g_len)
+        N_atoms_exp = N_real_atoms_w_H_1.repeat_interleave(g_len)
+        M_atoms_exp = M_real_atoms_w_H_2.repeat_interleave(g_len)
+        N_surf_exp = N_real_surf_1.repeat_interleave(g_len)
+        M_surf_exp = M_real_surf_2.repeat_interleave(g_len)
 
         # Compute combo scores
         scores_chunk = _batch_esp_combo_score(
@@ -303,7 +356,8 @@ def coarse_fine_esp_combo_align_many(
             point_charges_1_exp, point_charges_2_exp,
             radii_1_exp, radii_2_exp,
             alpha, lam, probe_radius, esp_weight,
-            VAA_exp, VBB_exp, N_real_exp, M_real_exp)
+            VAA_exp, VBB_exp, N_real_exp, M_real_exp,
+            N_atoms_exp, M_atoms_exp, N_surf_exp, M_surf_exp)
 
         coarse_score[:, o0:o1] = scores_chunk.view(BATCH, g_len)
 
@@ -337,6 +391,10 @@ def coarse_fine_esp_combo_align_many(
 
     N_k = N_real_centers.repeat_interleave(topk)
     M_k = M_real_centers.repeat_interleave(topk)
+    N_atoms_k = N_real_atoms_w_H_1.repeat_interleave(topk)
+    M_atoms_k = M_real_atoms_w_H_2.repeat_interleave(topk)
+    N_surf_k = N_real_surf_1.repeat_interleave(topk)
+    M_surf_k = M_real_surf_2.repeat_interleave(topk)
     VAA_k = VAA.repeat_interleave(topk)
     VBB_k = VBB.repeat_interleave(topk)
     VAA_plus_VBB = VAA_k + VBB_k
@@ -354,7 +412,7 @@ def coarse_fine_esp_combo_align_many(
     prev_max_score = -float('inf')
     no_improve_count = 0
 
-    for _ in range(steps_fine):
+    for step in range(steps_fine):
         # Use shape gradients for optimization (ESP doesn't affect SE3 derivatives much)
         # Transform fit data
         centers_w_H_2_t = apply_se3_transform(centers_w_H_2_k, q_k, t_k)
@@ -375,15 +433,12 @@ def coarse_fine_esp_combo_align_many(
             point_charges_1_k, point_charges_2_k,
             radii_1_k, radii_2_k,
             alpha, lam, probe_radius, esp_weight,
-            VAA_k, VBB_k, N_k, M_k)
+            VAA_k, VBB_k, N_k, M_k,
+            N_atoms_k, M_atoms_k, N_surf_k, M_surf_k)
 
         # Scale gradients for shape component
         denom = VAA_plus_VBB - VAB
         scale = VAA_plus_VBB / (denom * denom)
-
-        # Tangent-space projection
-        radial = (dQ * q_k).sum(dim=1, keepdim=True)
-        dQ_tan = dQ - q_k * radial
 
         # Track best
         better = score > best_score
@@ -392,20 +447,21 @@ def coarse_fine_esp_combo_align_many(
         best_q = torch.where(mask_q, q_k, best_q)
         best_t = torch.where(mask_q, t_k, best_t)
 
-        # Early stopping
-        current_max = best_score.max().item()
-        if current_max - prev_max_score < early_stop_tol:
-            no_improve_count += 1
-            if no_improve_count >= early_stop_patience:
-                break
-        else:
-            no_improve_count = 0
-            prev_max_score = current_max
+        # Early stopping check every 5 iterations to reduce GPU→CPU sync overhead
+        if step % 5 == 0:
+            current_max = best_score.max().item()
+            if current_max - prev_max_score < early_stop_tol:
+                no_improve_count += 1
+                if no_improve_count >= early_stop_patience:
+                    break
+            else:
+                no_improve_count = 0
+                prev_max_score = current_max
 
-        # Fused Adam update (using shape gradients scaled by shape weight)
-        fused_adam_qt(
+        # Fused Adam with tangent-space projection (avoids intermediate dQ_tan tensor)
+        fused_adam_qt_with_tangent_proj(
             q_k, t_k,
-            -dQ_tan * scale.unsqueeze(1) * (1 - esp_weight),
+            -dQ * scale.unsqueeze(1) * (1 - esp_weight),
             -dT * scale.unsqueeze(1) * (1 - esp_weight),
             m_q, v_q, m_t, v_t, lr)
 
@@ -439,6 +495,8 @@ def fast_optimize_esp_combo_score_overlay(
         probe_radius: float = 1.0,
         esp_weight: float = 0.5,
         num_repeats: int = 50,
+        trans_centers: Optional[torch.Tensor] = None,
+        num_repeats_per_trans: int = 10,
         topk: int = 30,
         steps_fine: int = 75,
         lr: float = 0.075,
@@ -467,7 +525,9 @@ def fast_optimize_esp_combo_score_overlay(
             ref_surf_esp, fit_surf_esp,
             ref_radii, fit_radii,
             alpha, lam, probe_radius, esp_weight,
-            num_repeats, **kwargs)
+            num_repeats,
+            trans_centers=trans_centers,
+            **kwargs)
 
     device = torch.device('cuda')
 
@@ -485,34 +545,38 @@ def fast_optimize_esp_combo_score_overlay(
     ref_radii_gpu = ref_radii.to(device, dtype=torch.float32).unsqueeze(0)
     fit_radii_gpu = fit_radii.to(device, dtype=torch.float32).unsqueeze(0)
 
-    N_real = torch.tensor([ref_centers.shape[0]], device=device, dtype=torch.int32)
-    M_real = torch.tensor([fit_centers.shape[0]], device=device, dtype=torch.int32)
+    trans_centers_batch = None
+    trans_centers_real = None
+    if trans_centers is not None:
+        tc = trans_centers.to(device, dtype=torch.float32)
+        trans_centers_batch = tc.unsqueeze(0)
+        trans_centers_real = torch.tensor([tc.shape[0]], device=device, dtype=torch.int32)
 
-    # Precompute self-overlaps
-    VAA = _self_overlap_chunks(ref_centers_gpu, N_real, alpha)
-    VBB = _self_overlap_chunks(fit_centers_gpu, M_real, alpha)
-
-    # Run alignment
-    score, q_best, t_best = coarse_fine_esp_combo_align_many(
+    aligned_batch, q_best, t_best, score = fast_optimize_esp_combo_score_overlay_batch(
         ref_centers_w_H_gpu, fit_centers_w_H_gpu,
         ref_centers_gpu, fit_centers_gpu,
         ref_points_gpu, fit_points_gpu,
         ref_partial_gpu, fit_partial_gpu,
         ref_esp_gpu, fit_esp_gpu,
         ref_radii_gpu, fit_radii_gpu,
-        VAA, VBB,
-        alpha=alpha,
+        alpha,
         lam=lam,
         probe_radius=probe_radius,
         esp_weight=esp_weight,
+        N_real_atoms_w_H_1=torch.tensor([ref_centers_w_H.shape[0]], device=device, dtype=torch.int32),
+        M_real_atoms_w_H_2=torch.tensor([fit_centers_w_H.shape[0]], device=device, dtype=torch.int32),
+        N_real_centers=torch.tensor([ref_centers.shape[0]], device=device, dtype=torch.int32),
+        M_real_centers=torch.tensor([fit_centers.shape[0]], device=device, dtype=torch.int32),
+        N_real_surf_1=torch.tensor([ref_points.shape[0]], device=device, dtype=torch.int32),
+        M_real_surf_2=torch.tensor([fit_points.shape[0]], device=device, dtype=torch.int32),
+        trans_centers_batch=trans_centers_batch,
+        trans_centers_real=trans_centers_real,
+        num_repeats_per_trans=num_repeats_per_trans,
         topk=topk,
         steps_fine=steps_fine,
         lr=lr,
-        N_real_centers=N_real,
-        M_real_centers=M_real)
-
-    # Apply transform
-    aligned = apply_se3_transform(fit_points_gpu[0], q_best[0], t_best[0])
+    )
+    aligned = aligned_batch[0]
 
     # Build SE(3) matrix
     R = quaternion_to_rotation_matrix(q_best[0])
@@ -521,3 +585,104 @@ def fast_optimize_esp_combo_score_overlay(
     SE3[:3, 3] = t_best[0]
 
     return aligned.cpu(), SE3.cpu(), score[0].cpu()
+
+
+def fast_optimize_esp_combo_score_overlay_batch(
+        ref_centers_w_H_batch: torch.Tensor,
+        fit_centers_w_H_batch: torch.Tensor,
+        ref_centers_batch: torch.Tensor,
+        fit_centers_batch: torch.Tensor,
+        ref_points_batch: torch.Tensor,
+        fit_points_batch: torch.Tensor,
+        ref_partial_charges_batch: torch.Tensor,
+        fit_partial_charges_batch: torch.Tensor,
+        ref_surf_esp_batch: torch.Tensor,
+        fit_surf_esp_batch: torch.Tensor,
+        ref_radii_batch: torch.Tensor,
+        fit_radii_batch: torch.Tensor,
+        alpha: float,
+        *,
+        lam: float = 0.001,
+        probe_radius: float = 1.0,
+        esp_weight: float = 0.5,
+        N_real_atoms_w_H_1: Optional[torch.Tensor] = None,
+        M_real_atoms_w_H_2: Optional[torch.Tensor] = None,
+        N_real_centers: Optional[torch.Tensor] = None,
+        M_real_centers: Optional[torch.Tensor] = None,
+        N_real_surf_1: Optional[torch.Tensor] = None,
+        M_real_surf_2: Optional[torch.Tensor] = None,
+        trans_centers_batch: Optional[torch.Tensor] = None,
+        trans_centers_real: Optional[torch.Tensor] = None,
+        num_repeats_per_trans: int = 10,
+        topk: int = 30,
+        steps_fine: int = 75,
+        lr: float = 0.075) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fast GPU-accelerated batch ESP-combo alignment with padding-safe masks.
+
+    Returns
+    -------
+    aligned_fit_points : torch.Tensor (B, M_surf_pad, 3)
+    q_best : torch.Tensor (B, 4)
+    t_best : torch.Tensor (B, 3)
+    scores : torch.Tensor (B,)
+    """
+    device = ref_centers_batch.device
+    BATCH = ref_centers_batch.shape[0]
+
+    if N_real_centers is None:
+        N_real_centers = ref_centers_batch.new_full(
+            (BATCH,), ref_centers_batch.shape[1], dtype=torch.int32
+        )
+    if M_real_centers is None:
+        M_real_centers = fit_centers_batch.new_full(
+            (BATCH,), fit_centers_batch.shape[1], dtype=torch.int32
+        )
+    if N_real_atoms_w_H_1 is None:
+        N_real_atoms_w_H_1 = ref_centers_w_H_batch.new_full(
+            (BATCH,), ref_centers_w_H_batch.shape[1], dtype=torch.int32
+        )
+    if M_real_atoms_w_H_2 is None:
+        M_real_atoms_w_H_2 = fit_centers_w_H_batch.new_full(
+            (BATCH,), fit_centers_w_H_batch.shape[1], dtype=torch.int32
+        )
+    if N_real_surf_1 is None:
+        N_real_surf_1 = ref_points_batch.new_full(
+            (BATCH,), ref_points_batch.shape[1], dtype=torch.int32
+        )
+    if M_real_surf_2 is None:
+        M_real_surf_2 = fit_points_batch.new_full(
+            (BATCH,), fit_points_batch.shape[1], dtype=torch.int32
+        )
+
+    VAA = _self_overlap_chunks(ref_centers_batch, N_real_centers, alpha)
+    VBB = _self_overlap_chunks(fit_centers_batch, M_real_centers, alpha)
+
+    scores, q_best, t_best = coarse_fine_esp_combo_align_many(
+        ref_centers_w_H_batch, fit_centers_w_H_batch,
+        ref_centers_batch, fit_centers_batch,
+        ref_points_batch, fit_points_batch,
+        ref_partial_charges_batch, fit_partial_charges_batch,
+        ref_surf_esp_batch, fit_surf_esp_batch,
+        ref_radii_batch, fit_radii_batch,
+        VAA, VBB,
+        alpha=alpha,
+        lam=lam,
+        probe_radius=probe_radius,
+        esp_weight=esp_weight,
+        trans_centers=trans_centers_batch,
+        trans_centers_real=trans_centers_real,
+        num_repeats_per_trans=num_repeats_per_trans,
+        topk=topk,
+        steps_fine=steps_fine,
+        lr=lr,
+        N_real_centers=N_real_centers,
+        M_real_centers=M_real_centers,
+        N_real_atoms_w_H_1=N_real_atoms_w_H_1,
+        M_real_atoms_w_H_2=M_real_atoms_w_H_2,
+        N_real_surf_1=N_real_surf_1,
+        M_real_surf_2=M_real_surf_2,
+    )
+
+    aligned_fit_points = apply_se3_transform(fit_points_batch, q_best, t_best)
+    return aligned_fit_points, q_best, t_best, scores

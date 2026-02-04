@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 import torch
 
-from .gaussian_overlap_triton import fused_adam_qt
+from .gaussian_overlap_triton import fused_adam_qt, fused_adam_qt_with_tangent_proj
 
 
 @triton.jit

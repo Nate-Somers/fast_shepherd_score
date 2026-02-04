@@ -510,7 +510,8 @@ def optimize_ROCS_esp_overlay(ref_points: torch.Tensor,
                               trans_centers: Union[torch.Tensor, None] = None,
                               lr: float = 0.1,
                               max_num_steps: int = 200,
-                              verbose: bool = False
+                              verbose: bool = False,
+                              use_fast: bool = True,
                               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Optimize alignment of fit_points with respect to ref_points using SE(3) transformations and
@@ -556,6 +557,27 @@ def optimize_ROCS_esp_overlay(ref_points: torch.Tensor,
         score : torch.Tensor (1,)
             Tanimoto shape similarity score for the optimal transformation.
     """
+    if (
+        use_fast
+        and torch.cuda.is_available()
+        and "FAST_ALIGNMENT_AVAILABLE" in globals()
+        and FAST_ALIGNMENT_AVAILABLE
+    ):
+        return fast_optimize_ROCS_esp_overlay(
+            ref_points=ref_points,
+            fit_points=fit_points,
+            ref_charges=ref_charges,
+            fit_charges=fit_charges,
+            alpha=alpha,
+            lam=lam,
+            num_repeats=num_repeats,
+            trans_centers=trans_centers,
+            num_repeats_per_trans=10,
+            topk=30,
+            steps_fine=max_num_steps,
+            lr=lr,
+        )
+
     # Initial guess for SE(3) parameters (quaternion followed by translation)
     if trans_centers is None:
         se3_params = _initialize_se3_params(ref_points=ref_points, fit_points=fit_points, num_repeats=num_repeats)
@@ -701,12 +723,44 @@ def optimize_esp_combo_score_overlay(ref_centers_w_H: torch.Tensor,
                                      trans_centers: Union[torch.Tensor, None] = None,
                                      lr: float = 0.1,
                                      max_num_steps: int = 200,
-                                     verbose: bool = False
+                                     verbose: bool = False,
+                                     use_fast: bool = True,
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Optimize alignment of fit_points with respect to ref_points using SE(3) transformations and
     maximizing electrostatic-weighted gaussian overlap score.
     """
+    if (
+        use_fast
+        and torch.cuda.is_available()
+        and "FAST_ALIGNMENT_AVAILABLE" in globals()
+        and FAST_ALIGNMENT_AVAILABLE
+    ):
+        return fast_optimize_esp_combo_score_overlay(
+            ref_centers_w_H=ref_centers_w_H,
+            fit_centers_w_H=fit_centers_w_H,
+            ref_centers=ref_centers,
+            fit_centers=fit_centers,
+            ref_points=ref_points,
+            fit_points=fit_points,
+            ref_partial_charges=ref_partial_charges,
+            fit_partial_charges=fit_partial_charges,
+            ref_surf_esp=ref_surf_esp,
+            fit_surf_esp=fit_surf_esp,
+            ref_radii=ref_radii,
+            fit_radii=fit_radii,
+            alpha=alpha,
+            lam=lam,
+            probe_radius=probe_radius,
+            esp_weight=esp_weight,
+            num_repeats=num_repeats,
+            trans_centers=trans_centers,
+            num_repeats_per_trans=10,
+            topk=30,
+            steps_fine=max_num_steps,
+            lr=lr,
+        )
+
     # Initial guess for SE(3) parameters (quaternion followed by translation)
     if trans_centers is None:
         se3_params = _initialize_se3_params(ref_points=ref_points, fit_points=fit_points, num_repeats=num_repeats)
@@ -944,7 +998,8 @@ def optimize_pharm_overlay(ref_pharms: torch.Tensor,
                            trans_centers: Union[torch.Tensor, None] = None,
                            lr: float = 0.1,
                            max_num_steps: int = 200,
-                           verbose: bool = False
+                           verbose: bool = False,
+                           use_fast: bool = True,
                            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Optimize alignment of fit_anchors with respect to ref_anchors using SE(3) transformations and
@@ -993,6 +1048,30 @@ def optimize_pharm_overlay(ref_pharms: torch.Tensor,
         score : torch.Tensor (1,)
             Tanimoto shape similarity score for the optimal transformation.
     """
+    if (
+        use_fast
+        and torch.cuda.is_available()
+        and "FAST_ALIGNMENT_AVAILABLE" in globals()
+        and FAST_ALIGNMENT_AVAILABLE
+    ):
+        return fast_optimize_pharm_overlay(
+            ref_pharms=ref_pharms,
+            fit_pharms=fit_pharms,
+            ref_anchors=ref_anchors,
+            fit_anchors=fit_anchors,
+            ref_vectors=ref_vectors,
+            fit_vectors=fit_vectors,
+            similarity=similarity,
+            extended_points=extended_points,
+            only_extended=only_extended,
+            num_repeats=num_repeats,
+            trans_centers=trans_centers,
+            num_repeats_per_trans=10,
+            topk=30,
+            steps_fine=max_num_steps,
+            lr=lr,
+        )
+
     # Initial guess for SE(3) parameters (quaternion followed by translation)
     if trans_centers is None:
         se3_params = _initialize_se3_params(ref_points=ref_anchors, fit_points=fit_anchors, num_repeats=num_repeats)

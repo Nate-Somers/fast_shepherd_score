@@ -171,11 +171,46 @@ def legacy_seeds_torch(ref_xyz: torch.Tensor,
     return F.normalize(q, dim=1), t
 
 
+def legacy_seeds_with_translations_torch(
+    ref_xyz: torch.Tensor,
+    fit_xyz: torch.Tensor,
+    trans_centers: torch.Tensor,
+    *,
+    num_repeats_per_trans: int = 10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Return legacy translation-seeded initializations as (q, t) on the same device/dtype.
+
+    This mirrors `alignment._initialize_se3_params_with_translations`, which is used when
+    legacy code is called with `trans_centers!=None` (aka `trans_init=True`).
+    """
+    from ..alignment import _initialize_se3_params_with_translations as _legacy_init_trans
+
+    ref_cpu = ref_xyz.detach().cpu()
+    fit_cpu = fit_xyz.detach().cpu()
+    trans_cpu = trans_centers.detach().cpu()
+
+    se3 = _legacy_init_trans(
+        ref_points=ref_cpu,
+        fit_points=fit_cpu,
+        trans_centers=trans_cpu,
+        num_repeats_per_trans=num_repeats_per_trans,
+    )
+
+    se3 = se3.to(dtype=ref_xyz.dtype, device=ref_xyz.device)
+    q, t = se3[:, :4], se3[:, 4:]
+    return F.normalize(q, dim=1), t
+
+
 def build_coarse_grid(A_batch: torch.Tensor,
                       B_batch: torch.Tensor,
                       N_real: torch.Tensor,
                       M_real: torch.Tensor,
-                      num_seeds: int = 50) -> Tuple[torch.Tensor, torch.Tensor]:
+                      num_seeds: int = 50,
+                      *,
+                      trans_centers_batch: Optional[torch.Tensor] = None,
+                      trans_centers_real: Optional[torch.Tensor] = None,
+                      num_repeats_per_trans: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Build a coarse grid of 500 pose hypotheses (250 rotations × 2 translations).
 
@@ -194,13 +229,43 @@ def build_coarse_grid(A_batch: torch.Tensor,
 
     Returns
     -------
-    q_grid : torch.Tensor (B, 500, 4)
-        Quaternion grid
-    t_grid : torch.Tensor (B, 500, 3)
+    q_grid : torch.Tensor (B, G, 4)
+        Quaternion grid. When `trans_centers_batch` is None, G=500. When
+        `trans_centers_batch` is provided, G is the legacy translation-seeded
+        initialization count (= 10*P + 5 for P translation centers).
+    t_grid : torch.Tensor (B, G, 3)
         Translation grid
     """
     device = A_batch.device
     BATCH = A_batch.shape[0]
+
+    if trans_centers_batch is not None:
+        if trans_centers_real is None:
+            trans_centers_real = torch.full(
+                (BATCH,), trans_centers_batch.shape[1], device=device, dtype=torch.int32
+            )
+
+        qs, ts = [], []
+        expected_G: Optional[int] = None
+        for i in range(BATCH):
+            p = int(trans_centers_real[i].item())
+            q_i, t_i = legacy_seeds_with_translations_torch(
+                A_batch[i, :N_real[i]],
+                B_batch[i, :M_real[i]],
+                trans_centers_batch[i, :p],
+                num_repeats_per_trans=num_repeats_per_trans,
+            )
+            if expected_G is None:
+                expected_G = q_i.shape[0]
+            elif q_i.shape[0] != expected_G:
+                raise ValueError(
+                    "Translation-seeded coarse grids require equal seed counts per pair. "
+                    "Bucket pairs by trans_centers_real before calling."
+                )
+            qs.append(q_i)
+            ts.append(t_i)
+
+        return torch.stack(qs, dim=0), torch.stack(ts, dim=0)
 
     # Generate seeds for each pair
     qs, ts = [], []

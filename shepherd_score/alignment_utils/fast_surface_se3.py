@@ -10,6 +10,7 @@ from typing import Tuple, Optional
 from ..score.gaussian_overlap_triton import (
     overlap_score_grad_se3_batch,
     fused_adam_qt,
+    fused_adam_qt_with_tangent_proj,
     _batch_self_overlap
 )
 from .fast_common import (
@@ -230,7 +231,7 @@ def coarse_fine_surface_align_many(
     prev_max_score = -float('inf')
     no_improve_count = 0
 
-    for _ in range(steps_fine):
+    for step in range(steps_fine):
         VAB, dQ, dT = _overlap_in_chunks_surface(
             A_k, B_k, q_k, t_k,
             alpha=alpha, N_real=N_k, M_real=M_k)
@@ -239,10 +240,6 @@ def coarse_fine_surface_align_many(
         score = VAB / denom
         scale = VAA_plus_VBB / (denom * denom)
 
-        # Tangent-space projection for quaternion gradients
-        radial = (dQ * q_k).sum(dim=1, keepdim=True)
-        dQ_tan = dQ - q_k * radial
-
         # Track best
         better = score > best_score
         best_score = torch.where(better, score, best_score)
@@ -250,20 +247,21 @@ def coarse_fine_surface_align_many(
         best_q = torch.where(mask_q, q_k, best_q)
         best_t = torch.where(mask_q, t_k, best_t)
 
-        # Early stopping check
-        current_max = best_score.max().item()
-        if current_max - prev_max_score < early_stop_tol:
-            no_improve_count += 1
-            if no_improve_count >= early_stop_patience:
-                break
-        else:
-            no_improve_count = 0
-            prev_max_score = current_max
+        # Early stopping check every 5 iterations to reduce GPU→CPU sync overhead
+        if step % 5 == 0:
+            current_max = best_score.max().item()
+            if current_max - prev_max_score < early_stop_tol:
+                no_improve_count += 1
+                if no_improve_count >= early_stop_patience:
+                    break
+            else:
+                no_improve_count = 0
+                prev_max_score = current_max
 
-        # Fused Adam update
-        fused_adam_qt(
+        # Fused Adam with tangent-space projection (avoids intermediate dQ_tan tensor)
+        fused_adam_qt_with_tangent_proj(
             q_k, t_k,
-            -dQ_tan * scale.unsqueeze(1),
+            -dQ * scale.unsqueeze(1),
             -dT * scale.unsqueeze(1),
             m_q, v_q, m_t, v_t, lr)
 

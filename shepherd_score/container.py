@@ -332,7 +332,7 @@ class MoleculePair:
         self.sim_aligned_pharm = None
 
     @staticmethod
-    def align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81):
+    def align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 75):
         """
         Batched alignment with workspace reuse & reduced per-pair transfers.
         """
@@ -400,9 +400,10 @@ class MoleculePair:
             # but we do clear the padding slices for deterministic results.
             ref_pad.zero_()
             fit_pad.zero_()
-            for i, p in enumerate(bucket):
-                n = N_real[i].item()  # small scalar read (host OK once per pair)
-                m = M_real[i].item()
+            # Batch .item() calls to reduce GPU→CPU sync overhead
+            n_list = N_real.tolist()
+            m_list = M_real.tolist()
+            for i, (p, n, m) in enumerate(zip(bucket, n_list, m_list)):
                 ref_pad[i, :n] = p._ref_xyz_t
                 fit_pad[i, :m] = p._fit_xyz_t
 
@@ -413,7 +414,7 @@ class MoleculePair:
             # ---- coarse + fine alignment ---------------------------------------
             scores, q_batch, t_batch = coarse_fine_align_many(
                 ref_pad, fit_pad, VAA, VBB,
-                N_real=N_real, M_real=M_real, alpha=alpha)
+                N_real=N_real, M_real=M_real, alpha=alpha, steps_fine=steps_fine)
 
             all_pairs.extend(bucket)
             all_scores.append(scores)
@@ -428,10 +429,10 @@ class MoleculePair:
         for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
             # quaternion_to_SE3 unchanged
             p.transform_vol_noH = quaternion_to_SE3(q, t)
-            p.sim_aligned_vol_noH = float(s)   
+            p.sim_aligned_vol_noH = float(s)
 
     @staticmethod
-    def align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81):
+    def align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 75):
         """
         Batched alignment over *surface point clouds* using Gaussian-overlap
         surface similarity (ROCS-style), modeled after `align_batch_vol`.
@@ -533,9 +534,10 @@ class MoleculePair:
             # Clear padding slices for determinism; write valid prefixes
             ref_pad.zero_()
             fit_pad.zero_()
-            for i, p in enumerate(bucket):
-                n = int(N_real[i].item())
-                m = int(M_real[i].item())
+            # Batch .item() calls to reduce GPU→CPU sync overhead
+            n_list = N_real.tolist()
+            m_list = M_real.tolist()
+            for i, (p, n, m) in enumerate(zip(bucket, n_list, m_list)):
                 ref_pad[i, :n] = p._ref_surf_t
                 fit_pad[i, :m] = p._fit_surf_t
 
@@ -546,7 +548,7 @@ class MoleculePair:
             # ---- coarse + fine alignment (same engine as volumetric) --------------
             scores, q_batch, t_batch = coarse_fine_align_many(
                 ref_pad, fit_pad, VAA, VBB,
-                N_real=N_real, M_real=M_real, alpha=alpha)
+                N_real=N_real, M_real=M_real, alpha=alpha, steps_fine=steps_fine)
 
             all_pairs.extend(bucket)
             all_scores.append(scores)
@@ -561,6 +563,529 @@ class MoleculePair:
         for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
             p.transform_surf = quaternion_to_SE3(q, t)
             p.sim_aligned_surf = float(s)
+
+    @staticmethod
+    def align_batch_esp(
+        pairs: list["MoleculePair"],
+        *,
+        alpha: float,
+        lam: float,
+        trans_init: bool = False,
+        num_repeats: int = 50,
+        num_repeats_per_trans: int = 10,
+        topk: int = 30,
+        steps_fine: int = 75,
+        lr: float = 0.075,
+    ) -> None:
+        """
+        Batched ESP alignment using the fused ESP Triton kernel.
+
+        Side effects
+        ------------
+        Writes:
+        - p.transform_esp
+        - p.sim_aligned_esp
+        """
+        if not pairs:
+            return
+
+        from .score.constants import LAM_SCALING
+        from .alignment_utils.fast_esp_se3 import fast_optimize_ROCS_esp_overlay_batch
+
+        device = pairs[0].device
+        lam_scaled = LAM_SCALING * lam
+
+        # Ensure surface tensors (+ ESP) exist on device
+        for p in pairs:
+            r = getattr(p, "_ref_surf_t", None)
+            f = getattr(p, "_fit_surf_t", None)
+            rc = getattr(p, "_ref_surf_esp_t", None)
+            fc = getattr(p, "_fit_surf_esp_t", None)
+
+            if r is None or f is None or rc is None or fc is None:
+                if p.ref_molec.surf_pos is None or p.fit_molec.surf_pos is None:
+                    raise ValueError("Surface points are None; cannot run align_batch_esp.")
+                if p.ref_molec.surf_esp is None or p.fit_molec.surf_esp is None:
+                    raise ValueError("Surface ESP is None; cannot run align_batch_esp.")
+
+                p._ref_surf_t = torch.as_tensor(p.ref_molec.surf_pos, dtype=torch.float32, device=device)
+                p._fit_surf_t = torch.as_tensor(p.fit_molec.surf_pos, dtype=torch.float32, device=device)
+                p._ref_surf_esp_t = torch.as_tensor(p.ref_molec.surf_esp, dtype=torch.float32, device=device)
+                p._fit_surf_esp_t = torch.as_tensor(p.fit_molec.surf_esp, dtype=torch.float32, device=device)
+            else:
+                if r.device != device:
+                    p._ref_surf_t = r.to(device, non_blocking=True)
+                if f.device != device:
+                    p._fit_surf_t = f.to(device, non_blocking=True)
+                if rc.device != device:
+                    p._ref_surf_esp_t = rc.to(device, non_blocking=True)
+                if fc.device != device:
+                    p._fit_surf_esp_t = fc.to(device, non_blocking=True)
+
+            # Translation centers must be available on device for trans_init.
+            if trans_init and getattr(p, "_ref_xyz_t", None) is None:
+                p._ref_xyz_t = torch.as_tensor(p.ref_molec.atom_pos, dtype=torch.float32, device=device)
+
+        all_pairs: list[MoleculePair] = []
+        all_scores: list[torch.Tensor] = []
+        all_q: list[torch.Tensor] = []
+        all_t: list[torch.Tensor] = []
+
+        # Bucket by padded surface sizes; for translation-seeded mode, also bucket by exact
+        # number of translation centers (legacy uses 10*P + 5 seeds).
+        buckets: dict[tuple[int, int, int], list[MoleculePair]] = {}
+        for p in pairs:
+            n_band = _band_key(p._ref_surf_t.shape[0])
+            m_band = _band_key(p._fit_surf_t.shape[0])
+            tc = int(p._ref_xyz_t.shape[0]) if trans_init else 0
+            buckets.setdefault((n_band, m_band, tc), []).append(p)
+
+        # Workspace caches keyed by (N_pad, M_pad, K)
+        workspaces: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
+        int_buffers: dict[int, dict[str, torch.Tensor]] = {}
+
+        for (N_pad, M_pad, tc), bucket in buckets.items():
+            K = len(bucket)
+
+            ib = int_buffers.get(K)
+            if ib is None:
+                ib = {
+                    "N": torch.empty(K, dtype=torch.int32, device=device),
+                    "M": torch.empty(K, dtype=torch.int32, device=device),
+                }
+                int_buffers[K] = ib
+            N_real = ib["N"]
+            M_real = ib["M"]
+
+            for i, p in enumerate(bucket):
+                N_real[i] = p._ref_surf_t.shape[0]
+                M_real[i] = p._fit_surf_t.shape[0]
+
+            ws_key = (N_pad, M_pad, K)
+            ws = workspaces.get(ws_key)
+            if ws is None:
+                ws = {
+                    "ref": torch.empty(K, N_pad, 3, device=device, dtype=torch.float32),
+                    "fit": torch.empty(K, M_pad, 3, device=device, dtype=torch.float32),
+                    "ref_c": torch.empty(K, N_pad, device=device, dtype=torch.float32),
+                    "fit_c": torch.empty(K, M_pad, device=device, dtype=torch.float32),
+                }
+                workspaces[ws_key] = ws
+
+            ref_pad = ws["ref"]
+            fit_pad = ws["fit"]
+            ref_c_pad = ws["ref_c"]
+            fit_c_pad = ws["fit_c"]
+
+            ref_pad.zero_()
+            fit_pad.zero_()
+            ref_c_pad.zero_()
+            fit_c_pad.zero_()
+            # Batch .item() calls to reduce GPU→CPU sync overhead
+            n_list = N_real.tolist()
+            m_list = M_real.tolist()
+            for i, (p, n, m) in enumerate(zip(bucket, n_list, m_list)):
+                ref_pad[i, :n] = p._ref_surf_t
+                fit_pad[i, :m] = p._fit_surf_t
+                ref_c_pad[i, :n] = p._ref_surf_esp_t
+                fit_c_pad[i, :m] = p._fit_surf_esp_t
+
+            trans_centers_batch = None
+            trans_centers_real = None
+            if trans_init:
+                # NOTE: this bucket key uses exact translation center count (tc), so
+                # the legacy seed count is identical for all pairs in this bucket.
+                trans_centers_batch = torch.empty(K, tc, 3, device=device, dtype=torch.float32)
+                for i, p in enumerate(bucket):
+                    trans_centers_batch[i] = p._ref_xyz_t
+                trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
+
+            _, q_batch, t_batch, scores = fast_optimize_ROCS_esp_overlay_batch(
+                ref_pad,
+                fit_pad,
+                ref_c_pad,
+                fit_c_pad,
+                alpha=alpha,
+                lam=lam_scaled,
+                N_real=N_real,
+                M_real=M_real,
+                trans_centers_batch=trans_centers_batch,
+                trans_centers_real=trans_centers_real,
+                num_repeats_per_trans=num_repeats_per_trans,
+                topk=topk,
+                steps_fine=steps_fine,
+                lr=lr,
+            )
+
+            all_pairs.extend(bucket)
+            all_scores.append(scores)
+            all_q.append(q_batch)
+            all_t.append(t_batch)
+
+        scores_cpu = torch.cat(all_scores).cpu()
+        q_cpu = torch.cat(all_q).cpu()
+        t_cpu = torch.cat(all_t).cpu()
+
+        for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
+            p.transform_esp = quaternion_to_SE3(q, t)
+            p.sim_aligned_esp = float(s)
+
+    @staticmethod
+    def align_batch_esp_combo(
+        pairs: list["MoleculePair"],
+        *,
+        alpha: float,
+        lam: float = 0.001,
+        probe_radius: float = 1.0,
+        esp_weight: float = 0.5,
+        trans_init: bool = False,
+        num_repeats: int = 50,
+        num_repeats_per_trans: int = 10,
+        topk: int = 30,
+        steps_fine: int = 75,
+        lr: float = 0.075,
+    ) -> None:
+        """
+        Batched ESP-combo alignment (ShaEP-style) with padding-safe masks.
+
+        Side effects
+        ------------
+        Writes:
+        - p.transform_esp_combo
+        - p.sim_aligned_esp_combo
+        """
+        if not pairs:
+            return
+
+        from .alignment_utils.fast_esp_combo_se3 import fast_optimize_esp_combo_score_overlay_batch
+
+        device = pairs[0].device
+
+        # Ensure required tensors exist on device
+        for p in pairs:
+            if p.ref_molec.surf_pos is None or p.fit_molec.surf_pos is None:
+                raise ValueError("Surface points are None; cannot run align_batch_esp_combo.")
+            if p.ref_molec.surf_esp is None or p.fit_molec.surf_esp is None:
+                raise ValueError("Surface ESP is None; cannot run align_batch_esp_combo.")
+
+            if getattr(p, "_ref_surf_t", None) is None:
+                p._ref_surf_t = torch.as_tensor(p.ref_molec.surf_pos, dtype=torch.float32, device=device)
+            if getattr(p, "_fit_surf_t", None) is None:
+                p._fit_surf_t = torch.as_tensor(p.fit_molec.surf_pos, dtype=torch.float32, device=device)
+            if getattr(p, "_ref_surf_esp_t", None) is None:
+                p._ref_surf_esp_t = torch.as_tensor(p.ref_molec.surf_esp, dtype=torch.float32, device=device)
+            if getattr(p, "_fit_surf_esp_t", None) is None:
+                p._fit_surf_esp_t = torch.as_tensor(p.fit_molec.surf_esp, dtype=torch.float32, device=device)
+
+            if getattr(p, "_ref_centers_w_H_t", None) is None:
+                p._ref_centers_w_H_t = torch.as_tensor(
+                    p.ref_molec.mol.GetConformer().GetPositions(), dtype=torch.float32, device=device
+                )
+            if getattr(p, "_fit_centers_w_H_t", None) is None:
+                p._fit_centers_w_H_t = torch.as_tensor(
+                    p.fit_molec.mol.GetConformer().GetPositions(), dtype=torch.float32, device=device
+                )
+            if getattr(p, "_ref_partial_t", None) is None:
+                p._ref_partial_t = torch.as_tensor(p.ref_molec.partial_charges, dtype=torch.float32, device=device)
+            if getattr(p, "_fit_partial_t", None) is None:
+                p._fit_partial_t = torch.as_tensor(p.fit_molec.partial_charges, dtype=torch.float32, device=device)
+            if getattr(p, "_ref_radii_t", None) is None:
+                p._ref_radii_t = torch.as_tensor(p.ref_molec.radii, dtype=torch.float32, device=device)
+            if getattr(p, "_fit_radii_t", None) is None:
+                p._fit_radii_t = torch.as_tensor(p.fit_molec.radii, dtype=torch.float32, device=device)
+
+            # Translation centers must be available on device for trans_init.
+            if trans_init and getattr(p, "_ref_xyz_t", None) is None:
+                p._ref_xyz_t = torch.as_tensor(p.ref_molec.atom_pos, dtype=torch.float32, device=device)
+            if trans_init and getattr(p, "_fit_xyz_t", None) is None:
+                p._fit_xyz_t = torch.as_tensor(p.fit_molec.atom_pos, dtype=torch.float32, device=device)
+
+        all_pairs: list[MoleculePair] = []
+        all_scores: list[torch.Tensor] = []
+        all_q: list[torch.Tensor] = []
+        all_t: list[torch.Tensor] = []
+
+        buckets: dict[tuple[int, int, int, int, int, int, int], list[MoleculePair]] = {}
+        for p in pairs:
+            n_surf_band = _band_key(p._ref_surf_t.shape[0])
+            m_surf_band = _band_key(p._fit_surf_t.shape[0])
+            n_wH_band = _band_key(p._ref_centers_w_H_t.shape[0])
+            m_wH_band = _band_key(p._fit_centers_w_H_t.shape[0])
+
+            # Shape "centers" use volumetric atoms when alpha==0.81, else surface points.
+            if alpha == 0.81:
+                n_cent_band = _band_key(p._ref_xyz_t.shape[0])
+                m_cent_band = _band_key(p._fit_xyz_t.shape[0])
+            else:
+                n_cent_band = n_surf_band
+                m_cent_band = m_surf_band
+
+            tc = int(p._ref_xyz_t.shape[0]) if trans_init else 0
+            buckets.setdefault((n_wH_band, m_wH_band, n_cent_band, m_cent_band, n_surf_band, m_surf_band, tc), []).append(p)
+
+        for (n_wH_pad, m_wH_pad, n_cent_pad, m_cent_pad, n_surf_pad, m_surf_pad, tc), bucket in buckets.items():
+            K = len(bucket)
+
+            # Allocate padded blocks
+            centers_w_H_1 = torch.zeros(K, n_wH_pad, 3, device=device, dtype=torch.float32)
+            centers_w_H_2 = torch.zeros(K, m_wH_pad, 3, device=device, dtype=torch.float32)
+            partial_1 = torch.zeros(K, n_wH_pad, device=device, dtype=torch.float32)
+            partial_2 = torch.zeros(K, m_wH_pad, device=device, dtype=torch.float32)
+            radii_1 = torch.zeros(K, n_wH_pad, device=device, dtype=torch.float32)
+            radii_2 = torch.zeros(K, m_wH_pad, device=device, dtype=torch.float32)
+
+            centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
+            centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
+
+            points_1 = torch.zeros(K, n_surf_pad, 3, device=device, dtype=torch.float32)
+            points_2 = torch.zeros(K, m_surf_pad, 3, device=device, dtype=torch.float32)
+            point_charges_1 = torch.zeros(K, n_surf_pad, device=device, dtype=torch.float32)
+            point_charges_2 = torch.zeros(K, m_surf_pad, device=device, dtype=torch.float32)
+
+            N_real_atoms_w_H_1 = torch.empty(K, device=device, dtype=torch.int32)
+            M_real_atoms_w_H_2 = torch.empty(K, device=device, dtype=torch.int32)
+            N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+            M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+            N_real_surf_1 = torch.empty(K, device=device, dtype=torch.int32)
+            M_real_surf_2 = torch.empty(K, device=device, dtype=torch.int32)
+
+            for i, p in enumerate(bucket):
+                n_wH = p._ref_centers_w_H_t.shape[0]
+                m_wH = p._fit_centers_w_H_t.shape[0]
+                n_surf = p._ref_surf_t.shape[0]
+                m_surf = p._fit_surf_t.shape[0]
+                N_real_atoms_w_H_1[i] = n_wH
+                M_real_atoms_w_H_2[i] = m_wH
+                N_real_surf_1[i] = n_surf
+                M_real_surf_2[i] = m_surf
+
+                centers_w_H_1[i, :n_wH] = p._ref_centers_w_H_t
+                centers_w_H_2[i, :m_wH] = p._fit_centers_w_H_t
+                partial_1[i, :n_wH] = p._ref_partial_t
+                partial_2[i, :m_wH] = p._fit_partial_t
+                radii_1[i, :n_wH] = p._ref_radii_t
+                radii_2[i, :m_wH] = p._fit_radii_t
+
+                points_1[i, :n_surf] = p._ref_surf_t
+                points_2[i, :m_surf] = p._fit_surf_t
+                point_charges_1[i, :n_surf] = p._ref_surf_esp_t
+                point_charges_2[i, :m_surf] = p._fit_surf_esp_t
+
+                if alpha == 0.81:
+                    n_cent = p._ref_xyz_t.shape[0]
+                    m_cent = p._fit_xyz_t.shape[0]
+                    centers_1[i, :n_cent] = p._ref_xyz_t
+                    centers_2[i, :m_cent] = p._fit_xyz_t
+                    N_real_centers[i] = n_cent
+                    M_real_centers[i] = m_cent
+                else:
+                    centers_1[i, :n_surf] = p._ref_surf_t
+                    centers_2[i, :m_surf] = p._fit_surf_t
+                    N_real_centers[i] = n_surf
+                    M_real_centers[i] = m_surf
+
+            trans_centers_batch = None
+            trans_centers_real = None
+            if trans_init:
+                trans_centers_batch = torch.empty(K, tc, 3, device=device, dtype=torch.float32)
+                for i, p in enumerate(bucket):
+                    trans_centers_batch[i] = p._ref_xyz_t
+                trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
+
+            _, q_batch, t_batch, scores = fast_optimize_esp_combo_score_overlay_batch(
+                centers_w_H_1,
+                centers_w_H_2,
+                centers_1,
+                centers_2,
+                points_1,
+                points_2,
+                partial_1,
+                partial_2,
+                point_charges_1,
+                point_charges_2,
+                radii_1,
+                radii_2,
+                alpha,
+                lam=lam,
+                probe_radius=probe_radius,
+                esp_weight=esp_weight,
+                N_real_atoms_w_H_1=N_real_atoms_w_H_1,
+                M_real_atoms_w_H_2=M_real_atoms_w_H_2,
+                N_real_centers=N_real_centers,
+                M_real_centers=M_real_centers,
+                N_real_surf_1=N_real_surf_1,
+                M_real_surf_2=M_real_surf_2,
+                trans_centers_batch=trans_centers_batch,
+                trans_centers_real=trans_centers_real,
+                num_repeats_per_trans=num_repeats_per_trans,
+                topk=topk,
+                steps_fine=steps_fine,
+                lr=lr,
+            )
+
+            all_pairs.extend(bucket)
+            all_scores.append(scores)
+            all_q.append(q_batch)
+            all_t.append(t_batch)
+
+        scores_cpu = torch.cat(all_scores).cpu()
+        q_cpu = torch.cat(all_q).cpu()
+        t_cpu = torch.cat(all_t).cpu()
+
+        for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
+                p.transform_esp_combo = quaternion_to_SE3(q, t)
+                p.sim_aligned_esp_combo = float(s)
+
+    @staticmethod
+    def align_batch_pharm(
+        pairs: list["MoleculePair"],
+        *,
+        similarity: _SIM_TYPE = "tanimoto",
+        extended_points: bool = False,
+        only_extended: bool = False,
+        trans_init: bool = False,
+        num_repeats: int = 50,
+        topk: int = 30,
+        steps_fine: int = 75,
+        lr: float = 0.075,
+    ):
+        """
+        Batched pharmacophore alignment using the fast GPU pathway when available.
+
+        Writes per-pair:
+        - p.transform_pharm (4x4)
+        - p.sim_aligned_pharm (float)
+        """
+        if not pairs:
+            return
+
+        if not torch.cuda.is_available():
+            # Slow fallback: per-pair legacy optimizer
+            for p in pairs:
+                p.align_with_pharm(
+                    similarity=similarity,
+                    extended_points=extended_points,
+                    only_extended=only_extended,
+                    trans_init=trans_init,
+                    num_repeats=num_repeats,
+                    lr=lr,
+                    max_num_steps=steps_fine,
+                    use_jax=False,
+                    verbose=False,
+                )
+            return
+
+        try:
+            from .alignment_utils.fast_pharm_se3 import fast_optimize_pharm_overlay_batch
+        except ImportError:
+            fast_optimize_pharm_overlay_batch = None
+
+        if fast_optimize_pharm_overlay_batch is None:
+            for p in pairs:
+                p.align_with_pharm(
+                    similarity=similarity,
+                    extended_points=extended_points,
+                    only_extended=only_extended,
+                    trans_init=trans_init,
+                    num_repeats=num_repeats,
+                    lr=lr,
+                    max_num_steps=steps_fine,
+                    use_jax=False,
+                    verbose=False,
+                )
+            return
+
+        device = pairs[0].device
+
+        # Ensure per-pair cached tensors exist on device.
+        for p in pairs:
+            if getattr(p, "_ref_pharm_types_t", None) is None:
+                p._ref_pharm_types_t = torch.as_tensor(p.ref_molec.pharm_types, dtype=torch.int64, device=device)
+            if getattr(p, "_fit_pharm_types_t", None) is None:
+                p._fit_pharm_types_t = torch.as_tensor(p.fit_molec.pharm_types, dtype=torch.int64, device=device)
+            if getattr(p, "_ref_pharm_ancs_t", None) is None:
+                p._ref_pharm_ancs_t = torch.as_tensor(p.ref_molec.pharm_ancs, dtype=torch.float32, device=device)
+            if getattr(p, "_fit_pharm_ancs_t", None) is None:
+                p._fit_pharm_ancs_t = torch.as_tensor(p.fit_molec.pharm_ancs, dtype=torch.float32, device=device)
+            if getattr(p, "_ref_pharm_vecs_t", None) is None:
+                p._ref_pharm_vecs_t = torch.as_tensor(p.ref_molec.pharm_vecs, dtype=torch.float32, device=device)
+            if getattr(p, "_fit_pharm_vecs_t", None) is None:
+                p._fit_pharm_vecs_t = torch.as_tensor(p.fit_molec.pharm_vecs, dtype=torch.float32, device=device)
+
+        all_pairs: list[MoleculePair] = []
+        all_scores: list[torch.Tensor] = []
+        all_q: list[torch.Tensor] = []
+        all_t: list[torch.Tensor] = []
+
+        buckets: dict[tuple[int, int, int], list[MoleculePair]] = {}
+        for p in pairs:
+            n_band = _band_key(p._ref_pharm_ancs_t.shape[0])
+            m_band = _band_key(p._fit_pharm_ancs_t.shape[0])
+            tc = int(p._ref_pharm_ancs_t.shape[0]) if trans_init else 0
+            buckets.setdefault((n_band, m_band, tc), []).append(p)
+
+        for (N_pad, M_pad, tc), bucket in buckets.items():
+            K = len(bucket)
+
+            ref_types = torch.zeros(K, N_pad, device=device, dtype=torch.int64)
+            fit_types = torch.zeros(K, M_pad, device=device, dtype=torch.int64)
+            ref_ancs = torch.zeros(K, N_pad, 3, device=device, dtype=torch.float32)
+            fit_ancs = torch.zeros(K, M_pad, 3, device=device, dtype=torch.float32)
+            ref_vecs = torch.zeros(K, N_pad, 3, device=device, dtype=torch.float32)
+            fit_vecs = torch.zeros(K, M_pad, 3, device=device, dtype=torch.float32)
+
+            N_real = torch.empty(K, device=device, dtype=torch.int32)
+            M_real = torch.empty(K, device=device, dtype=torch.int32)
+
+            for i, p in enumerate(bucket):
+                n = p._ref_pharm_ancs_t.shape[0]
+                m = p._fit_pharm_ancs_t.shape[0]
+                N_real[i] = n
+                M_real[i] = m
+
+                ref_types[i, :n] = p._ref_pharm_types_t
+                fit_types[i, :m] = p._fit_pharm_types_t
+                ref_ancs[i, :n] = p._ref_pharm_ancs_t
+                fit_ancs[i, :m] = p._fit_pharm_ancs_t
+                ref_vecs[i, :n] = p._ref_pharm_vecs_t
+                fit_vecs[i, :m] = p._fit_pharm_vecs_t
+
+            trans_centers_batch = ref_ancs if trans_init else None
+            trans_centers_real = N_real if trans_init else None
+
+            _, _, q_batch, t_batch, scores = fast_optimize_pharm_overlay_batch(
+                ref_types,
+                fit_types,
+                ref_ancs,
+                fit_ancs,
+                ref_vecs,
+                fit_vecs,
+                similarity=similarity,
+                extended_points=extended_points,
+                only_extended=only_extended,
+                num_repeats=num_repeats,
+                trans_centers_batch=trans_centers_batch,
+                trans_centers_real=trans_centers_real,
+                num_repeats_per_trans=10,
+                N_real=N_real,
+                M_real=M_real,
+                topk=topk,
+                steps_fine=steps_fine,
+                lr=lr,
+            )
+
+            all_pairs.extend(bucket)
+            all_scores.append(scores)
+            all_q.append(q_batch)
+            all_t.append(t_batch)
+
+        scores_cpu = torch.cat(all_scores).cpu()
+        q_cpu = torch.cat(all_q).cpu()
+        t_cpu = torch.cat(all_t).cpu()
+
+        for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
+            p.transform_pharm = quaternion_to_SE3(q, t)
+            p.sim_aligned_pharm = float(s)
 
     def align_with_vol_esp(self,
                            lam: float,
@@ -807,7 +1332,49 @@ class MoleculePair:
             self.transform_esp = np.array(se3_transform)
             self.sim_aligned_esp = np.array(score)
             return np.array(aligned_fit_points)
-        else: # Use Torch implementation
+        else: # Use Torch implementation (fast path on CUDA if available)
+            if torch.cuda.is_available():
+                try:
+                    from .alignment_utils.fast_esp_se3 import fast_optimize_ROCS_esp_overlay
+                except ImportError:
+                    fast_optimize_ROCS_esp_overlay = None
+
+                if fast_optimize_ROCS_esp_overlay is not None:
+                    # Prefer cached tensors to avoid repeated host->device transfers.
+                    if getattr(self, "_ref_surf_t", None) is None:
+                        self._ref_surf_t = torch.as_tensor(self.ref_molec.surf_pos, dtype=torch.float32, device=self.device)
+                    if getattr(self, "_fit_surf_t", None) is None:
+                        self._fit_surf_t = torch.as_tensor(self.fit_molec.surf_pos, dtype=torch.float32, device=self.device)
+                    if getattr(self, "_ref_surf_esp_t", None) is None:
+                        self._ref_surf_esp_t = torch.as_tensor(self.ref_molec.surf_esp, dtype=torch.float32, device=self.device)
+                    if getattr(self, "_fit_surf_esp_t", None) is None:
+                        self._fit_surf_esp_t = torch.as_tensor(self.fit_molec.surf_esp, dtype=torch.float32, device=self.device)
+
+                    trans_centers = None
+                    if trans_init:
+                        trans_centers = self._ref_xyz_t if hasattr(self, "_ref_xyz_t") else torch.as_tensor(
+                            self.ref_molec.atom_pos, dtype=torch.float32, device=self.device
+                        )
+
+                    aligned_fit_points_t, se3_transform_t, score_t = fast_optimize_ROCS_esp_overlay(
+                        ref_points=self._ref_surf_t,
+                        fit_points=self._fit_surf_t,
+                        ref_charges=self._ref_surf_esp_t,
+                        fit_charges=self._fit_surf_esp_t,
+                        alpha=alpha,
+                        lam=lam_scaled,
+                        num_repeats=num_repeats,
+                        trans_centers=trans_centers,
+                        num_repeats_per_trans=10,
+                        topk=30,
+                        steps_fine=max_num_steps,
+                        lr=lr,
+                    )
+
+                    self.transform_esp = se3_transform_t.numpy()
+                    self.sim_aligned_esp = score_t.numpy()
+                    return aligned_fit_points_t.numpy()
+
             aligned_fit_points, se3_transform, score = optimize_ROCS_esp_overlay(
                 ref_points=torch.from_numpy(self.ref_molec.surf_pos).to(torch.float32).to(self.device),
                 fit_points=torch.from_numpy(self.fit_molec.surf_pos).to(torch.float32).to(self.device),
@@ -915,6 +1482,79 @@ class MoleculePair:
                 ref_centers = torch.from_numpy(self.ref_molec.surf_pos).to(torch.float32).to(self.device)
                 fit_centers = torch.from_numpy(self.fit_molec.surf_pos).to(torch.float32).to(self.device)
 
+            if torch.cuda.is_available():
+                try:
+                    from .alignment_utils.fast_esp_combo_se3 import fast_optimize_esp_combo_score_overlay
+                except ImportError:
+                    fast_optimize_esp_combo_score_overlay = None
+
+                if fast_optimize_esp_combo_score_overlay is not None:
+                    # Prefer cached tensors (also used by the batch path).
+                    if getattr(self, "_ref_surf_t", None) is None:
+                        self._ref_surf_t = torch.as_tensor(self.ref_molec.surf_pos, dtype=torch.float32, device=self.device)
+                    if getattr(self, "_fit_surf_t", None) is None:
+                        self._fit_surf_t = torch.as_tensor(self.fit_molec.surf_pos, dtype=torch.float32, device=self.device)
+                    if getattr(self, "_ref_surf_esp_t", None) is None:
+                        self._ref_surf_esp_t = torch.as_tensor(self.ref_molec.surf_esp, dtype=torch.float32, device=self.device)
+                    if getattr(self, "_fit_surf_esp_t", None) is None:
+                        self._fit_surf_esp_t = torch.as_tensor(self.fit_molec.surf_esp, dtype=torch.float32, device=self.device)
+
+                    if getattr(self, "_ref_centers_w_H_t", None) is None:
+                        self._ref_centers_w_H_t = torch.as_tensor(
+                            self.ref_molec.mol.GetConformer().GetPositions(), dtype=torch.float32, device=self.device
+                        )
+                    if getattr(self, "_fit_centers_w_H_t", None) is None:
+                        self._fit_centers_w_H_t = torch.as_tensor(
+                            self.fit_molec.mol.GetConformer().GetPositions(), dtype=torch.float32, device=self.device
+                        )
+                    if getattr(self, "_ref_partial_t", None) is None:
+                        self._ref_partial_t = torch.as_tensor(self.ref_molec.partial_charges, dtype=torch.float32, device=self.device)
+                    if getattr(self, "_fit_partial_t", None) is None:
+                        self._fit_partial_t = torch.as_tensor(self.fit_molec.partial_charges, dtype=torch.float32, device=self.device)
+                    if getattr(self, "_ref_radii_t", None) is None:
+                        self._ref_radii_t = torch.as_tensor(self.ref_molec.radii, dtype=torch.float32, device=self.device)
+                    if getattr(self, "_fit_radii_t", None) is None:
+                        self._fit_radii_t = torch.as_tensor(self.fit_molec.radii, dtype=torch.float32, device=self.device)
+
+                    # Centers for shape component
+                    if alpha == 0.81:
+                        ref_centers_t = self._ref_xyz_t
+                        fit_centers_t = self._fit_xyz_t
+                    else:
+                        ref_centers_t = self._ref_surf_t
+                        fit_centers_t = self._fit_surf_t
+
+                    trans_centers = self._ref_xyz_t if trans_init else None
+
+                    aligned_fit_points_t, se3_transform_t, score_t = fast_optimize_esp_combo_score_overlay(
+                        ref_centers_w_H=self._ref_centers_w_H_t,
+                        fit_centers_w_H=self._fit_centers_w_H_t,
+                        ref_centers=ref_centers_t,
+                        fit_centers=fit_centers_t,
+                        ref_points=self._ref_surf_t,
+                        fit_points=self._fit_surf_t,
+                        ref_partial_charges=self._ref_partial_t,
+                        fit_partial_charges=self._fit_partial_t,
+                        ref_surf_esp=self._ref_surf_esp_t,
+                        fit_surf_esp=self._fit_surf_esp_t,
+                        ref_radii=self._ref_radii_t,
+                        fit_radii=self._fit_radii_t,
+                        alpha=alpha,
+                        lam=lam,
+                        probe_radius=probe_radius,
+                        esp_weight=esp_weight,
+                        num_repeats=num_repeats,
+                        trans_centers=trans_centers,
+                        num_repeats_per_trans=10,
+                        topk=30,
+                        steps_fine=max_num_steps,
+                        lr=lr,
+                    )
+
+                    self.transform_esp_combo = se3_transform_t.numpy()
+                    self.sim_aligned_esp_combo = score_t.numpy()
+                    return aligned_fit_points_t.numpy()
+
             aligned_fit_points, se3_transform, score = optimize_esp_combo_score_overlay(
                 ref_centers_w_H=torch.from_numpy(self.ref_molec.mol.GetConformer().GetPositions()).to(torch.float32).to(self.device),
                 fit_centers_w_H=torch.from_numpy(self.fit_molec.mol.GetConformer().GetPositions()).to(torch.float32).to(self.device),
@@ -992,10 +1632,55 @@ class MoleculePair:
         """
         if use_jax:
             raise NotImplementedError(f'Jax version of alignment has not been implemented yet. Use PyTorch version by setting `use_jax` to False.')
-        # PyTorch
+
+        # PyTorch (fast path on CUDA if available)
+        if torch.cuda.is_available():
+            try:
+                from .alignment_utils.fast_pharm_se3 import fast_optimize_pharm_overlay
+            except ImportError:
+                fast_optimize_pharm_overlay = None
+
+            if fast_optimize_pharm_overlay is not None:
+                if getattr(self, "_ref_pharm_types_t", None) is None:
+                    self._ref_pharm_types_t = torch.as_tensor(self.ref_molec.pharm_types, dtype=torch.int64, device=self.device)
+                if getattr(self, "_fit_pharm_types_t", None) is None:
+                    self._fit_pharm_types_t = torch.as_tensor(self.fit_molec.pharm_types, dtype=torch.int64, device=self.device)
+                if getattr(self, "_ref_pharm_ancs_t", None) is None:
+                    self._ref_pharm_ancs_t = torch.as_tensor(self.ref_molec.pharm_ancs, dtype=torch.float32, device=self.device)
+                if getattr(self, "_fit_pharm_ancs_t", None) is None:
+                    self._fit_pharm_ancs_t = torch.as_tensor(self.fit_molec.pharm_ancs, dtype=torch.float32, device=self.device)
+                if getattr(self, "_ref_pharm_vecs_t", None) is None:
+                    self._ref_pharm_vecs_t = torch.as_tensor(self.ref_molec.pharm_vecs, dtype=torch.float32, device=self.device)
+                if getattr(self, "_fit_pharm_vecs_t", None) is None:
+                    self._fit_pharm_vecs_t = torch.as_tensor(self.fit_molec.pharm_vecs, dtype=torch.float32, device=self.device)
+
+                trans_centers = self._ref_pharm_ancs_t if trans_init else None
+
+                aligned_fit_anchors_t, aligned_fit_vectors_t, se3_transform_t, score_t = fast_optimize_pharm_overlay(
+                    ref_pharms=self._ref_pharm_types_t,
+                    fit_pharms=self._fit_pharm_types_t,
+                    ref_anchors=self._ref_pharm_ancs_t,
+                    fit_anchors=self._fit_pharm_ancs_t,
+                    ref_vectors=self._ref_pharm_vecs_t,
+                    fit_vectors=self._fit_pharm_vecs_t,
+                    similarity=similarity,
+                    extended_points=extended_points,
+                    only_extended=only_extended,
+                    num_repeats=num_repeats,
+                    trans_centers=trans_centers,
+                    num_repeats_per_trans=10,
+                    topk=30,
+                    steps_fine=max_num_steps,
+                    lr=lr,
+                )
+
+                self.transform_pharm = se3_transform_t.numpy()
+                self.sim_aligned_pharm = score_t.numpy()
+                return aligned_fit_anchors_t.numpy(), aligned_fit_vectors_t.numpy()
+
         aligned_fit_anchors, aligned_fit_vectors, se3_transform, score = optimize_pharm_overlay(
-            ref_pharms=torch.from_numpy(self.ref_molec.pharm_types).to(torch.float32).to(self.device),
-            fit_pharms=torch.from_numpy(self.fit_molec.pharm_types).to(torch.float32).to(self.device),
+            ref_pharms=torch.from_numpy(self.ref_molec.pharm_types).to(torch.int64).to(self.device),
+            fit_pharms=torch.from_numpy(self.fit_molec.pharm_types).to(torch.int64).to(self.device),
             ref_anchors=torch.from_numpy(self.ref_molec.pharm_ancs).to(torch.float32).to(self.device),
             fit_anchors=torch.from_numpy(self.fit_molec.pharm_ancs).to(torch.float32).to(self.device),
             ref_vectors=torch.from_numpy(self.ref_molec.pharm_vecs).to(torch.float32).to(self.device),
@@ -1007,7 +1692,7 @@ class MoleculePair:
             trans_centers=torch.from_numpy(self.ref_molec.pharm_ancs).to(torch.float32).to(self.device) if trans_init else None,
             lr=lr,
             max_num_steps=max_num_steps,
-            verbose=verbose
+            verbose=verbose,
         )
 
         self.transform_pharm = se3_transform.numpy()
