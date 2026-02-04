@@ -73,29 +73,71 @@ def _self_overlap_in_chunks(P_pad, N_real, alpha=0.81):
     return V_all
 
 
+
+def _fallback_quats(num: int, device, dtype):
+    # Deterministic small set of “reasonable” rotations
+    s2 = math.sqrt(0.5)
+    base = torch.tensor([
+        [1.0, 0.0, 0.0, 0.0],          # identity
+        [0.0, 1.0, 0.0, 0.0],          # 180° about x
+        [0.0, 0.0, 1.0, 0.0],          # 180° about y
+        [0.0, 0.0, 0.0, 1.0],          # 180° about z
+        [s2,  s2, 0.0, 0.0],           # 90° about x
+        [s2, 0.0,  s2, 0.0],           # 90° about y
+        [s2, 0.0, 0.0,  s2],           # 90° about z
+        [0.0,  s2,  s2, 0.0],          # 180° about (x+y)
+        [0.0,  s2, 0.0,  s2],          # 180° about (x+z)
+        [0.0, 0.0,  s2,  s2],          # 180° about (y+z)
+    ], device=device, dtype=dtype)
+
+    if base.size(0) >= num:
+        q = base[:num].clone()
+    else:
+        reps = (num + base.size(0) - 1) // base.size(0)
+        q = base.repeat(reps, 1)[:num].clone()
+
+    return F.normalize(q, dim=1)
+
 @torch.no_grad()
 def _legacy_seeds_torch(ref_xyz: torch.Tensor,
                         fit_xyz: torch.Tensor,
                         *,
                         num_repeats: int = 50) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Return the exact legacy seeds as (q,t) on the *same device* / dtype as
-    `ref_xyz`.  Shapes = (num_repeats,4) and (num_repeats,3).
-    """
-    # legacy helper wants CPU tensors (it builds PCA etc. in Python)
+
+    # Move to CPU for legacy PCA routine, but guard against degenerate inputs
     ref_cpu = ref_xyz.detach().cpu()
     fit_cpu = fit_xyz.detach().cpu()
 
-    se3 = _legacy_init(ref_points=ref_cpu,          # <-- Torch tensors!
-                       fit_points=fit_cpu,
-                       num_repeats=num_repeats)     # (R,7) torch.float32 CPU
+    def fallback(reason: str):
+        # COM-to-COM translation seed
+        ref_com = ref_cpu.mean(dim=0) if ref_cpu.numel() else torch.zeros(3)
+        fit_com = fit_cpu.mean(dim=0) if fit_cpu.numel() else torch.zeros(3)
+        t0 = (ref_com - fit_com).to(device=ref_xyz.device, dtype=ref_xyz.dtype)
+        t  = t0.unsqueeze(0).repeat(num_repeats, 1)
+        q  = _fallback_quats(num_repeats, device=ref_xyz.device, dtype=ref_xyz.dtype)
+        return q, t
 
-    # move back to caller’s device / dtype
-    se3 = se3.to(dtype=ref_xyz.dtype, device=ref_xyz.device)
-    q, t = se3[:, :4], se3[:, 4:]
-    return torch.nn.functional.normalize(q, dim=1), t
+    # Minimal sanity checks (common culprits)
+    if ref_cpu.shape[0] < 3 or fit_cpu.shape[0] < 3:
+        return fallback("too_few_points")
+    if (not torch.isfinite(ref_cpu).all()) or (not torch.isfinite(fit_cpu).all()):
+        return fallback("non_finite_coords")
 
+    try:
+        se3 = _legacy_init(ref_points=ref_cpu, fit_points=fit_cpu, num_repeats=num_repeats)
 
+        # Catch NaNs/Infs coming back from PCA
+        if not torch.isfinite(se3).all():
+            return fallback("legacy_init_non_finite")
+
+        se3 = se3.to(dtype=ref_xyz.dtype, device=ref_xyz.device)
+        q, t = se3[:, :4], se3[:, 4:]
+        return F.normalize(q, dim=1), t
+
+    except Exception:
+        # Includes numpy.linalg.LinAlgError from PCA
+        return fallback("legacy_init_exception")
+    
 def coarse_fine_align_many(
         A_batch, B_batch, VAA, VBB, *,
         alpha: float = 0.81,
@@ -298,92 +340,3 @@ def coarse_fine_align_many(
 
 
 
-
-
-
-
-
-# ######################################################################
-# # [DEBUG] 1-shot gradient parity check (analytical vs. autograd)
-# # ------------------------------------------------------------------
-# if _ == 0:
-#     # pick the very first orientation in this micro-batch
-#     test_idx = 0
-
-#     # detach copies so we can re-enable gradient tracking
-#     realN = int(N_k[test_idx])                 # true atom counts (kernel)
-#     realM = int(M_k[test_idx])
-
-#     A_real = A_k[test_idx, :realN].detach()    # (realN,3)
-#     B_real = B_k[test_idx, :realM].detach()    # (realM,3)
-
-#     q_aut = q_k[test_idx:test_idx+1].detach().clone()
-#     t_aut = t_k[test_idx:test_idx+1].detach().clone()
-
-#     # autograd needs a single (7,) tensor:  [q (4) | t (3)]
-#     se3_aut = torch.cat([q_aut[0], t_aut[0]]).requires_grad_(True)
-
-
-#     # legacy objective returns (1-Tanimoto) –>  score = 1-loss
-#     loss = objective_ROCS_overlay(
-#         se3_params = se3_aut,
-#         ref_points = A_real,         # (N,3)
-#         fit_points = B_real,         # (M,3)
-#         alpha      = alpha)
-#     score = 1.0 - loss
-#     score.backward()                              # ↯ autograd grads
-#     grads    = se3_aut.grad           # (7,)
-#     dQ_auto  = grads[:4]              # (4,)
-#     dT_auto  = grads[4:]              # (3,)
-
-
-#     # analytical score-gradients  (kernel gives dVAB)
-#     scale_aut   = scale[test_idx]                 # scalar
-#     dQ_kernel   =  dQ_tan[test_idx] * scale_aut
-#     dT_kernel   =  dT[test_idx] * scale_aut
-
-#     # compare
-#     Δq = (dQ_kernel - dQ_auto).abs().max()
-#     Δt = (dT_kernel - dT_auto).abs().max()
-
-#     q_unit   = q_k[test_idx] / q_k[test_idx].norm()     # ensure exactly unit
-#     P        = torch.eye(4, device=q_unit.device) - q_unit[:,None] @ q_unit[None,:]
-#     dQ_proj  = P @ dQ_kernel    # project kernel grad into tangential plane
-
-#     # -------------------------------------------------------------- NEW
-#     #   ➊ How many atoms are real vs. padding?
-#     realN = int(N_k[test_idx].item())    # true atom counts you passed to the kernel
-#     realM = int(M_k[test_idx].item())
-#     print(f"[padding]  real N={realN}/{N_pad}   real M={realM}/{M_pad}")
-
-#     #   ➋ Does either gradient carry a radial-(‖q‖) component?
-#     print(f"[param]    ‖q‖={q_unit.norm():.6f}   "
-#           f"q·kern={torch.dot(q_unit, dQ_kernel):+.3e}   "
-#           f"q·auto={torch.dot(q_unit, dQ_auto):+.3e}")
-#     # -------------------------------------------------------------- END
-
-#     print("‖raw kernel grad‖ :", dQ_kernel.norm().item())
-#     print("‖projected grad‖ :", dQ_proj.norm().item())
-#     print("‖autograd grad‖  :", dQ_auto.norm().item())
-#     print("dot(q, autograd) :", torch.dot(q_unit, dQ_auto).item())   # ~0
-
-#     # ---- print ----------------------------------------------
-#     names = ["qw", "qx", "qy", "qz", "tx", "ty", "tz"]
-#     auto_full   = torch.cat([dQ_auto,  dT_auto])
-#     kern_full   = torch.cat([dQ_kernel, dT_kernel])
-#     delta_full  = kern_full - auto_full
-
-#     print("\n[grad-check] component   kernel_grad         autograd_grad        Δ")
-#     for n, k, a, d in zip(names, kern_full, auto_full, delta_full):
-#         print(f"                 {n:>2} :    {k:+.6e}       {a:+.6e}    {d:+.1e}")
-#     print()  # blank line for clarity
-
-#     thresh = 1e-4          # adjust if you need tighter tolerance
-#     if Δq > thresh or Δt > thresh:
-#         raise AssertionError(
-#             f"[grad-check] mismatch —  "
-#             f"dQ Δ={Δq.item():.3e}, dT Δ={Δt.item():.3e}")
-#     else:
-#         print(f"[grad-check] analytical == autograd  ✓ "
-#               f"(max‖Δ‖: dQ {Δq:.2e}, dT {Δt:.2e})")
-#     ####################################################################
