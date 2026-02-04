@@ -4,10 +4,10 @@ from ..alignment import objective_ROCS_overlay
 from typing import Optional
 from ..alignment import _initialize_se3_params as _legacy_init
 from pathlib import Path
-import torch.nn.functional as F
 from contextlib import suppress
 
-torch.backends.cuda.matmul.allow_tf32 = True 
+torch.backends.cuda.matmul.allow_tf32 = True
+
 
 @torch.no_grad()
 def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81,
@@ -103,7 +103,9 @@ def coarse_fine_align_many(
         steps_fine: int = 75,
         lr: float = 0.075,
         N_real: torch.Tensor | None = None,
-        M_real: torch.Tensor | None = None):
+        M_real: torch.Tensor | None = None,
+        early_stop_patience: int = 5,
+        early_stop_tol: float = 1e-5):
     """
     Vectorised padding-aware alignment over a batch of (A, B) pairs.
 
@@ -112,6 +114,8 @@ def coarse_fine_align_many(
     A_batch, B_batch : (B, N_pad, 3) / (B, M_pad, 3)  atom coordinates
     VAA, VBB         : (B,)  pre-computed Gaussian self-overlaps
     N_real, M_real   : (B,)  optional true atom counts
+    early_stop_patience : int  number of iterations without improvement before stopping
+    early_stop_tol : float  minimum improvement threshold
     """
     device = A_batch.device
     BATCH, N_pad, _ = A_batch.shape
@@ -131,7 +135,6 @@ def coarse_fine_align_many(
             A_batch[i, :N_real[i]], B_batch[i, :M_real[i]])
         qs.append(q_i)
         ts.append(t_i)
-
     quats   = torch.stack(qs, dim=0)             # (B, 50, 4)
     t_seeds = torch.stack(ts, dim=0)             # (B, 50, 3)
 
@@ -227,6 +230,10 @@ def coarse_fine_align_many(
     best_q = q_k.clone()
     best_t = t_k.clone()
 
+    # Early stopping state
+    prev_max_score = -float('inf')
+    no_improve_count = 0
+
     for _ in range(steps_fine):
         VAB, dQ, dT = _overlap_in_chunks(
             A_k, B_k, q_k, t_k,
@@ -249,6 +256,16 @@ def coarse_fine_align_many(
         best_q = torch.where(mask_q, q_k, best_q)
         best_t = torch.where(mask_q, t_k, best_t)
 
+        # Early stopping check: if global max score hasn't improved significantly
+        current_max = best_score.max().item()
+        if current_max - prev_max_score < early_stop_tol:
+            no_improve_count += 1
+            if no_improve_count >= early_stop_patience:
+                break
+        else:
+            no_improve_count = 0
+            prev_max_score = current_max
+
         fused_adam_qt(
             q_k, t_k,
             -dQ_tan * scale.unsqueeze(1),
@@ -257,22 +274,17 @@ def coarse_fine_align_many(
         )
 
     # ------------------------------------------------------------------
-    # 5) gather final results
+    # 5) gather final results (using already-tracked best scores, no recomputation)
     # ------------------------------------------------------------------
-    final_VAB, _, _ = _overlap_in_chunks(
-        A_k, B_k, q_k, t_k, alpha=alpha, N_real=N_k, M_real=M_k)
-
-    final_score = final_VAB / (
-        VAA.repeat_interleave(topk) +
-        VBB.repeat_interleave(topk) - final_VAB)
-    final_score = final_score.view(BATCH, topk)
+    # Reshape best_score to (BATCH, topk) and select best per pair
+    final_score = best_score.view(BATCH, topk)
 
     best = final_score.argmax(dim=1)
     sel  = best + torch.arange(BATCH, device=device) * topk
 
     return final_score.flatten()[sel], \
-           q_k.view(BATCH, topk, 4)[torch.arange(BATCH), best], \
-           t_k.view(BATCH, topk, 3)[torch.arange(BATCH), best]
+           best_q.view(BATCH, topk, 4)[torch.arange(BATCH), best], \
+           best_t.view(BATCH, topk, 3)[torch.arange(BATCH), best]
 
 
 
