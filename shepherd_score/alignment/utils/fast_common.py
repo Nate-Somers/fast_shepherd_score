@@ -463,8 +463,11 @@ def build_coarse_grid(A_batch: torch.Tensor,
     extra_t = (tips - B_batch.mean(1)).unsqueeze(1)    # (B, 1, 3)
     t_base = torch.cat([com_trans, extra_t], dim=1)    # (B, 2, 3)
 
-    # Cartesian product: 250 rotations × 2 translations = 500
+    # Cartesian product: n_rot rotations × 2 translations.  n_rot is derived from
+    # the actual rotation count (5*num_seeds) rather than hardcoded, so denser
+    # grids (num_seeds != 50) stay self-consistent between q_grid and t_grid.
+    n_rot = q_base.size(1)
     q_grid = q_base[:, :, None, :].expand(-1, -1, 2, -1).reshape(BATCH, -1, 4)
-    t_grid = t_base[:, None, :, :].expand(-1, 250, -1, -1).reshape(BATCH, -1, 3)
+    t_grid = t_base[:, None, :, :].expand(-1, n_rot, -1, -1).reshape(BATCH, -1, 3)
 
     return q_grid, t_grid

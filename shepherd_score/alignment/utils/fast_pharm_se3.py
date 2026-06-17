@@ -13,6 +13,7 @@ from ...score.gaussian_overlap_triton import fused_adam_qt
 from .fast_common import (
     check_gpu_available,
     build_coarse_grid,
+    batched_seeds_torch,
     apply_se3_transform,
     apply_so3_transform,
     quaternion_to_rotation_matrix
@@ -52,7 +53,7 @@ def coarse_fine_pharm_align_many(
         trans_centers_real: Optional[torch.Tensor] = None,
         num_repeats_per_trans: int = 10,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075,
         N_real: Optional[torch.Tensor] = None,
         M_real: Optional[torch.Tensor] = None,
@@ -105,97 +106,79 @@ def coarse_fine_pharm_align_many(
         M_real = anchors_2.new_full((BATCH,), M_pad, dtype=torch.int32)
 
     # ------------------------------------------------------------------
-    # 1) Build coarse grid of 500 poses
+    # 1) pose hypotheses
     # ------------------------------------------------------------------
-    q_grid, t_grid = build_coarse_grid(
-        anchors_1,
-        anchors_2,
-        N_real,
-        M_real,
-        num_seeds=num_seeds,
-        trans_centers_batch=trans_centers,
-        trans_centers_real=trans_centers_real,
-        num_repeats_per_trans=num_repeats_per_trans,
-    )
-    G = q_grid.size(1)  # 500 orientations
-
-    # ------------------------------------------------------------------
-    # 2) Coarse evaluation
-    # ------------------------------------------------------------------
-    ORI_CHUNK = 10_000  # Smaller chunks due to pharmacophore complexity
-    coarse_score = torch.empty(BATCH, G, device=device, dtype=anchors_1.dtype)
-
-    with torch.no_grad():
-        for o0 in range(0, G, ORI_CHUNK):
-            o1 = min(o0 + ORI_CHUNK, G)
-            g_len = o1 - o0
-
-            # Expand data for this chunk
-            q_rep = q_grid[:, o0:o1].reshape(-1, 4).contiguous()
-            t_rep = t_grid[:, o0:o1].reshape(-1, 3).contiguous()
-
-            # Reshape for batch processing
-            anchors_1_exp = anchors_1.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad, 3)
-            anchors_2_exp = anchors_2.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad, 3)
-            vectors_1_exp = vectors_1.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad, 3)
-            vectors_2_exp = vectors_2.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad, 3)
-            types_1_exp = types_1.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_pad)
-            types_2_exp = types_2.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_pad)
-
-            N_rep = N_real.repeat_interleave(g_len)
-            M_rep = M_real.repeat_interleave(g_len)
-            VAA_exp = VAA.repeat_interleave(g_len)
-            VBB_exp = VBB.repeat_interleave(g_len)
-
-            VAB_slice = batch_pharm_cross_overlap_with_transform(
-                anchors_1_exp,
-                anchors_2_exp,
-                vectors_1_exp,
-                vectors_2_exp,
-                types_1_exp,
-                types_2_exp,
-                q_rep,
-                t_rep,
-                extended_points=extended_points,
-                only_extended=only_extended,
-                N_real=N_rep,
-                M_real=M_rep,
-            )
-
-            scores_slice = pharm_similarity_from_overlaps(
-                VAB_slice,
-                VAA_exp,
-                VBB_exp,
-                similarity=similarity,
-            )
-
-            coarse_score[:, o0:o1] = scores_slice.view(BATCH, g_len)
+    if trans_centers is None:
+        # Reference seed set (identity + 4 PCA + Fibonacci, COM translation);
+        # fine-optimise ALL seeds and take the per-pair max -- NO coarse-grid +
+        # top-k pruning. Pruning on the raw (un-optimised) pharmacophore overlap
+        # repeatedly discarded the true basin for pseudo-symmetric molecules,
+        # pulling the score well below the reference (worst case > 0.6). See
+        # coarse_fine_align_many for the full rationale.
+        quats, t_seeds = batched_seeds_torch(anchors_1, anchors_2, N_real, M_real,
+                                             num_seeds=num_seeds)
+        P = quats.size(1)
+        q_best = quats.clone()
+        t_best = t_seeds.clone()
+    else:
+        # Legacy translation-seeded path: coarse grid + top-k pruning (unchanged).
+        q_grid, t_grid = build_coarse_grid(
+            anchors_1, anchors_2, N_real, M_real, num_seeds=num_seeds,
+            trans_centers_batch=trans_centers, trans_centers_real=trans_centers_real,
+            num_repeats_per_trans=num_repeats_per_trans,
+        )
+        G = q_grid.size(1)
+        ORI_CHUNK = 10_000  # Smaller chunks due to pharmacophore complexity
+        coarse_score = torch.empty(BATCH, G, device=device, dtype=anchors_1.dtype)
+        with torch.no_grad():
+            for o0 in range(0, G, ORI_CHUNK):
+                o1 = min(o0 + ORI_CHUNK, G)
+                g_len = o1 - o0
+                q_rep = q_grid[:, o0:o1].reshape(-1, 4).contiguous()
+                t_rep = t_grid[:, o0:o1].reshape(-1, 3).contiguous()
+                anchors_1_exp = anchors_1.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad, 3)
+                anchors_2_exp = anchors_2.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad, 3)
+                vectors_1_exp = vectors_1.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad, 3)
+                vectors_2_exp = vectors_2.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad, 3)
+                types_1_exp = types_1.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_pad)
+                types_2_exp = types_2.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_pad)
+                N_rep = N_real.repeat_interleave(g_len)
+                M_rep = M_real.repeat_interleave(g_len)
+                VAA_exp = VAA.repeat_interleave(g_len)
+                VBB_exp = VBB.repeat_interleave(g_len)
+                VAB_slice = batch_pharm_cross_overlap_with_transform(
+                    anchors_1_exp, anchors_2_exp, vectors_1_exp, vectors_2_exp,
+                    types_1_exp, types_2_exp, q_rep, t_rep,
+                    extended_points=extended_points, only_extended=only_extended,
+                    N_real=N_rep, M_real=M_rep,
+                )
+                scores_slice = pharm_similarity_from_overlaps(
+                    VAB_slice, VAA_exp, VBB_exp, similarity=similarity,
+                )
+                coarse_score[:, o0:o1] = scores_slice.view(BATCH, g_len)
+        best_idx = coarse_score.topk(k=topk, dim=1).indices
+        q_best = torch.gather(q_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 4)).clone()
+        t_best = torch.gather(t_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 3)).clone()
+        P = topk
 
     # ------------------------------------------------------------------
-    # 3) Select top-k orientations
+    # 2) Fine optimization with Adam over ALL P poses
     # ------------------------------------------------------------------
-    best_idx = coarse_score.topk(k=topk, dim=1).indices
-    q_best = torch.gather(q_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 4)).clone()
-    t_best = torch.gather(t_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 3)).clone()
+    q_param = q_best.reshape(-1, 4).contiguous()
+    t_param = t_best.reshape(-1, 3).contiguous()
 
-    # ------------------------------------------------------------------
-    # 4) Fine optimization with Adam
-    # ------------------------------------------------------------------
-    q_param = q_best.view(-1, 4).contiguous()
-    t_param = t_best.view(-1, 3).contiguous()
+    # Expand data for P poses
+    anchors_1_k = anchors_1.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad, 3)
+    anchors_2_k = anchors_2.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad, 3)
+    vectors_1_k = vectors_1.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad, 3)
+    vectors_2_k = vectors_2.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad, 3)
+    types_1_k = types_1.unsqueeze(1).expand(-1, P, -1).reshape(-1, N_pad)
+    types_2_k = types_2.unsqueeze(1).expand(-1, P, -1).reshape(-1, M_pad)
 
-    # Expand data for topk
-    anchors_1_k = anchors_1.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, N_pad, 3)
-    anchors_2_k = anchors_2.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, M_pad, 3)
-    vectors_1_k = vectors_1.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, N_pad, 3)
-    vectors_2_k = vectors_2.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, M_pad, 3)
-    types_1_k = types_1.unsqueeze(1).expand(-1, topk, -1).reshape(-1, N_pad)
-    types_2_k = types_2.unsqueeze(1).expand(-1, topk, -1).reshape(-1, M_pad)
-
-    N_k = N_real.repeat_interleave(topk)
-    M_k = M_real.repeat_interleave(topk)
-    VAA_k = VAA.repeat_interleave(topk)
-    VBB_k = VBB.repeat_interleave(topk)
+    N_k = N_real.repeat_interleave(P)
+    M_k = M_real.repeat_interleave(P)
+    VAA_k = VAA.repeat_interleave(P)
+    VBB_k = VBB.repeat_interleave(P)
 
     # Adam state
     m_q = torch.zeros_like(q_param)
@@ -219,7 +202,7 @@ def coarse_fine_pharm_align_many(
         # fast typed self-overlap with the analytical cross-overlap would make the
         # Tanimoto ratio inconsistent and collapse the score). Self-overlap is the
         # overlap of a molecule with itself under the identity transform; computed
-        # batched over the (topk-expanded) rows once (pose-invariant).
+        # batched over the (P seed-expanded) rows once (pose-invariant).
         _P = anchors_1_k.shape[0]
         _I3 = torch.eye(3, device=device, dtype=anchors_1_k.dtype).expand(_P, 3, 3)
         _z = torch.zeros(_P, 3, device=device, dtype=anchors_1_k.dtype)
@@ -308,9 +291,9 @@ def coarse_fine_pharm_align_many(
     # ------------------------------------------------------------------
     # 5) Gather final results
     # ------------------------------------------------------------------
-    final_score = best_score.view(BATCH, topk)
+    final_score = best_score.view(BATCH, P)
     best = final_score.argmax(dim=1)
-    sel = best + torch.arange(BATCH, device=device) * topk
+    sel = best + torch.arange(BATCH, device=device) * P
 
     return (final_score.flatten()[sel],
             best_q[sel],
@@ -331,7 +314,7 @@ def fast_optimize_pharm_overlay(
         trans_centers: Optional[torch.Tensor] = None,
         num_repeats_per_trans: int = 10,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075,
         **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -484,7 +467,7 @@ def fast_optimize_pharm_overlay_batch(
         N_real: Optional[torch.Tensor] = None,
         M_real: Optional[torch.Tensor] = None,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fast GPU-accelerated batch pharmacophore alignment.

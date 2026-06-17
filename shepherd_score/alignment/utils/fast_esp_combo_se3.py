@@ -17,6 +17,7 @@ from .fast_common import (
     check_gpu_available,
     legacy_seeds_torch,
     build_coarse_grid,
+    batched_seeds_torch,
     quat_mul,
     apply_se3_transform,
     apply_so3_transform,
@@ -238,11 +239,12 @@ def coarse_fine_esp_combo_align_many(
         lam: float = 0.001,
         probe_radius: float = 1.0,
         esp_weight: float = 0.5,
+        num_seeds: int = 50,
         trans_centers: Optional[torch.Tensor] = None,
         trans_centers_real: Optional[torch.Tensor] = None,
         num_repeats_per_trans: int = 10,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075,
         N_real_centers: Optional[torch.Tensor] = None,
         M_real_centers: Optional[torch.Tensor] = None,
@@ -289,114 +291,103 @@ def coarse_fine_esp_combo_align_many(
         M_real_surf_2 = points_2.new_full((BATCH,), M_surf, dtype=torch.int32)
 
     # ------------------------------------------------------------------
-    # 1) Build coarse grid of 500 poses
+    # 1) pose hypotheses
     # ------------------------------------------------------------------
-    q_grid, t_grid = build_coarse_grid(
-        points_1,
-        points_2,
-        N_real_surf_1,
-        M_real_surf_2,
-        num_seeds=50,
-        trans_centers_batch=trans_centers,
-        trans_centers_real=trans_centers_real,
-        num_repeats_per_trans=num_repeats_per_trans,
-    )
-    G = q_grid.size(1)
-
-    # ------------------------------------------------------------------
-    # 2) Coarse evaluation
-    # ------------------------------------------------------------------
-    ORI_CHUNK = 5_000  # Smaller chunks due to more data per evaluation
-    coarse_score = torch.empty(BATCH, G, device=device, dtype=centers_1.dtype)
-
-    for o0 in range(0, G, ORI_CHUNK):
-        o1 = min(o0 + ORI_CHUNK, G)
-        g_len = o1 - o0
-
-        # Expand all data for this chunk of orientations
-        q_rep = q_grid[:, o0:o1].reshape(-1, 4).contiguous()
-        t_rep = t_grid[:, o0:o1].reshape(-1, 3).contiguous()
-
-        # Apply transforms to fit molecule data
-        # Reshape: (B, g_len, ...) -> (B*g_len, ...)
-        centers_w_H_2_exp = centers_w_H_2.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad_w_H, 3)
-        centers_2_exp = centers_2.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad_centers, 3)
-        points_2_exp = points_2.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_surf, 3)
-
-        # Transform fit coordinates
-        centers_w_H_2_t = apply_se3_transform(centers_w_H_2_exp, q_rep, t_rep)
-        centers_2_t = apply_se3_transform(centers_2_exp, q_rep, t_rep)
-        points_2_t = apply_se3_transform(points_2_exp, q_rep, t_rep)
-
-        # Expand reference data
-        centers_w_H_1_exp = centers_w_H_1.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad_w_H, 3)
-        centers_1_exp = centers_1.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad_centers, 3)
-        points_1_exp = points_1.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_surf, 3)
-        partial_charges_1_exp = partial_charges_1.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_pad_w_H)
-        partial_charges_2_exp = partial_charges_2.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_pad_w_H)
-        point_charges_1_exp = point_charges_1.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_surf)
-        point_charges_2_exp = point_charges_2.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_surf)
-        radii_1_exp = radii_1.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_pad_w_H)
-        radii_2_exp = radii_2.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_pad_w_H)
-        VAA_exp = VAA.unsqueeze(1).expand(-1, g_len).reshape(-1)
-        VBB_exp = VBB.unsqueeze(1).expand(-1, g_len).reshape(-1)
-        N_real_exp = N_real_centers.repeat_interleave(g_len)
-        M_real_exp = M_real_centers.repeat_interleave(g_len)
-        N_atoms_exp = N_real_atoms_w_H_1.repeat_interleave(g_len)
-        M_atoms_exp = M_real_atoms_w_H_2.repeat_interleave(g_len)
-        N_surf_exp = N_real_surf_1.repeat_interleave(g_len)
-        M_surf_exp = M_real_surf_2.repeat_interleave(g_len)
-
-        # Compute combo scores
-        scores_chunk = _batch_esp_combo_score(
-            centers_w_H_1_exp, centers_w_H_2_t,
-            centers_1_exp, centers_2_t,
-            points_1_exp, points_2_t,
-            partial_charges_1_exp, partial_charges_2_exp,
-            point_charges_1_exp, point_charges_2_exp,
-            radii_1_exp, radii_2_exp,
-            alpha, lam, probe_radius, esp_weight,
-            VAA_exp, VBB_exp, N_real_exp, M_real_exp,
-            N_atoms_exp, M_atoms_exp, N_surf_exp, M_surf_exp)
-
-        coarse_score[:, o0:o1] = scores_chunk.view(BATCH, g_len)
+    if trans_centers is None:
+        # Reference seed set (identity + 4 PCA + Fibonacci, COM translation);
+        # fine-optimise ALL seeds and take the per-pair max -- NO coarse-grid +
+        # top-k pruning. Pruning on the raw (un-optimised) overlap dropped the
+        # true basin for pseudo-symmetric molecules; see
+        # fast_se3.coarse_fine_align_many for the full rationale. Seeds use the
+        # surface point clouds (same as the coarse grid did).
+        quats, t_seeds = batched_seeds_torch(points_1, points_2, N_real_surf_1,
+                                             M_real_surf_2, num_seeds=num_seeds)
+        P = quats.size(1)
+        q_best = quats.clone()
+        t_best = t_seeds.clone()
+    else:
+        # Legacy translation-seeded path: coarse grid + top-k pruning (unchanged).
+        q_grid, t_grid = build_coarse_grid(
+            points_1, points_2, N_real_surf_1, M_real_surf_2, num_seeds=num_seeds,
+            trans_centers_batch=trans_centers, trans_centers_real=trans_centers_real,
+            num_repeats_per_trans=num_repeats_per_trans,
+        )
+        G = q_grid.size(1)
+        ORI_CHUNK = 5_000  # Smaller chunks due to more data per evaluation
+        coarse_score = torch.empty(BATCH, G, device=device, dtype=centers_1.dtype)
+        for o0 in range(0, G, ORI_CHUNK):
+            o1 = min(o0 + ORI_CHUNK, G)
+            g_len = o1 - o0
+            q_rep = q_grid[:, o0:o1].reshape(-1, 4).contiguous()
+            t_rep = t_grid[:, o0:o1].reshape(-1, 3).contiguous()
+            centers_w_H_2_exp = centers_w_H_2.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad_w_H, 3)
+            centers_2_exp = centers_2.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad_centers, 3)
+            points_2_exp = points_2.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_surf, 3)
+            centers_w_H_2_t = apply_se3_transform(centers_w_H_2_exp, q_rep, t_rep)
+            centers_2_t = apply_se3_transform(centers_2_exp, q_rep, t_rep)
+            points_2_t = apply_se3_transform(points_2_exp, q_rep, t_rep)
+            centers_w_H_1_exp = centers_w_H_1.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad_w_H, 3)
+            centers_1_exp = centers_1.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad_centers, 3)
+            points_1_exp = points_1.unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_surf, 3)
+            partial_charges_1_exp = partial_charges_1.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_pad_w_H)
+            partial_charges_2_exp = partial_charges_2.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_pad_w_H)
+            point_charges_1_exp = point_charges_1.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_surf)
+            point_charges_2_exp = point_charges_2.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_surf)
+            radii_1_exp = radii_1.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_pad_w_H)
+            radii_2_exp = radii_2.unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_pad_w_H)
+            VAA_exp = VAA.unsqueeze(1).expand(-1, g_len).reshape(-1)
+            VBB_exp = VBB.unsqueeze(1).expand(-1, g_len).reshape(-1)
+            N_real_exp = N_real_centers.repeat_interleave(g_len)
+            M_real_exp = M_real_centers.repeat_interleave(g_len)
+            N_atoms_exp = N_real_atoms_w_H_1.repeat_interleave(g_len)
+            M_atoms_exp = M_real_atoms_w_H_2.repeat_interleave(g_len)
+            N_surf_exp = N_real_surf_1.repeat_interleave(g_len)
+            M_surf_exp = M_real_surf_2.repeat_interleave(g_len)
+            scores_chunk = _batch_esp_combo_score(
+                centers_w_H_1_exp, centers_w_H_2_t,
+                centers_1_exp, centers_2_t,
+                points_1_exp, points_2_t,
+                partial_charges_1_exp, partial_charges_2_exp,
+                point_charges_1_exp, point_charges_2_exp,
+                radii_1_exp, radii_2_exp,
+                alpha, lam, probe_radius, esp_weight,
+                VAA_exp, VBB_exp, N_real_exp, M_real_exp,
+                N_atoms_exp, M_atoms_exp, N_surf_exp, M_surf_exp)
+            coarse_score[:, o0:o1] = scores_chunk.view(BATCH, g_len)
+        best_idx = coarse_score.topk(k=topk, dim=1).indices
+        q_best = torch.gather(q_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 4)).clone()
+        t_best = torch.gather(t_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 3)).clone()
+        P = topk
 
     # ------------------------------------------------------------------
-    # 3) Select top-k orientations
-    # ------------------------------------------------------------------
-    best_idx = coarse_score.topk(k=topk, dim=1).indices
-    q_best = torch.gather(q_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 4)).clone()
-    t_best = torch.gather(t_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 3)).clone()
-
-    # ------------------------------------------------------------------
-    # 4) Fine optimization
+    # 2) Fine optimization over ALL P poses
     # ------------------------------------------------------------------
     # For ESP combo, we use the shape gradient for optimization but score with combo
-    q_k = q_best.view(-1, 4)
-    t_k = t_best.view(-1, 3)
+    q_k = q_best.reshape(-1, 4).contiguous()
+    t_k = t_best.reshape(-1, 3).contiguous()
 
-    # Expand all data for topk
-    centers_w_H_1_k = centers_w_H_1.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, N_pad_w_H, 3)
-    centers_w_H_2_k = centers_w_H_2.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, M_pad_w_H, 3)
-    centers_1_k = centers_1.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, N_pad_centers, 3)
-    centers_2_k = centers_2.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, M_pad_centers, 3)
-    points_1_k = points_1.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, N_surf, 3)
-    points_2_k = points_2.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, M_surf, 3)
-    partial_charges_1_k = partial_charges_1.unsqueeze(1).expand(-1, topk, -1).reshape(-1, N_pad_w_H)
-    partial_charges_2_k = partial_charges_2.unsqueeze(1).expand(-1, topk, -1).reshape(-1, M_pad_w_H)
-    point_charges_1_k = point_charges_1.unsqueeze(1).expand(-1, topk, -1).reshape(-1, N_surf)
-    point_charges_2_k = point_charges_2.unsqueeze(1).expand(-1, topk, -1).reshape(-1, M_surf)
-    radii_1_k = radii_1.unsqueeze(1).expand(-1, topk, -1).reshape(-1, N_pad_w_H)
-    radii_2_k = radii_2.unsqueeze(1).expand(-1, topk, -1).reshape(-1, M_pad_w_H)
+    # Expand all data for P poses
+    centers_w_H_1_k = centers_w_H_1.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad_w_H, 3)
+    centers_w_H_2_k = centers_w_H_2.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad_w_H, 3)
+    centers_1_k = centers_1.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad_centers, 3)
+    centers_2_k = centers_2.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad_centers, 3)
+    points_1_k = points_1.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_surf, 3)
+    points_2_k = points_2.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_surf, 3)
+    partial_charges_1_k = partial_charges_1.unsqueeze(1).expand(-1, P, -1).reshape(-1, N_pad_w_H)
+    partial_charges_2_k = partial_charges_2.unsqueeze(1).expand(-1, P, -1).reshape(-1, M_pad_w_H)
+    point_charges_1_k = point_charges_1.unsqueeze(1).expand(-1, P, -1).reshape(-1, N_surf)
+    point_charges_2_k = point_charges_2.unsqueeze(1).expand(-1, P, -1).reshape(-1, M_surf)
+    radii_1_k = radii_1.unsqueeze(1).expand(-1, P, -1).reshape(-1, N_pad_w_H)
+    radii_2_k = radii_2.unsqueeze(1).expand(-1, P, -1).reshape(-1, M_pad_w_H)
 
-    N_k = N_real_centers.repeat_interleave(topk)
-    M_k = M_real_centers.repeat_interleave(topk)
-    N_atoms_k = N_real_atoms_w_H_1.repeat_interleave(topk)
-    M_atoms_k = M_real_atoms_w_H_2.repeat_interleave(topk)
-    N_surf_k = N_real_surf_1.repeat_interleave(topk)
-    M_surf_k = M_real_surf_2.repeat_interleave(topk)
-    VAA_k = VAA.repeat_interleave(topk)
-    VBB_k = VBB.repeat_interleave(topk)
+    N_k = N_real_centers.repeat_interleave(P)
+    M_k = M_real_centers.repeat_interleave(P)
+    N_atoms_k = N_real_atoms_w_H_1.repeat_interleave(P)
+    M_atoms_k = M_real_atoms_w_H_2.repeat_interleave(P)
+    N_surf_k = N_real_surf_1.repeat_interleave(P)
+    M_surf_k = M_real_surf_2.repeat_interleave(P)
+    VAA_k = VAA.repeat_interleave(P)
+    VBB_k = VBB.repeat_interleave(P)
     VAA_plus_VBB = VAA_k + VBB_k
 
     # Adam state
@@ -468,13 +459,13 @@ def coarse_fine_esp_combo_align_many(
     # ------------------------------------------------------------------
     # 5) Gather final results
     # ------------------------------------------------------------------
-    final_score = best_score.view(BATCH, topk)
+    final_score = best_score.view(BATCH, P)
     best = final_score.argmax(dim=1)
-    sel = best + torch.arange(BATCH, device=device) * topk
+    sel = best + torch.arange(BATCH, device=device) * P
 
     return (final_score.flatten()[sel],
-            best_q.view(BATCH, topk, 4)[torch.arange(BATCH), best],
-            best_t.view(BATCH, topk, 3)[torch.arange(BATCH), best])
+            best_q.view(BATCH, P, 4)[torch.arange(BATCH), best],
+            best_t.view(BATCH, P, 3)[torch.arange(BATCH), best])
 
 
 def fast_optimize_esp_combo_score_overlay(
@@ -498,7 +489,7 @@ def fast_optimize_esp_combo_score_overlay(
         trans_centers: Optional[torch.Tensor] = None,
         num_repeats_per_trans: int = 10,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075,
         **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -615,7 +606,7 @@ def fast_optimize_esp_combo_score_overlay_batch(
         trans_centers_real: Optional[torch.Tensor] = None,
         num_repeats_per_trans: int = 10,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fast GPU-accelerated batch ESP-combo alignment with padding-safe masks.

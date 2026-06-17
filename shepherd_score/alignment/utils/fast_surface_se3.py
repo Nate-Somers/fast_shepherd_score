@@ -17,6 +17,7 @@ from .fast_common import (
     check_gpu_available,
     legacy_seeds_torch,
     build_coarse_grid,
+    batched_seeds_torch,
     quat_mul,
     apply_se3_transform,
     quaternion_to_rotation_matrix
@@ -103,8 +104,9 @@ def coarse_fine_surface_align_many(
         VBB: torch.Tensor,
         *,
         alpha: float,
-        topk: int = 30,
-        steps_fine: int = 75,
+        num_seeds: int = 50,
+        topk: int | None = None,        # deprecated: pruning removed
+        steps_fine: int = 100,
         lr: float = 0.075,
         N_real: Optional[torch.Tensor] = None,
         M_real: Optional[torch.Tensor] = None,
@@ -159,62 +161,26 @@ def coarse_fine_surface_align_many(
         M_real = A_batch.new_full((BATCH,), M_pad, dtype=torch.int32)
 
     # ------------------------------------------------------------------
-    # 1) Build coarse grid of 500 poses
+    # 1) reference seed set (no coarse grid / no top-k pruning); optimise all.
+    #    See fast_se3.coarse_fine_align_many for the rationale -- pruning on raw
+    #    overlap dropped the true basin for pseudo-symmetric molecules.
     # ------------------------------------------------------------------
-    q_grid, t_grid = build_coarse_grid(A_batch, B_batch, N_real, M_real, num_seeds=50)
-    G = q_grid.size(1)  # 500 orientations
-
-    # ------------------------------------------------------------------
-    # 2) Coarse evaluation (micro-batched for memory)
-    # ------------------------------------------------------------------
-    ORI_CHUNK = 25_000
-    PAIR_CHUNK = 65_535
-    coarse_score = torch.empty(BATCH, G, device=device, dtype=A_batch.dtype)
-
-    for o0 in range(0, G, ORI_CHUNK):
-        o1 = min(o0 + ORI_CHUNK, G)
-        g_len = o1 - o0
-
-        for p0 in range(0, BATCH, PAIR_CHUNK):
-            p1 = min(p0 + PAIR_CHUNK, BATCH)
-            slice_len = p1 - p0
-
-            A_rep = A_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad, 3)
-            B_rep = B_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad, 3)
-            q_rep = q_grid[p0:p1, o0:o1].reshape(-1, 4).contiguous()
-            t_rep = t_grid[p0:p1, o0:o1].reshape(-1, 3).contiguous()
-
-            N_rep = N_real[p0:p1].repeat_interleave(g_len)
-            M_rep = M_real[p0:p1].repeat_interleave(g_len)
-
-            VAB_slice, _, _ = _overlap_in_chunks_surface(
-                A_rep, B_rep, q_rep, t_rep,
-                alpha=alpha, N_real=N_rep, M_real=M_rep, NEED_GRAD=False)
-
-            coarse_score[p0:p1, o0:o1] = VAB_slice.view(slice_len, g_len)
-
-    # Convert to Tanimoto
-    coarse_score = coarse_score / (VAA[:, None] + VBB[:, None] - coarse_score)
+    quats, t_seeds = batched_seeds_torch(A_batch, B_batch, N_real, M_real,
+                                         num_seeds=num_seeds)
+    P = quats.size(1)
 
     # ------------------------------------------------------------------
-    # 3) Select top-k orientations
+    # 2) Fine optimization with Adam over ALL P seeds
     # ------------------------------------------------------------------
-    best_idx = coarse_score.topk(k=topk, dim=1).indices
-    q_best = torch.gather(q_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 4)).clone()
-    t_best = torch.gather(t_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 3)).clone()
+    A_k = A_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad, 3)
+    B_k = B_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad, 3)
+    q_k = quats.reshape(-1, 4).contiguous()
+    t_k = t_seeds.reshape(-1, 3).contiguous()
 
-    # ------------------------------------------------------------------
-    # 4) Fine optimization with Adam
-    # ------------------------------------------------------------------
-    A_k = A_batch.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, N_pad, 3)
-    B_k = B_batch.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, M_pad, 3)
-    q_k = q_best.view(-1, 4)
-    t_k = t_best.view(-1, 3)
-
-    N_k = N_real.repeat_interleave(topk)
-    M_k = M_real.repeat_interleave(topk)
-    VAA_rep = VAA.repeat_interleave(topk)
-    VBB_rep = VBB.repeat_interleave(topk)
+    N_k = N_real.repeat_interleave(P)
+    M_k = M_real.repeat_interleave(P)
+    VAA_rep = VAA.repeat_interleave(P)
+    VBB_rep = VBB.repeat_interleave(P)
     VAA_plus_VBB = VAA_rep + VBB_rep
 
     # Adam state
@@ -268,13 +234,13 @@ def coarse_fine_surface_align_many(
     # ------------------------------------------------------------------
     # 5) Gather final results
     # ------------------------------------------------------------------
-    final_score = best_score.view(BATCH, topk)
+    final_score = best_score.view(BATCH, P)
     best = final_score.argmax(dim=1)
-    sel = best + torch.arange(BATCH, device=device) * topk
+    sel = best + torch.arange(BATCH, device=device) * P
 
     return (final_score.flatten()[sel],
-            best_q.view(BATCH, topk, 4)[torch.arange(BATCH), best],
-            best_t.view(BATCH, topk, 3)[torch.arange(BATCH), best])
+            best_q.view(BATCH, P, 4)[torch.arange(BATCH), best],
+            best_t.view(BATCH, P, 3)[torch.arange(BATCH), best])
 
 
 def fast_optimize_ROCS_overlay(
@@ -283,7 +249,7 @@ def fast_optimize_ROCS_overlay(
         alpha: float,
         num_repeats: int = 50,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075,
         **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -366,7 +332,7 @@ def fast_optimize_ROCS_overlay_batch(
         N_real: Optional[torch.Tensor] = None,
         M_real: Optional[torch.Tensor] = None,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fast GPU-accelerated batch surface alignment.

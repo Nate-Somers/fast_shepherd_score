@@ -15,6 +15,7 @@ from .fast_common import (
     check_gpu_available,
     legacy_seeds_torch,
     build_coarse_grid,
+    batched_seeds_torch,
     quat_mul,
     apply_se3_transform,
     quaternion_to_rotation_matrix
@@ -110,11 +111,12 @@ def coarse_fine_esp_align_many(
         *,
         alpha: float = 0.81,
         lam: float = 0.3,
+        num_seeds: int = 50,
         trans_centers: Optional[torch.Tensor] = None,
         trans_centers_real: Optional[torch.Tensor] = None,
         num_repeats_per_trans: int = 10,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075,
         N_real: Optional[torch.Tensor] = None,
         M_real: Optional[torch.Tensor] = None,
@@ -169,75 +171,69 @@ def coarse_fine_esp_align_many(
         M_real = A_batch.new_full((BATCH,), M_pad, dtype=torch.int32)
 
     # ------------------------------------------------------------------
-    # 1) Build coarse grid of 500 poses
+    # 1) pose hypotheses
     # ------------------------------------------------------------------
-    q_grid, t_grid = build_coarse_grid(
-        A_batch,
-        B_batch,
-        N_real,
-        M_real,
-        num_seeds=50,
-        trans_centers_batch=trans_centers,
-        trans_centers_real=trans_centers_real,
-        num_repeats_per_trans=num_repeats_per_trans,
-    )
-    G = q_grid.size(1)  # 500 orientations
-
-    # ------------------------------------------------------------------
-    # 2) Coarse evaluation (micro-batched for memory)
-    # ------------------------------------------------------------------
-    ORI_CHUNK = 25_000
-    PAIR_CHUNK = 65_535
-    coarse_score = torch.empty(BATCH, G, device=device, dtype=A_batch.dtype)
-
-    for o0 in range(0, G, ORI_CHUNK):
-        o1 = min(o0 + ORI_CHUNK, G)
-        g_len = o1 - o0
-
-        for p0 in range(0, BATCH, PAIR_CHUNK):
-            p1 = min(p0 + PAIR_CHUNK, BATCH)
-            slice_len = p1 - p0
-
-            A_rep = A_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad, 3)
-            B_rep = B_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad, 3)
-            CA_rep = CA_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_pad)
-            CB_rep = CB_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_pad)
-            q_rep = q_grid[p0:p1, o0:o1].reshape(-1, 4).contiguous()
-            t_rep = t_grid[p0:p1, o0:o1].reshape(-1, 3).contiguous()
-
-            N_rep = N_real[p0:p1].repeat_interleave(g_len)
-            M_rep = M_real[p0:p1].repeat_interleave(g_len)
-
-            VAB_slice, _, _ = _overlap_in_chunks_esp(
-                A_rep, B_rep, CA_rep, CB_rep, q_rep, t_rep,
-                alpha=alpha, lam=lam, N_real=N_rep, M_real=M_rep, NEED_GRAD=False)
-
-            coarse_score[p0:p1, o0:o1] = VAB_slice.view(slice_len, g_len)
-
-    # Convert to Tanimoto
-    coarse_score = coarse_score / (VAA[:, None] + VBB[:, None] - coarse_score)
-
-    # ------------------------------------------------------------------
-    # 3) Select top-k orientations
-    # ------------------------------------------------------------------
-    best_idx = coarse_score.topk(k=topk, dim=1).indices
-    q_best = torch.gather(q_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 4)).clone()
-    t_best = torch.gather(t_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 3)).clone()
+    if trans_centers is None:
+        # Reference seed set (identity + 4 PCA + Fibonacci, COM translation),
+        # fine-optimised in full with a per-pair max -- NO coarse-grid + top-k
+        # pruning. The raw-overlap ranking the pruning relied on is a poor
+        # predictor of post-optimisation score and repeatedly discarded the
+        # true basin for pseudo-symmetric molecules, pulling ESP scores ~5%
+        # below the reference. See coarse_fine_align_many for the full rationale.
+        quats, t_seeds = batched_seeds_torch(A_batch, B_batch, N_real, M_real,
+                                             num_seeds=num_seeds)
+        P = quats.size(1)
+        q_best = quats.clone()
+        t_best = t_seeds.clone()
+    else:
+        # Legacy translation-seeded path: coarse grid + top-k pruning (unchanged).
+        q_grid, t_grid = build_coarse_grid(
+            A_batch, B_batch, N_real, M_real, num_seeds=num_seeds,
+            trans_centers_batch=trans_centers, trans_centers_real=trans_centers_real,
+            num_repeats_per_trans=num_repeats_per_trans,
+        )
+        G = q_grid.size(1)
+        ORI_CHUNK = 25_000
+        PAIR_CHUNK = 65_535
+        coarse_score = torch.empty(BATCH, G, device=device, dtype=A_batch.dtype)
+        for o0 in range(0, G, ORI_CHUNK):
+            o1 = min(o0 + ORI_CHUNK, G)
+            g_len = o1 - o0
+            for p0 in range(0, BATCH, PAIR_CHUNK):
+                p1 = min(p0 + PAIR_CHUNK, BATCH)
+                slice_len = p1 - p0
+                A_rep = A_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad, 3)
+                B_rep = B_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad, 3)
+                CA_rep = CA_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_pad)
+                CB_rep = CB_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_pad)
+                q_rep = q_grid[p0:p1, o0:o1].reshape(-1, 4).contiguous()
+                t_rep = t_grid[p0:p1, o0:o1].reshape(-1, 3).contiguous()
+                N_rep = N_real[p0:p1].repeat_interleave(g_len)
+                M_rep = M_real[p0:p1].repeat_interleave(g_len)
+                VAB_slice, _, _ = _overlap_in_chunks_esp(
+                    A_rep, B_rep, CA_rep, CB_rep, q_rep, t_rep,
+                    alpha=alpha, lam=lam, N_real=N_rep, M_real=M_rep, NEED_GRAD=False)
+                coarse_score[p0:p1, o0:o1] = VAB_slice.view(slice_len, g_len)
+        coarse_score = coarse_score / (VAA[:, None] + VBB[:, None] - coarse_score)
+        best_idx = coarse_score.topk(k=topk, dim=1).indices
+        q_best = torch.gather(q_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 4)).clone()
+        t_best = torch.gather(t_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 3)).clone()
+        P = topk
 
     # ------------------------------------------------------------------
-    # 4) Fine optimization with Adam
+    # 2) Fine optimization with Adam over ALL P poses
     # ------------------------------------------------------------------
-    A_k = A_batch.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, N_pad, 3)
-    B_k = B_batch.unsqueeze(1).expand(-1, topk, -1, -1).reshape(-1, M_pad, 3)
-    CA_k = CA_batch.unsqueeze(1).expand(-1, topk, -1).reshape(-1, N_pad)
-    CB_k = CB_batch.unsqueeze(1).expand(-1, topk, -1).reshape(-1, M_pad)
-    q_k = q_best.view(-1, 4)
-    t_k = t_best.view(-1, 3)
+    A_k = A_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad, 3)
+    B_k = B_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad, 3)
+    CA_k = CA_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, N_pad)
+    CB_k = CB_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, M_pad)
+    q_k = q_best.reshape(-1, 4).contiguous()
+    t_k = t_best.reshape(-1, 3).contiguous()
 
-    N_k = N_real.repeat_interleave(topk)
-    M_k = M_real.repeat_interleave(topk)
-    VAA_rep = VAA.repeat_interleave(topk)
-    VBB_rep = VBB.repeat_interleave(topk)
+    N_k = N_real.repeat_interleave(P)
+    M_k = M_real.repeat_interleave(P)
+    VAA_rep = VAA.repeat_interleave(P)
+    VBB_rep = VBB.repeat_interleave(P)
     VAA_plus_VBB = VAA_rep + VBB_rep
 
     # Adam state
@@ -263,7 +259,8 @@ def coarse_fine_esp_align_many(
         score = VAB / denom
         scale = VAA_plus_VBB / (denom * denom)
 
-        # Track best
+        # Track best via torch.where (fixed-shape, sync-free; boolean
+        # index-assignment was measured slower due to a per-step device sync).
         better = score > best_score
         best_score = torch.where(better, score, best_score)
         mask_q = better.unsqueeze(1)
@@ -291,13 +288,13 @@ def coarse_fine_esp_align_many(
     # ------------------------------------------------------------------
     # 5) Gather final results
     # ------------------------------------------------------------------
-    final_score = best_score.view(BATCH, topk)
+    final_score = best_score.view(BATCH, P)
     best = final_score.argmax(dim=1)
-    sel = best + torch.arange(BATCH, device=device) * topk
+    sel = best + torch.arange(BATCH, device=device) * P
 
     return (final_score.flatten()[sel],
-            best_q.view(BATCH, topk, 4)[torch.arange(BATCH), best],
-            best_t.view(BATCH, topk, 3)[torch.arange(BATCH), best])
+            best_q.view(BATCH, P, 4)[torch.arange(BATCH), best],
+            best_t.view(BATCH, P, 3)[torch.arange(BATCH), best])
 
 
 def fast_optimize_ROCS_esp_overlay(
@@ -311,7 +308,7 @@ def fast_optimize_ROCS_esp_overlay(
         trans_centers: Optional[torch.Tensor] = None,
         num_repeats_per_trans: int = 10,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075,
         **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -422,7 +419,7 @@ def fast_optimize_ROCS_esp_overlay_batch(
         trans_centers_real: Optional[torch.Tensor] = None,
         num_repeats_per_trans: int = 10,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fast GPU-accelerated batch ESP alignment.
