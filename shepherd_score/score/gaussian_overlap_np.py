@@ -1,4 +1,4 @@
-""" 
+"""
 Gaussian volume overlap scoring functions -- Shape-only (i.e., not color)
 NUMPY VERSION
 
@@ -39,6 +39,29 @@ def get_overlap_np(centers_1:np.ndarray,
     tanimoto = shape_tanimoto_np(centers_1, centers_2, alpha)
     return tanimoto
 
+def get_max_overlap_np(centers_1: np.ndarray,
+                       centers_2: np.ndarray,
+                       alpha: float = 0.81
+                       ) -> np.ndarray:
+    """ Maximum overlap volume among any pair of centers (always in [0, 1] range)."""
+    R2 = (distance.cdist(centers_1, centers_2)**2.0).T
+
+    return np.max(np.exp(-(alpha / 2) * R2))
+
+def get_linear_hard_sphere_overlap_np(centers_1: np.ndarray, centers_2: np.ndarray, min_dist: float) -> np.ndarray:
+    """ Compute linear hard sphere overlap.
+
+    This function is linear based on the distance between centers
+    For distance d
+    d > min_dist: 0
+    0 < d < min_dist: linear from 0 to 1
+    d == 0: 1
+
+    Returns:
+        np.ndarray shape (1,) with the sum of hard sphere overlaps between)
+    """
+    dists = distance.cdist(centers_1, centers_2)
+    return np.sum(np.maximum((min_dist - dists) / min_dist, 0.0))
 
 def VAB_2nd_order_cosine_np(centers_1: np.ndarray,
                             centers_2: np.ndarray,
@@ -52,8 +75,16 @@ def VAB_2nd_order_cosine_np(centers_1: np.ndarray,
     NumPy implementation with single instance functionality.
     """
     if len(centers_1.shape) == 2:
+        # Normalize vectors for cosine similarity
+        norm_v1 = np.linalg.norm(vectors_1, axis=1, keepdims=True)
+        norm_v2 = np.linalg.norm(vectors_2, axis=1, keepdims=True)
+
+        # Avoid division by zero if a vector is all zeros
+        vec1_norm = np.divide(vectors_1, norm_v1, out=np.zeros_like(vectors_1), where=norm_v1!=0)
+        vec2_norm = np.divide(vectors_2, norm_v2, out=np.zeros_like(vectors_2), where=norm_v2!=0)
+
         # cosine similarity
-        V2 = np.matmul(vectors_1, vectors_2.T).T
+        V2 = np.matmul(vec1_norm, vec2_norm.T).T # Now uses normalized vectors
         if allow_antiparallel:
             V2 = np.abs(V2)
         else:

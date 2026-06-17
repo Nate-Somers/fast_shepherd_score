@@ -1,9 +1,16 @@
+slurm/
+extra_scripts/
+tests/test_parallel.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 
 .DS_Store
+
+notebooks/
+.vscode/
 
 # C extensions
 *.so
@@ -74,6 +81,9 @@ instance/
 
 # Scrapy stuff:
 .scrapy
+
+# setuptools_scm generated version file
+shepherd_score/_version.py
 
 # Sphinx documentation
 docs/_build/

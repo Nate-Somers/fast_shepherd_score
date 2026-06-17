@@ -1,4 +1,4 @@
-""" 
+"""
 Electrostatic potential similarity scoring functions.
 JAX VERSIONS
 """
@@ -6,7 +6,7 @@ JAX VERSIONS
 from shepherd_score.score.constants import COULOMB_SCALING, LAM_SCALING
 from jax import jit, Array
 import jax.numpy as jnp
-from shepherd_score.score.gaussian_overlap_jax import jax_sq_cdist, get_overlap_jax, jax_cdist
+from shepherd_score.score.gaussian_overlap_jax import jax_sq_cdist, get_overlap_jax, jax_cdist, _mask_prod_jax
 
 
 def VAB_2nd_order_esp_jax(centers_1: Array,
@@ -26,6 +26,85 @@ def VAB_2nd_order_esp_jax(centers_1: Array,
                            * jnp.exp(-C2/lam)
                           )
     return VAB_2nd_order
+
+
+def VAB_2nd_order_esp_jax_mask(centers_1: Array,
+                              centers_2: Array,
+                              charges_1: Array,
+                              charges_2: Array,
+                              mask_1: Array,
+                              mask_2: Array,
+                              alpha: float,
+                              lam: float
+                              ) -> Array:
+    """ 2nd order volume overlap of AB with masking for padded entries.
+    charges expected as shape (-1, 1). """
+    R2 = jax_sq_cdist(centers_1, centers_2)
+    C2 = jax_sq_cdist(charges_1, charges_2)
+    M2 = _mask_prod_jax(mask_1, mask_2)
+    VAB_2nd_order = jnp.sum(M2 * jnp.pi**(1.5) \
+                           * jnp.exp(-(alpha / 2) * R2) \
+                           / ((2*alpha)**(1.5))\
+                           * jnp.exp(-C2/lam)
+                          )
+    return VAB_2nd_order
+
+
+def shape_tanimoto_esp_jax_mask(centers_1: Array,
+                                centers_2: Array,
+                                charges_1: Array,
+                                charges_2: Array,
+                                mask_1: Array,
+                                mask_2: Array,
+                                alpha: float,
+                                lam: float
+                                ) -> Array:
+    """ Compute Tanimoto ESP similarity with masking for padded entries. """
+    VAA = VAB_2nd_order_esp_jax_mask(centers_1, centers_1, charges_1, charges_1, mask_1, mask_1, alpha, lam)
+    VBB = VAB_2nd_order_esp_jax_mask(centers_2, centers_2, charges_2, charges_2, mask_2, mask_2, alpha, lam)
+    VAB = VAB_2nd_order_esp_jax_mask(centers_1, centers_2, charges_1, charges_2, mask_1, mask_2, alpha, lam)
+    return VAB / (VAA + VBB - VAB)
+
+
+@jit
+def get_overlap_esp_jax_mask(centers_1: Array,
+                             centers_2: Array,
+                             charges_1: Array,
+                             charges_2: Array,
+                             mask_1: Array,
+                             mask_2: Array,
+                             alpha: float = 0.81,
+                             lam: float = 0.3*LAM_SCALING
+                             ) -> Array:
+    """
+    Jitted Jax function. Masked version of get_overlap_esp_jax.
+    Padding entries indicated by mask arrays are excluded from the overlap computation.
+
+    Parameters
+    ----------
+    centers_1 : Array (N, 3)
+    centers_2 : Array (N, 3)
+    charges_1 : Array (N,) or (N, 1)
+    charges_2 : Array (N,) or (N, 1)
+    mask_1 : Array (N,)
+        Binary mask: 1 for real entries, 0 for padding.
+    mask_2 : Array (N,)
+        Binary mask: 1 for real entries, 0 for padding.
+    alpha : float
+    lam : float
+
+    Returns
+    -------
+    Array scalar
+        Tanimoto ESP similarity.
+    """
+    charges_1 = jnp.reshape(charges_1, (-1, 1))
+    charges_2 = jnp.reshape(charges_2, (-1, 1))
+    tanimoto = shape_tanimoto_esp_jax_mask(centers_1, centers_2,
+                                           charges_1, charges_2,
+                                           mask_1, mask_2,
+                                           alpha, lam)
+    return tanimoto
 
 
 def shape_tanimoto_esp_jax(centers_1: Array,
@@ -51,37 +130,35 @@ def get_overlap_esp_jax(centers_1: Array,
                      ) -> Array:
     """
     Jitted Jax function.
-    Compute electrostatic similarity which weights Gaussian volume overlap by electrostatics. 
+    Compute electrostatic similarity which weights Gaussian volume overlap by electrostatics.
     The Tanimoto score is used.
 
     Typically `lam=0.3*LAM_SCALING` is used for surface point clouds and `lam=0.1` for partial charge
     weighted volumetric overlap.
-    
+
     Parameters
     ----------
     centers_1 : Array (N, 3)
         Coordinates for the sets of points representing molecule 1.
     centers_2 : Array (N, 3)
         Coordinates for the sets of points representing molecule 2.
-    charges_1 : Array (N,)
+    charges_1 : Array (N,1)
         Electrostatic energy for the sets of points representing molecule 1.
-    charges_2 : Array (N,)
+    charges_2 : Array (N,1)
         Electrostatic energy for the sets of points representing molecule 2.
     alpha : float
         Parameter controlling the width of the Gaussians.
     lam : float
         Parameter controlling the influence of electrostatics.
-    
+
     Returns
     -------
     Array (N,)
         Tanimoto similarities of electrostatics.
     """
     # initialize prefactor and alpha matrices
-    if len(charges_1.shape) == 1:
-        charges_1 = charges_1.reshape((-1,1))
-    if len(charges_2.shape) == 1:
-        charges_2 = charges_2.reshape((-1,1))
+    charges_1 = jnp.reshape(charges_1, (-1, 1))
+    charges_2 = jnp.reshape(charges_2, (-1, 1))
 
     tanimoto = shape_tanimoto_esp_jax(centers_1, centers_2,
                                       charges_1, charges_2,
@@ -98,7 +175,7 @@ def _esp_comparison_jax(points_1: Array,
                         probe_radius: float = 1.0,
                         lam: float = 0.001
                         ) -> Array:
-    """ 
+    """
     Helper function for computing the electrostatic potential (ESP) component of ShaEP score.
     It computes the difference in ESP at surface/observer points of molecule 1 for the ESP values
     generated by molecule 1 and molecule 2. It masks out observer points if they are in
@@ -112,21 +189,21 @@ def _esp_comparison_jax(points_1: Array,
     centers_w_H_2 : Array (M + m_H, 3)
         Coordinates for atoms (including hydrogens) of molecule 2. Used in calculation of ESP at
         points_1 and masking out those within molecule 2's volume.
-    
+
     partial_charges_2 : Array (M + m_H,)
         Partial charges corresponding to centers_w_H_2. Used to calculate ESP.
 
     points_charges_1 : Array (N_surf,)
         Precalculated ESP's of molecule 1 corresponding to points_1.
-    
+
     radii_2 : Array (M + m_H,)
         Radii of each atom corresponding to centers_w_H_2. Used for masking operation.
-    
+
     probe_radius : float (default = 1.0)
         Probe radius (default is 1 angstrom). Surfaces assumed to be generated with vdW radius and
         a probe radius of 1.2 angstroms (vdW radius of hydrogen). 1.0 used rather than 1.2 as a
         tolerance.
-    
+
     lam : float (default = 0.001)
         Electrostatic potential weighting parameter (smaller = higher weight).
         0.001 was chosen as default based empirical observations of the distribution of scores
@@ -181,26 +258,26 @@ def esp_combo_score_jax(centers_w_H_1: Array,
         Coordinates of points for molecule 1 used to compute shape similarity.
         Use atom centers for volumentric similarity. Use surface centers for surface similarity.
         Same for centers except (M, 3) or (m_surf, 3).
-    
+
     points_1 : Array (n_surf, 3)
         Coordinates of surface points for molecule 1.
         Same for points_2 except (m_surf, 3).
-    
+
     partial_charges_1 : Array (N + n_H,)
         Partial charges corresponding to the atoms in centers_w_H_1.
         Same for partial_charges_2 except (M + m_H,).
-    
+
     point_charges_1 : Array (n_surf,)
         The electrostatic potential calculated at each surface point (points_1).
         Same for point_charges_1 except (m_surf,)
-    
+
     radii_1 : Array (N + n_H,)
         vdW radii corresponding to the atoms in centers_w_H_1 (angstroms)
         Same for radii_2 except (M + m_H,)
-    
+
     alpha : float
         Gaussian width parameter used for shape similarity.
-    
+
     lam : float (default = 0.001)
         Electrostatic potential weighting parameter (smaller = higher weight).
         0.001 was chosen as default based empirical observations of the distribution of scores
@@ -210,18 +287,17 @@ def esp_combo_score_jax(centers_w_H_1: Array,
         Surface points found within vdW radii + probe radius will be masked out. Surface generation
         uses a probe radius of 1.2 (radius of hydrogen) so we use a slightly lower radius for be
         more tolerant.
-    
+
     esp_weight : float (default = 0.5)
         Weight to be placed on electrostatic similarity with respect to shape similarity.
         0 = only shape similarity
         1 = only electrostatic similarity
-    
+
     Returns
     -------
     Array (1,)
         Similarity score (range: [0, 1]). Higher is more similar.
     """
-
     # Calculate the difference in ESP at the surface of molecule 1
     #   Expects hydrogens for the centers
     esp_1 = _esp_comparison_jax(points_1, centers_w_H_2, partial_charges_2, point_charges_1, radii_2, probe_radius, lam)

@@ -180,7 +180,7 @@ def get_volume_overlap_score_extended_points_np(ptype_str: str,
                                                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Score both the anchor and extended point volume overlap instead of a vector similarity.
-    """    
+    """
     ptype_str = ptype_str.lower()
     ptype_idx = P_TYPES_LWRCASE.index(ptype_str)
     VAB, VAA, VBB = 0., 0., 0.
@@ -190,17 +190,23 @@ def get_volume_overlap_score_extended_points_np(ptype_str: str,
         VAB, VAA, VBB = 0., 0., 0.
     elif len(mask_inds_1) == 0:
         VAB, VAA = 0., 0.
-        VBB = _compute_fit_overlap_np(overlap_func=VAB_2nd_order_np,
-                                        anchors_2=anchors_2[mask_inds_2],
-                                        alpha = P_ALPHAS[ptype_str])
+        if not only_extended:
+            VBB = _compute_fit_overlap_np(overlap_func=VAB_2nd_order_np,
+                                            anchors_2=anchors_2[mask_inds_2],
+                                            alpha = P_ALPHAS[ptype_str])
+        else:
+            VBB = 0.
         VBB += _compute_fit_overlap_np(overlap_func=VAB_2nd_order_np,
                                         anchors_2=vectors_2[mask_inds_2]+anchors_2[mask_inds_2],
                                         alpha = P_ALPHAS[ptype_str])
     elif len(mask_inds_2) == 0:
         VAB, VBB = 0., 0.
-        VAA = _compute_ref_overlap_np(overlap_func=VAB_2nd_order_np,
-                                        anchors_1=anchors_1[mask_inds_1],
-                                        alpha = P_ALPHAS[ptype_str])
+        if not only_extended:
+            VAA = _compute_ref_overlap_np(overlap_func=VAB_2nd_order_np,
+                                            anchors_1=anchors_1[mask_inds_1],
+                                            alpha = P_ALPHAS[ptype_str])
+        else:
+            VAA = 0.
         VAA += _compute_ref_overlap_np(overlap_func=VAB_2nd_order_np,
                                         anchors_1=vectors_1[mask_inds_1]+anchors_1[mask_inds_1],
                                         alpha = P_ALPHAS[ptype_str])
@@ -281,7 +287,7 @@ def get_overlap_pharm_np(ptype_1: np.ndarray,
     elif similarity.lower() == 'tversky_fit':
         similarity_func = partial(tversky_func_np, sigma=0.05)
     else:
-        raise ValueError(f'Argument `similarity` must be one of (tanimoto, tversky, tversky_ref, tversky_fit).')
+        raise ValueError('Argument `similarity` must be one of (tanimoto, tversky, tversky_ref, tversky_fit).')
 
     # Determine if single instance or batched
     if len(ptype_1.shape) == 1 and len(ptype_2.shape) == 1:
@@ -407,17 +413,27 @@ def get_overlap_pharm_np(ptype_1: np.ndarray,
         overlap += VAB
         ref_overlap += VAA
         fit_overlap += VBB
-    
+
     # Halogen
     if 'halogen' in ptype_key2ind:
-        VAB, VAA, VBB = get_vector_volume_overlap_score_np(ptype_str='halogen',
-                                                           ptype_1=ptype_1,
-                                                           ptype_2=ptype_2,
-                                                           anchors_1=anchors_1,
-                                                           anchors_2=anchors_2,
-                                                           vectors_1=vectors_1,
-                                                           vectors_2=vectors_2,
-                                                           allow_antiparallel=False)
+        if extended_points:
+            VAB, VAA, VBB = get_volume_overlap_score_extended_points_np(ptype_str='halogen',
+                                                                        ptype_1=ptype_1,
+                                                                        ptype_2=ptype_2,
+                                                                        anchors_1=anchors_1,
+                                                                        anchors_2=anchors_2,
+                                                                        vectors_1=vectors_1,
+                                                                        vectors_2=vectors_2,
+                                                                        only_extended=only_extended)
+        else:
+            VAB, VAA, VBB = get_vector_volume_overlap_score_np(ptype_str='halogen',
+                                                               ptype_1=ptype_1,
+                                                               ptype_2=ptype_2,
+                                                               anchors_1=anchors_1,
+                                                               anchors_2=anchors_2,
+                                                               vectors_1=vectors_1,
+                                                               vectors_2=vectors_2,
+                                                               allow_antiparallel=False)
         overlap += VAB
         ref_overlap += VAA
         fit_overlap += VBB
@@ -450,7 +466,7 @@ def get_pharm_combo_score(centers_1: np.ndarray,
     elif similarity.lower() == 'tversky_fit':
         similarity_func = partial(tversky_func_np, sigma=0.05)
     else:
-        raise ValueError(f'Argument `similarity` must be one of (tanimoto, tversky, tversky_ref, tversky_fit).')
+        raise ValueError('Argument `similarity` must be one of (tanimoto, tversky, tversky_ref, tversky_fit).')
 
     # Pharmacophore scoring
     pharm_score = get_overlap_pharm_np(ptype_1=ptype_1,

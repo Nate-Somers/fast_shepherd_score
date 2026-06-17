@@ -442,7 +442,7 @@ def batch_pharm_overlap_with_transform(
     VAB, VAA, VBB : torch.Tensor (B,)
         Overlap scores
     """
-    from ..alignment_utils.fast_common import apply_se3_transform, apply_so3_transform
+    from ..alignment.utils.fast_common import apply_se3_transform, apply_so3_transform
 
     # Transform fit molecule
     anchors_2_t = apply_se3_transform(anchors_2, q, t)
@@ -476,7 +476,7 @@ def batch_pharm_cross_overlap_with_transform(
     """
     Compute cross-overlap VAB after applying SE(3) transform to fit molecule.
     """
-    from ..alignment_utils.fast_common import apply_se3_transform, apply_so3_transform
+    from ..alignment.utils.fast_common import apply_se3_transform, apply_so3_transform
 
     anchors_2_t = apply_se3_transform(anchors_2, q, t)
     vectors_2_t = apply_so3_transform(vectors_2, q)

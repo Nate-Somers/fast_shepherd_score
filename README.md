@@ -1,4 +1,18 @@
 # *ShEPhERD* Scoring Functions
+
+<div align="center">
+
+[![PyPI version](https://img.shields.io/pypi/v/shepherd-score.svg)](https://pypi.org/project/shepherd-score/)
+[![Python versions](https://img.shields.io/pypi/pyversions/shepherd-score.svg)](https://pypi.org/project/shepherd-score/)
+[![Documentation Status](https://readthedocs.org/projects/shepherd-score/badge/?version=latest)](https://shepherd-score.readthedocs.io/en/latest/?badge=latest)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/coleygroup/shepherd-score)
+
+
+📄 **[Paper](https://arxiv.org/abs/2411.04130)** | 📚 **[Documentation](https://shepherd-score.readthedocs.io/en/latest/)** | 📦 **[PyPI](https://pypi.org/project/shepherd-score/)**
+
+</div>
+
+
 This repository contains the code for **generating/optimizing conformers**, **extracting interaction profiles**, **aligning interaction profiles**, and **differentiably scoring 3D similarity**. It also contains modules to evaluate conformers generated with *ShEPhERD*<sup>1</sup> and other generative models.
 
 The formulation of the interaction profile representation, scoring, alignment, and evaluations are found in our preprint [*ShEPhERD*: Diffusing shape, electrostatics, and pharmacophores for bioisosteric drug design](https://arxiv.org/abs/2411.04130). The diffusion model itself is found in a *separate* repository: [https://github.com/coleygroup/shepherd](https://github.com/coleygroup/shepherd).
@@ -11,105 +25,116 @@ The formulation of the interaction profile representation, scoring, alignment, a
 <sub><sup>1</sup> *ShEPhERD*: **S**hape, **E**lectrostatics, and **Ph**armacophores **E**xplicit **R**epresentation **D**iffusion</sub>
 
 ## Table of Contents
-1. [File Structure](#file-structure)
-2. [Requirements](#requirements)
+1. [Documentation](#documentation)
+2. [File Structure](#file-structure)
 3. [Installation](#installation)
-4. [Usage](#how-to-use)
-5. [Scoring and Alignment Examples](#scoring-and-alignment-examples)
-6. [Evaluation Examples and Scripts](#evaluation-examples-and-scripts)
-7. [Data](#data)
+4. [Requirements](#requirements)
+5. [Usage](#how-to-use)
+6. [Scoring and Alignment Examples](#scoring-and-alignment-examples)
+7. [Evaluation Examples and Scripts](#evaluation-examples-and-scripts)
+8. [Data](#data)
+
+## Documentation
+
+Full documentation is available at [shepherd-score.readthedocs.io](https://shepherd-score.readthedocs.io/en/latest/).
 
 
 ## File Structure
 ```
 .
 ├── shepherd_score/
-│   ├── alignment_utils/                    # Alignment and rigid transformations tools
-│   │   ├── pca.py
-│   │   └── se3.py
-│   ├── evaluations/                        # Evaluation suite
-│   │   ├── pdbs/
-│   │   ├── utils/
-│   │   │   ├── convert_data.py
-│   │   │   └── interactions.py
-│   │   ├── docking.py                      # Docking evaluations
-│   │   └── evaluate.py                     # Generated conformer evaluation pipelines
-│   ├── pharm_utils/
-│   │   ├── pharmacophore.py
-│   │   ├── pharm_vec.py
-│   │   └── smarts_featues.fdef             # Pharmacophore definitions
-│   ├── score/                              # Scoring related functions and constants
+│   ├── alignment/                        # Alignment package with PyTorch, JAX, and utilities
+│   │   ├── utils/                        # SE(3) and PCA utilities (torch, numpy, jax)
+│   │   │   ├── se3*.py                   # SE(3) transformations (torch, numpy, jax)
+│   │   │   └── pca*.py                   # Principal component alignment (torch, numpy, jax)
+│   │   ├── _torch.py                     # PyTorch alignment algorithms (autograd)
+│   │   ├── _torch_analytical.py          # PyTorch alignment algorithms (analytical gradients)
+│   │   ├── _jax.py                       # JAX alignment algorithms
+│   │   └── _jax_parallel.py              # JAX parallel alignment algorithms
+│   ├── alignment_jax.py                  # Backwards compatibility shim
+│   ├── evaluations/                      # Evaluation suite
+│   │   ├── pdbs/                         # PDBQT files used in *ShEPhERD* manuscript
+│   │   ├── utils/                        # Converting data types and others
+│   │   ├── docking
+│   │   │   ├── docking.py                # Docking classes
+│   │   │   └── pipelines.py              # Docking evaluation pipelines
+│   │   └── evaluate/                     # Generated conformer evaluation pipelines
+│   │       ├── evals.py                  # Individual evaluation classes
+│   │       └── pipelines.py              # Evaluation pipeline classes
+│   ├── pharm_utils/                      # Pharmacophore definitions
+│   ├── protonation/                      # Functions for protonation
+│   ├── score/                            # Scoring related functions and constants
+│   │   ├── analytical_gradients/         # Analytical gradient implementations
+│   │   │   └── _torch.py                 # PyTorch analytical gradients for shape, ESP, pharmacophore
 │   │   ├── constants.py
 │   │   ├── electrostatic_scoring.py
 │   │   ├── gaussian_overlap.py
 │   │   └── pharmacophore_scoring.py
-│   ├── alignment.py
-│   ├── conformer_generation.py             # Conformer generation with rdkit and xtb
-│   ├── container.py                        # Molecule and MoleculePair classes
-│   ├── extract_profiles.py                 # Functions to extract interaction profiles
+│   ├── conformer_generation.py           # RDKit and xtb related functions for conformers
+│   ├── container/                        # Molecule, MoleculePair, MoleculePairBatch classes
+│   ├── extract_profiles.py               # Functions to extract interaction profiles
 │   ├── generate_point_cloud.py
-│   ├── objective.py                        # Objective function used for REINVENT
-│   └── visualize.py                        # Visualization tools
-├── scripts/                                # Scripts for running evaluations
-├── examples/                               # Jupyter notebook tutorials/examples 
+│   ├── objective.py                      # Objective function used for REINVENT
+│   └── visualize.py                      # Visualization tools
+├── scripts/                              # Scripts for running evaluations
+├── examples/                             # Jupyter notebook tutorials/examples
 ├── tests/
-├── environment.yml                         # Environment
 └── README.md
 ```
 
 
-## Requirements
-An example environment can be found at `environment.yml`, however, this package should generally work where PyTorch, Open3D, RDKit, and xTB can be installed in an environment with Python >=3.8.
-
-#### Minimum requirements for interaction profile extraction, scoring/alignment, and evaluations
-```
-python>=3.8
-numpy>1.2,<2.0
-pytorch>=1.12
-mkl==2024.0 (use conda)
-open3d>=0.18
-rdkit>=2023.03 (newest available is recommended)
-xtb>=6.6 (use conda)
-scipy>=1.10
-pandas>=2.0
-```
-
-<sup>Make sure that mkl is *not* 2024.1 since there is a known [issue](https://github.com/pytorch/pytorch/issues/123097) that prevents importing torch.</sup>
-
-#### If you are coming from the *ShEPhERD* repository, you can use the same environment as described there and add the optional packages listed below, if needed.
-
-
-#### Optional software necessary for docking evaluation
-```
-meeko
-vina==1.2.5
-```
-You can pip install the python bindings for Autodock Vina for the python interface. However, this also requires an installation of the executable of Autodock Vina v1.2.5: [https://vina.scripps.edu/downloads/](https://vina.scripps.edu/downloads/) and the ADFR software suite: [https://ccsb.scripps.edu/adfr/implementation/](https://ccsb.scripps.edu/adfr/implementation/).
-
-#### Other optional packages
-```
-jax==0.4.26
-jaxlib==0.4.26+cuda12.cudnn89
-optax==0.2.2
-py3dmol>=2.1.0
-biopython>=1.84
-prolif>=2.0.3
-mdanalysis>=2.2.0
-scikit-learn>=1.3
-```
-
 ## Installation
-### via PyPI
-`pip install shepherd-score`
 
-### For local development (includes `examples/`, `tests/`, etc.)
-1. Clone this repo
-2. Navigate to this repo's top-level directory
-3. Set up the environment following the instructions above
-4. Run `pip install -e .` for developer install
+### Via PyPI
+```bash
+pip install shepherd-score
+```
+
+#### Install xTB
+xTB will need to be installed manually since there are no PyPi bindings. This can be done in a conda environment, but since this approach has been reported to lead to conflicts, we suggest installing 
+from [source](https://xtb-docs.readthedocs.io/en/latest/setup.html) and adding it to `PATH`.
+### With optional dependencies
+```bash
+# JAX support (for faster scoring and alignment)
+pip install "shepherd-score[jax]"
+
+# Include docking evaluation tools
+pip install "shepherd-score[docking]"
+
+# Everything
+pip install "shepherd-score[all]"
+```
+
+### For local development
+```bash
+git clone https://github.com/coleygroup/shepherd-score.git
+cd shepherd-score
+pip install -e ".[all]"
+```
+
+## Requirements
+
+This package works where PyTorch, Open3D, RDKit, and xTB can be installed for Python >=3.9. **If you are coming from the *ShEPhERD* repository, you can use the same environment as described there.**
+Core dependencies (installed automatically) which enables interaction profile extraction, scoring/alignment, and evaluations are listed below.
+```
+python>=3.9
+numpy
+torch>=1.12
+open3d>=0.18
+rdkit>=2023.03
+pandas>=2.0
+scipy>=1.10
+```
+
+> **Note**: If using `torch<=2.4`, ensure that `mkl==2024.0` with conda since there is a known [issue](https://github.com/pytorch/pytorch/issues/123097) that prevents importing torch.
+
+#### Docking with Autodock Vina
+Installing `shepherd-score[docking]` will automatically install the python bindings for Autodock Vina for the python interface. However, a manual installation of the executable of Autodock Vina v1.2.5 is required and can be found here: [https://vina.scripps.edu/downloads/](https://vina.scripps.edu/downloads/).
 
 ## Usage
-The package has base functions and convenience wrappers. Scoring can be done with either NumPy or Torch, but alignment requires Torch. There are also Jax implementations for both scoring and alignment of gaussian overlap and ESP similarity, but currently *not* for pharmacophores.
+The package has base functions and convenience wrappers. Scoring can be done with either NumPy or Torch, but alignment requires Torch. There are also Jax implementations for both scoring and alignment of gaussian overlap, ESP similarity, and pharmacophore similarity.
+
+**Update 8/20/25**: Applicable xTB functions and evaluation pipeline evaluations are now parallelizable through the `num_workers` argument in the `.evaluate` method.
 
 ### Base functions
 #### Conformer generation
@@ -136,6 +161,8 @@ Useful conformer generation functions are found in the `shepherd_score.conformer
     - `shepherd_score.container.Molecule` accepts an RDKit `Mol` object (with an associated conformer) and generates user-specified interaction profiles
 - `MoleculePair` class
     - `shepherd_score.container.MoleculePair` operates on `Molecule` objects and prepares them for scoring and alignment
+- `MoleculePairBatch` class
+    - `shepherd_score.container.MoleculePairBatch` operates on a list of `MoleculePair` objects and enables accelerated alignment by padding all arrays to a common shape so a single compiled JAX kernel is reused across every pair. Supports optional multi-CPU parallelism.
 
 
 ## Scoring and Alignment Examples
@@ -207,7 +234,7 @@ pharm_score = mp.score_with_pharm()
 ```
 
 ### Alignment
-Next we show alignment using the same MoleculePair class.
+Next we show alignment using the same `MoleculePair` class.
 
 ```python
 # Centers the two molecules' COM's to the origin
@@ -230,6 +257,20 @@ mp.transform_{surf/esp/pharm}
 transformed_fit_molec = mp.get_transformed_molecule(
     se3_transform=mp.transform_{surf/esp/pharm}
 )
+```
+
+Alignment of multiple `MoleculePair` objects can be accelerated with `MoleculePairBatch` with Jax installed.
+
+```python
+from shepherd_score.container import MoleculePairBatch
+
+batch = MoleculePairBatch(pairs)  # `pairs` is a list of MoleculePair objects
+
+# accelerated JAX-based volumetric alignment via padding
+scores, aligned = batch.align_with_vol()
+
+# Multi-CPU parallel via shard_map (must set XLA_FLAGS *before* importing JAX)
+scores, aligned = batch.align_with_vol(num_workers=4, num_buckets=4, use_shmap=True)
 ```
 
 ## Evaluation Examples and Scripts
@@ -265,7 +306,7 @@ conf_eval = ConfEval(atoms=atom_array, positions=position_array)
 uncond_pipe = UnconditionalEvalPipeline(
     generated_mols = [(a, p) for a, p in zip(atom_arrays, position_arrays)]
 )
-uncond_pipe.evaluate()
+uncond_pipe.evaluate(num_workers=4)
 
 # Properties are stored as attributes and can be converted into pandas df's
 sample_df, global_series = uncond_pipe.to_pandas()
@@ -285,14 +326,12 @@ This project is licensed under the MIT License -- see [LICENSE](./LICENSE) file 
 If you use or adapt `shepherd_score` or [*ShEPhERD*](https://github.com/coleygroup/shepherd) in your work, please cite us:
 
 ```bibtex
-@misc{adamsShEPhERD2024,
-  title = {{{ShEPhERD}}: {{Diffusing}} Shape, Electrostatics, and Pharmacophores for Bioisosteric Drug Design},
-  author = {Adams, Keir and Abeywardane, Kento and Fromer, Jenna and Coley, Connor W.},
-  year = {2024},
-  number = {arXiv:2411.04130},
-  eprint = {2411.04130},
-  publisher = {arXiv},
-  doi = {10.48550/arXiv.2411.04130},
-  archiveprefix = {arXiv}
+@inproceedings{
+adams2025shepherd,
+title={Sh{EP}h{ERD}: Diffusing shape, electrostatics, and pharmacophores for bioisosteric drug design},
+author={Keir Adams and Kento Abeywardane and Jenna Fromer and Connor W. Coley},
+booktitle={The Thirteenth International Conference on Learning Representations},
+year={2025},
+url={https://openreview.net/forum?id=KSLkFYHlYg}
 }
 ```

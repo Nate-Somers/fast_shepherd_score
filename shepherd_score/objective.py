@@ -5,10 +5,11 @@ molecules.
 
 from typing import Union, Optional, List, Tuple
 import os
+from tqdm import tqdm
 
 import numpy as np
 from rdkit import Chem
-import open3d # imported because sometimes order matters
+import open3d # noqa: F401 (imported because sometimes order matters)
 import torch
 
 from shepherd_score.container import Molecule, MoleculePair
@@ -17,7 +18,7 @@ from shepherd_score.score import gaussian_tanimoto as get_overlap # CHANGED
 from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
 from shepherd_score.score.electrostatic_scoring import get_overlap_esp
 from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
-from shepherd_score.alignment_utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
+from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.conformer_generation import embed_conformer_from_smiles, optimize_conformer_with_xtb
 from shepherd_score.conformer_generation import generate_opt_conformers, generate_opt_conformers_xtb, charges_from_single_point_conformer_with_xtb
 from shepherd_score.score.constants import ALPHA
@@ -74,7 +75,7 @@ class GeneralObjective:
             self.num_points = None
         else:
             self.alpha = ALPHA(self.num_points) if self.num_points is not None else None
-        
+
         self.lam = 0.1 if self.use_vol else 0.3
 
         self.pharm_multi_vector = pharm_multi_vector
@@ -83,7 +84,7 @@ class GeneralObjective:
 
         self.sim_score_distr_with_resample = np.array([1.])
         self.sim_score_upper_bound = 1.
-        
+
         if self.representation == 'shape':
             pass
         elif self.representation in ('electrostatics', 'esp'):
@@ -94,7 +95,7 @@ class GeneralObjective:
             raise ValueError(f'Please enter a valid key for `rep`. "{rep}" was given')
 
         if self.representation in ('shape', 'esp') and self.num_points is None and not self.use_vol:
-            raise ValueError(f'Either `use_vol` must be True or `num_points` must be supplied for surface point cloud.')
+            raise ValueError('Either `use_vol` must be True or `num_points` must be supplied for surface point cloud.')
         if self.representation == 'pharm' and self.pharm_multi_vector is None:
             raise ValueError(f'`pharm_multi_vector` must be supplied for surface point cloud. {pharm_multi_vector} was given.')
 
@@ -118,7 +119,7 @@ class GeneralObjective:
             try:
                 ref_mol.GetConformer()
                 has_conformer = True
-            except:
+            except Exception:
                 has_conformer = False
 
             if not has_conformer:
@@ -145,11 +146,11 @@ class GeneralObjective:
             self.ref_molec = Molecule(mol=ref_mol,
                                       num_surf_points=self.num_points,
                                       partial_charges=self.ref_partial_charges)
-        
+
         elif self.representation == 'pharm':
             self.ref_molec = Molecule(mol=ref_mol,
                                       pharm_multi_vector=self.pharm_multi_vector)
-        
+
         if self.representation in ('shape', 'esp') and not self.use_vol:
             self.sim_score_distr_with_resample = self.resampling_surf_scores()
             self.sim_score_upper_bound = max(self.sim_score_distr_with_resample)
@@ -212,7 +213,7 @@ class GeneralObjective:
                     ).cpu().numpy()
                 else:
                     score_distr[i] = get_overlap_esp_np(
-                        centers_1=self.ref_molec.surf_pos, 
+                        centers_1=self.ref_molec.surf_pos,
                         centers_2=molec.surf_pos,
                         charges_1=self.ref_molec.surf_esp,
                         charges_2=molec.surf_esp,
@@ -276,7 +277,7 @@ class GeneralObjective:
                                         trans_init=trans_init,
                                         use_jax=use_jax)
                 score = molec_pair.sim_aligned_esp
-        
+
         elif self.representation == 'pharm':
             molec_pair.align_with_pharm(similarity='tanimoto',
                                         extended_points=False,
@@ -338,9 +339,9 @@ class GeneralObjective:
             fit_partial_charges = []
             for m in fit_mols:
                 fit_partial_charges.append(charges_from_single_point_conformer_with_xtb(
-                    conformer=m, 
-                    solvent=self.solvent, 
-                    num_cores=self.num_processes, 
+                    conformer=m,
+                    solvent=self.solvent,
+                    num_cores=self.num_processes,
                     temp_dir=TMPDIR
                 ))
 
@@ -386,13 +387,13 @@ class GeneralObjective:
                                              num_conformers=num_conformers,
                                              trans_init=trans_init,
                                              use_jax=use_jax))
-                except:
+                except Exception:
                     scores.append(-1.)
 
             self.buffer[smi] = scores[-1] # store {smiles : score}
 
         return scores
-    
+
 
 
 class Objective:
@@ -437,7 +438,7 @@ class Objective:
 
         self.num_points = num_points
         self.alpha = ALPHA(self.num_points)
-        
+
         self.lam = 0.3
 
         self.pharm_multi_vector = pharm_multi_vector
@@ -481,14 +482,14 @@ class Objective:
                              probe_radius=self.ref_molec.probe_radius,
                              partial_charges=self.ref_molec.partial_charges)
             esp_score_distr[i] = get_overlap_esp_np(
-                centers_1=self.ref_molec.surf_pos, 
+                centers_1=self.ref_molec.surf_pos,
                 centers_2=molec.surf_pos,
                 charges_1=self.ref_molec.surf_esp,
                 charges_2=molec.surf_esp,
                 alpha=self.alpha,
                 lam=self.lam
             )
-        
+
         pharm_score = get_overlap_pharm_np(self.ref_molec.pharm_types, self.ref_molec.pharm_types,
                                          self.ref_molec.pharm_ancs, self.ref_molec.pharm_ancs,
                                          self.ref_molec.pharm_vecs, self.ref_molec.pharm_vecs,
@@ -598,15 +599,15 @@ class Objective:
             if self.xtb_opt:
                 charge = Chem.GetFormalCharge(Chem.MolFromSmiles(smiles))
                 fit_mols, _, fit_partial_charges = generate_opt_conformers_xtb(
-                    smiles, charge=charge, MMFF_optimize=True, verbose=False, num_confs=num_conformers
+                    smiles, charge=charge, MMFF_optimize=True, verbose=False, num_confs=num_conformers, temp_dir=TMPDIR
                 )
             else:
                 fit_mols = generate_opt_conformers(smiles, MMFF_optimize=True, verbose=False, num_confs=num_conformers)
                 fit_partial_charges = []
                 for m in fit_mols:
                     fit_partial_charges.append(charges_from_single_point_conformer_with_xtb(
-                        conformer=m, 
-                        solvent=self.solvent, 
+                        conformer=m,
+                        solvent=self.solvent,
                         num_cores=self.num_processes,
                         charge=charge,
                         temp_dir=TMPDIR
@@ -627,7 +628,8 @@ class Objective:
                        smiles: List[str],
                        num_conformers: int = 5,
                        trans_init: bool = False,
-                       use_jax: bool = False) -> List[float]:
+                       use_jax: bool = False,
+                       verbose=False) -> List[float]:
         """
         Aligns and scores multiple fit SMILES.
 
@@ -644,19 +646,24 @@ class Objective:
         List[float] : similarity scores. Returns a value of -1 if Objective.score fails for any reason.
         """
         scores = []
-        for smi in smiles:
+        if verbose:
+            pbar = tqdm(smiles, total=len(smiles))
+        else:
+            pbar = smiles
+        for smi in pbar:
             try:
                 # Canonicalize smiles
                 smi = Chem.CanonSmiles(smi)
-            except:
+            except Exception:
                 # if not a valid smiles skip
                 scores.append(-1.)
-                self.buffer[smi] = scores[-1]
+                self.buffer[smi] = {'esp': None,
+                                    'pharm': None}
                 continue
 
             if smi in self.buffer:
                 # skip if we've already computed it
-                scores.append(self.buffer[smi])
+                scores.append(self.buffer[smi]['esp'] + self.buffer[smi]['pharm'])
             else:
                 try:
                     esp_score, pharm_score = self.score(
@@ -666,8 +673,10 @@ class Objective:
                         use_jax=use_jax
                     )
                     scores.append(esp_score + pharm_score)
-                except:
+                except Exception:
                     scores.append(-1.)
+                    esp_score = None
+                    pharm_score = None
 
             self.buffer[smi] = {'esp': esp_score,
                                 'pharm': pharm_score}

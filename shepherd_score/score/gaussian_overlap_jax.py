@@ -1,4 +1,4 @@
-""" 
+"""
 Gaussian volume overlap scoring functions -- Shape-only (i.e., not color)
 JAX VERSION (~ 6x faster than numpy)
 
@@ -10,6 +10,7 @@ https://doi.org/10.1021/j100011a016
 """
 from jax import jit, Array
 import jax.numpy as jnp
+import jax
 
 
 ###################################################################################################
@@ -22,12 +23,12 @@ def jax_cdist(X_1: Array,
               ) -> Array:
     """
     Jax implementation pairwise euclidian distances.
-    
+
     Parameters
     ----------
     X_1 : Array (N, P)
     X_2 : Array (M, P)
-    
+
     Returns
     -------
     Array (N, M)
@@ -42,12 +43,12 @@ def jax_sq_cdist(X_1: Array,
                  ) -> Array:
     """
     Jax implementation pairwise SQUARED euclidian distances.
-    
+
     Parameters
     ----------
     X_1 : Array (N, P)
     X_2 : Array (M, P)
-    
+
     Returns
     -------
     Array (N, M)
@@ -81,6 +82,21 @@ def get_overlap_jax(centers_1: Array,
     tanimoto = shape_tanimoto_jax(centers_1, centers_2, alpha)
     return tanimoto
 
+@jit
+def get_max_overlap_jax(centers_1: Array, centers_2: Array, alpha: float) -> Array:
+    """ Maximum overlap volume among any pair of centers (always in [0, 1] range)."""
+    R2 = jax_sq_cdist(centers_1, centers_2)
+
+    return jnp.max(jnp.exp(-(alpha / 2) * R2))
+
+@jit
+def get_linear_hard_sphere_overlap_jax(centers_1: Array, centers_2: Array, min_dist: float) -> Array:
+    """Compute linear hard sphere overlap .
+
+    See get_linear_hard_sphere_overlap_np for details.
+    """
+    dists = jax_cdist(centers_1, centers_2)
+    return jnp.sum(jax.nn.relu((min_dist - dists) / min_dist))
 
 @jit
 def _mask_prod_jax(mask_1: Array, mask_2: Array):
@@ -117,3 +133,76 @@ def get_overlap_jax_mask(centers_1: Array,
     """ Compute ROCS Gaussian volume overlap using jitted jax function. """
     tanimoto = shape_tanimoto_jax_mask(centers_1, centers_2, mask_1, mask_2, alpha)
     return tanimoto
+
+
+def _VAB_2nd_order_cosine_jax(centers_1: Array,
+                              centers_2: Array,
+                              vectors_1: Array,
+                              vectors_2: Array,
+                              alpha: float,
+                              allow_antiparallel: bool,
+                              ) -> Array:
+    """
+    2nd order volume overlap of AB weighted by cosine similarity (JAX version) - implementation part.
+    """
+    R2 = jax_sq_cdist(centers_1, centers_2)  # (N1, N2)
+    term_common = (jnp.pi**1.5) / ((2 * alpha)**1.5)
+
+    # Normalize vectors
+    vec1_norm = vectors_1 / jnp.linalg.norm(vectors_1, axis=-1, keepdims=True)
+    vec2_norm = vectors_2 / jnp.linalg.norm(vectors_2, axis=-1, keepdims=True)
+
+    # Cosine similarity: (N1, N2)
+    V2_sim = jnp.dot(vec1_norm, vec2_norm.T)
+
+    V2_sim = jax.lax.cond(
+        allow_antiparallel,
+        lambda x: jnp.abs(x),    # True branch
+        lambda x: jnp.clip(x, 0., 1.),  # False branch
+        V2_sim
+    )
+    V2_weighted = (V2_sim + 2.) / 3.
+
+    VAB_second_order = jnp.sum(term_common *
+                               V2_weighted *  # REMOVED .T : V2_weighted is (N1,N2), R2 is (N1,N2)
+                               jnp.exp(-(alpha / 2) * R2))
+    return VAB_second_order
+
+VAB_2nd_order_cosine_jax = jit(_VAB_2nd_order_cosine_jax, static_argnames=["allow_antiparallel"])
+
+
+def _VAB_2nd_order_cosine_jax_mask(centers_1: Array,
+                                   centers_2: Array,
+                                   vectors_1: Array,
+                                   vectors_2: Array,
+                                   mask_1: Array,
+                                   mask_2: Array,
+                                   alpha: float,
+                                   allow_antiparallel: bool,
+                                   ) -> Array:
+    """
+    2nd order volume overlap of AB weighted by cosine similarity (JAX version) - implementation part.
+    Vectors are assumed to be normalized.
+    """
+    R2 = jax_sq_cdist(centers_1, centers_2)  # (N1, N2)
+    M2 = _mask_prod_jax(mask_1, mask_2)
+    term_common = (jnp.pi**1.5) / ((2 * alpha)**1.5)
+
+    # Cosine similarity: (N1, N2)
+    V2_sim = jnp.dot(vectors_1, vectors_2.T)
+
+    V2_sim = jax.lax.cond(
+        allow_antiparallel,
+        lambda x: jnp.abs(x),    # True branch
+        lambda x: jnp.clip(x, 0., 1.),  # False branch
+        V2_sim
+    )
+    V2_weighted = (V2_sim + 2.) / 3.
+
+    VAB_second_order = jnp.sum(term_common *
+                                 M2 *
+                                 V2_weighted *
+                                 jnp.exp(-(alpha / 2) * R2))
+    return VAB_second_order
+
+VAB_2nd_order_cosine_jax_mask = jit(_VAB_2nd_order_cosine_jax_mask, static_argnames=["allow_antiparallel"])
