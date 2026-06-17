@@ -604,7 +604,7 @@ class MoleculePair:
         if not pairs:
             return
 
-        from .score.constants import LAM_SCALING
+        from shepherd_score.score.constants import LAM_SCALING
         from shepherd_score.alignment.utils.fast_esp_se3 import fast_optimize_ROCS_esp_overlay_batch
 
         device = pairs[0].device

@@ -1,4 +1,5 @@
 import torch, math
+import torch.nn.functional as F
 from ...score.gaussian_overlap_triton import overlap_score_grad_se3_batch, fused_adam_qt, _batch_self_overlap
 from .._torch import objective_ROCS_overlay
 from typing import Optional
