@@ -5,6 +5,7 @@ MoleculePair class facilitates alignment with interaction profiles.
 from typing import Union, List, Optional, Tuple
 from copy import deepcopy
 import sys
+import os
 
 import numpy as np
 import rdkit.Chem as Chem
@@ -41,6 +42,75 @@ def _band_key(n: int) -> int:
 # ---- persistent, per-process caches (reused across calls) -------------------
 _ALIGN_WORKSPACES: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
 _INT_BUFFER_CACHE: dict[int, dict[str, torch.Tensor]] = {}
+
+# Measured fine-loop footprint (bytes per pair) keyed by (mode, N_pad, M_pad,
+# num_seeds). Lets the sub-batcher size each bucket's chunk to the GPU.
+_PAIR_FOOTPRINT_BYTES: dict[tuple, int] = {}
+# Set env SUBBATCH_DEBUG=1 to print the chosen chunk size per bucket.
+_SUBBATCH_DEBUG = bool(os.environ.get("SUBBATCH_DEBUG"))
+
+
+def _subbatched_align(process, K: int, *, key: tuple,
+                      safety: float = 0.7, init_cap: int = 1024):
+    """Drive ``process(start, count) -> (scores, q, t)`` over ``K`` independent
+    pairs in GPU-memory-safe sub-batches and concatenate the per-pair results.
+
+    Because pairs are independent (each result is its own max over seeds),
+    chunking + concatenation is *exactly equivalent* to one big call -- it only
+    bounds peak memory, so it never changes a score.
+
+    Sizing is dynamic and per-bucket: bytes-per-pair is measured from the fine
+    loop's peak allocation and cached per ``key=(mode, N_pad, M_pad, num_seeds)``
+    (so a band-112 / pharm bucket -- whose footprint grows ~quadratically with
+    pad size -- gets a much smaller chunk than a cheap band-32 surf bucket). Each
+    chunk is sized so its peak stays under ``safety`` x (free device memory +
+    torch's reusable cache). A previously-unseen shape starts at ``init_cap``
+    pairs, then grows once calibrated; an OOM halves the chunk and retries. Off
+    CUDA (or if a single pair won't fit) it just calls ``process`` once.
+    """
+    if not torch.cuda.is_available():
+        return process(0, K)
+
+    def _budget() -> float:
+        free, _ = torch.cuda.mem_get_info()
+        reusable = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        return safety * (free + max(0, reusable))
+
+    fp = _PAIR_FOOTPRINT_BYTES.get(key)
+    need_resize = fp is None
+    K_sub = max(1, min(K, int(_budget() // fp))) if fp else min(K, init_cap)
+    if _SUBBATCH_DEBUG:
+        print(f"[subbatch] key={key} K={K} init_fp={fp} K_sub0={K_sub} "
+              f"free={torch.cuda.mem_get_info()[0]//(1024*1024)}MiB", flush=True)
+
+    sc_parts, q_parts, t_parts = [], [], []
+    s = 0
+    while s < K:
+        k = min(K_sub, K - s)
+        try:
+            torch.cuda.reset_peak_memory_stats()
+            sc, q, t = process(s, k)
+            peak = int(torch.cuda.max_memory_allocated())
+            fp_meas = max(1, -(-peak // k))                      # ceil bytes/pair
+            _PAIR_FOOTPRINT_BYTES[key] = max(_PAIR_FOOTPRINT_BYTES.get(key, 0), fp_meas)
+            sc_parts.append(sc); q_parts.append(q); t_parts.append(t)
+            s += k
+            if need_resize:   # first success -> we now know the real footprint
+                fp = _PAIR_FOOTPRINT_BYTES[key]
+                remaining = K - s
+                if remaining > 0:
+                    K_sub = max(1, min(remaining, int(_budget() // fp)))
+                need_resize = False
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            # Some OOMs surface as a plain RuntimeError; only treat those as OOM.
+            if not isinstance(exc, torch.cuda.OutOfMemoryError) \
+                    and "out of memory" not in str(exc).lower():
+                raise
+            torch.cuda.empty_cache()
+            if k <= 1:
+                raise
+            K_sub = max(1, k // 2)
+    return torch.cat(sc_parts), torch.cat(q_parts), torch.cat(t_parts)
 
 def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) -> Chem.Mol:
     """
@@ -347,7 +417,7 @@ class MoleculePair:
         self.sim_aligned_pharm = None
 
     @staticmethod
-    def align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 75):
+    def align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 100):
         """
         Batched alignment with workspace reuse & reduced per-pair transfers.
         """
@@ -426,10 +496,14 @@ class MoleculePair:
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
             VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
 
-            # ---- coarse + fine alignment ---------------------------------------
-            scores, q_batch, t_batch = coarse_fine_align_many(
-                ref_pad, fit_pad, VAA, VBB,
-                N_real=N_real, M_real=M_real, alpha=alpha, steps_fine=steps_fine)
+            # ---- coarse + fine alignment, in GPU-memory-safe sub-batches -------
+            def _proc(_s, _k):
+                sl = slice(_s, _s + _k)
+                return coarse_fine_align_many(
+                    ref_pad[sl], fit_pad[sl], VAA[sl], VBB[sl],
+                    N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine)
+            scores, q_batch, t_batch = _subbatched_align(
+                _proc, K, key=("vol", N_pad, M_pad, 50))
 
             all_pairs.extend(bucket)
             all_scores.append(scores)
@@ -447,7 +521,7 @@ class MoleculePair:
             p.sim_aligned_vol_noH = float(s)
 
     @staticmethod
-    def align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 75):
+    def align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 100):
         """
         Batched alignment over *surface point clouds* using Gaussian-overlap
         surface similarity (ROCS-style), modeled after `align_batch_vol`.
@@ -563,10 +637,15 @@ class MoleculePair:
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
             VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
 
-            # ---- coarse + fine alignment (same engine as volumetric) --------------
-            scores, q_batch, t_batch = coarse_fine_align_many(
-                ref_pad, fit_pad, VAA, VBB,
-                N_real=N_real, M_real=M_real, alpha=alpha, steps_fine=steps_fine)
+            # ---- coarse + fine alignment (same engine as volumetric), processed in
+            # GPU-memory-safe sub-batches sized per bucket (pairs are independent)
+            def _proc(_s, _k):
+                sl = slice(_s, _s + _k)
+                return coarse_fine_align_many(
+                    ref_pad[sl], fit_pad[sl], VAA[sl], VBB[sl],
+                    N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine)
+            scores, q_batch, t_batch = _subbatched_align(
+                _proc, K, key=("surf", N_pad, M_pad, 50))
 
             all_pairs.extend(bucket)
             all_scores.append(scores)
@@ -592,7 +671,7 @@ class MoleculePair:
         num_repeats: int = 50,
         num_repeats_per_trans: int = 10,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075,
     ) -> None:
         """
@@ -718,22 +797,22 @@ class MoleculePair:
                     trans_centers_batch[i] = p._ref_xyz_t
                 trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
 
-            _, q_batch, t_batch, scores = fast_optimize_ROCS_esp_overlay_batch(
-                ref_pad,
-                fit_pad,
-                ref_c_pad,
-                fit_c_pad,
-                alpha=alpha,
-                lam=lam_scaled,
-                N_real=N_real,
-                M_real=M_real,
-                trans_centers_batch=trans_centers_batch,
-                trans_centers_real=trans_centers_real,
-                num_repeats_per_trans=num_repeats_per_trans,
-                topk=topk,
-                steps_fine=steps_fine,
-                lr=lr,
-            )
+            # GPU-memory-safe sub-batching per bucket (independent pairs).
+            def _proc(_s, _k):
+                sl = slice(_s, _s + _k)
+                tcb = trans_centers_batch[sl] if trans_centers_batch is not None else None
+                tcr = trans_centers_real[sl] if trans_centers_real is not None else None
+                _, q, t, sc = fast_optimize_ROCS_esp_overlay_batch(
+                    ref_pad[sl], fit_pad[sl], ref_c_pad[sl], fit_c_pad[sl],
+                    alpha=alpha, lam=lam_scaled,
+                    N_real=N_real[sl], M_real=M_real[sl],
+                    trans_centers_batch=tcb, trans_centers_real=tcr,
+                    num_repeats_per_trans=num_repeats_per_trans,
+                    topk=topk, steps_fine=steps_fine, lr=lr,
+                )
+                return sc, q, t
+            scores, q_batch, t_batch = _subbatched_align(
+                _proc, K, key=("esp", N_pad, M_pad, 50))
 
             all_pairs.extend(bucket)
             all_scores.append(scores)
@@ -760,7 +839,7 @@ class MoleculePair:
         num_repeats: int = 50,
         num_repeats_per_trans: int = 10,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075,
     ) -> None:
         """
@@ -964,7 +1043,7 @@ class MoleculePair:
         trans_init: bool = False,
         num_repeats: int = 50,
         topk: int = 30,
-        steps_fine: int = 75,
+        steps_fine: int = 100,
         lr: float = 0.075,
     ):
         """
@@ -1071,26 +1150,25 @@ class MoleculePair:
             trans_centers_batch = ref_ancs if trans_init else None
             trans_centers_real = N_real if trans_init else None
 
-            _, _, q_batch, t_batch, scores = fast_optimize_pharm_overlay_batch(
-                ref_types,
-                fit_types,
-                ref_ancs,
-                fit_ancs,
-                ref_vecs,
-                fit_vecs,
-                similarity=similarity,
-                extended_points=extended_points,
-                only_extended=only_extended,
-                num_repeats=num_repeats,
-                trans_centers_batch=trans_centers_batch,
-                trans_centers_real=trans_centers_real,
-                num_repeats_per_trans=10,
-                N_real=N_real,
-                M_real=M_real,
-                topk=topk,
-                steps_fine=steps_fine,
-                lr=lr,
-            )
+            # GPU-memory-safe sub-batching per bucket (independent pairs). Pharm's
+            # analytical fine loop has the largest (~N_pad*M_pad) footprint, so
+            # this is where the dynamic cap matters most.
+            def _proc(_s, _k):
+                sl = slice(_s, _s + _k)
+                tcb = trans_centers_batch[sl] if trans_centers_batch is not None else None
+                tcr = trans_centers_real[sl] if trans_centers_real is not None else None
+                _, _, q, t, sc = fast_optimize_pharm_overlay_batch(
+                    ref_types[sl], fit_types[sl], ref_ancs[sl], fit_ancs[sl],
+                    ref_vecs[sl], fit_vecs[sl],
+                    similarity=similarity, extended_points=extended_points,
+                    only_extended=only_extended, num_repeats=num_repeats,
+                    trans_centers_batch=tcb, trans_centers_real=tcr,
+                    num_repeats_per_trans=10, N_real=N_real[sl], M_real=M_real[sl],
+                    topk=topk, steps_fine=steps_fine, lr=lr,
+                )
+                return sc, q, t
+            scores, q_batch, t_batch = _subbatched_align(
+                _proc, K, key=("pharm", N_pad, M_pad, num_repeats))
 
             all_pairs.extend(bucket)
             all_scores.append(scores)
