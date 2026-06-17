@@ -126,6 +126,38 @@ def test_bucketing_counts():
 # ---------------------------------------------------------------------------
 # Runner smoke (no timing assertions)
 # ---------------------------------------------------------------------------
+@pytest.mark.slow
+def test_multidevice_shmap_simulated():
+    """Exercise the multi-GPU shard_map path on N *simulated* devices.
+
+    Runs in a subprocess so the ``XLA_FLAGS`` device-count override is applied
+    before JAX is imported (and so it does not perturb the device count seen by
+    the rest of the test session).  This validates the exact code that would run
+    on a real multi-GPU host -- only the device kind differs.
+    """
+    import os
+    import subprocess
+    import sys
+
+    try:
+        import jax  # noqa: F401
+    except Exception:
+        pytest.skip("JAX not installed")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ)
+    env["SIM_DEVICES"] = "4"
+    # ensure the subprocess can import the top-level `benchmarks` package
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-m", "benchmarks.validate_multigpu"],
+        cwd=repo_root, env=env, capture_output=True, text=True, timeout=900,
+    )
+    out = proc.stdout + "\n" + proc.stderr
+    assert "platform=cpu devices=4" in out, out
+    assert "MULTI-DEVICE VALIDATION OK" in out, out
+
+
 def test_runner_smoke():
     from benchmarks.alignment_bench.runner import run_matrix, to_markdown
     results = run_matrix(modes=("vol",), n_pairs=4, uniform_size=14,

@@ -410,6 +410,51 @@ class _FastBatch(Backend):
                              n_buckets=n_buckets)
 
 
+class _JaxShmapMultiDevice(Backend):
+    """Many pairs across **multiple devices** via JAX ``shard_map``.
+
+    On a multi-GPU host this shards the pair axis across the GPUs; on a single
+    device it is skipped (sharding over one device is just the single-device
+    path).  To validate the multi-device code path on a 1-GPU/CPU box, launch a
+    fresh process with ``JAX_PLATFORMS=cpu`` and
+    ``XLA_FLAGS=--xla_force_host_platform_device_count=N`` set before import --
+    see ``benchmarks/validate_multigpu.py``.
+    """
+
+    granularity = "multi"
+    name = "gpu_multi_jax_shmap"
+
+    def __init__(self):
+        # device label is resolved lazily (depends on the JAX platform present)
+        self.device = "multi"
+
+    def available(self):
+        # Route through jax_shmap so its no-preallocate env defaults are applied
+        # before JAX initialises (lets JAX coexist with torch/Triton on the GPU).
+        from benchmarks.alignment_bench import jax_shmap
+        n = jax_shmap.jax_device_count()
+        if n == 0:
+            return False, "JAX not importable"
+        if n <= 1:
+            return False, f"need >1 JAX device (found {n}); set XLA_FLAGS to simulate"
+        self.device = f"{jax_shmap.jax_platform()}x{n}"
+        return True, ""
+
+    def prepare(self, cohort: Cohort, cfg: BenchConfig):
+        from benchmarks.alignment_bench import jax_shmap
+        if cohort.mode not in jax_shmap.SUPPORTED:
+            raise ValueError(f"jax_shmap unsupported mode {cohort.mode}")
+        state = jax_shmap.prepare_inputs(cohort.mode, cohort, cfg)
+        return (state, cfg)
+
+    def run(self, state) -> BackendOutput:
+        from benchmarks.alignment_bench import jax_shmap
+        st, cfg = state
+        scores = jax_shmap.run(st, cfg)
+        return BackendOutput(scores=scores,
+                             extra={"n_devices": st["n_dev"], "total_padded": st["total"]})
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -423,6 +468,7 @@ def all_backends() -> List[Backend]:
         _TorchSingle("cuda", analytical=False),
         _FastSingle(),
         _FastBatch(),
+        _JaxShmapMultiDevice(),     # multi-GPU (auto-skips unless >1 device)
     ]
 
 

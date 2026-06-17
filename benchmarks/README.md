@@ -33,7 +33,7 @@ runs except multi-GPU, which needs >1 device).
 | `gpu_single_torch` | GPU | single | torch autograd on CUDA |
 | `gpu_single_fast` | GPU | single | Triton fast optimiser (`fast_optimize_*`) |
 | `gpu_multi_batch` | GPU | multi (batched) | container `align_batch_*` with size bucketing |
-| *multi-GPU* | GPU×N | multi-device | JAX `shard_map` — **only runs with >1 device** |
+| `gpu_multi_jax_shmap` | GPU×N | multi-device | JAX `shard_map` across devices — **auto-skips unless >1 device** |
 
 "single" = one pair per call (latency); "multi" = many pairs processed together
 (throughput).  Both are summarised as **pairs/s** so they are directly
@@ -143,9 +143,29 @@ No timing is asserted (machine dependent) — speed lives in the benchmark repor
   `shepherd_score.container.Molecule` objects from SMILES (via
   `conformer_generation` + xTB + Open3D surfaces) and bins them by heavy-atom
   count into uniform/mixed cohorts. The rest of the harness is unchanged.
-* **Multi-GPU.** Add a backend wrapping `shepherd_score.alignment._jax_parallel`
-  `optimize_*_shmap`; it should report `available() == False` unless
-  `len(jax.devices()) > 1`.
+* **Multi-GPU** is implemented (`gpu_multi_jax_shmap`, in
+  `alignment_bench/jax_shmap.py`) on top of
+  `shepherd_score.alignment._jax_parallel`'s `shard_map` kernels. It shards the
+  pair axis across `jax.devices()` (the GPUs on a multi-GPU host) and supports
+  `vol`/`surf`/`esp`/`pharm`. It auto-skips when only one device is visible.
+
+  **Run it on real GPUs:** nothing special — JAX shards across every visible
+  GPU; restrict with `CUDA_VISIBLE_DEVICES`. The backend disables JAX VRAM
+  preallocation so it coexists with the torch/Triton backends.
+
+  **Validate it without a multi-GPU box:** JAX can fork N virtual CPU devices,
+  exercising the identical shard_map code path. The env vars must be set before
+  JAX imports, so it runs as its own entry point:
+
+  ```
+  SIM_DEVICES=4 python -m benchmarks.validate_multigpu     # simulate 4 devices
+  python  -m benchmarks.validate_multigpu --real           # use real devices
+  ```
+
+  `tests/test_alignment_backends.py::test_multidevice_shmap_simulated` runs this
+  in a subprocess as part of CI. On a real multi-GPU host, drop
+  `gpu_multi_jax_shmap` into a normal `run_alignment_benchmark` run and it will
+  participate automatically.
 
 ## Layout
 
