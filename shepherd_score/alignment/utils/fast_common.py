@@ -282,6 +282,18 @@ def batched_seeds_torch(A_batch: torch.Tensor,
 
     N_real = N_real.to(device)
     M_real = M_real.to(device)
+
+    # Match _initialize_se3_params seed-count semantics: num_repeats==1 is a
+    # single identity seed; 1<num_repeats<5 is bumped to 5 (so the 4 PCA seeds
+    # always fit). Everything >=5 is identity + 4 PCA + (num_seeds-5) Fibonacci.
+    if num_seeds == 1:
+        q = torch.zeros(A_batch.shape[0], 1, 4, device=device, dtype=dtype)
+        q[:, :, 0] = 1.0
+        t = torch.zeros(A_batch.shape[0], 1, 3, device=device, dtype=dtype)
+        return q, t
+    if num_seeds < 5:
+        num_seeds = 5
+
     mask_n = (torch.arange(Npad, device=device)[None] < N_real[:, None]).to(dtype)
     mask_m = (torch.arange(Mpad, device=device)[None] < M_real[:, None]).to(dtype)
     nreal = mask_n.sum(1).clamp(min=1.0)
@@ -336,8 +348,10 @@ def batched_seeds_torch(A_batch: torch.Tensor,
     identity[:, :, 0] = 1.0
     if num_seeds == 50:
         fibo = _get_45_fibo().to(device=device, dtype=dtype)
-    else:
+    elif num_seeds > 5:
         fibo = _quats_from_fibo(num_seeds - 5).to(device=device, dtype=dtype)
+    else:  # num_seeds == 5 -> identity + 4 PCA only, no Fibonacci
+        fibo = identity.new_zeros(0, 4)
     fibo_b = fibo.unsqueeze(0).expand(K, -1, -1)                    # (K, num_seeds-5, 4)
 
     quats = torch.cat([identity, pca_quats, fibo_b], dim=1)        # (K, num_seeds, 4)

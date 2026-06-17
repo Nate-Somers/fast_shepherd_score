@@ -281,10 +281,6 @@ def coarse_fine_align_many(
         score = VAB / denom
         scale = VAA_plus_VBB / (denom * denom)
 
-        # Tangent-space projection
-        radial = (dQ * q_k).sum(dim=1, keepdim=True)
-        dQ_tan = dQ - q_k * radial
-
         better = score > best_score  # boolean mask, no .any()
 
         # Masked assignment (no host branch)
@@ -307,9 +303,12 @@ def coarse_fine_align_many(
                 no_improve_count = 0
                 prev_max_score = current_max
 
-        fused_adam_qt(
+        # Tangent-space projection is fused into the Adam kernel (raw dQ in);
+        # algebraically identical to projecting -dQ_tan*scale since `scale` is a
+        # per-row scalar and the projection is linear.
+        fused_adam_qt_with_tangent_proj(
             q_k, t_k,
-            -dQ_tan * scale.unsqueeze(1),
+            -dQ * scale.unsqueeze(1),
             -dT * scale.unsqueeze(1),
             m_q, v_q, m_t, v_t, lr
         )
