@@ -18,6 +18,21 @@ from .fast_common import (
     quaternion_to_rotation_matrix
 )
 
+# Analytical (autograd-free) pharmacophore value+gradient, reused from the
+# upstream analytical-gradients module. Used to drive the fine loop without
+# building a per-step autograd graph (only valid for un-padded inputs; the
+# padded batch path keeps the autograd fallback).
+from ...score.analytical_gradients import (
+    compute_overlap_and_grad_pharm,
+    compute_self_overlaps_pharm,
+    apply_tanimoto_chain_rule,
+    apply_tversky_chain_rule,
+    project_grad_R_to_quaternion,
+    _rotation_matrix_from_unit_quat,
+)
+
+_PHARM_SIGMA_MAP = {'tversky': 0.95, 'tversky_ref': 1.0, 'tversky_fit': 0.05}
+
 
 def coarse_fine_pharm_align_many(
         anchors_1: torch.Tensor,
@@ -195,33 +210,78 @@ def coarse_fine_pharm_align_many(
     prev_max_score = -float('inf')
     no_improve_count = 0
 
-    for step in range(steps_fine):
-        q_var = q_param.detach().requires_grad_(True)
-        t_var = t_param.detach().requires_grad_(True)
-
-        VAB = batch_pharm_cross_overlap_with_transform(
-            anchors_1_k,
-            anchors_2_k,
-            vectors_1_k,
-            vectors_2_k,
-            types_1_k,
-            types_2_k,
-            q_var,
-            t_var,
-            extended_points=extended_points,
-            only_extended=only_extended,
-            N_real=N_k,
-            M_real=M_k,
+    # Use the analytical (autograd-free) gradient when there is no padding
+    # (single-pair path and equal-size buckets). The analytical overlap has no
+    # N_real/M_real masking, so padded batches keep the autograd path.
+    use_analytical = bool((N_k == N_pad).all() and (M_k == M_pad).all())
+    if use_analytical:
+        # Self-overlaps consistent with the analytical cross-overlap (mixing the
+        # fast typed self-overlap with the analytical cross-overlap would make the
+        # Tanimoto ratio inconsistent and collapse the score). Self-overlap is the
+        # overlap of a molecule with itself under the identity transform; computed
+        # batched over the (topk-expanded) rows once (pose-invariant).
+        _P = anchors_1_k.shape[0]
+        _I3 = torch.eye(3, device=device, dtype=anchors_1_k.dtype).expand(_P, 3, 3)
+        _z = torch.zeros(_P, 3, device=device, dtype=anchors_1_k.dtype)
+        VAA_an, _, _ = compute_overlap_and_grad_pharm(
+            _I3, _z, types_1_k, types_1_k, anchors_1_k, anchors_1_k, vectors_1_k, vectors_1_k,
+            extended_points=extended_points, only_extended=only_extended,
         )
-        score = pharm_similarity_from_overlaps(VAB, VAA_k, VBB_k, similarity=similarity)
-        loss = -score.sum()
+        VBB_an, _, _ = compute_overlap_and_grad_pharm(
+            _I3, _z, types_2_k, types_2_k, anchors_2_k, anchors_2_k, vectors_2_k, vectors_2_k,
+            extended_points=extended_points, only_extended=only_extended,
+        )
 
-        dQ, dT = torch.autograd.grad(loss, (q_var, t_var), create_graph=False)
+    for step in range(steps_fine):
+        if use_analytical:
+            # One fused value+grad pass, no autograd graph, no per-step host sync.
+            q_unit = torch.nn.functional.normalize(q_param, dim=1)
+            R = _rotation_matrix_from_unit_quat(q_unit)
+            O_AB, grad_R, grad_t = compute_overlap_and_grad_pharm(
+                R, t_param, types_1_k, types_2_k,
+                anchors_1_k, anchors_2_k, vectors_1_k, vectors_2_k,
+                extended_points=extended_points, only_extended=only_extended,
+            )
+            score = pharm_similarity_from_overlaps(O_AB, VAA_an, VBB_an, similarity=similarity)
+            if similarity == 'tanimoto':
+                _, sgrad_R, sgrad_t = apply_tanimoto_chain_rule(O_AB, VAA_an + VBB_an, grad_R, grad_t)
+            else:
+                sigma = _PHARM_SIGMA_MAP[similarity]
+                D = sigma * VAA_an + (1.0 - sigma) * VBB_an
+                _, sgrad_R, sgrad_t = apply_tversky_chain_rule(O_AB, D, grad_R, grad_t)
+            # grad w.r.t. unit quat -> raw quat (normalisation Jacobian); this
+            # already lies in the tangent space, so the projection below is a no-op.
+            grad_q_unit = project_grad_R_to_quaternion(sgrad_R, q_unit)
+            qn = q_param.norm(dim=1, keepdim=True).clamp(min=1e-12)
+            dQ = (grad_q_unit - q_unit * (q_unit * grad_q_unit).sum(1, keepdim=True)) / qn
+            dT = sgrad_t
+        else:
+            q_var = q_param.detach().requires_grad_(True)
+            t_var = t_param.detach().requires_grad_(True)
 
-        # Track best
+            VAB = batch_pharm_cross_overlap_with_transform(
+                anchors_1_k,
+                anchors_2_k,
+                vectors_1_k,
+                vectors_2_k,
+                types_1_k,
+                types_2_k,
+                q_var,
+                t_var,
+                extended_points=extended_points,
+                only_extended=only_extended,
+                N_real=N_k,
+                M_real=M_k,
+            )
+            score = pharm_similarity_from_overlaps(VAB, VAA_k, VBB_k, similarity=similarity)
+            loss = -score.sum()
+
+            dQ, dT = torch.autograd.grad(loss, (q_var, t_var), create_graph=False)
+
+        # Track best (use the detached score so no autograd graph is retained)
         score_det = score.detach()
         better = score_det > best_score
-        best_score = torch.where(better, score, best_score)
+        best_score = torch.where(better, score_det, best_score)
         mask_q = better.unsqueeze(1)
         best_q = torch.where(mask_q, q_param, best_q)
         best_t = torch.where(mask_q, t_param, best_t)
@@ -237,9 +297,10 @@ def coarse_fine_pharm_align_many(
                 no_improve_count = 0
                 prev_max_score = current_max
 
-        # Tangent-space projection for quaternion
-        radial = (dQ * q_var).sum(dim=1, keepdim=True)
-        dQ_tan = dQ - q_var * radial
+        # Tangent-space projection for quaternion (q_param is ~unit; for the
+        # analytical branch dQ is already tangent so this is a no-op).
+        radial = (dQ * q_param).sum(dim=1, keepdim=True)
+        dQ_tan = dQ - q_param * radial
 
         # Adam update (using fused kernel for efficiency)
         fused_adam_qt(q_param, t_param, dQ_tan.detach(), dT.detach(), m_q, v_q, m_t, v_t, lr)
