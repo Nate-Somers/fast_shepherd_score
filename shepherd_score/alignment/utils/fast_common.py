@@ -167,6 +167,9 @@ def legacy_seeds_torch(ref_xyz: torch.Tensor,
 
     # Move back to caller's device/dtype
     se3 = se3.to(dtype=ref_xyz.dtype, device=ref_xyz.device)
+    # _initialize_se3_params returns (7,) for num_repeats==1; normalise to (R, 7)
+    if se3.dim() == 1:
+        se3 = se3.unsqueeze(0)
     q, t = se3[:, :4], se3[:, 4:]
     return F.normalize(q, dim=1), t
 
@@ -198,6 +201,8 @@ def legacy_seeds_with_translations_torch(
     )
 
     se3 = se3.to(dtype=ref_xyz.dtype, device=ref_xyz.device)
+    if se3.dim() == 1:
+        se3 = se3.unsqueeze(0)
     q, t = se3[:, :4], se3[:, 4:]
     return F.normalize(q, dim=1), t
 

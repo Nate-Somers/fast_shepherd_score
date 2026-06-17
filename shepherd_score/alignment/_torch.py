@@ -658,7 +658,7 @@ def optimize_ROCS_esp_overlay(ref_points: torch.Tensor,
                               lr: float = 0.1,
                               max_num_steps: int = 200,
                               verbose: bool = False,
-                              use_fast: bool = True,
+                              use_fast: bool = False,
                               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Optimize alignment of fit_points with respect to ref_points using SE(3) transformations and
@@ -905,7 +905,7 @@ def optimize_esp_combo_score_overlay(ref_centers_w_H: torch.Tensor,
                                      lr: float = 0.1,
                                      max_num_steps: int = 200,
                                      verbose: bool = False,
-                                     use_fast: bool = True,
+                                     use_fast: bool = False,
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Optimize alignment using ESP combo score.
@@ -1188,7 +1188,7 @@ def optimize_pharm_overlay(ref_pharms: torch.Tensor,
                            lr: float = 0.1,
                            max_num_steps: int = 200,
                            verbose: bool = False,
-                           use_fast: bool = True,
+                           use_fast: bool = False,
                            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Optimize alignment of fit_anchors with respect to ref_anchors using SE(3) transformations and

@@ -17,18 +17,13 @@ from .constants import P_TYPES, P_ALPHAS
 # Lowercase type names for indexing
 P_TYPES_LOWER = tuple(map(str.lower, P_TYPES))
 
-# Pre-compute alpha array for GPU indexing
-# Order matches P_TYPES: Acceptor, Donor, Aromatic, Hydrophobe, Halogen, Cation, Anion, ZnBinder
-ALPHA_VALUES = torch.tensor([
-    P_ALPHAS['acceptor'],   # 0
-    P_ALPHAS['donor'],      # 1
-    P_ALPHAS['aromatic'],   # 2
-    P_ALPHAS['hydrophobe'], # 3
-    P_ALPHAS['halogen'],    # 4
-    P_ALPHAS['cation'],     # 5
-    P_ALPHAS['anion'],      # 6
-    P_ALPHAS['znbinder'],   # 7
-], dtype=torch.float32)
+# Pre-compute alpha array for GPU indexing.
+# Built directly from P_TYPES so it stays in sync if pharmacophore types are
+# added/removed upstream (e.g. the 'Dummy' type). Order matches P_TYPES.
+ALPHA_VALUES = torch.tensor(
+    [P_ALPHAS[name] for name in P_TYPES_LOWER],
+    dtype=torch.float32,
+)
 
 # Types that use vector cosine weighting
 VECTOR_TYPES = {2, 0, 1, 4}  # aromatic, acceptor, donor, halogen
