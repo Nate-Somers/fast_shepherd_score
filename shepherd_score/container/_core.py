@@ -468,9 +468,12 @@ class MoleculePair:
         • p.sim_aligned_surf    ← best Tanimoto surface score (float)
         """
 
-        # --- workspace caches keyed by (N_pad, M_pad) ---
-        _ALIGN_WORKSPACES: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
-        _INT_BUFFER_CACHE: dict[int, dict[str, torch.Tensor]] = {}
+        # Reuse the persistent, per-process workspace/int-buffer caches (same
+        # ref/fit scratch-buffer layout as align_batch_vol). The previous local
+        # re-declarations here shadowed the module globals, so the surf path
+        # never reused workspaces across calls. Buffers are zeroed before use,
+        # so cross-call (and cross-modality) reuse is safe.
+        global _ALIGN_WORKSPACES, _INT_BUFFER_CACHE
 
         if not pairs:
             return

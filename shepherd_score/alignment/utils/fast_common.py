@@ -207,6 +207,161 @@ def legacy_seeds_with_translations_torch(
     return F.normalize(q, dim=1), t
 
 
+def _fallback_quats(num: int, device, dtype) -> torch.Tensor:
+    """Deterministic set of 'reasonable' rotations (matches fast_se3._fallback_quats)."""
+    import math
+    s2 = math.sqrt(0.5)
+    base = torch.tensor([
+        [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0], [s2, s2, 0.0, 0.0], [s2, 0.0, s2, 0.0],
+        [s2, 0.0, 0.0, s2], [0.0, s2, s2, 0.0], [0.0, s2, 0.0, s2],
+        [0.0, 0.0, s2, s2],
+    ], device=device, dtype=dtype)
+    if base.size(0) >= num:
+        q = base[:num].clone()
+    else:
+        reps = (num + base.size(0) - 1) // base.size(0)
+        q = base.repeat(reps, 1)[:num].clone()
+    return F.normalize(q, dim=1)
+
+
+def _masked_principal_axes(points: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Per-row principal axes (rows = axes, longest first) computed over the
+    REAL (unmasked) points only.
+
+    points : (K, P, 3)   mask : (K, P) in {0,1}
+    Returns (K, 3, 3). Division by N is omitted because it scales eigenvalues
+    uniformly and does not change eigenvectors or their ordering. Padding rows
+    are zeroed after centering so they contribute nothing to the inertia tensor.
+    """
+    n = mask.sum(1).clamp(min=1.0)                                  # (K,)
+    com = (points * mask.unsqueeze(-1)).sum(1) / n.unsqueeze(-1)    # (K,3)
+    centered = (points - com.unsqueeze(1)) * mask.unsqueeze(-1)     # (K,P,3)
+    A = (centered ** 2).sum((1, 2))                                 # (K,)
+    Bmat = torch.bmm(centered.transpose(1, 2), centered)            # (K,3,3)
+    eye = torch.eye(3, device=points.device, dtype=points.dtype)
+    inertia = A.view(-1, 1, 1) * eye - Bmat                         # (K,3,3)
+    _, eigvecs = torch.linalg.eigh(inertia)                         # ascending eigenvalues
+    return torch.flip(eigvecs, (2,)).transpose(1, 2)               # rows = descending axes
+
+
+def batched_seeds_torch(A_batch: torch.Tensor,
+                        B_batch: torch.Tensor,
+                        N_real: torch.Tensor,
+                        M_real: torch.Tensor,
+                        num_seeds: int = 50) -> Tuple[torch.Tensor, torch.Tensor]:
+    """GPU-native, fully batched replacement for the per-pair seed loop.
+
+    Produces the SAME seed set as calling ``_initialize_se3_params`` per pair
+    (identity + 4 principal-component-alignment quaternions + Fibonacci-sampled
+    rotations, all with COM-aligning translations), but for the whole cohort in
+    one vectorized pass with NO ``.cpu()``/numpy round-trip. The principal-axis
+    PCA is done in float64 (numpy uses float64) for near-degenerate stability.
+
+    Pairs with < 3 real points or non-finite coordinates fall back to a fixed
+    deterministic rotation set + COM-to-COM translation (matching the per-pair
+    fallback in ``fast_se3._legacy_seeds_torch``).
+
+    Parameters
+    ----------
+    A_batch, B_batch : (K, Npad, 3) / (K, Mpad, 3)  padded coordinates
+    N_real, M_real   : (K,)  true point counts
+    num_seeds        : int   number of base seeds per pair (default 50)
+
+    Returns
+    -------
+    quats : (K, num_seeds, 4)   t : (K, num_seeds, 3)
+    """
+    from shepherd_score.alignment._torch import _get_45_fibo, _quats_from_fibo
+
+    device = A_batch.device
+    dtype = A_batch.dtype
+    K = A_batch.shape[0]
+    Npad = A_batch.shape[1]
+    Mpad = B_batch.shape[1]
+
+    N_real = N_real.to(device)
+    M_real = M_real.to(device)
+    mask_n = (torch.arange(Npad, device=device)[None] < N_real[:, None]).to(dtype)
+    mask_m = (torch.arange(Mpad, device=device)[None] < M_real[:, None]).to(dtype)
+    nreal = mask_n.sum(1).clamp(min=1.0)
+    mreal = mask_m.sum(1).clamp(min=1.0)
+
+    ref_com = (A_batch * mask_n.unsqueeze(-1)).sum(1) / nreal.unsqueeze(-1)   # (K,3)
+    fit_com = (B_batch * mask_m.unsqueeze(-1)).sum(1) / mreal.unsqueeze(-1)   # (K,3)
+
+    # ---- 4 principal-component-alignment quaternions per pair (float64) ----
+    A64 = torch.nan_to_num(A_batch.double())
+    B64 = torch.nan_to_num(B_batch.double())
+    mask_n64 = mask_n.double()
+    mask_m64 = mask_m.double()
+
+    ref_axes = _masked_principal_axes(A64, mask_n64)                 # (K,3,3)
+    ref_axes4 = ref_axes.unsqueeze(1).repeat(1, 4, 1, 1)            # (K,4,3,3)
+    ref_axes4[:, 1, 0] = -ref_axes4[:, 1, 0]                         # flip longest
+    ref_axes4[:, 2, 1] = -ref_axes4[:, 2, 1]                         # flip 2nd-longest
+    ref_axes4[:, 3, 0] = -ref_axes4[:, 3, 0]                         # flip both
+    ref_axes4[:, 3, 1] = -ref_axes4[:, 3, 1]
+    ref_axes_f = ref_axes4.reshape(4 * K, 3, 3)
+
+    fit_c = (B64 - fit_com.double().unsqueeze(1)) * mask_m64.unsqueeze(-1)
+    fit4 = fit_c.unsqueeze(1).repeat(1, 4, 1, 1).reshape(4 * K, Mpad, 3)
+    mask_m4 = mask_m64.unsqueeze(1).repeat(1, 4, 1).reshape(4 * K, Mpad)
+
+    quat_order = [None, None]
+    for ax in range(2):
+        fit_axes = _masked_principal_axes(fit4, mask_m4)            # (4K,3,3)
+        v1 = fit_axes[:, ax]                                        # (4K,3)
+        v2 = ref_axes_f[:, ax]                                      # (4K,3)
+        cos = torch.clamp((v1 * v2).sum(1, keepdim=True), -1.0, 1.0)
+        angle = torch.acos(cos)                                    # (4K,1)
+        axis = torch.linalg.cross(v1, v2, dim=1)                   # (4K,3)
+        axis_norm = axis.norm(dim=1, keepdim=True)
+        # Degenerate (parallel/antiparallel) axes -> safe default [1,0,0]; these
+        # few seeds are non-optimal but recovered by the Fibonacci seeds + the
+        # coarse grid + fine optimisation (validated by the score-parity gate).
+        axis = torch.where(axis_norm < 1e-8,
+                           torch.tensor([1.0, 0.0, 0.0], dtype=axis.dtype, device=device),
+                           axis / axis_norm.clamp(min=1e-12))
+        half = angle * 0.5
+        q = torch.cat([torch.cos(half), axis * torch.sin(half)], dim=1)  # (4K,4)
+        quat_order[ax] = q
+        R = quaternion_to_rotation_matrix(q)                       # (4K,3,3)
+        fit4 = torch.einsum('kni,kji->knj', fit4, R) * mask_m4.unsqueeze(-1)
+
+    pca_quats = quat_mul(quat_order[1], quat_order[0]).reshape(K, 4, 4).to(dtype)
+
+    # ---- identity + Fibonacci seeds (Fibonacci set is fixed across pairs) ----
+    identity = torch.zeros(K, 1, 4, device=device, dtype=dtype)
+    identity[:, :, 0] = 1.0
+    if num_seeds == 50:
+        fibo = _get_45_fibo().to(device=device, dtype=dtype)
+    else:
+        fibo = _quats_from_fibo(num_seeds - 5).to(device=device, dtype=dtype)
+    fibo_b = fibo.unsqueeze(0).expand(K, -1, -1)                    # (K, num_seeds-5, 4)
+
+    quats = torch.cat([identity, pca_quats, fibo_b], dim=1)        # (K, num_seeds, 4)
+    quats = F.normalize(quats, p=2, dim=-1)
+
+    # ---- translations: t = ref_com - R(q) @ fit_com  (COM alignment) ----
+    R_all = quaternion_to_rotation_matrix(quats.reshape(-1, 4)).reshape(K, num_seeds, 3, 3)
+    rot_fit_com = torch.einsum('ksij,kj->ksi', R_all, fit_com)
+    trans = ref_com.unsqueeze(1) - rot_fit_com                     # (K, num_seeds, 3)
+
+    # ---- fallback for degenerate pairs (< 3 pts / non-finite) ----
+    valid = ((N_real >= 3) & (M_real >= 3)
+             & torch.isfinite(A_batch).all(dim=2).all(dim=1)
+             & torch.isfinite(B_batch).all(dim=2).all(dim=1))
+    if not bool(valid.all()):
+        fb_q = _fallback_quats(num_seeds, device, dtype).unsqueeze(0).expand(K, -1, -1)
+        fb_t = (ref_com - fit_com).unsqueeze(1).expand(-1, num_seeds, -1)
+        vmask = valid.view(K, 1, 1)
+        quats = torch.where(vmask, quats, fb_q)
+        trans = torch.where(vmask, trans, fb_t)
+
+    return quats, trans
+
+
 def build_coarse_grid(A_batch: torch.Tensor,
                       B_batch: torch.Tensor,
                       N_real: torch.Tensor,
@@ -272,15 +427,8 @@ def build_coarse_grid(A_batch: torch.Tensor,
 
         return torch.stack(qs, dim=0), torch.stack(ts, dim=0)
 
-    # Generate seeds for each pair
-    qs, ts = [], []
-    for i in range(BATCH):
-        q_i, t_i = legacy_seeds_torch(
-            A_batch[i, :N_real[i]], B_batch[i, :M_real[i]], num_repeats=num_seeds)
-        qs.append(q_i)
-        ts.append(t_i)
-    quats = torch.stack(qs, dim=0)    # (B, 50, 4)
-    t_seeds = torch.stack(ts, dim=0)  # (B, 50, 3)
+    # GPU-native, fully batched seeds (no per-pair CPU/numpy PCA round-trip).
+    quats, t_seeds = batched_seeds_torch(A_batch, B_batch, N_real, M_real, num_seeds=num_seeds)
 
     # π-axis flips to get 5x more rotations
     qx = torch.tensor([0., 1., 0., 0.], device=device)

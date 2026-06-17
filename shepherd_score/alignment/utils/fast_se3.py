@@ -1,6 +1,7 @@
 import torch, math
 import torch.nn.functional as F
-from ...score.gaussian_overlap_triton import overlap_score_grad_se3_batch, fused_adam_qt, _batch_self_overlap
+from ...score.gaussian_overlap_triton import overlap_score_grad_se3_batch, fused_adam_qt, fused_adam_qt_with_tangent_proj, _batch_self_overlap
+from .fast_common import batched_seeds_torch
 from .._torch import objective_ROCS_overlay
 from typing import Optional
 from .._torch import _initialize_se3_params as _legacy_init
@@ -172,14 +173,8 @@ def coarse_fine_align_many(
     # ------------------------------------------------------------------
     # 1) build a coarse grid of 250 rotations × 2 translations = 500 poses
     # ------------------------------------------------------------------
-    qs, ts = [], []
-    for i in range(BATCH):
-        q_i, t_i = _legacy_seeds_torch(
-            A_batch[i, :N_real[i]], B_batch[i, :M_real[i]])
-        qs.append(q_i)
-        ts.append(t_i)
-    quats   = torch.stack(qs, dim=0)             # (B, 50, 4)
-    t_seeds = torch.stack(ts, dim=0)             # (B, 50, 3)
+    # GPU-native, fully batched seeds (no per-pair CPU/numpy PCA round-trip).
+    quats, t_seeds = batched_seeds_torch(A_batch, B_batch, N_real, M_real, num_seeds=50)
 
     # π-axis flips
     def quat_mul(q, r):
@@ -277,7 +272,7 @@ def coarse_fine_align_many(
     prev_max_score = -float('inf')
     no_improve_count = 0
 
-    for _ in range(steps_fine):
+    for step in range(steps_fine):
         VAB, dQ, dT = _overlap_in_chunks(
             A_k, B_k, q_k, t_k,
             alpha=alpha, N_real=N_k, M_real=M_k)
@@ -299,15 +294,18 @@ def coarse_fine_align_many(
         best_q = torch.where(mask_q, q_k, best_q)
         best_t = torch.where(mask_q, t_k, best_t)
 
-        # Early stopping check: if global max score hasn't improved significantly
-        current_max = best_score.max().item()
-        if current_max - prev_max_score < early_stop_tol:
-            no_improve_count += 1
-            if no_improve_count >= early_stop_patience:
-                break
-        else:
-            no_improve_count = 0
-            prev_max_score = current_max
+        # Early stopping check, gated to every 5 steps to avoid a per-step
+        # GPU->CPU sync (consistent with the esp/surf/pharm drivers). Gating
+        # only makes early-stop *less* aggressive, so scores cannot drop.
+        if step % 5 == 0:
+            current_max = best_score.max().item()
+            if current_max - prev_max_score < early_stop_tol:
+                no_improve_count += 1
+                if no_improve_count >= early_stop_patience:
+                    break
+            else:
+                no_improve_count = 0
+                prev_max_score = current_max
 
         fused_adam_qt(
             q_k, t_k,
