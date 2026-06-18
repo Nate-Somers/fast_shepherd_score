@@ -51,8 +51,11 @@ The original repo runs in an isolated subprocess (both packages are named
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
 import os
+import pickle
 import subprocess
 import sys
 import time
@@ -65,6 +68,12 @@ import numpy as np
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 ORIG_REPO = os.path.join(_ROOT, "shepherd-score-original-repo")
+_MOLCACHE = os.path.join(_HERE, "molcache")     # persisted base molecules (original-repo path)
+
+
+def _orig_base_cache_path(smi, spa, seed):
+    key = hashlib.md5(f"origv1|{smi}|{spa}|{seed}".encode()).hexdigest()
+    return os.path.join(_MOLCACHE, key + ".pkl")
 
 MODES = ["vol", "surf", "esp", "pharm"]
 BUCKETS = ["same", "cross"]
@@ -222,23 +231,55 @@ def orig_cell(planfile):
     with open(planfile) as f:
         plan = json.load(f)
     cfg, spa = plan["cfg"], plan["cfg"]["surf_per_atom"]
-    base = {}                                                      # smiles -> (Molecule, rdmol, ns)
+    base = {}                                                      # smiles -> (Molecule, rdmol|None, ns)
 
     def build_base(smi, seed):
-        if smi not in base:
-            rd = embed(smi, MMFF_optimize=True, random_seed=seed)
-            ns = max(24, spa * Chem.RemoveHs(rd).GetNumAtoms())
-            base[smi] = (Molecule(rd, num_surf_points=ns, pharm_multi_vector=False), rd, ns)
+        """Base Molecule for a SMILES, built ONCE: in-memory for this process and
+        pickled under benchmarks/molcache/, so repeat runs skip the (Open3D surface
+        + MMFF + pharmacophore) rebuild entirely."""
+        if smi in base:
+            return base[smi]
+        cpath = _orig_base_cache_path(smi, spa, seed)
+        if os.path.exists(cpath):
+            try:
+                with open(cpath, "rb") as fh:
+                    mol, ns = pickle.load(fh)
+                base[smi] = (mol, None, ns)
+                return base[smi]
+            except Exception:
+                pass
+        rd = embed(smi, MMFF_optimize=True, random_seed=seed)
+        ns = max(24, spa * Chem.RemoveHs(rd).GetNumAtoms())
+        mol = Molecule(rd, num_surf_points=ns, pharm_multi_vector=False)
+        base[smi] = (mol, rd, ns)
+        try:
+            os.makedirs(_MOLCACHE, exist_ok=True)
+            with open(cpath, "wb") as fh:
+                pickle.dump((mol, ns), fh)
+        except Exception:
+            pass
         return base[smi]
 
     def rotated(smi, R, t, seed):
-        _, rd, ns = build_base(smi, seed)
-        rd2 = Chem.Mol(rd)
-        conf = rd2.GetConformer()
-        pos = conf.GetPositions() @ np.asarray(R).T + np.asarray(t)
-        for i in range(rd2.GetNumAtoms()):
-            conf.SetAtomPosition(i, Point3D(*[float(x) for x in pos[i]]))
-        return Molecule(rd2, num_surf_points=ns, pharm_multi_vector=False)
+        """A rigid SE(3) copy of the base molecule WITHOUT recomputing its surface.
+        Surface / ESP / pharmacophores are rotation-equivariant, so we rotate the
+        precomputed arrays (a matmul) on a shallow copy and share the invariant
+        ones -- exactly what the fork's _transform does, and ~1000x cheaper than
+        reconstructing a Molecule (Open3D + MMFF + RDKit) per pair. As a bonus both
+        engines now align IDENTICAL pairs, so the original self-score is exactly 1.0
+        too (the old per-pair surface rebuild was not perfectly rotation-equivariant)."""
+        m0 = build_base(smi, seed)[0]
+        R = np.asarray(R, dtype=np.float64); t = np.asarray(t, dtype=np.float64)
+        m = copy.copy(m0)                                  # shares rdmol + invariant arrays
+        m.atom_pos = m0.atom_pos @ R.T + t
+        if getattr(m0, "surf_pos", None) is not None:
+            m.surf_pos = m0.surf_pos @ R.T + t
+        if getattr(m0, "pharm_ancs", None) is not None:
+            m.pharm_ancs = m0.pharm_ancs @ R.T + t
+            v = m0.pharm_vecs @ R.T
+            nrm = np.linalg.norm(v, axis=1, keepdims=True)
+            m.pharm_vecs = v / np.where(nrm > 0, nrm, 1.0)
+        return m
 
     def align(mode, pairs):
         b = MoleculePairBatch(pairs)
