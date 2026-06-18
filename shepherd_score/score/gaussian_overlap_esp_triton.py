@@ -7,9 +7,12 @@ import triton
 import triton.language as tl
 import torch
 
-from .gaussian_overlap_triton import fused_adam_qt, fused_adam_qt_with_tangent_proj
+from .gaussian_overlap_triton import (
+    fused_adam_qt, fused_adam_qt_with_tangent_proj, _OVERLAP_CONFIGS)
 
 
+# Self-tunes per (N_pad, M_pad) on the actual device -- no GPU-specific hardcoding.
+@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'])
 @triton.jit
 def _gauss_overlap_esp_se3_tiled(
     A_ptr, B_ptr,                 # coordinates: flat (B * N_pad * 3), (B * M_pad * 3)
@@ -227,13 +230,6 @@ def overlap_score_grad_esp_se3_batch(
     device = A.device
     dtype  = A.dtype
 
-    # One CTA per pose -> latency/occupancy bound; a small tile + 1 warp/CTA
-    # maximises resident CTAs/SM to hide load latency. Measured 2.5-9.3x over the
-    # old BLOCK=64 default across N=32..112 (benchmarks/profile_overlap_esp.py).
-    auto_cfg = BLOCK is None
-    if auto_cfg:
-        BLOCK = 16
-
     if N_real is None:
         N_real = torch.full((K,), N_pad, device=device, dtype=torch.int32)
     else:
@@ -253,14 +249,8 @@ def overlap_score_grad_esp_se3_batch(
 
     grid = (K,)    # 1-D launch: one CTA per alignment
 
-    launch_kw = {}
-    if num_warps is not None:
-        launch_kw["num_warps"] = num_warps
-    elif auto_cfg:
-        launch_kw["num_warps"] = 1
-    if num_stages is not None:
-        launch_kw["num_stages"] = num_stages
-
+    # BLOCK + num_warps chosen by triton.autotune per (N_pad, M_pad) on the actual
+    # device; legacy BLOCK/num_warps/num_stages kwargs accepted but ignored.
     _gauss_overlap_esp_se3_tiled[grid](
         A.contiguous().view(-1),
         B.contiguous().view(-1),
@@ -273,9 +263,7 @@ def overlap_score_grad_esp_se3_batch(
         K, M_pad, N_pad,
         half_alpha, k_const, inv_lam,
         out_S, out_dQ.view(-1), out_dT.view(-1),
-        BLOCK,
         NEED_GRAD=NEED_GRAD,
-        **launch_kw,
     )
     return out_S, out_dQ, out_dT
 

@@ -35,6 +35,17 @@ def _load_xyz(ptr, idx, mask):
     return x, y, z
 
 # ----------------- score and gradients wrt quaternion q and translation t -----------------     
+# No hardcoded, GPU-specific tile/warp choice: triton.autotune benchmarks these
+# candidates on the ACTUAL device and caches the best per (N_pad, M_pad), so the
+# kernel self-tunes to whatever GPU / Triton version it runs on. (Hardcoding
+# BLOCK=16/num_warps=1 was optimal only for this RTX 4050 + triton 3.6.0.)
+_OVERLAP_CONFIGS = [
+    triton.Config({'BLOCK': _b}, num_warps=_w)
+    for _b in (16, 32, 64) for _w in (1, 2, 4)
+]
+
+
+@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'])
 @triton.jit
 def _gauss_overlap_se3_tiled(
     A_ptr, B_ptr,                 # flat (B * N_pad * 3), (B * M_pad * 3)
@@ -43,7 +54,7 @@ def _gauss_overlap_se3_tiled(
     BATCH, M_pad, N_pad,          # ints
     half_alpha, k_const,          # scalars
     S_ptr, dQ_ptr, dT_ptr,        # outputs (S: (B,), dQ: (B*4), dT: (B*3))
-    BLOCK: tl.constexpr,          # single tile edge (e.g. 64)
+    BLOCK: tl.constexpr,          # tile edge (chosen by autotune)
     NEED_GRAD: tl.constexpr
 ):
     # -------- which alignment (one CTA per pair) --------
@@ -205,11 +216,6 @@ def overlap_score_grad_se3_batch(
     device = A.device
     dtype  = A.dtype
 
-    # Auto-select optimal BLOCK size based on molecule dimensions
-    auto_cfg = BLOCK is None
-    if auto_cfg:
-        BLOCK = _select_block_size(N_pad, M_pad)
-
     if N_real is None:
         N_real = torch.full((K,), N_pad, device=device, dtype=torch.int32)
     else:
@@ -228,17 +234,9 @@ def overlap_score_grad_se3_batch(
 
     grid = (K,)    # 1-D launch: one CTA per alignment
 
-    # One warp per CTA on the auto path: the small tile + 1 warp maximises
-    # resident CTAs/SM to hide load latency (see _select_block_size). Explicit
-    # BLOCK callers keep Triton's default unless they pass num_warps themselves.
-    launch_kw = {}
-    if num_warps is not None:
-        launch_kw["num_warps"] = num_warps
-    elif auto_cfg:
-        launch_kw["num_warps"] = 1
-    if num_stages is not None:
-        launch_kw["num_stages"] = num_stages
-
+    # BLOCK + num_warps are chosen by triton.autotune per (N_pad, M_pad) on the
+    # ACTUAL device (see _OVERLAP_CONFIGS) -- nothing GPU-specific. The legacy
+    # BLOCK/num_warps/num_stages kwargs are accepted for back-compat but ignored.
     _gauss_overlap_se3_tiled[grid](
         A.contiguous().view(-1),
         B.contiguous().view(-1),
@@ -249,9 +247,7 @@ def overlap_score_grad_se3_batch(
         K, M_pad, N_pad,
         half_alpha, k_const,
         out_S, out_dQ.view(-1), out_dT.view(-1),
-        BLOCK,
         NEED_GRAD=NEED_GRAD,
-        **launch_kw,
     )
     return out_S, out_dQ, out_dT
 
