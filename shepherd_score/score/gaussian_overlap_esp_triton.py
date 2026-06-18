@@ -12,7 +12,8 @@ from .gaussian_overlap_triton import (
 
 
 # Self-tunes per (N_pad, M_pad) on the actual device -- no GPU-specific hardcoding.
-@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'])
+# cache_results=True persists the choice to disk so the sweep is once-per-machine.
+@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _gauss_overlap_esp_se3_tiled(
     A_ptr, B_ptr,                 # coordinates: flat (B * N_pad * 3), (B * M_pad * 3)

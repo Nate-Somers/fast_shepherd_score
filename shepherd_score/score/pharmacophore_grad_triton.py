@@ -16,7 +16,7 @@ import triton.language as tl
 # from the feature count (next_pow2), not a GPU-specific constant; only the warp
 # count is hardware-dependent, so autotune picks it -- nothing hardcoded per GPU.
 @triton.autotune(configs=[triton.Config({}, num_warps=_w) for _w in (1, 2, 4, 8)],
-                 key=['N_pad', 'M_pad'])
+                 key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _pharm_score_grad_kernel(
     Aanc_ptr, Banc_ptr,            # ref/fit anchors  (P*N*3) / (P*M*3)

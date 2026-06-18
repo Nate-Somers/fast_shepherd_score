@@ -123,8 +123,10 @@ def _subbatched_align(process, K: int, *, key: tuple,
     pad size -- gets a much smaller chunk than a cheap band-32 surf bucket). Each
     chunk is sized so its peak stays under ``safety`` x (free device memory +
     torch's reusable cache). A previously-unseen shape starts at ``init_cap``
-    pairs, then grows once calibrated; an OOM halves the chunk and retries. Off
-    CUDA (or if a single pair won't fit) it just calls ``process`` once.
+    pairs, then grows once calibrated (only chunks at least a quarter of the
+    target size update the footprint, so a tiny trailing remainder cannot inflate
+    it); an OOM halves the chunk and retries. Off CUDA (or if a single pair won't
+    fit) it just calls ``process`` once.
     """
     if not torch.cuda.is_available():
         return process(0, K)
@@ -145,16 +147,29 @@ def _subbatched_align(process, K: int, *, key: tuple,
 
     sc_parts, q_parts, t_parts = [], [], []
     s = 0
+    _nchunks = 0; _noom = 0; _ks = []                            # diag (SUBBATCH_DEBUG)
     while s < K:
         k = min(K_sub, K - s)
         try:
             torch.cuda.reset_peak_memory_stats()
             sc, q, t = process(s, k)
             peak = int(torch.cuda.max_memory_allocated())
-            fp_meas = max(1, -(-peak // k))                      # ceil bytes/pair
-            _PAIR_FOOTPRINT_BYTES[key] = max(_PAIR_FOOTPRINT_BYTES.get(key, 0), fp_meas)
+            # Fold a chunk into the per-pair footprint only when it is large enough
+            # that the fixed workspace overhead (seed/autotune scratch -- tens of MB,
+            # independent of k) is amortised. peak/k = fixed/k + per_pair, so a tiny
+            # trailing remainder (e.g. k=7) yields a wildly inflated bytes/pair that
+            # max() would lock in, collapsing every later chunk to a fraction of its
+            # right size (pharm was observed going 2 -> 16 -> 82 chunks this way). The
+            # first chunk has k == K_sub so it always qualifies; calibration is never
+            # starved.
+            if k >= max(1, K_sub // 4):
+                fp_meas = max(1, -(-peak // k))                  # ceil bytes/pair
+                _PAIR_FOOTPRINT_BYTES[key] = max(_PAIR_FOOTPRINT_BYTES.get(key, 0), fp_meas)
             sc_parts.append(sc); q_parts.append(q); t_parts.append(t)
             s += k
+            _nchunks += 1
+            if _SUBBATCH_DEBUG:
+                _ks.append(k)
             if need_resize:   # first success -> we now know the real footprint
                 fp = _PAIR_FOOTPRINT_BYTES[key]
                 remaining = K - s
@@ -167,9 +182,17 @@ def _subbatched_align(process, K: int, *, key: tuple,
                     and "out of memory" not in str(exc).lower():
                 raise
             torch.cuda.empty_cache()
+            _noom += 1
+            if _SUBBATCH_DEBUG:
+                print(f"[subbatch] OOM at k={k} (after {_nchunks} ok) "
+                      f"free={torch.cuda.mem_get_info()[0]//(1024*1024)}MiB -> K_sub={max(1, k // 2)}",
+                      flush=True)
             if k <= 1:
                 raise
             K_sub = max(1, k // 2)
+    if _SUBBATCH_DEBUG:
+        print(f"[subbatch] DONE key={key} K={K} nchunks={_nchunks} noom={_noom} "
+              f"ks={_ks} final_fp={_PAIR_FOOTPRINT_BYTES.get(key)}", flush=True)
     return torch.cat(sc_parts), torch.cat(q_parts), torch.cat(t_parts)
 
 def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) -> Chem.Mol:
