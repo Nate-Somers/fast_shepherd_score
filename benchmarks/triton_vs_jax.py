@@ -77,8 +77,9 @@ def main():
     ap.add_argument("--modes", nargs="+", default=["surf", "esp", "pharm"])
     ap.add_argument("--buckets", nargs="+", default=["same", "cross"])
     ap.add_argument("--batches", type=int, nargs="+", default=[16, 64, 256, 1024])
-    ap.add_argument("--budget", type=float, default=15.0,
-                    help="seconds; once a JAX size exceeds this, larger sizes are TIMEOUT")
+    ap.add_argument("--budget", type=float, default=60.0,
+                    help="seconds HARD cap: a JAX cell PROJECTED (from the prior cell's flat "
+                         "mol/s) to exceed this is skipped (TIMEOUT), never run to completion")
     ap.add_argument("--num-repeats", type=int, default=16)
     ap.add_argument("--steps-fine", type=int, default=100)
     ap.add_argument("--max-steps", type=int, default=100)
@@ -97,8 +98,10 @@ def main():
         print("GPU:", torch.cuda.get_device_name(0), "| JAX:", jax_shmap.jax_device_count(),
               jax_shmap.jax_platform())
     print(f"config: num_repeats/restarts={args.num_repeats}, steps={args.steps_fine}, "
-          f"JAX budget={args.budget:.0f}s, timing=MIN (fork {args.fork_reps} reps / jax {args.jax_reps} reps post-JIT)")
+          f"JAX cap={args.budget:.0f}s, timing=MIN (fork {args.fork_reps} reps / jax {args.jax_reps} reps post-JIT)")
     print("Speedup conflates implementation AND CPU->GPU (jaxlib is CPU-only here).")
+    print(f"60s HARD cap: JAX cells projected > {args.budget:.0f}s are skipped (TIMEOUT). "
+          "Original pharm at 10k is SKIP (not run).")
     print("=" * 104)
     hdr = (f'{"mode":5s} {"bucket":6s} {"batch":>5s} | {"JAX-CPU s":>10s} {"JAX mol/s":>9s} {"jscore":>6s} | '
            f'{"Triton s":>9s} {"Trit mol/s":>10s} {"tscore":>6s} | {"speedup":>8s}')
@@ -107,6 +110,7 @@ def main():
     for mode in args.modes:
         for bucket in args.buckets:
             jax_status = "na" if args.skip_jax else "alive"   # alive | timeout | na
+            last_jmps = None                                   # JAX mol/s last cell (~flat -> projects next)
             for nb in args.batches:
                 co = make_real_cohort(mode, n_pairs=nb, bucket_kind=bucket, seed=3)
                 try:
@@ -119,19 +123,27 @@ def main():
                 f_mps = nb / ftime
 
                 jcell, jmps_s, jsc_s, sp_s = "TIMEOUT", "-", "-", "-"
-                if jax_status == "alive":
-                    try:
-                        jtime, jscore = time_jax(mode, co, cfg, args.jax_reps)
-                        over = jtime > args.budget
-                        jcell = f"{jtime:9.3f}" + ("*" if over else " ")
-                        jmps_s = f"{nb / jtime:9.1f}"
-                        jsc_s = f"{jscore:6.3f}"
-                        sp_s = f"{jtime / ftime:7.1f}x"
-                        if over:
-                            jax_status = "timeout"
-                    except Exception as e:
-                        jcell, jmps_s, jsc_s, sp_s = f"NA:{type(e).__name__}", "-", "-", "-"
-                        jax_status = "na"
+                if mode == "pharm" and nb >= 10000:
+                    jcell = "SKIP"                            # user: never run the original pharm path at 10k
+                elif jax_status == "alive":
+                    proj = (nb / last_jmps) if last_jmps else 0.0
+                    if last_jmps is not None and proj > args.budget:
+                        jcell = "TIMEOUT"                     # projected > cap -> skip; never run a cell > cap
+                        jax_status = "timeout"
+                    else:
+                        try:
+                            jtime, jscore = time_jax(mode, co, cfg, args.jax_reps)
+                            over = jtime > args.budget
+                            jcell = f"{jtime:9.3f}" + ("*" if over else " ")
+                            jmps_s = f"{nb / jtime:9.1f}"
+                            jsc_s = f"{jscore:6.3f}"
+                            sp_s = f"{jtime / ftime:7.1f}x"
+                            last_jmps = nb / jtime
+                            if over:
+                                jax_status = "timeout"
+                        except Exception as e:
+                            jcell, jmps_s, jsc_s, sp_s = f"NA:{type(e).__name__}", "-", "-", "-"
+                            jax_status = "na"
                 elif jax_status == "na":
                     jcell = "NA"
 

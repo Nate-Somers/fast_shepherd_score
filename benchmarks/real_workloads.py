@@ -28,10 +28,27 @@ so the bucketing penalty can be isolated on real data.
 from __future__ import annotations
 
 import functools
+import hashlib
+import os
+import pickle
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+
+def _disk_cache_path(smiles: str, surf_per_atom: int, seed: int) -> Optional[str]:
+    """Path for a cached _RealMol, or None if disk caching is off.
+
+    Enabled by setting env FSS_MOL_CACHE_DIR (used by the per-cell subprocess
+    benchmark so fresh processes don't each rebuild the molecules). Transparent:
+    the build is deterministic, so a cache hit is identical to a rebuild.
+    """
+    d = os.environ.get("FSS_MOL_CACHE_DIR")
+    if not d:
+        return None
+    key = hashlib.md5(f"v1|{smiles}|{surf_per_atom}|{seed}".encode()).hexdigest()
+    return os.path.join(d, key + ".pkl")
 
 from benchmarks.alignment_bench.workloads import PairSpec, Cohort, _random_rotation
 
@@ -78,6 +95,16 @@ class _RealMol:
 
 @functools.lru_cache(maxsize=None)
 def _build_molecule(smiles: str, surf_per_atom: int = 3, seed: int = 42) -> _RealMol:
+    # Optional cross-process disk cache (FSS_MOL_CACHE_DIR) so per-cell subprocess
+    # benchmarks don't rebuild the molecules every process.
+    _cpath = _disk_cache_path(smiles, surf_per_atom, seed)
+    if _cpath and os.path.exists(_cpath):
+        try:
+            with open(_cpath, "rb") as _f:
+                return pickle.load(_f)
+        except Exception:
+            pass
+
     from rdkit import Chem
     from shepherd_score.conformer_generation import embed_conformer_from_smiles
     from shepherd_score.container import Molecule
@@ -86,7 +113,7 @@ def _build_molecule(smiles: str, surf_per_atom: int = 3, seed: int = 42) -> _Rea
     nheavy = Chem.RemoveHs(rd).GetNumAtoms()
     ns = max(24, surf_per_atom * nheavy)
     m = Molecule(rd, num_surf_points=ns, pharm_multi_vector=False)
-    return _RealMol(
+    mol = _RealMol(
         atom_pos=np.asarray(m.atom_pos, dtype=np.float64),
         surf_pos=np.asarray(m.surf_pos, dtype=np.float64),
         surf_esp=np.asarray(m.surf_esp, dtype=np.float64),
@@ -95,6 +122,14 @@ def _build_molecule(smiles: str, surf_per_atom: int = 3, seed: int = 42) -> _Rea
         pharm_ancs=np.asarray(m.pharm_ancs, dtype=np.float64),
         pharm_vecs=np.asarray(m.pharm_vecs, dtype=np.float64),
     )
+    if _cpath:
+        try:
+            os.makedirs(os.path.dirname(_cpath), exist_ok=True)
+            with open(_cpath, "wb") as _f:
+                pickle.dump(mol, _f)
+        except Exception:
+            pass
+    return mol
 
 
 def _transform(mol: _RealMol, R: np.ndarray, t: np.ndarray) -> _RealMol:
