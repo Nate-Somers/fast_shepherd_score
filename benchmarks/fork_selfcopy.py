@@ -34,21 +34,24 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--modes", nargs="+", default=["surf", "esp", "pharm"])
     ap.add_argument("--n-pairs", type=int, default=40)
-    ap.add_argument("--steps-fine", type=int, default=100)
+    ap.add_argument("--steps-fine", type=int, nargs="+", default=[100],
+                    help="one or more step counts; cohort built once, swept in-process")
     ap.add_argument("--seed", type=int, default=5)
     args = ap.parse_args()
 
-    print(f"FORK SELF-COPY PARITY (drop from known optimum 1.0; steps_fine={args.steps_fine})")
-    hdr = f'{"mode":6s} {"bucket":6s} {"fork_mean":>9s} {"mean_drop":>9s} {"worst_drop":>10s} {"n>=0.99":>8s}'
+    print(f"FORK SELF-COPY PARITY (drop from known optimum 1.0; steps sweep={args.steps_fine})")
+    hdr = (f'{"mode":6s} {"bucket":6s} {"steps":>5s} {"fork_mean":>9s} {"mean_drop":>9s} '
+           f'{"worst_drop":>10s} {"n>=0.99":>8s}')
     print(hdr); print("-" * len(hdr))
     for mode in args.modes:
         for bucket in ("same", "cross"):
             co = make_real_cohort(mode, n_pairs=args.n_pairs, bucket_kind=bucket, seed=args.seed)
-            s = run_mode(mode, co, args.steps_fine)
-            drop = np.clip(1.0 - s, 0, None)
-            frac = float((s >= 0.99).mean())
-            print(f'{mode:6s} {bucket:6s} {s.mean():9.4f} {drop.mean():9.4f} '
-                  f'{drop.max():10.4f} {frac:8.2f}')
+            for steps in args.steps_fine:
+                s = run_mode(mode, co, steps)
+                drop = np.clip(1.0 - s, 0, None)
+                frac = float((s >= 0.99).mean())
+                print(f'{mode:6s} {bucket:6s} {steps:5d} {s.mean():9.4f} {drop.mean():9.4f} '
+                      f'{drop.max():10.4f} {frac:8.2f}')
 
 
 if __name__ == "__main__":
