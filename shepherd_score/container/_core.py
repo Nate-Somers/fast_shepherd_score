@@ -51,6 +51,63 @@ _PAIR_FOOTPRINT_BYTES: dict[tuple, int] = {}
 _SUBBATCH_DEBUG = bool(os.environ.get("SUBBATCH_DEBUG"))
 
 
+# --- multi-GPU dispatch ------------------------------------------------------
+import threading as _threading
+
+_DISPATCH_LOCAL = _threading.local()
+
+
+def _dev_idx(device: torch.device) -> int:
+    """Cache-key component so per-device workspaces/buffers never collide under
+    the multi-GPU dispatcher. Constant 0 on a single GPU -> no behaviour change."""
+    return device.index if (device.type == "cuda" and device.index is not None) else -1
+
+
+def _should_distribute(pairs) -> bool:
+    """True when `pairs` should be sharded across multiple CUDA devices."""
+    if getattr(_DISPATCH_LOCAL, "active", False):
+        return False                       # already inside a per-device shard
+    if not torch.cuda.is_available() or torch.cuda.device_count() <= 1:
+        return False
+    if not pairs or pairs[0].device.type != "cuda":
+        return False
+    return len(pairs) >= 2 * torch.cuda.device_count()
+
+
+def _run_distributed(align_fn, pairs, **kwargs):
+    """Shard `pairs` across ALL visible CUDA devices and run `align_fn` on each in
+    parallel (CUDA ops release the GIL); results are written in-place to the pairs.
+    The per-device workspace/footprint caches are device-keyed so concurrent
+    shards never collide. NOTE: the single-GPU path (via _should_distribute) is
+    validated; the multi-GPU concurrency path needs multi-GPU hardware to benchmark."""
+    ndev = torch.cuda.device_count()
+    shards = [sh for sh in (pairs[i::ndev] for i in range(ndev)) if sh]
+    errs = {}
+
+    def _worker(dev_idx, shard):
+        _DISPATCH_LOCAL.active = True
+        try:
+            with torch.cuda.device(dev_idx):
+                dev = torch.device("cuda", dev_idx)
+                for p in shard:
+                    p.device = dev          # align_fn moves this shard's tensors to `dev`
+                align_fn(shard, **kwargs)
+        except Exception as e:              # noqa: BLE001 - re-raised after join
+            import traceback
+            errs[dev_idx] = (repr(e), traceback.format_exc())
+        finally:
+            _DISPATCH_LOCAL.active = False
+
+    threads = [_threading.Thread(target=_worker, args=(k, sh), daemon=True)
+               for k, sh in enumerate(shards)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errs:
+        raise RuntimeError(f"multi-GPU align failed on device(s) {list(errs)}: {errs}")
+
+
 def _subbatched_align(process, K: int, *, key: tuple,
                       safety: float = 0.7, init_cap: int = 1024):
     """Drive ``process(start, count) -> (scores, q, t)`` over ``K`` independent
@@ -71,6 +128,8 @@ def _subbatched_align(process, K: int, *, key: tuple,
     """
     if not torch.cuda.is_available():
         return process(0, K)
+
+    key = (torch.cuda.current_device(),) + tuple(key)   # device-scope the footprint cache
 
     def _budget() -> float:
         free, _ = torch.cuda.mem_get_info()
@@ -427,6 +486,9 @@ class MoleculePair:
         
         if not pairs:
             return
+        if _should_distribute(pairs):
+            return _run_distributed(MoleculePair.align_batch_vol, pairs,
+                                    alpha=alpha, steps_fine=steps_fine)
 
         device = pairs[0].device
         # --- move coords once (skip if already there & right dtype) -------------
@@ -455,7 +517,7 @@ class MoleculePair:
             K = len(bucket)
 
             # ---- integer buffers (reuse) ---------------------------------------
-            ib_key = K
+            ib_key = (_dev_idx(device), K)
             int_buf = _INT_BUFFER_CACHE.get(ib_key)
             if int_buf is None:
                 int_buf = {
@@ -472,7 +534,7 @@ class MoleculePair:
                 M_real[i] = p._fit_xyz_t.shape[0]
 
             # ---- workspaces (reuse & grow) -------------------------------------
-            ws_key = (N_pad, M_pad)
+            ws_key = (_dev_idx(device), N_pad, M_pad)
             ws = _ALIGN_WORKSPACES.get(ws_key)
             if ws is None or ws['ref'].shape[0] < K:
                 # allocate at least K; allow some headroom (optional)
@@ -557,6 +619,9 @@ class MoleculePair:
 
         if not pairs:
             return
+        if _should_distribute(pairs):
+            return _run_distributed(MoleculePair.align_batch_surf, pairs,
+                                    alpha=alpha, steps_fine=steps_fine)
 
         device = pairs[0].device
 
@@ -603,7 +668,7 @@ class MoleculePair:
             K = len(bucket)
 
             # ---- integer buffers (reuse) ------------------------------------------
-            ib_key = K
+            ib_key = (_dev_idx(device), K)
             int_buf = _INT_BUFFER_CACHE.get(ib_key)
             if int_buf is None:
                 int_buf = {
@@ -620,7 +685,7 @@ class MoleculePair:
                 M_real[i] = p._fit_surf_t.shape[0]
 
             # ---- workspaces (reuse & grow) ----------------------------------------
-            ws_key = (N_pad, M_pad)
+            ws_key = (_dev_idx(device), N_pad, M_pad)
             ws = _ALIGN_WORKSPACES.get(ws_key)
             if ws is None or ws['ref'].shape[0] < K:
                 ref_pad = torch.empty(K, N_pad, 3, device=device, dtype=torch.float32)
@@ -696,6 +761,12 @@ class MoleculePair:
         """
         if not pairs:
             return
+        if _should_distribute(pairs):
+            return _run_distributed(MoleculePair.align_batch_esp, pairs,
+                                    alpha=alpha, lam=lam, trans_init=trans_init,
+                                    num_repeats=num_repeats,
+                                    num_repeats_per_trans=num_repeats_per_trans,
+                                    topk=topk, steps_fine=steps_fine, lr=lr)
 
         from shepherd_score.score.constants import LAM_SCALING
         from shepherd_score.alignment.utils.fast_esp_se3 import fast_optimize_ROCS_esp_overlay_batch
@@ -869,6 +940,13 @@ class MoleculePair:
         """
         if not pairs:
             return
+        if _should_distribute(pairs):
+            return _run_distributed(MoleculePair.align_batch_esp_combo, pairs,
+                                    alpha=alpha, lam=lam, probe_radius=probe_radius,
+                                    esp_weight=esp_weight, trans_init=trans_init,
+                                    num_repeats=num_repeats,
+                                    num_repeats_per_trans=num_repeats_per_trans,
+                                    topk=topk, steps_fine=steps_fine, lr=lr)
 
         from shepherd_score.alignment.utils.fast_esp_combo_se3 import fast_optimize_esp_combo_score_overlay_batch
 
@@ -1071,6 +1149,12 @@ class MoleculePair:
         """
         if not pairs:
             return
+        if _should_distribute(pairs):
+            return _run_distributed(MoleculePair.align_batch_pharm, pairs,
+                                    similarity=similarity, extended_points=extended_points,
+                                    only_extended=only_extended, trans_init=trans_init,
+                                    num_repeats=num_repeats, topk=topk,
+                                    steps_fine=steps_fine, lr=lr)
 
         if not torch.cuda.is_available():
             # Slow fallback: per-pair legacy optimizer
