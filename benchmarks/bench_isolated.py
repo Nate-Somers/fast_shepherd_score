@@ -33,6 +33,13 @@ def _run_one_cell(mode, bucket, batch, skip_jax):
     cfg = B.BenchConfig(num_repeats=16, steps_fine=100, max_steps=100, topk=30)
     co = make_real_cohort(mode, n_pairs=batch, bucket_kind=bucket, seed=3)
 
+    # Record the original-pharm-10k SKIP up front: the fork at this size can exceed
+    # the cap and get this subprocess killed before any post-fork line would print.
+    jax_handled = skip_jax
+    if not skip_jax and mode == "pharm" and batch >= 10000:
+        print("JAX " + json.dumps({"skip": "pharm10k"}), flush=True)
+        jax_handled = True
+
     try:
         # extra warmup: a fresh process pays Triton compile/autotune + sub-batcher
         # footprint calibration cold, so warm twice before the timed MIN of 3.
@@ -41,10 +48,7 @@ def _run_one_cell(mode, bucket, batch, skip_jax):
     except Exception as e:                                   # e.g. CUDA OOM
         print("FORK " + json.dumps({"err": type(e).__name__}), flush=True)
 
-    if skip_jax:
-        return
-    if mode == "pharm" and batch >= 10000:
-        print("JAX " + json.dumps({"skip": "pharm10k"}), flush=True)   # user: no original pharm 10k
+    if jax_handled:
         return
     try:
         jt, js = time_jax(mode, co, cfg, 1)
@@ -91,20 +95,25 @@ def main():
                    env=env, check=False)
 
     SLACK = 25.0   # imports + cached cohort build + JAX JIT, outside the align we cap
-    print("=" * 96)
-    print("PER-CELL SUBPROCESS-ISOLATED speed scan  (fresh process per cell, "
-          f"hard {args.timeout:.0f}s cap on EVERYTHING incl. fork)")
-    print("Honest per-cell numbers: no cross-cell GPU memory-state accumulation.")
-    print("=" * 96)
-    hdr = (f'{"mode":5s} {"bucket":6s} {"batch":>5s} | {"JAX mol/s":>9s} {"jscore":>6s} | '
-           f'{"fork mol/s":>10s} {"fscore":>6s} | {"speedup":>8s}')
+    print("=" * 104)
+    print("FORK Triton-GPU  vs  ORIGINAL JAX-CPU  --  PER-CELL SUBPROCESS-ISOLATED (honest per cell)")
+    print(f"fresh process per cell; hard {args.timeout:.0f}s cap on EVERYTHING incl. fork; "
+          "JAX projected > cap = TIMEOUT (not run); original pharm 10k = SKIP")
+    print("Speedup conflates implementation AND CPU->GPU (jaxlib is CPU-only here).")
+    print("=" * 104)
+    hdr = (f'{"mode":5s} {"bucket":6s} {"batch":>5s} | {"JAX-CPU s":>9s} {"JAX mol/s":>9s} {"jscore":>6s} | '
+           f'{"Triton s":>8s} {"Trit mol/s":>10s} {"tscore":>6s} | {"speedup":>8s}')
     print(hdr); print("-" * len(hdr))
     for mode in args.modes:
         for bucket in args.buckets:
+            last_jmps = None                                   # JAX mol/s last cell (~flat -> projects next)
             for batch in args.batches:
+                # project JAX time from the prior cell's rate; skip launching it if
+                # it would blow the cap (avoids running an over-budget JAX cell to its kill)
+                proj_skip = (last_jmps is not None and batch / last_jmps > args.timeout)
                 cmd = [sys.executable, "-m", "benchmarks.bench_isolated",
                        "--cell", mode, bucket, str(batch)]
-                if args.skip_jax:
+                if args.skip_jax or proj_skip:
                     cmd.append("--skip-jax")
                 killed = False
                 try:
@@ -116,32 +125,36 @@ def main():
                     killed = True
 
                 fork, jax = _parse(out)
+                if jax and "mps" in jax:
+                    last_jmps = jax["mps"]
 
                 # JAX cell
-                if jax and "mps" in jax:
-                    jcell, jsc = f"{jax['mps']:9.1f}", f"{jax['score']:6.3f}"
+                if proj_skip:
+                    jsec, jmps, jsc = "TIMEOUT", "-", "-"
+                elif jax and "mps" in jax:
+                    jsec, jmps, jsc = f"{jax['s']:9.3f}", f"{jax['mps']:9.1f}", f"{jax['score']:6.3f}"
                 elif jax and jax.get("skip"):
-                    jcell, jsc = "SKIP", "-"
+                    jsec, jmps, jsc = "SKIP", "-", "-"
                 elif jax and "err" in jax:
-                    jcell, jsc = f"NA:{jax['err']}"[:9], "-"
+                    jsec, jmps, jsc = f"NA:{jax['err']}"[:9], "-", "-"
                 elif args.skip_jax:
-                    jcell, jsc = "-", "-"
+                    jsec, jmps, jsc = "-", "-", "-"
                 else:
-                    jcell, jsc = ("TIMEOUT" if killed else "-"), "-"
+                    jsec, jmps, jsc = ("TIMEOUT" if killed else "-"), "-", "-"
 
                 # fork cell
                 sp = "-"
                 if fork and "mps" in fork:
-                    fcell, fsc = f"{fork['mps']:10.1f}", f"{fork['score']:6.3f}"
+                    fsec, fmps, fsc = f"{fork['s']:8.3f}", f"{fork['mps']:10.1f}", f"{fork['score']:6.3f}"
                     if jax and "mps" in jax:
                         sp = f"{jax['s'] / fork['s']:7.1f}x"
                 elif fork and "err" in fork:
-                    fcell, fsc = f"ERR:{fork['err']}"[:10], "-"
+                    fsec, fmps, fsc = f"ERR:{fork['err']}"[:8], "-", "-"
                 else:
-                    fcell, fsc = ("TIMEOUT" if killed else "-"), "-"
+                    fsec, fmps, fsc = ("TIMEOUT" if killed else "-"), "-", "-"
 
-                print(f'{mode:5s} {bucket:6s} {batch:5d} | {jcell:>9s} {jsc:>6s} | '
-                      f'{fcell:>10s} {fsc:>6s} | {sp:>8s}', flush=True)
+                print(f'{mode:5s} {bucket:6s} {batch:5d} | {jsec:>9s} {jmps:>9s} {jsc:>6s} | '
+                      f'{fsec:>8s} {fmps:>10s} {fsc:>6s} | {sp:>8s}', flush=True)
             print("-" * len(hdr))
 
 
