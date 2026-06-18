@@ -10,20 +10,17 @@ import numpy as np
 
 def _select_block_size(N_pad: int, M_pad: int) -> int:
     """
-    Heuristic BLOCK size selection for optimal GPU occupancy.
+    BLOCK (tile edge) for the one-CTA-per-pose overlap kernel.
 
-    - Smaller molecules benefit from smaller blocks (less padding waste)
-    - Larger molecules benefit from larger blocks (better memory coalescing)
+    The kernel is latency/occupancy bound at large pose count: each CTA does a
+    tiny N*M overlap and stalls on its coordinate loads, so throughput is set by
+    how many CTAs stay resident per SM. A SMALL tile (plus num_warps=1, see the
+    launch) minimises per-CTA registers -> maximises resident CTAs -> hides the
+    latency. Measured 2-3.6x over the previous 32/64/128 heuristic across
+    N=32..112 at P=200k (benchmarks/profile_overlap.py). The previous "bigger
+    block for bigger molecule" intuition was backwards for this access pattern.
     """
-    max_dim = max(N_pad, M_pad)
-    if max_dim <= 32:
-        return 32
-    elif max_dim <= 64:
-        return 64
-    elif max_dim <= 128:
-        return 64  # 64 is often optimal for medium sizes
-    else:
-        return 128  # Larger blocks for bigger molecules
+    return 16
 
 @triton.jit
 def _load_xyz(ptr, idx, mask):
@@ -189,7 +186,9 @@ def overlap_score_grad_se3_batch(
     N_real: torch.Tensor | None = None,
     M_real: torch.Tensor | None = None,
     NEED_GRAD: bool = True,
-    BLOCK: int | None = None
+    BLOCK: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ):
     """
     One CTA per alignment (pair). Internal tile loops over A,B.
@@ -207,7 +206,8 @@ def overlap_score_grad_se3_batch(
     dtype  = A.dtype
 
     # Auto-select optimal BLOCK size based on molecule dimensions
-    if BLOCK is None:
+    auto_cfg = BLOCK is None
+    if auto_cfg:
         BLOCK = _select_block_size(N_pad, M_pad)
 
     if N_real is None:
@@ -228,6 +228,17 @@ def overlap_score_grad_se3_batch(
 
     grid = (K,)    # 1-D launch: one CTA per alignment
 
+    # One warp per CTA on the auto path: the small tile + 1 warp maximises
+    # resident CTAs/SM to hide load latency (see _select_block_size). Explicit
+    # BLOCK callers keep Triton's default unless they pass num_warps themselves.
+    launch_kw = {}
+    if num_warps is not None:
+        launch_kw["num_warps"] = num_warps
+    elif auto_cfg:
+        launch_kw["num_warps"] = 1
+    if num_stages is not None:
+        launch_kw["num_stages"] = num_stages
+
     _gauss_overlap_se3_tiled[grid](
         A.contiguous().view(-1),
         B.contiguous().view(-1),
@@ -240,6 +251,7 @@ def overlap_score_grad_se3_batch(
         out_S, out_dQ.view(-1), out_dT.view(-1),
         BLOCK,
         NEED_GRAD=NEED_GRAD,
+        **launch_kw,
     )
     return out_S, out_dQ, out_dT
 
