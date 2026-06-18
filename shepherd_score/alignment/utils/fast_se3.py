@@ -249,7 +249,8 @@ def coarse_fine_align_many(
         N_real: torch.Tensor | None = None,
         M_real: torch.Tensor | None = None,
         early_stop_patience: int = 5,
-        early_stop_tol: float = 1e-5):
+        early_stop_tol: float = 1e-5,
+        seeds: tuple | None = None):
     """
     Vectorised padding-aware alignment over a batch of (A, B) pairs.
 
@@ -294,8 +295,15 @@ def coarse_fine_align_many(
     # ------------------------------------------------------------------
     # 1) reference seed set (no coarse grid, no flips, no 2nd translation)
     # ------------------------------------------------------------------
-    quats, t_seeds = batched_seeds_torch(A_batch, B_batch, N_real, M_real,
-                                         num_seeds=num_seeds)
+    # Seeds may be precomputed once per band and passed in, so the sub-batcher
+    # can chunk ONLY the (memory-heavy) fine loop without re-paying the
+    # launch-bound seed-gen per chunk. Slicing precomputed per-pair seeds is
+    # exactly equivalent to recomputing per chunk (seeds are per-pair independent).
+    if seeds is None:
+        quats, t_seeds = batched_seeds_torch(A_batch, B_batch, N_real, M_real,
+                                             num_seeds=num_seeds)
+    else:
+        quats, t_seeds = seeds
     S = quats.size(1)
 
     # ------------------------------------------------------------------

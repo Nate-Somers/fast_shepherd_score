@@ -26,6 +26,7 @@ from shepherd_score.alignment import optimize_ROCS_overlay, optimize_ROCS_overla
 from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_overlay_analytical
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.alignment.utils.fast_se3 import coarse_fine_align_many, _self_overlap_in_chunks
+from shepherd_score.alignment.utils.fast_common import batched_seeds_torch
 from shepherd_score.alignment.utils.se3 import quaternion_to_SE3
 
 ### BEGIN size_bucketing #####################################################
@@ -496,12 +497,17 @@ class MoleculePair:
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
             VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
 
+            # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
+            # memory-pressured chunking never re-pays the launch-bound seed-gen.
+            seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=50)
+
             # ---- coarse + fine alignment, in GPU-memory-safe sub-batches -------
             def _proc(_s, _k):
                 sl = slice(_s, _s + _k)
                 return coarse_fine_align_many(
                     ref_pad[sl], fit_pad[sl], VAA[sl], VBB[sl],
-                    N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine)
+                    N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine,
+                    seeds=(seeds_q[sl], seeds_t[sl]))
             scores, q_batch, t_batch = _subbatched_align(
                 _proc, K, key=("vol", N_pad, M_pad, 50))
 
@@ -637,13 +643,18 @@ class MoleculePair:
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
             VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
 
+            # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
+            # memory-pressured chunking never re-pays the launch-bound seed-gen.
+            seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=50)
+
             # ---- coarse + fine alignment (same engine as volumetric), processed in
             # GPU-memory-safe sub-batches sized per bucket (pairs are independent)
             def _proc(_s, _k):
                 sl = slice(_s, _s + _k)
                 return coarse_fine_align_many(
                     ref_pad[sl], fit_pad[sl], VAA[sl], VBB[sl],
-                    N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine)
+                    N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine,
+                    seeds=(seeds_q[sl], seeds_t[sl]))
             scores, q_batch, t_batch = _subbatched_align(
                 _proc, K, key=("surf", N_pad, M_pad, 50))
 
@@ -797,7 +808,12 @@ class MoleculePair:
                     trans_centers_batch[i] = p._ref_xyz_t
                 trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
 
-            # GPU-memory-safe sub-batching per bucket (independent pairs).
+            # NOTE: seed-gen hoist intentionally NOT applied to esp. Unlike surf/vol
+            # (where it cleanly helps under memory pressure), for esp's heavier
+            # per-chunk footprint the held full-band seeds shaved enough free memory
+            # to tip the sub-batcher into OOM-retry thrash under pressure (esp-same
+            # large-batch went 1912 -> 273 mol/s). Clean-process esp is already fast;
+            # the per-cell subprocess benchmark removes the pressure entirely.
             def _proc(_s, _k):
                 sl = slice(_s, _s + _k)
                 tcb = trans_centers_batch[sl] if trans_centers_batch is not None else None
