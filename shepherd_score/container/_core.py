@@ -27,7 +27,7 @@ from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_over
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.alignment.utils.fast_se3 import coarse_fine_align_many, _self_overlap_in_chunks
 from shepherd_score.alignment.utils.fast_common import batched_seeds_torch
-from shepherd_score.alignment.utils.se3 import quaternion_to_SE3
+from shepherd_score.alignment.utils.se3 import quaternion_to_SE3, quaternions_to_SE3_batch
 
 ### BEGIN size_bucketing #####################################################
 # Every heavy-atom count 3‒150 is mapped to a “band” of 8 atoms
@@ -556,10 +556,11 @@ class MoleculePair:
             N_real = int_buf['N']
             M_real = int_buf['M']
 
-            # Fill in-place (no new tensor creation)
-            for i, p in enumerate(bucket):
-                N_real[i] = p._ref_xyz_t.shape[0]
-                M_real[i] = p._fit_xyz_t.shape[0]
+            # Fill once from CPU lists (one H2D each) -- was per-element GPU writes
+            n_list = [p._ref_xyz_t.shape[0] for p in bucket]
+            m_list = [p._fit_xyz_t.shape[0] for p in bucket]
+            N_real.copy_(torch.tensor(n_list, dtype=torch.int32))
+            M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
 
             # ---- workspaces (reuse & grow) -------------------------------------
             ws_key = (_dev_idx(device), N_pad, M_pad)
@@ -576,9 +577,6 @@ class MoleculePair:
             # but we do clear the padding slices for deterministic results.
             ref_pad.zero_()
             fit_pad.zero_()
-            # Batch .item() calls to reduce GPU→CPU sync overhead
-            n_list = N_real.tolist()
-            m_list = M_real.tolist()
             for i, (p, n, m) in enumerate(zip(bucket, n_list, m_list)):
                 ref_pad[i, :n] = p._ref_xyz_t
                 fit_pad[i, :m] = p._fit_xyz_t
@@ -611,9 +609,9 @@ class MoleculePair:
         q_cpu = torch.cat(all_q).cpu()
         t_cpu = torch.cat(all_t).cpu()
 
-        for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
-            # quaternion_to_SE3 unchanged
-            p.transform_vol_noH = quaternion_to_SE3(q, t)
+        SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
+        for p, s, S in zip(all_pairs, scores_cpu, SE3_all):
+            p.transform_vol_noH = S
             p.sim_aligned_vol_noH = float(s)
 
     @staticmethod
@@ -707,10 +705,12 @@ class MoleculePair:
             N_real = int_buf['N']
             M_real = int_buf['M']
 
-            # Fill in-place
-            for i, p in enumerate(bucket):
-                N_real[i] = p._ref_surf_t.shape[0]
-                M_real[i] = p._fit_surf_t.shape[0]
+            # Fill once from CPU lists (one H2D each) instead of per-element GPU
+            # scalar writes (which were ~8k tiny dispatches/sync per align).
+            n_list = [p._ref_surf_t.shape[0] for p in bucket]
+            m_list = [p._fit_surf_t.shape[0] for p in bucket]
+            N_real.copy_(torch.tensor(n_list, dtype=torch.int32))
+            M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
 
             # ---- workspaces (reuse & grow) ----------------------------------------
             ws_key = (_dev_idx(device), N_pad, M_pad)
@@ -761,8 +761,9 @@ class MoleculePair:
         q_cpu = torch.cat(all_q).cpu()
         t_cpu = torch.cat(all_t).cpu()
 
-        for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
-            p.transform_surf = quaternion_to_SE3(q, t)
+        SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
+        for p, s, S in zip(all_pairs, scores_cpu, SE3_all):
+            p.transform_surf = S
             p.sim_aligned_surf = float(s)
 
     @staticmethod
@@ -864,9 +865,8 @@ class MoleculePair:
             N_real = ib["N"]
             M_real = ib["M"]
 
-            for i, p in enumerate(bucket):
-                N_real[i] = p._ref_surf_t.shape[0]
-                M_real[i] = p._fit_surf_t.shape[0]
+            N_real.copy_(torch.tensor([p._ref_surf_t.shape[0] for p in bucket], dtype=torch.int32))
+            M_real.copy_(torch.tensor([p._fit_surf_t.shape[0] for p in bucket], dtype=torch.int32))
 
             ws_key = (N_pad, M_pad, K)
             ws = workspaces.get(ws_key)
@@ -938,8 +938,9 @@ class MoleculePair:
         q_cpu = torch.cat(all_q).cpu()
         t_cpu = torch.cat(all_t).cpu()
 
-        for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
-            p.transform_esp = quaternion_to_SE3(q, t)
+        SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
+        for p, s, S in zip(all_pairs, scores_cpu, SE3_all):
+            p.transform_esp = S
             p.sim_aligned_esp = float(s)
 
     @staticmethod
@@ -1262,12 +1263,11 @@ class MoleculePair:
             N_real = torch.empty(K, device=device, dtype=torch.int32)
             M_real = torch.empty(K, device=device, dtype=torch.int32)
 
-            for i, p in enumerate(bucket):
-                n = p._ref_pharm_ancs_t.shape[0]
-                m = p._fit_pharm_ancs_t.shape[0]
-                N_real[i] = n
-                M_real[i] = m
-
+            n_list = [p._ref_pharm_ancs_t.shape[0] for p in bucket]
+            m_list = [p._fit_pharm_ancs_t.shape[0] for p in bucket]
+            N_real.copy_(torch.tensor(n_list, dtype=torch.int32))   # was per-element GPU writes
+            M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
+            for i, (p, n, m) in enumerate(zip(bucket, n_list, m_list)):
                 ref_types[i, :n] = p._ref_pharm_types_t
                 fit_types[i, :m] = p._fit_pharm_types_t
                 ref_ancs[i, :n] = p._ref_pharm_ancs_t
@@ -1307,8 +1307,9 @@ class MoleculePair:
         q_cpu = torch.cat(all_q).cpu()
         t_cpu = torch.cat(all_t).cpu()
 
-        for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
-            p.transform_pharm = quaternion_to_SE3(q, t)
+        SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
+        for p, s, S in zip(all_pairs, scores_cpu, SE3_all):
+            p.transform_pharm = S
             p.sim_aligned_pharm = float(s)
 
     def align_with_vol(self,

@@ -102,11 +102,21 @@ def ab(modes, batch, reps, strategies, ndist=40):
     return t, acc
 
 
+_GRAPH_MAX_P_DEFAULT = fse3._GRAPH_MAX_P
+
+
 def _off():
     fse3._PRUNE_AFTER = 0; fse3._PRUNE_KEEP = 0
     fse3._ES_PATIENCE = None; fse3._ES_TOL = None
     fcom.ES_PATIENCE_OVERRIDE = None                      # esp/pharm
     cc._NUM_SEEDS = None
+    fse3._GRAPH_MAX_P = _GRAPH_MAX_P_DEFAULT
+
+
+def _graphs():
+    def f():
+        _off(); fse3._GRAPH_MAX_P = 10 ** 9               # enable CUDA-graph fine loop at any batch
+    return f
 
 
 def _prune(after, keep):
@@ -143,8 +153,11 @@ def main():
     ap.add_argument("--es-patience", type=int, action="append")
     ap.add_argument("--seeds", type=int, action="append")
     ap.add_argument("--combo", nargs=2, type=int, metavar=("PATIENCE", "SEEDS"), action="append")
+    ap.add_argument("--graphs", action="store_true", help="A/B CUDA-graph fine loop at the test batch")
     args = ap.parse_args()
     strategies = [("baseline", _off)]
+    if args.graphs:
+        strategies.append(("cuda_graphs", _graphs()))
     for after, keep in (args.prune or []):
         strategies.append((f"prune@{after}/keep{keep}", _prune(after, keep)))
     for p in (args.es_patience or []):

@@ -64,6 +64,24 @@ Baseline (speedlab best-of-6, batch 4096): **vol 5260, surf 2545→4456, esp 167
 
 **Shipped safe wins:** num_stages/maxnreg autotune (surf/esp kernel) + num_stages (pharm kernel) + Lever 2 patience=2 (surf/vol only). esp/pharm get num_stages (bit-identical) + will get the cutoff. *Note: pharm self-copy min is ~0.80 at baseline (pre-existing under-convergence on a hard pharmacophore) — a separate quality item, not introduced here.*
 
+| 8 | spatial cutoff | tile-skip feasibility | surf | tile-skip only **2%** even sorted | n/a | ❌ INFEASIBLE — drug molecules (~10-15 Å) are barely bigger than the 6.3 Å cutoff, so no 16-pt tile is all-far. Per-pair sparsity (0.40) needs per-lane skip (SIMT can't). |
+
+## 🎯 BREAKTHROUGH — the align is OVERHEAD-bound, not kernel-bound
+Decomposing the align (time at 2 vs 50 fine steps): **T_fixed (per-call setup) = 670–823 ms; T_step (kernel) only 0.15–7 ms.** At ~25 steps the *kernel is <20% of the align* (vol ~0%). The real cost was **per-pair Python loops over 4096 pairs**: `N_real[i]=…` (≈8k tiny GPU scalar writes) and a per-pair `quaternion_to_SE3` writeback. **Both are pure data-movement → BIT-IDENTICAL to vectorize.**
+
+| 9 | **vectorize N_real fill (CPU list + one H2D) + batched SE3 writeback** | all modes | — | **bit-identical (self=1.000, dist|Δ|=0)** | ✅✅ THE WIN |
+
+**Measured throughput (speedlab paired, batch 4096), before → after:**
+
+| mode | before | **after** | × | self |
+|---|--:|--:|--:|--:|
+| vol | 5,260 | **18,367** | 3.5× | 1.000 |
+| surf | 2,545 | **16,342** | 6.5× | 1.000 |
+| esp | 1,673 | **6,199** | 3.7× | 1.000 |
+| pharm | 2,128 | (re-measuring) | | |
+
+**vol and surf are >10k, bit-identical (zero accuracy change).** Mechanism: `quaternions_to_SE3_batch` (se3.py) uses the identical per-element formula; the build fills are the same data via `copy_`/pad. No optimization math touched.
+
 **KEY FINDING (kernel microbench, clean paired):** the overlap value+grad kernel is **compute-bound on the Gaussian `exp()`** (mem-util ~0%, 6.05 ms/200k poses ≈ constant across latency/occupancy configs). **Bit-identical headroom is ~1.09×, full stop.** Occupancy (BLOCK/warps) cannot be raised without changing the float reduction (accuracy). So the multi-pose-per-CTA rewrite is also unlikely to help (latency hiding gave only 1.06×; the bottleneck is exp throughput, not stalls).
 
 ## Assessment — is >10k reachable with ZERO accuracy loss?

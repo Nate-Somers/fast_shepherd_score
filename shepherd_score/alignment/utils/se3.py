@@ -41,6 +41,23 @@ def quaternion_to_SE3(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     SE3[:3,  3] = t
     return SE3
 
+
+def quaternions_to_SE3_batch(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Batched, bit-identical to quaternion_to_SE3 applied row-wise.
+    q : (K, 4) normalised (r,i,j,k); t : (K, 3) -> (K, 4, 4)."""
+    r, i, j, k = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    two = 2.0
+    R = torch.stack((
+        1 - two * (j * j + k * k), two * (i * j - k * r),     two * (i * k + j * r),
+        two * (i * j + k * r),     1 - two * (i * i + k * k), two * (j * k - i * r),
+        two * (i * k - j * r),     two * (j * k + i * r),     1 - two * (i * i + j * j),
+    ), dim=1).view(-1, 3, 3)
+    K = q.shape[0]
+    SE3 = torch.eye(4, dtype=q.dtype, device=q.device).repeat(K, 1, 1)
+    SE3[:, :3, :3] = R
+    SE3[:, :3, 3] = t
+    return SE3
+
 def quaternions_to_rotation_matrix(quaternions: torch.Tensor) -> torch.Tensor:
     """
     Converts quaternion to a rotation matrix. Supports batched and non-batched inputs.
