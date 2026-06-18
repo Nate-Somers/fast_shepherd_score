@@ -12,6 +12,7 @@ from ...score.pharmacophore_overlap_triton import (
 from ...score.gaussian_overlap_triton import fused_adam_qt
 from ...score.pharmacophore_grad_triton import pharm_score_grad_se3_batch
 from ...score.analytical_gradients._torch import build_lookup_tables
+from . import fast_common as _fc
 from .fast_common import (
     check_gpu_available,
     build_coarse_grid,
@@ -298,7 +299,7 @@ def coarse_fine_pharm_align_many(
             current_max = best_score.max().item()
             if current_max - prev_max_score < early_stop_tol:
                 no_improve_count += 1
-                if no_improve_count >= early_stop_patience:
+                if no_improve_count >= (_fc.ES_PATIENCE_OVERRIDE or early_stop_patience):
                     break
             else:
                 no_improve_count = 0

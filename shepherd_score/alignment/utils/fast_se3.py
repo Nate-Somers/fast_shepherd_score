@@ -169,6 +169,20 @@ _FINE_GRAPH_CACHE: dict = {}
 # launch-bound GPU benefits; enable with FINE_FUSED_STEP=1. Do not enable here.
 _FINE_FUSED = os.environ.get("FINE_FUSED_STEP", "0") != "0"
 
+# Early seed-prune (H1): after _PRUNE_AFTER fine steps, keep only the top
+# _PRUNE_KEEP seeds per pair (by current best score) and finish only those. Cuts
+# pose-steps from ~num_seeds*steps to num_seeds*K + keep*(steps-K). A few steps of
+# optimisation make the score a good basin predictor (unlike the 0-step prune that
+# was removed). OFF by default (=0); accuracy-gated via benchmarks/speedlab.py.
+_PRUNE_AFTER = int(os.environ.get("FINE_PRUNE_AFTER", 0))
+_PRUNE_KEEP = int(os.environ.get("FINE_PRUNE_KEEP", 0))
+
+# Early-stop trim (H2/Lever 2): patience=5 (5 checks x 5 steps = 25 steps after the
+# best stops improving) over-runs on the fast-converging self-copy benchmark.
+# Module-level overrides (None -> use the call's params); set via speedlab.
+_ES_PATIENCE = (lambda v: int(v) if v else None)(os.environ.get("FINE_ES_PATIENCE"))
+_ES_TOL = (lambda v: float(v) if v else None)(os.environ.get("FINE_ES_TOL"))
+
 
 class _GraphedFineSurf:
     """Capture one in-place surf fine step into a CUDA graph; replay = N steps.
@@ -293,7 +307,11 @@ def coarse_fine_align_many(
         topk: int | None = None,        # deprecated: pruning removed (see below)
         N_real: torch.Tensor | None = None,
         M_real: torch.Tensor | None = None,
-        early_stop_patience: int = 5,
+        early_stop_patience: int = 2,   # Lever 2: surf/vol self-copies converge fast;
+                                        # patience 5 over-ran ~25 steps. =2 is paired-
+                                        # validated accuracy-safe (distinct max|Δ|=0,
+                                        # self=1.0). esp/pharm converge slower -> they
+                                        # keep 5 (patience 2 there cost ~8e-3).
         early_stop_tol: float = 1e-5,
         seeds: tuple | None = None):
     """
@@ -398,7 +416,9 @@ def coarse_fine_align_many(
         best_q = q_k.clone()
         best_t = t_k.clone()
 
-        # Early stopping state
+        # Early stopping state (module overrides win if set -- Lever 2)
+        es_patience = _ES_PATIENCE if _ES_PATIENCE is not None else early_stop_patience
+        es_tol = _ES_TOL if _ES_TOL is not None else early_stop_tol
         prev_max_score = -float('inf')
         no_improve_count = 0
 
@@ -419,13 +439,27 @@ def coarse_fine_align_many(
             best_q = torch.where(mask_q, q_k, best_q)
             best_t = torch.where(mask_q, t_k, best_t)
 
+            # --- early seed-prune (H1): keep only top-KEEP seeds/pair, finish those ---
+            if _PRUNE_AFTER and _PRUNE_KEEP and step == _PRUNE_AFTER - 1 and S > _PRUNE_KEEP:
+                topi = best_score.view(BATCH, S).topk(_PRUNE_KEEP, dim=1).indices
+                gidx = (topi + torch.arange(BATCH, device=device).unsqueeze(1) * S).reshape(-1)
+                q_k = q_k[gidx].contiguous(); t_k = t_k[gidx].contiguous()
+                m_q = m_q[gidx].contiguous(); v_q = v_q[gidx].contiguous()
+                m_t = m_t[gidx].contiguous(); v_t = v_t[gidx].contiguous()
+                best_score = best_score[gidx].contiguous()
+                best_q = best_q[gidx].contiguous(); best_t = best_t[gidx].contiguous()
+                A_k = A_k[gidx].contiguous(); B_k = B_k[gidx].contiguous()
+                N_k = N_k[gidx].contiguous(); M_k = M_k[gidx].contiguous()
+                VAA_plus_VBB = VAA_plus_VBB[gidx].contiguous()
+                S = _PRUNE_KEEP
+
             # Early stopping check, gated to every 5 steps to avoid a per-step
             # GPU->CPU sync. Gating only makes early-stop *less* aggressive.
             if step % 5 == 0:
                 current_max = best_score.max().item()
-                if current_max - prev_max_score < early_stop_tol:
+                if current_max - prev_max_score < es_tol:
                     no_improve_count += 1
-                    if no_improve_count >= early_stop_patience:
+                    if no_improve_count >= es_patience:
                         break
                 else:
                     no_improve_count = 0

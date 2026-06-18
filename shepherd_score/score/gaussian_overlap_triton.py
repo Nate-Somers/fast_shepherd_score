@@ -40,8 +40,8 @@ def _load_xyz(ptr, idx, mask):
 # kernel self-tunes to whatever GPU / Triton version it runs on. (Hardcoding
 # BLOCK=16/num_warps=1 was optimal only for this RTX 4050 + triton 3.6.0.)
 _OVERLAP_CONFIGS = [
-    triton.Config({'BLOCK': _b}, num_warps=_w)
-    for _b in (16, 32, 64) for _w in (1, 2, 4)
+    triton.Config({'BLOCK': _b}, num_warps=_w, num_stages=_s)
+    for _b in (16, 32, 64) for _w in (1, 2, 4) for _s in (1, 2, 3, 4)
 ]
 
 

@@ -11,6 +11,7 @@ from ...score.gaussian_overlap_esp_triton import (
     fused_adam_qt,
     fused_adam_qt_with_tangent_proj
 )
+from . import fast_common as _fc
 from .fast_common import (
     check_gpu_available,
     legacy_seeds_torch,
@@ -272,7 +273,7 @@ def coarse_fine_esp_align_many(
             current_max = best_score.max().item()
             if current_max - prev_max_score < early_stop_tol:
                 no_improve_count += 1
-                if no_improve_count >= early_stop_patience:
+                if no_improve_count >= (_fc.ES_PATIENCE_OVERRIDE or early_stop_patience):
                     break
             else:
                 no_improve_count = 0

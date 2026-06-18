@@ -1,9 +1,16 @@
 # shepherd_score/alignment/utils/fast_common.py
 # Common utilities shared across fast GPU-accelerated alignment methods.
 
+import os
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
+
+# Shared early-stop patience override for the esp/pharm fine loops (None -> use the
+# call's default). Lever 2: patience=5 over-runs ~25 steps after convergence on the
+# fast-converging self-copy benchmark. Set via speedlab; accuracy-gated. (surf/vol
+# uses fast_se3._ES_PATIENCE.)
+ES_PATIENCE_OVERRIDE = (lambda v: int(v) if v else None)(os.environ.get("FINE_ES_PATIENCE"))
 
 
 def check_gpu_available() -> bool:

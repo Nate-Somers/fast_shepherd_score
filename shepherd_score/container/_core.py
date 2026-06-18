@@ -50,6 +50,11 @@ _PAIR_FOOTPRINT_BYTES: dict[tuple, int] = {}
 # Set env SUBBATCH_DEBUG=1 to print the chosen chunk size per bucket.
 _SUBBATCH_DEBUG = bool(os.environ.get("SUBBATCH_DEBUG"))
 
+# Override the vol/surf seed count (default 50) for speed experiments. Fewer seeds
+# = fewer poses = ~linear speedup, but coarser SO(3) coverage risks distinct-pair
+# accuracy -- gated in benchmarks/speedlab.py. None -> 50.
+_NUM_SEEDS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_SEEDS"))
+
 
 # --- multi-GPU dispatch ------------------------------------------------------
 import threading as _threading
@@ -584,7 +589,7 @@ class MoleculePair:
 
             # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
             # memory-pressured chunking never re-pays the launch-bound seed-gen.
-            seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=50)
+            seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=(_NUM_SEEDS or 50))
 
             # ---- coarse + fine alignment, in GPU-memory-safe sub-batches -------
             def _proc(_s, _k):
@@ -733,7 +738,7 @@ class MoleculePair:
 
             # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
             # memory-pressured chunking never re-pays the launch-bound seed-gen.
-            seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=50)
+            seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=(_NUM_SEEDS or 50))
 
             # ---- coarse + fine alignment (same engine as volumetric), processed in
             # GPU-memory-safe sub-batches sized per bucket (pairs are independent)

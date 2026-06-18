@@ -15,7 +15,8 @@ import triton.language as tl
 # Self-tunes num_warps per (N_pad, M_pad) on the actual device. BLOCK is derived
 # from the feature count (next_pow2), not a GPU-specific constant; only the warp
 # count is hardware-dependent, so autotune picks it -- nothing hardcoded per GPU.
-@triton.autotune(configs=[triton.Config({}, num_warps=_w) for _w in (1, 2, 4, 8)],
+@triton.autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
+                          for _w in (1, 2, 4, 8) for _s in (1, 2, 3, 4)],
                  key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _pharm_score_grad_kernel(
