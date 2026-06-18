@@ -30,7 +30,7 @@ def _overlap_in_chunks_volumetric(A, B, q, t, *, alpha: float,
                                    N_real: torch.Tensor,
                                    M_real: torch.Tensor,
                                    NEED_GRAD: bool = True,
-                                   BLOCK: int = 64):
+                                   BLOCK: int | None = None):   # None -> kernel auto: BLOCK=16, 1 warp/CTA
     """Evaluate volumetric overlap kernel in chunks."""
     K = A.shape[0]
     N_real = N_real.to(torch.int32).contiguous()

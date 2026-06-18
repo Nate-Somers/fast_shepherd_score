@@ -200,7 +200,9 @@ def overlap_score_grad_esp_se3_batch(
     N_real: torch.Tensor | None = None,
     M_real: torch.Tensor | None = None,
     NEED_GRAD: bool = True,
-    BLOCK: int = 64
+    BLOCK: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ):
     """
     ESP-weighted overlap with SE(3) gradients.
@@ -225,6 +227,13 @@ def overlap_score_grad_esp_se3_batch(
     device = A.device
     dtype  = A.dtype
 
+    # One CTA per pose -> latency/occupancy bound; a small tile + 1 warp/CTA
+    # maximises resident CTAs/SM to hide load latency. Measured 2.5-9.3x over the
+    # old BLOCK=64 default across N=32..112 (benchmarks/profile_overlap_esp.py).
+    auto_cfg = BLOCK is None
+    if auto_cfg:
+        BLOCK = 16
+
     if N_real is None:
         N_real = torch.full((K,), N_pad, device=device, dtype=torch.int32)
     else:
@@ -244,6 +253,14 @@ def overlap_score_grad_esp_se3_batch(
 
     grid = (K,)    # 1-D launch: one CTA per alignment
 
+    launch_kw = {}
+    if num_warps is not None:
+        launch_kw["num_warps"] = num_warps
+    elif auto_cfg:
+        launch_kw["num_warps"] = 1
+    if num_stages is not None:
+        launch_kw["num_stages"] = num_stages
+
     _gauss_overlap_esp_se3_tiled[grid](
         A.contiguous().view(-1),
         B.contiguous().view(-1),
@@ -258,6 +275,7 @@ def overlap_score_grad_esp_se3_batch(
         out_S, out_dQ.view(-1), out_dT.view(-1),
         BLOCK,
         NEED_GRAD=NEED_GRAD,
+        **launch_kw,
     )
     return out_S, out_dQ, out_dT
 

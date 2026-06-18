@@ -27,7 +27,7 @@ def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float,
                            N_real: torch.Tensor,
                            M_real: torch.Tensor,
                            NEED_GRAD: bool = True,
-                           BLOCK: int = 64):
+                           BLOCK: int | None = None):   # None -> kernel auto: BLOCK=16, 1 warp/CTA
     """
     Evaluate the fused ESP overlap kernel in chunks respecting CUDA grid limits.
 
