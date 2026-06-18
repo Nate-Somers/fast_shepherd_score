@@ -31,10 +31,48 @@ import functools
 import hashlib
 import os
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+
+# --- self-contained pair/cohort containers + geometry helper ----------------
+# (previously imported from the now-removed alignment_bench package)
+@dataclass
+class PairSpec:
+    """One reference/fit pair plus the ground-truth transform used to build it."""
+    ref: object
+    fit: object
+    R: np.ndarray            # (3, 3) rotation applied to make fit
+    t: np.ndarray            # (3,)   translation applied to make fit
+    n_ref: int               # mode-relevant point count of ref (the "size")
+    n_fit: int
+
+
+@dataclass
+class Cohort:
+    """A reproducible set of pairs sharing a size/bucket policy."""
+    name: str
+    mode: str
+    pairs: List[PairSpec]
+    size_kind: str           # "same" | "cross"
+    seed: int
+    noise: float
+    meta: Dict[str, object] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+
+def _random_rotation(rng: np.random.Generator) -> np.ndarray:
+    """Uniformly random 3x3 proper rotation matrix (via QR of a Gaussian)."""
+    a = rng.standard_normal((3, 3))
+    q, r = np.linalg.qr(a)
+    q = q @ np.diag(np.sign(np.diag(r)))
+    if np.linalg.det(q) < 0:
+        q[:, 0] = -q[:, 0]
+    return q.astype(np.float64)
 
 
 def _disk_cache_path(smiles: str, surf_per_atom: int, seed: int) -> Optional[str]:
@@ -49,8 +87,6 @@ def _disk_cache_path(smiles: str, surf_per_atom: int, seed: int) -> Optional[str
         return None
     key = hashlib.md5(f"v1|{smiles}|{surf_per_atom}|{seed}".encode()).hexdigest()
     return os.path.join(d, key + ".pkl")
-
-from benchmarks.alignment_bench.workloads import PairSpec, Cohort, _random_rotation
 
 # (name, SMILES, approx heavy-atom count) — real marketed drugs, small -> large.
 DRUGS: List[Tuple[str, str, int]] = [
