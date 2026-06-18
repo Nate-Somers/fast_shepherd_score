@@ -10,6 +10,8 @@ from ...score.pharmacophore_overlap_triton import (
     pharm_similarity_from_overlaps,
 )
 from ...score.gaussian_overlap_triton import fused_adam_qt
+from ...score.pharmacophore_grad_triton import pharm_score_grad_se3_batch
+from ...score.analytical_gradients._torch import build_lookup_tables
 from .fast_common import (
     check_gpu_available,
     build_coarse_grid,
@@ -193,38 +195,60 @@ def coarse_fine_pharm_align_many(
     prev_max_score = -float('inf')
     no_improve_count = 0
 
-    # Use the analytical (autograd-free) gradient when there is no padding
-    # (single-pair path and equal-size buckets). The analytical overlap has no
-    # N_real/M_real masking, so padded batches keep the autograd path.
-    use_analytical = bool((N_k == N_pad).all() and (M_k == M_pad).all())
+    # The Triton value+grad kernel (pharm_score_grad_se3_batch) is the fast,
+    # masking-aware path: it matches compute_overlap_and_grad_pharm to ~1e-7 on
+    # value AND gradient (benchmarks/pharm_kernel_parity.py) and is ~20-100x
+    # faster, and -- unlike the analytical torch path -- it handles N_real/M_real
+    # masking, so it also covers padded buckets (which previously fell back to the
+    # slow per-step autograd path). It implements the base overlap; extended_points
+    # keeps the analytical/autograd fallback.
+    use_kernel = (not extended_points) and anchors_1_k.is_cuda
+    use_analytical = use_kernel or bool((N_k == N_pad).all() and (M_k == M_pad).all())
+    _pk_tables = None
     if use_analytical:
-        # Self-overlaps consistent with the analytical cross-overlap (mixing the
-        # fast typed self-overlap with the analytical cross-overlap would make the
-        # Tanimoto ratio inconsistent and collapse the score). Self-overlap is the
-        # overlap of a molecule with itself under the identity transform; computed
-        # batched over the (P seed-expanded) rows once (pose-invariant).
+        # Self-overlaps MUST use the same overlap as the per-step cross-overlap
+        # (mixing conventions makes the Tanimoto ratio inconsistent and collapses
+        # the score). Self-overlap = overlap of a molecule with itself under
+        # identity; pose-invariant, computed once over the P seed-expanded rows.
         _P = anchors_1_k.shape[0]
         _I3 = torch.eye(3, device=device, dtype=anchors_1_k.dtype).expand(_P, 3, 3)
         _z = torch.zeros(_P, 3, device=device, dtype=anchors_1_k.dtype)
-        VAA_an, _, _ = compute_overlap_and_grad_pharm(
-            _I3, _z, types_1_k, types_1_k, anchors_1_k, anchors_1_k, vectors_1_k, vectors_1_k,
-            extended_points=extended_points, only_extended=only_extended,
-        )
-        VBB_an, _, _ = compute_overlap_and_grad_pharm(
-            _I3, _z, types_2_k, types_2_k, anchors_2_k, anchors_2_k, vectors_2_k, vectors_2_k,
-            extended_points=extended_points, only_extended=only_extended,
-        )
+        if use_kernel:
+            _pk_tables = build_lookup_tables(device, anchors_1_k.dtype)
+            _al, _Ks, _cats = _pk_tables
+            VAA_an, _, _ = pharm_score_grad_se3_batch(
+                _I3, _z, types_1_k, types_1_k, anchors_1_k, anchors_1_k, vectors_1_k, vectors_1_k,
+                _al, _Ks, _cats, N_real=N_k, M_real=N_k, NEED_GRAD=False)
+            VBB_an, _, _ = pharm_score_grad_se3_batch(
+                _I3, _z, types_2_k, types_2_k, anchors_2_k, anchors_2_k, vectors_2_k, vectors_2_k,
+                _al, _Ks, _cats, N_real=M_k, M_real=M_k, NEED_GRAD=False)
+        else:
+            VAA_an, _, _ = compute_overlap_and_grad_pharm(
+                _I3, _z, types_1_k, types_1_k, anchors_1_k, anchors_1_k, vectors_1_k, vectors_1_k,
+                extended_points=extended_points, only_extended=only_extended,
+            )
+            VBB_an, _, _ = compute_overlap_and_grad_pharm(
+                _I3, _z, types_2_k, types_2_k, anchors_2_k, anchors_2_k, vectors_2_k, vectors_2_k,
+                extended_points=extended_points, only_extended=only_extended,
+            )
 
     for step in range(steps_fine):
         if use_analytical:
             # One fused value+grad pass, no autograd graph, no per-step host sync.
             q_unit = torch.nn.functional.normalize(q_param, dim=1)
             R = _rotation_matrix_from_unit_quat(q_unit)
-            O_AB, grad_R, grad_t = compute_overlap_and_grad_pharm(
-                R, t_param, types_1_k, types_2_k,
-                anchors_1_k, anchors_2_k, vectors_1_k, vectors_2_k,
-                extended_points=extended_points, only_extended=only_extended,
-            )
+            if use_kernel:
+                _al, _Ks, _cats = _pk_tables
+                O_AB, grad_R, grad_t = pharm_score_grad_se3_batch(
+                    R, t_param, types_1_k, types_2_k,
+                    anchors_1_k, anchors_2_k, vectors_1_k, vectors_2_k,
+                    _al, _Ks, _cats, N_real=N_k, M_real=M_k)
+            else:
+                O_AB, grad_R, grad_t = compute_overlap_and_grad_pharm(
+                    R, t_param, types_1_k, types_2_k,
+                    anchors_1_k, anchors_2_k, vectors_1_k, vectors_2_k,
+                    extended_points=extended_points, only_extended=only_extended,
+                )
             score = pharm_similarity_from_overlaps(O_AB, VAA_an, VBB_an, similarity=similarity)
             if similarity == 'tanimoto':
                 _, sgrad_R, sgrad_t = apply_tanimoto_chain_rule(O_AB, VAA_an + VBB_an, grad_R, grad_t)
