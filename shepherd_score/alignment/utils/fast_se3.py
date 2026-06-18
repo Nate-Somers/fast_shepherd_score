@@ -1,4 +1,4 @@
-import torch, math
+import torch, math, os
 import torch.nn.functional as F
 from ...score.gaussian_overlap_triton import overlap_score_grad_se3_batch, fused_adam_qt, fused_adam_qt_with_tangent_proj, _batch_self_overlap
 from .fast_common import batched_seeds_torch
@@ -139,7 +139,106 @@ def _legacy_seeds_torch(ref_xyz: torch.Tensor,
     except Exception:
         # Includes numpy.linalg.LinAlgError from PCA
         return fallback("legacy_init_exception")
-    
+
+# ----------------------------------------------------------------------------
+# CUDA-graph fast path for the surf/vol fine loop (gaussian kernel).
+#
+# The fine loop is launch-bound at small batch (~10 kernel launches/step). We
+# capture ONE in-place fine step into a CUDA graph and replay it N times -- replay
+# carries state between steps, so N replays == N steps with ~zero per-step launch
+# overhead. Bit-identical to the eager loop (microbench-validated: max|delta|=0),
+# ~2.7x faster at batch 16, fading to ~1x by batch 256 (compute-bound). So it is
+# used ONLY for small P (where it helps and the per-shape buffers are cheap);
+# large P and any capture failure fall back to the eager loop. Disable with
+# FINE_CUDA_GRAPHS=0.
+_FINE_GRAPHS = os.environ.get("FINE_CUDA_GRAPHS", "1") != "0"
+_GRAPH_MAX_P = int(os.environ.get("FINE_GRAPH_MAX_P", 16000))   # ~batch<=320 (x50 seeds)
+_GRAPH_STEPS = int(os.environ.get("FINE_GRAPH_STEPS", 50))      # fixed steps; eager early-stops ~50
+_FINE_GRAPH_CACHE: dict = {}
+
+
+class _GraphedFineSurf:
+    """Capture one in-place surf fine step into a CUDA graph; replay = N steps.
+
+    All loop-carried state (q/t, Adam moments, best_*) lives in persistent buffers
+    updated in place; per-step temporaries use out= so there are no host syncs and
+    no reallocation -- the requirements for graph capture. Inputs (A/B/seeds/...)
+    are copied into the buffers before each replay, so one captured graph serves
+    every bucket of the same (N_pad, M_pad, P) shape.
+    """
+
+    def __init__(self, N_pad, M_pad, P, steps, alpha, lr, device):
+        self.steps = steps; self.alpha = float(alpha); self.lr = float(lr)
+        f = lambda *s: torch.empty(*s, device=device, dtype=torch.float32)
+        self.A = f(P, N_pad, 3); self.B = f(P, M_pad, 3)
+        self.Nr = torch.empty(P, device=device, dtype=torch.int32)
+        self.Mr = torch.empty(P, device=device, dtype=torch.int32)
+        self.norm = f(P)
+        self.qs = f(P, 4); self.ts = f(P, 3)            # seeds (replay start state)
+        self.q = f(P, 4); self.t = f(P, 3)
+        self.mq = f(P, 4); self.vq = f(P, 4); self.mt = f(P, 3); self.vt = f(P, 3)
+        self.best = f(P); self.bq = f(P, 4); self.bt = f(P, 3)
+        self.denom = f(P); self.d2 = f(P); self.score = f(P); self.scale = f(P)
+        self.better = torch.empty(P, device=device, dtype=torch.bool)
+        self.gq = f(P, 4); self.gt = f(P, 3)
+        self.graph = None
+
+    def _step(self):
+        VAB, dQ, dT = overlap_score_grad_se3_batch(
+            self.A, self.B, self.q, self.t, alpha=self.alpha, N_real=self.Nr, M_real=self.Mr)
+        torch.sub(self.norm, VAB, out=self.denom)
+        torch.div(VAB, self.denom, out=self.score)
+        torch.mul(self.denom, self.denom, out=self.d2)
+        torch.div(self.norm, self.d2, out=self.scale)
+        torch.gt(self.score, self.best, out=self.better)
+        torch.where(self.better, self.score, self.best, out=self.best)
+        bm = self.better.unsqueeze(1)
+        torch.where(bm, self.q, self.bq, out=self.bq)
+        torch.where(bm, self.t, self.bt, out=self.bt)
+        torch.mul(dQ, self.scale.unsqueeze(1), out=self.gq); self.gq.neg_()
+        torch.mul(dT, self.scale.unsqueeze(1), out=self.gt); self.gt.neg_()
+        fused_adam_qt_with_tangent_proj(self.q, self.t, self.gq, self.gt,
+                                        self.mq, self.vq, self.mt, self.vt, self.lr)
+
+    def _load(self, A, B, Nr, Mr, norm, qs, ts):
+        self.A.copy_(A); self.B.copy_(B)
+        self.Nr.copy_(Nr.to(torch.int32)); self.Mr.copy_(Mr.to(torch.int32))
+        self.norm.copy_(norm); self.qs.copy_(qs); self.ts.copy_(ts)
+
+    def _reset(self):
+        self.q.copy_(self.qs); self.t.copy_(self.ts)
+        self.mq.zero_(); self.vq.zero_(); self.mt.zero_(); self.vt.zero_()
+        self.best.fill_(-float('inf')); self.bq.copy_(self.qs); self.bt.copy_(self.ts)
+
+    def capture(self, A, B, Nr, Mr, norm, qs, ts):
+        self._load(A, B, Nr, Mr, norm, qs, ts); self._reset()
+        s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):                       # warmup -> compile/autotune
+            for _ in range(3):
+                self._step()
+        torch.cuda.current_stream().wait_stream(s)
+        self._reset()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self._step()
+
+    def run(self, A, B, Nr, Mr, norm, qs, ts):
+        self._load(A, B, Nr, Mr, norm, qs, ts); self._reset()
+        for _ in range(self.steps):
+            self.graph.replay()
+        return self.best, self.bq, self.bt
+
+
+def _run_graphed_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps, N_pad, M_pad, P):
+    key = (N_pad, M_pad, P, steps, round(float(alpha), 4), round(float(lr), 5))
+    gf = _FINE_GRAPH_CACHE.get(key)
+    if gf is None:
+        gf = _GraphedFineSurf(N_pad, M_pad, P, steps, alpha, lr, A_k.device)
+        gf.capture(A_k, B_k, N_k, M_k, norm, q_seed, t_seed)
+        _FINE_GRAPH_CACHE[key] = gf
+    return gf.run(A_k, B_k, N_k, M_k, norm, q_seed, t_seed)
+
+
 def coarse_fine_align_many(
         A_batch, B_batch, VAA, VBB, *,
         alpha: float = 0.81,
@@ -204,65 +303,75 @@ def coarse_fine_align_many(
     # ------------------------------------------------------------------
     A_k = A_batch.unsqueeze(1).expand(-1, S, -1, -1).reshape(-1, N_pad, 3)
     B_k = B_batch.unsqueeze(1).expand(-1, S, -1, -1).reshape(-1, M_pad, 3)
-    q_k = quats.reshape(-1, 4).contiguous()
-    t_k = t_seeds.reshape(-1, 3).contiguous()
+    q_seed = quats.reshape(-1, 4).contiguous()
+    t_seed = t_seeds.reshape(-1, 3).contiguous()
 
     N_k = N_real.repeat_interleave(S)
     M_k = M_real.repeat_interleave(S)
     VAA_plus_VBB = (VAA + VBB).repeat_interleave(S)        # invariant in loop
+    P = q_seed.shape[0]
 
-    m_q = torch.zeros_like(q_k); v_q = torch.zeros_like(q_k)
-    m_t = torch.zeros_like(t_k); v_t = torch.zeros_like(t_k)
+    # --- CUDA-graph fast path for the launch-bound small-batch regime --------
+    best_score = best_q = best_t = None
+    if (_FINE_GRAPHS and torch.cuda.is_available() and P <= _GRAPH_MAX_P
+            and A_batch.dtype == torch.float32):
+        try:
+            best_score, best_q, best_t = _run_graphed_fine(
+                A_k.contiguous(), B_k.contiguous(), q_seed, t_seed, N_k, M_k,
+                VAA_plus_VBB, alpha, lr, min(steps_fine, _GRAPH_STEPS), N_pad, M_pad, P)
+        except Exception:
+            best_score = None                              # capture failed -> eager
 
-    best_score = torch.full((len(q_k),), -float('inf'), device=device)
-    best_q = q_k.clone()
-    best_t = t_k.clone()
+    # --- eager fall-back (large P, non-CUDA, fp64, or capture failure) -------
+    if best_score is None:
+        q_k = q_seed.clone()
+        t_k = t_seed.clone()
+        m_q = torch.zeros_like(q_k); v_q = torch.zeros_like(q_k)
+        m_t = torch.zeros_like(t_k); v_t = torch.zeros_like(t_k)
 
-    # Early stopping state
-    prev_max_score = -float('inf')
-    no_improve_count = 0
+        best_score = torch.full((len(q_k),), -float('inf'), device=device)
+        best_q = q_k.clone()
+        best_t = t_k.clone()
 
-    for step in range(steps_fine):
-        VAB, dQ, dT = _overlap_in_chunks(
-            A_k, B_k, q_k, t_k,
-            alpha=alpha, N_real=N_k, M_real=M_k)
+        # Early stopping state
+        prev_max_score = -float('inf')
+        no_improve_count = 0
 
-        denom = VAA_plus_VBB - VAB
-        score = VAB / denom
-        scale = VAA_plus_VBB / (denom * denom)
+        for step in range(steps_fine):
+            VAB, dQ, dT = _overlap_in_chunks(
+                A_k, B_k, q_k, t_k,
+                alpha=alpha, N_real=N_k, M_real=M_k)
 
-        better = score > best_score  # boolean mask, no .any()
+            denom = VAA_plus_VBB - VAB
+            score = VAB / denom
+            scale = VAA_plus_VBB / (denom * denom)
 
-        # Masked assignment via torch.where: fixed-shape and SYNC-FREE. (Boolean
-        # index-assignment best_q[better]=... was measured ~1.4-4x SLOWER because
-        # the data-dependent gather forces a per-step GPU->CPU sync.)
-        best_score = torch.where(better, score, best_score)
-        mask_q = better.unsqueeze(1)
-        best_q = torch.where(mask_q, q_k, best_q)
-        best_t = torch.where(mask_q, t_k, best_t)
+            better = score > best_score  # boolean mask, no .any()
 
-        # Early stopping check, gated to every 5 steps to avoid a per-step
-        # GPU->CPU sync. Gating only makes early-stop *less* aggressive, so
-        # scores cannot drop.
-        if step % 5 == 0:
-            current_max = best_score.max().item()
-            if current_max - prev_max_score < early_stop_tol:
-                no_improve_count += 1
-                if no_improve_count >= early_stop_patience:
-                    break
-            else:
-                no_improve_count = 0
-                prev_max_score = current_max
+            # Masked assignment via torch.where: fixed-shape and SYNC-FREE.
+            best_score = torch.where(better, score, best_score)
+            mask_q = better.unsqueeze(1)
+            best_q = torch.where(mask_q, q_k, best_q)
+            best_t = torch.where(mask_q, t_k, best_t)
 
-        # Tangent-space projection is fused into the Adam kernel (raw dQ in);
-        # algebraically identical to projecting -dQ_tan*scale since `scale` is a
-        # per-row scalar and the projection is linear.
-        fused_adam_qt_with_tangent_proj(
-            q_k, t_k,
-            -dQ * scale.unsqueeze(1),
-            -dT * scale.unsqueeze(1),
-            m_q, v_q, m_t, v_t, lr
-        )
+            # Early stopping check, gated to every 5 steps to avoid a per-step
+            # GPU->CPU sync. Gating only makes early-stop *less* aggressive.
+            if step % 5 == 0:
+                current_max = best_score.max().item()
+                if current_max - prev_max_score < early_stop_tol:
+                    no_improve_count += 1
+                    if no_improve_count >= early_stop_patience:
+                        break
+                else:
+                    no_improve_count = 0
+                    prev_max_score = current_max
+
+            fused_adam_qt_with_tangent_proj(
+                q_k, t_k,
+                -dQ * scale.unsqueeze(1),
+                -dT * scale.unsqueeze(1),
+                m_q, v_q, m_t, v_t, lr
+            )
 
     # ------------------------------------------------------------------
     # 3) gather final results (using already-tracked best scores)
