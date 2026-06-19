@@ -1,0 +1,50 @@
+{
+  "vol|same": {
+    "fork": [
+      [
+        1,
+        169.84973576053946
+      ],
+      [
+        100,
+        14145.650085817117
+      ]
+    ],
+    "fork_score": {
+      "1": 0.9999998211860657,
+      "100": 0.999999548792839
+    }
+  },
+  "_meta": {
+    "hardware": {
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "cpu": "AMD EPYC 9135 16-Core Processor",
+      "host": "node5106",
+      "python": "3.11.15",
+      "platform": "Linux-4.18.0-553.83.1.el8_10.x86_64-x86_64-with-glibc2.28",
+      "torch": "2.11.0+cu128",
+      "cuda": "12.8"
+    },
+    "timestamp": "2026-06-19 18:00",
+    "cap": 10.0,
+    "tag": "blackwell_rtx6000_smoke",
+    "cfg": {
+      "num_repeats": 16,
+      "steps": 100,
+      "lr": 0.1,
+      "alpha": 0.81,
+      "lam": 0.3,
+      "surf_per_atom": 3
+    },
+    "modes": [
+      "vol"
+    ],
+    "buckets": [
+      "same"
+    ],
+    "sizes": [
+      1,
+      100
+    ]
+  }
+}
