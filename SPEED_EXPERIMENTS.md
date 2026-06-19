@@ -82,6 +82,36 @@ Decomposing the align (time at 2 vs 50 fine steps): **T_fixed (per-call setup) =
 
 **vol and surf are >10k, bit-identical (zero accuracy change).** Mechanism: `quaternions_to_SE3_batch` (se3.py) uses the identical per-element formula; the build fills are the same data via `copy_`/pad. No optimization math touched.
 
+---
+
+# Round 2 — push to 100k pairs/s on ALL modes
+
+**Current (speedlab paired, batch 4096):** vol 18.4k, surf 16.3k, esp 6.2k, pharm 2.7k.
+
+**The wall:** throughput plateaus by batch ~10k (vol|same n=100000 = 17.5k ≈ n=10000 16.1k) → the residual cost is **PER-PAIR** (the build + result Python loops scale linearly with batch, so larger batch doesn't amortize them). At 100k pairs/s the per-pair budget is **10 µs/pair**; today vol is ~38 µs/pair (T_fixed 158ms/4096). Python attr-access + a GPU dispatch is ~10–40 µs, so 100k is at the edge of what per-pair Python allows.
+
+**Hypotheses (Round 2):**
+- **R1 — vectorize the remaining per-pair build loops** (ref_pad fill `ref_pad[i,:n]=…` is still K GPU copies; the lazy `_*_t` cache check loop). pad_sequence / pre-stack. Bit-identical.
+- **R2 — collapse the result-write loop** (`for p: p.transform=…; p.sim=float(s)` is K attr-sets + K `float()`). Batch the `.cpu()`/`float` and minimise Python per pair.
+- **R3 — eliminate per-pair iteration entirely** (architectural): a batched fast-path that consumes pre-stacked tensors, bypassing the MoleculePair list — the only way under ~10 µs/pair.
+- **R4 — esp/pharm kernels** (compute-bound) need a faster per-step kernel to scale; esp/pharm are far from 100k (6.2k / 2.7k) and may be infeasible without accuracy-lossy precision.
+- Reuse `speedlab` (paired) + `parity_scores` (bit-exact gate). 100k is a stretch goal; expect honest ceilings per mode.
+
+## ⚠️ Measurement confound: laptop GPU throttles under sustained load
+The headline runs all modes/sizes **sequentially in one process**, so later cells run on a clock throttled by earlier heavy cells. Same surf cohort, batch 10000:
+- **isolated fresh process (boost clock): 16,926 pairs/s**
+- **headline (after vol's 100k cells): 1,830 pairs/s** — a **9× artifact**.
+- all 4 modes back-to-back in one process @4096: vol **7.9k** (was 18.4k isolated), surf **5.2k**, esp **2.0k**, pharm 2.7k.
+
+**True per-mode peak (isolated, best-of-N):** vol ~18k, surf ~16k (**both >10k**), esp ~6k, pharm ~2.7k. **Sustained/throttled:** ~2-3× lower. The 100k push must beat BOTH the per-pair overhead AND a hardware throttle that already caps sustained throughput ~2-3× below peak.
+
+## Round 2 log
+| # | hypothesis | mode | throughput Δ | accuracy | verdict |
+|---|---|---|---|---|---|
+| 0 | baseline (Round 1 end, isolated peak) | all | vol 18k / surf 16k / esp 6k / pharm 2.7k | bit-exact | reference |
+| R1 | `ref_pad`/`fit_pad` per-pair GPU copies → `pad_sequence` batched fill | vol, surf | **vol 18.4k→26k, surf 16k→18.2k** | **bit-identical** (git-stash gate ✓, self=1.0, dist\|Δ\|=0) | **SHIP** |
+| — | benchmark fix: `--cooldown` before each timed cell (recover→re-warm→time) so sequential runs aren't throttle-confounded | headline | n/a (measurement) | n/a | ship |
+
 **KEY FINDING (kernel microbench, clean paired):** the overlap value+grad kernel is **compute-bound on the Gaussian `exp()`** (mem-util ~0%, 6.05 ms/200k poses ≈ constant across latency/occupancy configs). **Bit-identical headroom is ~1.09×, full stop.** Occupancy (BLOCK/warps) cannot be raised without changing the float reduction (accuracy). So the multi-pose-per-CTA rewrite is also unlikely to help (latency hiding gave only 1.06×; the bottleneck is exp throughput, not stalls).
 
 ## Assessment — is >10k reachable with ZERO accuracy loss?

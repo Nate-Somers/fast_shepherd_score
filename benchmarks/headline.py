@@ -80,6 +80,10 @@ BUCKETS = ["same", "cross"]
 SIZES = [1, 10, 100, 1000, 10000, 100000]
 DEFAULT_CAP = 10.0
 SURF_PER_ATOM = 3
+# Idle pause before each timed fork cell so the GPU clock recovers and each mode is
+# timed un-throttled (this laptop GPU throttles ~2-3x under sustained load, which
+# otherwise bleeds across cells and depresses later modes). Set with --cooldown.
+_COOLDOWN = 2.0
 SELF_SCORE_WARN = 0.95          # self-copy optimum is 1.0; warn below this
 
 
@@ -129,8 +133,15 @@ def _fork_time(mode, pairs, cfg):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    run(); sync()                                                  # warmup (Triton autotune / JIT)
-    sync(); t0 = time.perf_counter(); run(); sync()
+    # Cooldown BEFORE the warmup: idle lets the clock recover from the prior cells'
+    # sustained-load throttle; the warmup then re-warms it back to boost so the timed
+    # run isn't cold-started. (Otherwise later modes, e.g. surf after vol's 100k cell,
+    # are timed on a throttled clock and look far slower than they are.)
+    if _COOLDOWN > 0:
+        sync(); time.sleep(_COOLDOWN)
+    run(); sync()                                                  # warmup (re-warm + autotune/JIT cache)
+    sync(); t0 = time.perf_counter()
+    run(); sync()
     dt = time.perf_counter() - t0
     attr = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf",
             "esp": "sim_aligned_esp", "pharm": "sim_aligned_pharm"}[mode]
@@ -562,7 +573,13 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.81)
     ap.add_argument("--lam", type=float, default=0.3)
     ap.add_argument("--topk", type=int, default=30)
+    ap.add_argument("--cooldown", type=float, default=2.0,
+                    help="idle seconds before each timed fork cell so the clock recovers "
+                         "(un-throttled, clean per-mode numbers). 0 disables.")
     args = ap.parse_args()
+
+    global _COOLDOWN
+    _COOLDOWN = args.cooldown
 
     if args.orig_cell:                                             # isolated subprocess entry
         return orig_cell(args.orig_cell)

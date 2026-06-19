@@ -577,9 +577,13 @@ class MoleculePair:
             # but we do clear the padding slices for deterministic results.
             ref_pad.zero_()
             fit_pad.zero_()
-            for i, (p, n, m) in enumerate(zip(bucket, n_list, m_list)):
-                ref_pad[i, :n] = p._ref_xyz_t
-                fit_pad[i, :m] = p._fit_xyz_t
+            # Batched pad-fill (was K per-pair GPU copies). pad_sequence pads with 0
+            # to match the zero-init prefix-write -> bit-identical. (R1)
+            _ps = torch.nn.utils.rnn.pad_sequence
+            _rp = _ps([p._ref_xyz_t for p in bucket], batch_first=True)
+            _fp = _ps([p._fit_xyz_t for p in bucket], batch_first=True)
+            ref_pad[:, :_rp.shape[1]] = _rp
+            fit_pad[:, :_fp.shape[1]] = _fp
 
             # ---- self-overlaps (reused kernel) ---------------------------------
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
@@ -728,9 +732,13 @@ class MoleculePair:
             # Batch .item() calls to reduce GPU→CPU sync overhead
             n_list = N_real.tolist()
             m_list = M_real.tolist()
-            for i, (p, n, m) in enumerate(zip(bucket, n_list, m_list)):
-                ref_pad[i, :n] = p._ref_surf_t
-                fit_pad[i, :m] = p._fit_surf_t
+            # Batched pad-fill (was K per-pair GPU copies). pad_sequence zero-pads to
+            # match the zero-init prefix-write -> bit-identical. (R1)
+            _ps = torch.nn.utils.rnn.pad_sequence
+            _rp = _ps([p._ref_surf_t for p in bucket], batch_first=True)
+            _fp = _ps([p._fit_surf_t for p in bucket], batch_first=True)
+            ref_pad[:, :_rp.shape[1]] = _rp
+            fit_pad[:, :_fp.shape[1]] = _fp
 
             # ---- self-overlaps on surface point clouds ----------------------------
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
