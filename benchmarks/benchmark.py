@@ -756,11 +756,11 @@ def render_plot(data, modes, buckets, sizes, cap, out_png, meta=None):
     stamp = (meta or {}).get("timestamp", "")
     tag = (meta or {}).get("tag")
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6.8), sharey=True)
-    # per-panel: (data key, title, hardware annotation under the title)
-    panels = [("orig", "Original upstream repo  (JAX · CPU)", cpu),
-              ("fork", "This fork  (Triton · GPU)", gpu)]
-    for ax, (pk, title, hw_label) in zip(axes, panels):
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7.2), sharey=True)
+    # per-panel: (data key, engine, the hardware that panel ran on)
+    panels = [("orig", "Original upstream repo  ·  JAX / CPU", cpu),
+              ("fork", "This fork  ·  Triton / GPU", gpu)]
+    for ax, (pk, engine, hw_label) in zip(axes, panels):
         for mode in modes:
             for bucket in buckets:
                 pts = data.get(f"{mode}|{bucket}", {}).get(pk, [])
@@ -771,23 +771,25 @@ def render_plot(data, modes, buckets, sizes, cap, out_png, meta=None):
                         markersize=7, linewidth=2.4, label=f"{mode} · {bucket}", clip_on=False)
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlabel("batch size — pairs aligned per call (log)")
-        ax.set_title(title, fontweight="bold")
-        # hardware annotation, clearly under each panel title
-        ax.text(0.5, 1.005, hw_label, transform=ax.transAxes, ha="center", va="bottom",
-                fontsize=9, color="#444444")
+        # Engine + the hardware it ran on as ONE two-line title, so tight_layout
+        # reserves room for both -> nothing free-floating to overlap the suptitle.
+        ax.set_title(engine + "\n" + hw_label, fontsize=10.5, linespacing=1.6,
+                     fontweight="bold")
         ax.grid(True, which="major", color="#cccccc", alpha=0.8)
         ax.grid(True, which="minor", ls=":", color="#e8e8e8", alpha=0.6)
     axes[0].set_ylabel("pair-alignments / second (higher = faster, log)")
     axes[1].legend(title="mode · bucket", loc="best", framealpha=0.95)
 
-    fig.suptitle("Molecular-alignment throughput — real drug self-copy pairs\n"
-                 f"fork runs the full size sweep; the original line stops where a cell "
-                 f"exceeded the {cap:.0f}s wall-clock cap",
-                 fontweight="bold")
+    fig.suptitle("Molecular-alignment throughput — real drug self-copy pairs",
+                 fontweight="bold", fontsize=13.5, y=0.985)
+    cap_note = (f"fork runs the full size sweep; the original line stops where a cell "
+                f"exceeded the {cap:.0f}s wall-clock cap")
     footer = "   ·   ".join(([f"run: {tag}"] if tag else []) + [_hw_footer(hw)]
                             + ([stamp] if stamp else []))
-    fig.text(0.5, 0.01, footer, ha="center", va="bottom", fontsize=8, color="#666666")
-    fig.tight_layout(rect=[0, 0.035, 1, 0.93])
+    fig.text(0.5, 0.05, cap_note, ha="center", va="bottom", fontsize=9,
+             color="#555555", style="italic")
+    fig.text(0.5, 0.012, footer, ha="center", va="bottom", fontsize=8, color="#666666")
+    fig.tight_layout(rect=[0, 0.085, 1, 0.94])
     fig.savefig(out_png, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"wrote {out_png}")
