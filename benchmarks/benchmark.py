@@ -448,6 +448,11 @@ def _spawn_fork_cell(plan):
         planfile = fh.name
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
+    # Turn on the deterministic molecule disk cache so each fresh cell loads the
+    # 15 base molecules instead of rebuilding them (RDKit+MMFF+Open3D+pharm). The
+    # build is outside the timed region, so this is a pure wall-clock win with no
+    # effect on any measured number. (User-set FSS_MOL_CACHE_DIR is respected.)
+    env.setdefault("FSS_MOL_CACHE_DIR", _MOLCACHE)
     # The child runs this file as a script, so put the repo root on its path
     # (for `import benchmarks...`) ahead of anything else; shepherd_score resolves
     # to the fork (repo root), NOT the original repo.
@@ -941,6 +946,11 @@ def run_replot(args):
 
 def run_accuracy(args):
     """50 DIFFERENT-molecule pairs per mode, fork vs original scores."""
+    # Same deterministic molecule disk cache as the speed sweep. The accuracy
+    # branch builds the fork side in-process, so set the env var here before any
+    # _build_molecule call; it shares benchmarks/molcache/ with the speed sweep,
+    # so a second run (or a run after the sweep) loads instead of rebuilding.
+    os.environ.setdefault("FSS_MOL_CACHE_DIR", _MOLCACHE)
     cfg = _cfg_from_args(args)
     rng = np.random.default_rng(args.seed)
     smis = [s for _, s, _ in DRUGS]
