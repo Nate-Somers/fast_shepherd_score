@@ -66,6 +66,13 @@ def _dev_idx(device: torch.device) -> int:
     return device.index if (device.type == "cuda" and device.index is not None) else -1
 
 
+# Minimum pairs PER DEVICE before multi-GPU sharding pays off. Sharding adds fixed
+# per-call overhead (thread spawn, per-device cuSOLVER warmup, result sync) and the
+# per-pair host work is GIL-serialized across worker threads, so small/mid batches are
+# faster on one GPU. Calibrated on 4x L40S (sub-linear; crossover a few k pairs/device).
+_MIN_SHARD_PER_DEVICE = 4096
+
+
 def _should_distribute(pairs) -> bool:
     """True when `pairs` should be sharded across multiple CUDA devices."""
     if getattr(_DISPATCH_LOCAL, "active", False):
@@ -74,7 +81,7 @@ def _should_distribute(pairs) -> bool:
         return False
     if not pairs or pairs[0].device.type != "cuda":
         return False
-    return len(pairs) >= 2 * torch.cuda.device_count()
+    return len(pairs) >= _MIN_SHARD_PER_DEVICE * torch.cuda.device_count()
 
 
 def _run_distributed(align_fn, pairs, **kwargs):
@@ -84,6 +91,17 @@ def _run_distributed(align_fn, pairs, **kwargs):
     shards never collide. NOTE: the single-GPU path (via _should_distribute) is
     validated; the multi-GPU concurrency path needs multi-GPU hardware to benchmark."""
     ndev = torch.cuda.device_count()
+    # Warm thread-unsafe lazy CUDA init single-threaded BEFORE sharding: PyTorch cuSOLVER
+    # handle init raises "lazy wrapper should be called at most once" if first-touched
+    # concurrently from the worker threads below. Init eigh per device up front.
+    for _d in range(ndev):
+        with torch.cuda.device(_d):
+            torch.linalg.eigh(torch.eye(3, device=torch.device("cuda", _d)))
+    # CUDA-graph capture is not safe across the per-device worker threads (the RNG
+    # generator-registration state races -> "graph should be registered to the state").
+    # Use the eager fine loop for the multi-GPU path; per-pair results are unchanged.
+    import shepherd_score.alignment.utils.fast_se3 as _fse3
+    _fse3._FINE_GRAPHS = False
     shards = [sh for sh in (pairs[i::ndev] for i in range(ndev)) if sh]
     errs = {}
 
@@ -1079,14 +1097,20 @@ class MoleculePair:
             elif fx.device != device:
                 p._fit_xyz_t = fx.to(device, non_blocking=True)
 
-            if getattr(p, "_ref_xyz_esp_t", None) is None:
+            rxe = getattr(p, "_ref_xyz_esp_t", None)
+            if rxe is None:
                 p._ref_xyz_esp_t = torch.as_tensor(
                     p.ref_molec.partial_charges[p.ref_molec._nonH_atoms_idx],
                     dtype=torch.float32, device=device)
-            if getattr(p, "_fit_xyz_esp_t", None) is None:
+            elif rxe.device != device:
+                p._ref_xyz_esp_t = rxe.to(device, non_blocking=True)
+            fxe = getattr(p, "_fit_xyz_esp_t", None)
+            if fxe is None:
                 p._fit_xyz_esp_t = torch.as_tensor(
                     p.fit_molec.partial_charges[p.fit_molec._nonH_atoms_idx],
                     dtype=torch.float32, device=device)
+            elif fxe.device != device:
+                p._fit_xyz_esp_t = fxe.to(device, non_blocking=True)
 
         MoleculePair._esp_bucketed_align(
             pairs, alpha=alpha, lam_scaled=lam,            # RAW lam (matches per-pair vol_esp)
@@ -1143,37 +1167,29 @@ class MoleculePair:
             if p.ref_molec.surf_esp is None or p.fit_molec.surf_esp is None:
                 raise ValueError("Surface ESP is None; cannot run _align_batch_esp_combo.")
 
-            if getattr(p, "_ref_surf_t", None) is None:
-                p._ref_surf_t = torch.as_tensor(p.ref_molec.surf_pos, dtype=torch.float32, device=device)
-            if getattr(p, "_fit_surf_t", None) is None:
-                p._fit_surf_t = torch.as_tensor(p.fit_molec.surf_pos, dtype=torch.float32, device=device)
-            if getattr(p, "_ref_surf_esp_t", None) is None:
-                p._ref_surf_esp_t = torch.as_tensor(p.ref_molec.surf_esp, dtype=torch.float32, device=device)
-            if getattr(p, "_fit_surf_esp_t", None) is None:
-                p._fit_surf_esp_t = torch.as_tensor(p.fit_molec.surf_esp, dtype=torch.float32, device=device)
+            def _ensure(p, attr, src, dtype):
+                t = getattr(p, attr, None)
+                if t is None:
+                    setattr(p, attr, torch.as_tensor(src, dtype=dtype, device=device))
+                elif t.device != device:
+                    setattr(p, attr, t.to(device, non_blocking=True))
 
-            if getattr(p, "_ref_centers_w_H_t", None) is None:
-                p._ref_centers_w_H_t = torch.as_tensor(
-                    p.ref_molec.mol.GetConformer().GetPositions(), dtype=torch.float32, device=device
-                )
-            if getattr(p, "_fit_centers_w_H_t", None) is None:
-                p._fit_centers_w_H_t = torch.as_tensor(
-                    p.fit_molec.mol.GetConformer().GetPositions(), dtype=torch.float32, device=device
-                )
-            if getattr(p, "_ref_partial_t", None) is None:
-                p._ref_partial_t = torch.as_tensor(p.ref_molec.partial_charges, dtype=torch.float32, device=device)
-            if getattr(p, "_fit_partial_t", None) is None:
-                p._fit_partial_t = torch.as_tensor(p.fit_molec.partial_charges, dtype=torch.float32, device=device)
-            if getattr(p, "_ref_radii_t", None) is None:
-                p._ref_radii_t = torch.as_tensor(p.ref_molec.radii, dtype=torch.float32, device=device)
-            if getattr(p, "_fit_radii_t", None) is None:
-                p._fit_radii_t = torch.as_tensor(p.fit_molec.radii, dtype=torch.float32, device=device)
+            _ensure(p, "_ref_surf_t", p.ref_molec.surf_pos, torch.float32)
+            _ensure(p, "_fit_surf_t", p.fit_molec.surf_pos, torch.float32)
+            _ensure(p, "_ref_surf_esp_t", p.ref_molec.surf_esp, torch.float32)
+            _ensure(p, "_fit_surf_esp_t", p.fit_molec.surf_esp, torch.float32)
+            _ensure(p, "_ref_centers_w_H_t",
+                    p.ref_molec.mol.GetConformer().GetPositions(), torch.float32)
+            _ensure(p, "_fit_centers_w_H_t",
+                    p.fit_molec.mol.GetConformer().GetPositions(), torch.float32)
+            _ensure(p, "_ref_partial_t", p.ref_molec.partial_charges, torch.float32)
+            _ensure(p, "_fit_partial_t", p.fit_molec.partial_charges, torch.float32)
+            _ensure(p, "_ref_radii_t", p.ref_molec.radii, torch.float32)
+            _ensure(p, "_fit_radii_t", p.fit_molec.radii, torch.float32)
 
-            # Translation centers must be available on device for trans_init.
-            if trans_init and getattr(p, "_ref_xyz_t", None) is None:
-                p._ref_xyz_t = torch.as_tensor(p.ref_molec.atom_pos, dtype=torch.float32, device=device)
-            if trans_init and getattr(p, "_fit_xyz_t", None) is None:
-                p._fit_xyz_t = torch.as_tensor(p.fit_molec.atom_pos, dtype=torch.float32, device=device)
+            if trans_init:
+                _ensure(p, "_ref_xyz_t", p.ref_molec.atom_pos, torch.float32)
+                _ensure(p, "_fit_xyz_t", p.fit_molec.atom_pos, torch.float32)
 
         all_pairs: list[MoleculePair] = []
         all_scores: list[torch.Tensor] = []
@@ -1387,20 +1403,38 @@ class MoleculePair:
 
         device = pairs[0].device
 
-        # Ensure per-pair cached tensors exist on device.
+        # Ensure per-pair cached tensors exist on the correct device.
         for p in pairs:
-            if getattr(p, "_ref_pharm_types_t", None) is None:
+            rt = getattr(p, "_ref_pharm_types_t", None)
+            if rt is None:
                 p._ref_pharm_types_t = torch.as_tensor(p.ref_molec.pharm_types, dtype=torch.int64, device=device)
-            if getattr(p, "_fit_pharm_types_t", None) is None:
+            elif rt.device != device:
+                p._ref_pharm_types_t = rt.to(device, non_blocking=True)
+            ft = getattr(p, "_fit_pharm_types_t", None)
+            if ft is None:
                 p._fit_pharm_types_t = torch.as_tensor(p.fit_molec.pharm_types, dtype=torch.int64, device=device)
-            if getattr(p, "_ref_pharm_ancs_t", None) is None:
+            elif ft.device != device:
+                p._fit_pharm_types_t = ft.to(device, non_blocking=True)
+            ra = getattr(p, "_ref_pharm_ancs_t", None)
+            if ra is None:
                 p._ref_pharm_ancs_t = torch.as_tensor(p.ref_molec.pharm_ancs, dtype=torch.float32, device=device)
-            if getattr(p, "_fit_pharm_ancs_t", None) is None:
+            elif ra.device != device:
+                p._ref_pharm_ancs_t = ra.to(device, non_blocking=True)
+            fa = getattr(p, "_fit_pharm_ancs_t", None)
+            if fa is None:
                 p._fit_pharm_ancs_t = torch.as_tensor(p.fit_molec.pharm_ancs, dtype=torch.float32, device=device)
-            if getattr(p, "_ref_pharm_vecs_t", None) is None:
+            elif fa.device != device:
+                p._fit_pharm_ancs_t = fa.to(device, non_blocking=True)
+            rv = getattr(p, "_ref_pharm_vecs_t", None)
+            if rv is None:
                 p._ref_pharm_vecs_t = torch.as_tensor(p.ref_molec.pharm_vecs, dtype=torch.float32, device=device)
-            if getattr(p, "_fit_pharm_vecs_t", None) is None:
+            elif rv.device != device:
+                p._ref_pharm_vecs_t = rv.to(device, non_blocking=True)
+            fv = getattr(p, "_fit_pharm_vecs_t", None)
+            if fv is None:
                 p._fit_pharm_vecs_t = torch.as_tensor(p.fit_molec.pharm_vecs, dtype=torch.float32, device=device)
+            elif fv.device != device:
+                p._fit_pharm_vecs_t = fv.to(device, non_blocking=True)
 
         all_pairs: list[MoleculePair] = []
         all_scores: list[torch.Tensor] = []

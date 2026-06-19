@@ -248,7 +248,17 @@ def _masked_principal_axes(points: torch.Tensor, mask: torch.Tensor) -> torch.Te
     Bmat = torch.bmm(centered.transpose(1, 2), centered)            # (K,3,3)
     eye = torch.eye(3, device=points.device, dtype=points.dtype)
     inertia = A.view(-1, 1, 1) * eye - Bmat                         # (K,3,3)
-    _, eigvecs = torch.linalg.eigh(inertia)                         # ascending eigenvalues
+    # cusolver batched eigh hits CUSOLVER_STATUS_INVALID_VALUE for K > ~8192;
+    # chunk to stay under the limit.
+    _EIGH_CHUNK = 4096
+    K = inertia.shape[0]
+    if K <= _EIGH_CHUNK:
+        _, eigvecs = torch.linalg.eigh(inertia)
+    else:
+        eigvecs = torch.empty_like(inertia)
+        for s in range(0, K, _EIGH_CHUNK):
+            e = min(s + _EIGH_CHUNK, K)
+            _, eigvecs[s:e] = torch.linalg.eigh(inertia[s:e])
     return torch.flip(eigvecs, (2,)).transpose(1, 2)               # rows = descending axes
 
 
