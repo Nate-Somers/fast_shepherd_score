@@ -180,6 +180,7 @@ cython_debug/
 
 # Upstream repo clone (compared against in benchmarks; never committed)
 shepherd-score-original-repo/
-# Generated benchmark artifacts
+# Generated benchmark artifacts.
+# molcache/ = regenerable deterministic molecule cache (not committed).
+# results/ IS committed (saved benchmark outputs: RTX 4050 laptop + L40S 1/4-GPU).
 benchmarks/molcache/
-benchmarks/results/

@@ -1,0 +1,50 @@
+{
+  "vol|same": {
+    "fork": [
+      [
+        1,
+        156.02936450497424
+      ],
+      [
+        10,
+        527.4519207814143
+      ]
+    ],
+    "fork_score": {
+      "1": 0.9999998211860657,
+      "10": -Infinity
+    }
+  },
+  "_meta": {
+    "hardware": {
+      "gpu": "NVIDIA L40S",
+      "cpu": "INTEL(R) XEON(R) GOLD 6542Y",
+      "host": "node3615",
+      "python": "3.11.15",
+      "platform": "Linux-4.18.0-372.9.1.el8.x86_64-x86_64-with-glibc2.28",
+      "torch": "2.11.0+cu128",
+      "cuda": "12.8"
+    },
+    "timestamp": "2026-06-19 10:57",
+    "cap": 10.0,
+    "tag": "4gpu_l40s_smoke",
+    "cfg": {
+      "num_repeats": 16,
+      "steps": 100,
+      "lr": 0.1,
+      "alpha": 0.81,
+      "lam": 0.3,
+      "surf_per_atom": 3
+    },
+    "modes": [
+      "vol"
+    ],
+    "buckets": [
+      "same"
+    ],
+    "sizes": [
+      1,
+      10
+    ]
+  }
+}
