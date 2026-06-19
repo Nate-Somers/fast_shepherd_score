@@ -67,6 +67,50 @@ class MoleculePairBatch:
     def __init__(self, pairs: List[MoleculePair]):
         self.pairs = pairs
 
+    # Backend names that route to the Triton/CUDA MoleculePair.align_batch_* path.
+    _TRITON_BACKENDS = ("triton", "cuda", "gpu")
+
+    def _triton_align(self, align_fn, align_kwargs, score_attr, transform_attr,
+                      fit_attr, return_aligned):
+        """Route a batch alignment through the Triton ``MoleculePair.align_batch_*``
+        path with ZERO extra alignment work.
+
+        ``align_fn(self.pairs, **align_kwargs)`` is byte-identical to calling the
+        Triton static method directly, so alignment throughput is unchanged (and it
+        inherits the same multi-GPU sharding via ``_should_distribute``). Scores +
+        SE(3) transforms are read from the in-place results the Triton path writes
+        (also populated in-place by the multi-GPU path).
+
+        ``aligned_list`` (transformed fit points) is OFF by default — the Triton
+        path's primary outputs are the score and the stored transform, and a user
+        can apply the transform themselves. When ``return_aligned=True`` it is built
+        GPU-batched from the already-cached fit tensor (``fit_attr``), grouped by
+        device so multi-GPU shards (whose tensors live on different devices) are
+        handled correctly.
+        """
+        align_fn(self.pairs, **align_kwargs)                 # <- identical to standalone Triton call
+        pairs = self.pairs
+        scores = np.array([float(getattr(p, score_attr)) for p in pairs])
+        if not return_aligned:
+            return scores, [None] * len(pairs)
+
+        import torch
+        aligned = [None] * len(pairs)
+        by_dev: dict = {}
+        for i, p in enumerate(pairs):
+            by_dev.setdefault(getattr(p, fit_attr).device, []).append(i)
+        for dev, idxs in by_dev.items():
+            fits = [getattr(pairs[i], fit_attr) for i in idxs]
+            Ss = torch.stack([torch.as_tensor(getattr(pairs[i], transform_attr),
+                                              dtype=torch.float32) for i in idxs]).to(dev)
+            fit_pad = torch.nn.utils.rnn.pad_sequence(fits, batch_first=True)  # (k, Mpad, 3)
+            # aligned = fit @ R.T + t  (row-vector SE(3) convention)
+            aligned_pad = torch.baddbmm(Ss[:, :3, 3][:, None, :], fit_pad,
+                                        Ss[:, :3, :3].transpose(1, 2)).cpu().numpy()
+            for j, i in enumerate(idxs):
+                aligned[i] = aligned_pad[j, :fits[j].shape[0]]
+        return scores, aligned
+
     def _pad_and_mask_vol(self, no_H: bool = True, include_charges: bool = False):
         """Extract, pad, and create masks for volumetric (and optionally ESP) alignment.
 
@@ -139,6 +183,9 @@ class MoleculePairBatch:
                        use_shmap: bool = True,
                        num_buckets: int = 1,
                        verbose: bool = False,
+                       backend: str = "jax",
+                       alpha: float = 0.81,
+                       return_aligned: bool = False,
                        ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using padded masked volumetric similarity via JAX.
 
@@ -194,7 +241,27 @@ class MoleculePairBatch:
             Scores for each pair. Shape: (N,).
         aligned_list : list of np.ndarray
             Aligned fit atom coordinates (unpadded) for each pair.
+        backend : str
+            ``"jax"`` (default) uses the JAX/XLA path below. ``"triton"`` (aliases
+            ``"cuda"``/``"gpu"``) routes to the Triton ``MoleculePair.align_batch_vol``
+            kernel path (heavy-atom only), which also handles multi-GPU internally via
+            ``_should_distribute``. ``max_num_steps`` maps to the Triton ``steps_fine``.
+        return_aligned : bool
+            For the Triton backend, skip building ``aligned_list`` when ``False``
+            (pure delegation, zero overhead over a direct ``align_batch_vol`` call).
         """
+        if backend in self._TRITON_BACKENDS:
+            if not no_H:
+                raise NotImplementedError(
+                    "the Triton vol backend aligns heavy atoms only (no_H=True)")
+            return self._triton_align(
+                MoleculePair.align_batch_vol,
+                dict(alpha=alpha, steps_fine=max_num_steps),
+                "sim_aligned_vol_noH", "transform_vol_noH",
+                "_fit_xyz_t", return_aligned)
+        if backend != "jax":
+            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+
         # build raw (unpadded) position arrays for every pair
         raw_refs, raw_fits, trans_centers_list = [], [], []
         for pair in self.pairs:
@@ -553,6 +620,8 @@ class MoleculePairBatch:
                         num_workers: int = 1,
                         use_shmap: bool = False,
                         verbose: bool = False,
+                        backend: str = "jax",
+                        return_aligned: bool = False,
                         ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using surface similarity.
 
@@ -595,7 +664,20 @@ class MoleculePairBatch:
             Scores for each pair. Shape: (N,).
         aligned_list : list of np.ndarray
             Aligned fit surface coordinates for each pair.
+        backend : str
+            ``"jax"`` (default) or ``"triton"`` (aliases ``"cuda"``/``"gpu"``) which
+            routes to ``MoleculePair.align_batch_surf`` (multi-GPU-aware). ``return_aligned``
+            controls building the aligned-surface list (off by default = pure delegation).
         """
+        if backend in self._TRITON_BACKENDS:
+            return self._triton_align(
+                MoleculePair.align_batch_surf,
+                dict(alpha=alpha, steps_fine=max_num_steps),
+                "sim_aligned_surf", "transform_surf",
+                "_fit_surf_t", return_aligned)
+        if backend != "jax":
+            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+
         n_pairs = len(self.pairs)
         pair_data = [
             (pair.ref_molec.surf_pos,
@@ -668,6 +750,8 @@ class MoleculePairBatch:
                        num_workers: int = 1,
                        use_shmap: bool = False,
                        verbose: bool = False,
+                       backend: str = "jax",
+                       return_aligned: bool = False,
                        ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using ESP+surface similarity.
 
@@ -712,7 +796,22 @@ class MoleculePairBatch:
             Scores for each pair. Shape: (N,).
         aligned_list : list of np.ndarray
             Aligned fit surface coordinates for each pair.
+        backend : str
+            ``"jax"`` (default) or ``"triton"`` (aliases ``"cuda"``/``"gpu"``) which
+            routes to ``MoleculePair.align_batch_esp`` (multi-GPU-aware; it applies the
+            same internal LAM_SCALING as this path, so ``lam`` is consistent across
+            backends). ``return_aligned`` controls the aligned-surface list.
         """
+        if backend in self._TRITON_BACKENDS:
+            return self._triton_align(
+                MoleculePair.align_batch_esp,
+                dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
+                     trans_init=trans_init, lr=lr, steps_fine=max_num_steps),
+                "sim_aligned_esp", "transform_esp",
+                "_fit_surf_t", return_aligned)
+        if backend != "jax":
+            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+
         from shepherd_score.score.constants import LAM_SCALING
         lam_scaled = float(LAM_SCALING * lam)
 
@@ -855,6 +954,8 @@ class MoleculePairBatch:
                          use_shmap: bool = True,
                          num_buckets: int = 1,
                          verbose: bool = False,
+                         backend: str = "jax",
+                         return_aligned: bool = False,
                          ) -> Tuple[np.ndarray, List[np.ndarray], List[np.ndarray]]:
         """Align all pairs using padded masked pharmacophore similarity via JAX.
 
@@ -913,7 +1014,44 @@ class MoleculePairBatch:
             Aligned fit pharmacophore anchors (unpadded) for each pair.
         aligned_vectors_list : list of np.ndarray
             Aligned fit pharmacophore vectors (unpadded) for each pair.
+        backend : str
+            ``"jax"`` (default) or ``"triton"`` (aliases ``"cuda"``/``"gpu"``) which
+            routes to ``MoleculePair.align_batch_pharm`` (multi-GPU-aware). With
+            ``return_aligned=True`` the aligned anchors (rotate+translate) and vectors
+            (rotate only) are rebuilt GPU-batched from the cached fit tensors.
         """
+        if backend in self._TRITON_BACKENDS:
+            MoleculePair.align_batch_pharm(
+                self.pairs, similarity=similarity, extended_points=extended_points,
+                only_extended=only_extended, trans_init=trans_init,
+                num_repeats=num_repeats, steps_fine=max_num_steps, lr=lr)
+            pairs = self.pairs
+            n = len(pairs)
+            scores = np.array([float(p.sim_aligned_pharm) for p in pairs])
+            if not return_aligned:
+                return scores, [None] * n, [None] * n
+            import torch
+            anchors = [None] * n
+            vectors = [None] * n
+            by_dev: dict = {}
+            for i, p in enumerate(pairs):
+                by_dev.setdefault(p._fit_pharm_ancs_t.device, []).append(i)
+            for dev, idxs in by_dev.items():
+                Ss = torch.stack([torch.as_tensor(pairs[i].transform_pharm,
+                                                  dtype=torch.float32) for i in idxs]).to(dev)
+                Rt = Ss[:, :3, :3].transpose(1, 2)
+                anc = [pairs[i]._fit_pharm_ancs_t for i in idxs]
+                vec = [pairs[i]._fit_pharm_vecs_t for i in idxs]
+                _ps = torch.nn.utils.rnn.pad_sequence
+                anc_al = torch.baddbmm(Ss[:, :3, 3][:, None, :], _ps(anc, batch_first=True), Rt).cpu().numpy()
+                vec_al = torch.bmm(_ps(vec, batch_first=True), Rt).cpu().numpy()       # vectors: rotate only
+                for j, i in enumerate(idxs):
+                    anchors[i] = anc_al[j, :anc[j].shape[0]]
+                    vectors[i] = vec_al[j, :vec[j].shape[0]]
+            return scores, anchors, vectors
+        if backend != "jax":
+            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+
         # Validate pharmacophore data and collect raw arrays for all pairs.
         for idx, pair in enumerate(self.pairs):
             if (pair.ref_molec.pharm_types is None or
