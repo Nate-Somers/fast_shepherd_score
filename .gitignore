@@ -182,6 +182,4 @@ cython_debug/
 shepherd-score-original-repo/
 # Generated benchmark artifacts
 benchmarks/molcache/
-benchmarks/plot_data.json
-benchmarks/speed_plot.png
-benchmarks/speed_table.md
+benchmarks/results/

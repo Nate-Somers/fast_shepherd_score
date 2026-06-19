@@ -25,8 +25,6 @@ from shepherd_score.score.pharmacophore_scoring import _SIM_TYPE, get_overlap_ph
 from shepherd_score.alignment import optimize_ROCS_overlay, optimize_ROCS_overlay_analytical, optimize_ROCS_esp_overlay, optimize_ROCS_esp_overlay_analytical, optimize_esp_combo_score_overlay
 from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_overlay_analytical
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
-from shepherd_score.alignment.utils.fast_se3 import coarse_fine_align_many, _self_overlap_in_chunks
-from shepherd_score.alignment.utils.fast_common import batched_seeds_torch
 from shepherd_score.alignment.utils.se3 import quaternion_to_SE3, quaternions_to_SE3_batch
 
 ### BEGIN size_bucketing #####################################################
@@ -52,7 +50,7 @@ _SUBBATCH_DEBUG = bool(os.environ.get("SUBBATCH_DEBUG"))
 
 # Override the vol/surf seed count (default 50) for speed experiments. Fewer seeds
 # = fewer poses = ~linear speedup, but coarser SO(3) coverage risks distinct-pair
-# accuracy -- gated in benchmarks/speedlab.py. None -> 50.
+# accuracy -- gated in benchmarks/experiments/speedlab.py. None -> 50.
 _NUM_SEEDS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_SEEDS"))
 
 
@@ -505,7 +503,7 @@ class MoleculePair:
         self.sim_aligned_pharm = None
 
     @staticmethod
-    def align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 100):
+    def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 100):
         """
         Batched alignment with workspace reuse & reduced per-pair transfers.
         """
@@ -515,8 +513,11 @@ class MoleculePair:
         if not pairs:
             return
         if _should_distribute(pairs):
-            return _run_distributed(MoleculePair.align_batch_vol, pairs,
+            return _run_distributed(MoleculePair._align_batch_vol, pairs,
                                     alpha=alpha, steps_fine=steps_fine)
+
+        from shepherd_score.alignment.utils.fast_se3 import coarse_fine_align_many, _self_overlap_in_chunks
+        from shepherd_score.alignment.utils.fast_common import batched_seeds_torch
 
         device = pairs[0].device
         # --- move coords once (skip if already there & right dtype) -------------
@@ -619,10 +620,10 @@ class MoleculePair:
             p.sim_aligned_vol_noH = float(s)
 
     @staticmethod
-    def align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 100):
+    def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 100):
         """
         Batched alignment over *surface point clouds* using Gaussian-overlap
-        surface similarity (ROCS-style), modeled after `align_batch_vol`.
+        surface similarity (ROCS-style), modeled after `_align_batch_vol`.
 
         Inputs
         ------
@@ -641,7 +642,7 @@ class MoleculePair:
         """
 
         # Reuse the persistent, per-process workspace/int-buffer caches (same
-        # ref/fit scratch-buffer layout as align_batch_vol). The previous local
+        # ref/fit scratch-buffer layout as _align_batch_vol). The previous local
         # re-declarations here shadowed the module globals, so the surf path
         # never reused workspaces across calls. Buffers are zeroed before use,
         # so cross-call (and cross-modality) reuse is safe.
@@ -650,8 +651,11 @@ class MoleculePair:
         if not pairs:
             return
         if _should_distribute(pairs):
-            return _run_distributed(MoleculePair.align_batch_surf, pairs,
+            return _run_distributed(MoleculePair._align_batch_surf, pairs,
                                     alpha=alpha, steps_fine=steps_fine)
+
+        from shepherd_score.alignment.utils.fast_se3 import coarse_fine_align_many, _self_overlap_in_chunks
+        from shepherd_score.alignment.utils.fast_common import batched_seeds_torch
 
         device = pairs[0].device
 
@@ -671,7 +675,7 @@ class MoleculePair:
                 r_np = p.ref_molec.surf_pos
                 f_np = p.fit_molec.surf_pos
                 if r_np is None or f_np is None:
-                    raise ValueError("Surface points are None; cannot run align_batch_surf.")
+                    raise ValueError("Surface points are None; cannot run _align_batch_surf.")
                 p._ref_surf_t = torch.as_tensor(r_np, dtype=torch.float32, device=device)
                 p._fit_surf_t = torch.as_tensor(f_np, dtype=torch.float32, device=device)
             else:
@@ -775,7 +779,7 @@ class MoleculePair:
             p.sim_aligned_surf = float(s)
 
     @staticmethod
-    def align_batch_esp(
+    def _align_batch_esp(
         pairs: list["MoleculePair"],
         *,
         alpha: float,
@@ -799,7 +803,7 @@ class MoleculePair:
         if not pairs:
             return
         if _should_distribute(pairs):
-            return _run_distributed(MoleculePair.align_batch_esp, pairs,
+            return _run_distributed(MoleculePair._align_batch_esp, pairs,
                                     alpha=alpha, lam=lam, trans_init=trans_init,
                                     num_repeats=num_repeats,
                                     num_repeats_per_trans=num_repeats_per_trans,
@@ -820,9 +824,9 @@ class MoleculePair:
 
             if r is None or f is None or rc is None or fc is None:
                 if p.ref_molec.surf_pos is None or p.fit_molec.surf_pos is None:
-                    raise ValueError("Surface points are None; cannot run align_batch_esp.")
+                    raise ValueError("Surface points are None; cannot run _align_batch_esp.")
                 if p.ref_molec.surf_esp is None or p.fit_molec.surf_esp is None:
-                    raise ValueError("Surface ESP is None; cannot run align_batch_esp.")
+                    raise ValueError("Surface ESP is None; cannot run _align_batch_esp.")
 
                 p._ref_surf_t = torch.as_tensor(p.ref_molec.surf_pos, dtype=torch.float32, device=device)
                 p._fit_surf_t = torch.as_tensor(p.fit_molec.surf_pos, dtype=torch.float32, device=device)
@@ -952,7 +956,7 @@ class MoleculePair:
             p.sim_aligned_esp = float(s)
 
     @staticmethod
-    def align_batch_esp_combo(
+    def _align_batch_esp_combo(
         pairs: list["MoleculePair"],
         *,
         alpha: float,
@@ -978,7 +982,7 @@ class MoleculePair:
         if not pairs:
             return
         if _should_distribute(pairs):
-            return _run_distributed(MoleculePair.align_batch_esp_combo, pairs,
+            return _run_distributed(MoleculePair._align_batch_esp_combo, pairs,
                                     alpha=alpha, lam=lam, probe_radius=probe_radius,
                                     esp_weight=esp_weight, trans_init=trans_init,
                                     num_repeats=num_repeats,
@@ -992,9 +996,9 @@ class MoleculePair:
         # Ensure required tensors exist on device
         for p in pairs:
             if p.ref_molec.surf_pos is None or p.fit_molec.surf_pos is None:
-                raise ValueError("Surface points are None; cannot run align_batch_esp_combo.")
+                raise ValueError("Surface points are None; cannot run _align_batch_esp_combo.")
             if p.ref_molec.surf_esp is None or p.fit_molec.surf_esp is None:
-                raise ValueError("Surface ESP is None; cannot run align_batch_esp_combo.")
+                raise ValueError("Surface ESP is None; cannot run _align_batch_esp_combo.")
 
             if getattr(p, "_ref_surf_t", None) is None:
                 p._ref_surf_t = torch.as_tensor(p.ref_molec.surf_pos, dtype=torch.float32, device=device)
@@ -1165,7 +1169,7 @@ class MoleculePair:
                 p.sim_aligned_esp_combo = float(s)
 
     @staticmethod
-    def align_batch_pharm(
+    def _align_batch_pharm(
         pairs: list["MoleculePair"],
         *,
         similarity: _SIM_TYPE = "tanimoto",
@@ -1187,7 +1191,7 @@ class MoleculePair:
         if not pairs:
             return
         if _should_distribute(pairs):
-            return _run_distributed(MoleculePair.align_batch_pharm, pairs,
+            return _run_distributed(MoleculePair._align_batch_pharm, pairs,
                                     similarity=similarity, extended_points=extended_points,
                                     only_extended=only_extended, trans_init=trans_init,
                                     num_repeats=num_repeats, topk=topk,

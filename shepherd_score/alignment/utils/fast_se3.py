@@ -173,7 +173,7 @@ _FINE_FUSED = os.environ.get("FINE_FUSED_STEP", "0") != "0"
 # _PRUNE_KEEP seeds per pair (by current best score) and finish only those. Cuts
 # pose-steps from ~num_seeds*steps to num_seeds*K + keep*(steps-K). A few steps of
 # optimisation make the score a good basin predictor (unlike the 0-step prune that
-# was removed). OFF by default (=0); accuracy-gated via benchmarks/speedlab.py.
+# was removed). OFF by default (=0); accuracy-gated via benchmarks/experiments/speedlab.py.
 _PRUNE_AFTER = int(os.environ.get("FINE_PRUNE_AFTER", 0))
 _PRUNE_KEEP = int(os.environ.get("FINE_PRUNE_KEEP", 0))
 

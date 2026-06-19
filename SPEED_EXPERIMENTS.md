@@ -1,10 +1,10 @@
 # Speed experiments — toward >10k pairs/s (no accuracy loss)
 
-**Goal:** push `benchmarks/headline.py` throughput (pairs/s) past **10,000** without
+**Goal:** push `benchmarks/benchmark.py` throughput (pairs/s) past **10,000** without
 sacrificing accuracy: self-copy score must stay **1.000** (pharm 0.999), and
 distinct-molecule-pair scores must match the current fork (`max|Δ|` ≈ 0).
 
-**Method:** `benchmarks/speedlab.py` — in-process A/B (best-of-N warm, noise-robust
+**Method:** `benchmarks/experiments/speedlab.py` — in-process A/B (best-of-N warm, noise-robust
 on a clock-jittery GPU), fork-only (no original-repo reruns). Each experiment is a
 flag toggled in the fork; a change ships only if it is **faster AND accuracy-safe**.
 

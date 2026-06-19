@@ -7,7 +7,7 @@ math (bit-identical) -- only BLOCK / num_warps / num_stages / maxnreg differ, so
 this finds occupancy/latency wins with zero accuracy risk. Parity of outputs is
 asserted against the baseline config.
 
-  python -m benchmarks.kernelbench --P 200000 --N 48 --reps 24
+  python -m benchmarks.experiments.kernelbench --P 200000 --N 48 --reps 24
 """
 import argparse
 import math

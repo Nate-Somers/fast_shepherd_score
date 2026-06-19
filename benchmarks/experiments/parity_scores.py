@@ -4,7 +4,7 @@ stash, run on committed code, diff."""
 import numpy as np
 import torch
 
-from benchmarks.real_workloads import _build_molecule, DRUGS
+from benchmarks.benchmark import _build_molecule, DRUGS
 from shepherd_score.container import MoleculePair as MP
 
 dev = torch.device("cuda")
@@ -19,8 +19,8 @@ while len(sel) < 30:
 KW = {"vol": dict(alpha=0.81), "surf": dict(alpha=0.81),
       "esp": dict(alpha=0.81, lam=0.3, num_repeats=50, topk=30, lr=0.075),
       "pharm": dict(num_repeats=50, topk=30, lr=0.1)}
-FN = {"vol": MP.align_batch_vol, "surf": MP.align_batch_surf,
-      "esp": MP.align_batch_esp, "pharm": MP.align_batch_pharm}
+FN = {"vol": MP._align_batch_vol, "surf": MP._align_batch_surf,
+      "esp": MP._align_batch_esp, "pharm": MP._align_batch_pharm}
 AT = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf",
       "esp": "sim_aligned_esp", "pharm": "sim_aligned_pharm"}
 

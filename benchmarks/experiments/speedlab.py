@@ -10,7 +10,7 @@ Accuracy is deterministic, measured once per config: self-copy min (want 1.000) 
 distinct-molecule-pair max|Δ| vs baseline (want 0). A change ships only if the paired
 speedup > 1 AND accuracy is preserved.
 
-  python -m benchmarks.speedlab --modes vol surf --batch 4096 --reps 8 --es-patience 3
+  python -m benchmarks.experiments.speedlab --modes vol surf --batch 4096 --reps 8 --es-patience 3
 """
 import argparse
 import statistics
@@ -19,7 +19,7 @@ import time
 import numpy as np
 import torch
 
-from benchmarks.real_workloads import make_real_cohort, _build_molecule, DRUGS
+from benchmarks.benchmark import make_real_cohort, _build_molecule, DRUGS
 from shepherd_score.container import MoleculePair as MP
 import shepherd_score.alignment.utils.fast_se3 as fse3
 import shepherd_score.alignment.utils.fast_common as fcom
@@ -34,8 +34,8 @@ KW = {
     "esp":   dict(alpha=0.81, lam=0.3, num_repeats=50, topk=30, steps_fine=100, lr=0.075),
     "pharm": dict(num_repeats=50, topk=30, steps_fine=100, lr=0.1),
 }
-FN = {"vol": MP.align_batch_vol, "surf": MP.align_batch_surf,
-      "esp": MP.align_batch_esp, "pharm": MP.align_batch_pharm}
+FN = {"vol": MP._align_batch_vol, "surf": MP._align_batch_surf,
+      "esp": MP._align_batch_esp, "pharm": MP._align_batch_pharm}
 
 
 def _align(mode, pairs):

@@ -67,12 +67,12 @@ class MoleculePairBatch:
     def __init__(self, pairs: List[MoleculePair]):
         self.pairs = pairs
 
-    # Backend names that route to the Triton/CUDA MoleculePair.align_batch_* path.
+    # Backend names that route to the Triton/CUDA MoleculePair._align_batch_* path.
     _TRITON_BACKENDS = ("triton", "cuda", "gpu")
 
     def _triton_align(self, align_fn, align_kwargs, score_attr, transform_attr,
                       fit_attr, return_aligned):
-        """Route a batch alignment through the Triton ``MoleculePair.align_batch_*``
+        """Route a batch alignment through the Triton ``MoleculePair._align_batch_*``
         path with ZERO extra alignment work.
 
         ``align_fn(self.pairs, **align_kwargs)`` is byte-identical to calling the
@@ -243,19 +243,19 @@ class MoleculePairBatch:
             Aligned fit atom coordinates (unpadded) for each pair.
         backend : str
             ``"jax"`` (default) uses the JAX/XLA path below. ``"triton"`` (aliases
-            ``"cuda"``/``"gpu"``) routes to the Triton ``MoleculePair.align_batch_vol``
+            ``"cuda"``/``"gpu"``) routes to the Triton ``MoleculePair._align_batch_vol``
             kernel path (heavy-atom only), which also handles multi-GPU internally via
             ``_should_distribute``. ``max_num_steps`` maps to the Triton ``steps_fine``.
         return_aligned : bool
             For the Triton backend, skip building ``aligned_list`` when ``False``
-            (pure delegation, zero overhead over a direct ``align_batch_vol`` call).
+            (pure delegation, zero overhead over a direct ``_align_batch_vol`` call).
         """
         if backend in self._TRITON_BACKENDS:
             if not no_H:
                 raise NotImplementedError(
                     "the Triton vol backend aligns heavy atoms only (no_H=True)")
             return self._triton_align(
-                MoleculePair.align_batch_vol,
+                MoleculePair._align_batch_vol,
                 dict(alpha=alpha, steps_fine=max_num_steps),
                 "sim_aligned_vol_noH", "transform_vol_noH",
                 "_fit_xyz_t", return_aligned)
@@ -666,12 +666,12 @@ class MoleculePairBatch:
             Aligned fit surface coordinates for each pair.
         backend : str
             ``"jax"`` (default) or ``"triton"`` (aliases ``"cuda"``/``"gpu"``) which
-            routes to ``MoleculePair.align_batch_surf`` (multi-GPU-aware). ``return_aligned``
+            routes to ``MoleculePair._align_batch_surf`` (multi-GPU-aware). ``return_aligned``
             controls building the aligned-surface list (off by default = pure delegation).
         """
         if backend in self._TRITON_BACKENDS:
             return self._triton_align(
-                MoleculePair.align_batch_surf,
+                MoleculePair._align_batch_surf,
                 dict(alpha=alpha, steps_fine=max_num_steps),
                 "sim_aligned_surf", "transform_surf",
                 "_fit_surf_t", return_aligned)
@@ -798,13 +798,13 @@ class MoleculePairBatch:
             Aligned fit surface coordinates for each pair.
         backend : str
             ``"jax"`` (default) or ``"triton"`` (aliases ``"cuda"``/``"gpu"``) which
-            routes to ``MoleculePair.align_batch_esp`` (multi-GPU-aware; it applies the
+            routes to ``MoleculePair._align_batch_esp`` (multi-GPU-aware; it applies the
             same internal LAM_SCALING as this path, so ``lam`` is consistent across
             backends). ``return_aligned`` controls the aligned-surface list.
         """
         if backend in self._TRITON_BACKENDS:
             return self._triton_align(
-                MoleculePair.align_batch_esp,
+                MoleculePair._align_batch_esp,
                 dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
                      trans_init=trans_init, lr=lr, steps_fine=max_num_steps),
                 "sim_aligned_esp", "transform_esp",
@@ -1016,12 +1016,12 @@ class MoleculePairBatch:
             Aligned fit pharmacophore vectors (unpadded) for each pair.
         backend : str
             ``"jax"`` (default) or ``"triton"`` (aliases ``"cuda"``/``"gpu"``) which
-            routes to ``MoleculePair.align_batch_pharm`` (multi-GPU-aware). With
+            routes to ``MoleculePair._align_batch_pharm`` (multi-GPU-aware). With
             ``return_aligned=True`` the aligned anchors (rotate+translate) and vectors
             (rotate only) are rebuilt GPU-batched from the cached fit tensors.
         """
         if backend in self._TRITON_BACKENDS:
-            MoleculePair.align_batch_pharm(
+            MoleculePair._align_batch_pharm(
                 self.pairs, similarity=similarity, extended_points=extended_points,
                 only_extended=only_extended, trans_init=trans_init,
                 num_repeats=num_repeats, steps_fine=max_num_steps, lr=lr)
