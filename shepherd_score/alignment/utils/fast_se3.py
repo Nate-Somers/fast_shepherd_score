@@ -246,7 +246,7 @@ class _GraphedFineSurf:
         torch.cuda.current_stream().wait_stream(s)
         self._reset()
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
+        with torch.cuda.graph(self.graph, capture_error_mode="thread_local"):
             self._step()
 
     def run(self, A, B, Nr, Mr, norm, qs, ts):
@@ -257,7 +257,7 @@ class _GraphedFineSurf:
 
 
 def _run_graphed_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps, N_pad, M_pad, P):
-    key = (N_pad, M_pad, P, steps, round(float(alpha), 4), round(float(lr), 5))
+    key = (A_k.device.index, N_pad, M_pad, P, steps, round(float(alpha), 4), round(float(lr), 5))
     gf = _FINE_GRAPH_CACHE.get(key)
     if gf is None:
         gf = _GraphedFineSurf(N_pad, M_pad, P, steps, alpha, lr, A_k.device)
