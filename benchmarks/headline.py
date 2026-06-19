@@ -80,10 +80,6 @@ BUCKETS = ["same", "cross"]
 SIZES = [1, 10, 100, 1000, 10000, 100000]
 DEFAULT_CAP = 10.0
 SURF_PER_ATOM = 3
-# Idle pause before each timed fork cell so the GPU clock recovers and each mode is
-# timed un-throttled (this laptop GPU throttles ~2-3x under sustained load, which
-# otherwise bleeds across cells and depresses later modes). Set with --cooldown.
-_COOLDOWN = 2.0
 SELF_SCORE_WARN = 0.95          # self-copy optimum is 1.0; warn below this
 
 
@@ -111,41 +107,41 @@ def _fork_pool_smiles(mode, bucket):
     return [DRUGS[i][1] for i in idx]
 
 
+_SCORE_ATTR = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf",
+               "esp": "sim_aligned_esp", "pharm": "sim_aligned_pharm"}
+
+
+def _fork_align(MP, mode, pairs, cfg):
+    if mode == "vol":
+        MP.align_batch_vol(pairs, alpha=cfg["alpha"], steps_fine=cfg["steps"])
+    elif mode == "surf":
+        MP.align_batch_surf(pairs, alpha=cfg["alpha"], steps_fine=cfg["steps"])
+    elif mode == "esp":
+        MP.align_batch_esp(pairs, alpha=cfg["alpha"], lam=cfg["lam"],
+                           num_repeats=cfg["num_repeats"], topk=cfg["topk"],
+                           steps_fine=cfg["steps"], lr=cfg["lr"])
+    elif mode == "pharm":
+        MP.align_batch_pharm(pairs, num_repeats=cfg["num_repeats"], topk=cfg["topk"],
+                             steps_fine=cfg["steps"], lr=cfg["lr"])
+    else:
+        raise ValueError(mode)
+
+
 def _fork_time(mode, pairs, cfg):
-    """One timed fork alignment of an already-built list of MoleculePair. -> (sec, mean_score)."""
+    """One warmup + one timed fork alignment. -> (sec, mean_score). Used by the
+    accuracy branch; the speed sweep uses the isolated-subprocess path below."""
     import torch
     from shepherd_score.container import MoleculePair as MP
-
-    def run():
-        if mode == "vol":
-            MP.align_batch_vol(pairs, alpha=cfg["alpha"], steps_fine=cfg["steps"])
-        elif mode == "surf":
-            MP.align_batch_surf(pairs, alpha=cfg["alpha"], steps_fine=cfg["steps"])
-        elif mode == "esp":
-            MP.align_batch_esp(pairs, alpha=cfg["alpha"], lam=cfg["lam"],
-                               num_repeats=cfg["num_repeats"], topk=cfg["topk"],
-                               steps_fine=cfg["steps"], lr=cfg["lr"])
-        elif mode == "pharm":
-            MP.align_batch_pharm(pairs, num_repeats=cfg["num_repeats"], topk=cfg["topk"],
-                                 steps_fine=cfg["steps"], lr=cfg["lr"])
 
     def sync():
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    # Cooldown BEFORE the warmup: idle lets the clock recover from the prior cells'
-    # sustained-load throttle; the warmup then re-warms it back to boost so the timed
-    # run isn't cold-started. (Otherwise later modes, e.g. surf after vol's 100k cell,
-    # are timed on a throttled clock and look far slower than they are.)
-    if _COOLDOWN > 0:
-        sync(); time.sleep(_COOLDOWN)
-    run(); sync()                                                  # warmup (re-warm + autotune/JIT cache)
+    _fork_align(MP, mode, pairs, cfg); sync()                      # warmup (autotune / JIT)
     sync(); t0 = time.perf_counter()
-    run(); sync()
+    _fork_align(MP, mode, pairs, cfg); sync()
     dt = time.perf_counter() - t0
-    attr = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf",
-            "esp": "sim_aligned_esp", "pharm": "sim_aligned_pharm"}[mode]
-    sc = np.array([float(getattr(p, attr)) for p in pairs], dtype=float)
+    sc = np.array([float(getattr(p, _SCORE_ATTR[mode])) for p in pairs], dtype=float)
     return dt, float(sc.mean())
 
 
@@ -160,33 +156,106 @@ def _fork_clear():
         torch.cuda.empty_cache()
 
 
-def fork_speed_sweep(modes, buckets, sizes, cap, cfg, seed):
-    """Run the fork over every (mode, bucket) line with the cap stop rule."""
+# ---------------------------------------------------------------------------
+# Isolated speed sweep
+# ---------------------------------------------------------------------------
+# Each (mode, bucket, size) CELL runs in its OWN fresh subprocess. A fresh process
+# means (a) the GPU clock has recovered -- no cell is timed on a throttle bled from
+# a previous cell (this laptop GPU throttles ~2-3x under sustained load), and (b) the
+# Triton kernel autotunes at THIS cell's batch (the autotune key is the per-pose
+# shape, so a process reuses whatever config it first picked -- sharing a process
+# across sizes would lock in the tiny-n config and cripple the large cells). Each
+# cell is timed best-of-N (fastest = un-throttled boost-clock rep) -> isolated peaks.
+def fork_cell(planfile):
+    """Entry inside an isolated fork subprocess: measure ONE (mode, bucket, size)
+    cell best-of-N and print a RES line."""
+    import torch
     from benchmarks.real_workloads import make_real_cohort
     from shepherd_score.container import MoleculePair as MP
-    import torch
+    with open(planfile) as fh:
+        plan = json.load(fh)
+    mode, bucket, nb = plan["mode"], plan["bucket"], plan["size"]
+    cfg, seed, reps, budget = plan["cfg"], plan["seed"], plan["reps"], plan["budget"]
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    def sync():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    try:
+        co = make_real_cohort(mode, n_pairs=nb, bucket_kind=bucket, seed=seed)
+        pairs = [MP(p.ref, p.fit, do_center=False, device=dev) for p in co.pairs]
+        _fork_align(MP, mode, pairs, cfg); sync()                  # warmup: autotune at THIS batch + clock to boost
+        best = float("inf"); n = 0; total = 0.0
+        while n < reps and total < budget:                         # best-of-N, time-budgeted
+            sync(); t0 = time.perf_counter()
+            _fork_align(MP, mode, pairs, cfg); sync()
+            dt = time.perf_counter() - t0
+            best = min(best, dt); total += dt; n += 1
+        sc = float(np.array([float(getattr(p, _SCORE_ATTR[mode])) for p in pairs]).mean())
+        print(f"  fork {mode}|{bucket:5s} n={nb:<7d} {best:7.3f}s  {nb / best:10.1f} pairs/s  "
+              f"self={sc:.3f}  (best of {n}, isolated)", flush=True)
+        print("RES " + json.dumps({"key": f"{mode}|{bucket}", "n": nb, "t": best,
+                                    "score": sc, "nreps": n}), flush=True)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  fork {mode}|{bucket:5s} n={nb:<7d} ERR {type(e).__name__}: {e}", flush=True)
+        print("RES " + json.dumps({"key": f"{mode}|{bucket}", "n": nb,
+                                    "err": f"{type(e).__name__}: {e}"}), flush=True)
+
+
+def _spawn_fork_cell(plan):
+    """Spawn a fresh fork subprocess for one cell; return its parsed RES dict."""
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump(plan, fh)
+        planfile = fh.name
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    # The child runs headline.py as a script, so put the repo root on its path
+    # (for `import benchmarks...`) ahead of anything else; shepherd_score resolves
+    # to the fork (repo root), NOT the original repo.
+    env["PYTHONPATH"] = _ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    cmd = [sys.executable, os.path.abspath(__file__), "--fork-cell", planfile]
+    rec = None
+    try:
+        p = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        for ln in p.stdout.splitlines():
+            if ln.startswith("RES "):
+                rec = json.loads(ln.split(" ", 1)[1])
+            else:
+                print(ln, flush=True)
+        if p.returncode != 0 and rec is None:
+            sys.stderr.write(p.stderr[-2000:])
+            rec = {"err": f"exit {p.returncode}"}
+    finally:
+        try:
+            os.unlink(planfile)
+        except OSError:
+            pass
+    return rec
+
+
+def fork_speed_sweep(modes, buckets, sizes, cap, cfg, seed, reps=5, budget=4.0):
+    """Isolated speed sweep: each (mode, bucket, size) cell in its OWN fresh
+    subprocess, with the per-line cap-stop rule (a cell over the cap ends its line)."""
     data = {}
     for mode in modes:
         for bucket in buckets:
             key = f"{mode}|{bucket}"
             data[key] = {"fork": [], "fork_score": {}}
             for nb in sizes:
-                co = make_real_cohort(mode, n_pairs=nb, bucket_kind=bucket, seed=seed)
-                pairs = [MP(p.ref, p.fit, do_center=False, device=dev) for p in co.pairs]
-                try:
-                    dt, score = _fork_time(mode, pairs, cfg)
-                except Exception as e:
-                    print(f"  fork {key:12s} n={nb:<7d} ERR {type(e).__name__}", flush=True)
-                    _fork_clear(); break
-                mps = nb / dt
-                data[key]["fork"].append([nb, mps])
-                data[key]["fork_score"][nb] = score
-                print(f"  fork {key:12s} n={nb:<7d} {dt:7.3f}s  {mps:10.1f} pairs/s  self={score:.3f}",
-                      flush=True)
-                _fork_clear()
-                if dt > cap:                                       # cap stop: don't run larger sizes
+                plan = {"mode": mode, "bucket": bucket, "size": nb, "cfg": cfg,
+                        "seed": seed, "reps": reps, "budget": budget}
+                rec = _spawn_fork_cell(plan)
+                if not rec or "err" in rec:
+                    print(f"  fork {key:12s} n={nb:<7d} ERR "
+                          f"{(rec or {}).get('err', 'subprocess failed')}", flush=True)
+                    break
+                data[key]["fork"].append([nb, rec["n"] / rec["t"]])
+                data[key]["fork_score"][nb] = rec["score"]
+                if rec["t"] > cap:                                 # cap stop: don't run larger sizes
                     break
     return data
 
@@ -474,8 +543,8 @@ def run_speed(args):
           f"original={'on' if not args.no_original else 'off'}")
     print("=" * 88)
 
-    print("\n[fork] Triton/CUDA batch path")
-    data = fork_speed_sweep(modes, buckets, sizes, args.cap, cfg, args.seed)
+    print("\n[fork] Triton/CUDA batch path (each cell isolated in its own fresh subprocess)")
+    data = fork_speed_sweep(modes, buckets, sizes, args.cap, cfg, args.seed, args.reps, args.budget)
 
     if not args.no_original:
         print("\n[original] upstream repo (isolated subprocess)")
@@ -556,6 +625,7 @@ def _spearman(a, b):
 def main():
     ap = argparse.ArgumentParser(description="Headline fork-vs-original alignment benchmark")
     ap.add_argument("--orig-cell", help=argparse.SUPPRESS)         # internal: run as original subprocess
+    ap.add_argument("--fork-cell", help=argparse.SUPPRESS)         # internal: run as isolated fork subprocess
     ap.add_argument("--modes", nargs="+", default=MODES, choices=MODES)
     ap.add_argument("--buckets", nargs="+", default=BUCKETS, choices=BUCKETS)
     ap.add_argument("--sizes", type=int, nargs="+", default=SIZES)
@@ -573,16 +643,17 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.81)
     ap.add_argument("--lam", type=float, default=0.3)
     ap.add_argument("--topk", type=int, default=30)
-    ap.add_argument("--cooldown", type=float, default=2.0,
-                    help="idle seconds before each timed fork cell so the clock recovers "
-                         "(un-throttled, clean per-mode numbers). 0 disables.")
+    ap.add_argument("--reps", type=int, default=5,
+                    help="max timed reps per isolated cell; the fastest (un-throttled) is kept")
+    ap.add_argument("--budget", type=float, default=4.0,
+                    help="per-cell time budget (s): stop adding reps once exceeded, so slow "
+                         "cells take 1 rep and fast cells get best-of-reps")
     args = ap.parse_args()
-
-    global _COOLDOWN
-    _COOLDOWN = args.cooldown
 
     if args.orig_cell:                                             # isolated subprocess entry
         return orig_cell(args.orig_cell)
+    if args.fork_cell:                                            # isolated fork subprocess entry
+        return fork_cell(args.fork_cell)
     if args.accuracy:
         return run_accuracy(args)
     return run_speed(args)

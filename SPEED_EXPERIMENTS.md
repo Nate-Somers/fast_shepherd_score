@@ -105,12 +105,15 @@ The headline runs all modes/sizes **sequentially in one process**, so later cell
 
 **True per-mode peak (isolated, best-of-N):** vol ~18k, surf ~16k (**both >10k**), esp ~6k, pharm ~2.7k. **Sustained/throttled:** ~2-3× lower. The 100k push must beat BOTH the per-pair overhead AND a hardware throttle that already caps sustained throughput ~2-3× below peak.
 
+**Fix shipped:** the headline now runs **each `(mode, bucket, size)` cell in its own fresh subprocess** (`fork_cell` / `--fork-cell`), best-of-N time-budgeted. A fresh process = (a) a recovered clock — no cell is timed on a throttle bled from a previous cell — and (b) the kernel autotunes at **this** cell's batch. (b) is the subtle part: the Triton autotune key is the per-pose shape, so it's **batch-independent** — a process that first runs n=1 locks in the tiny-batch config and reuses it for n=10000, crippling it (a per-line prototype gave vol n=10000 = 2.5k instead of 24k). Per-cell avoids that. Replaced the in-process sequential sweep + `--cooldown` band-aid (both removed). Result vs sequential: surf|same n=10000 5393→**15021**, esp|same n=10000 573→**5672**, pharm|same n=10000 131→**8970**; all bit-exact.
+
 ## Round 2 log
 | # | hypothesis | mode | throughput Δ | accuracy | verdict |
 |---|---|---|---|---|---|
 | 0 | baseline (Round 1 end, isolated peak) | all | vol 18k / surf 16k / esp 6k / pharm 2.7k | bit-exact | reference |
 | R1 | `ref_pad`/`fit_pad` per-pair GPU copies → `pad_sequence` batched fill | vol, surf | **vol 18.4k→26k, surf 16k→18.2k** | **bit-identical** (git-stash gate ✓, self=1.0, dist\|Δ\|=0) | **SHIP** |
-| — | benchmark fix: `--cooldown` before each timed cell (recover→re-warm→time) so sequential runs aren't throttle-confounded | headline | n/a (measurement) | n/a | ship |
+| — | benchmark fix v1: `--cooldown` before each timed cell — partial (surf 1830→5393); superseded | headline | n/a | n/a | replaced |
+| — | benchmark fix v2: **per-cell isolated subprocess** + best-of-N; sequential mode + cooldown removed | headline | isolated peaks: vol **24.8k** / surf **16.5k** / esp **5.7k** / pharm **9.1k**; all modes now reach n=100k | self=1.0 (pharm 0.999) | **ship** |
 
 **KEY FINDING (kernel microbench, clean paired):** the overlap value+grad kernel is **compute-bound on the Gaussian `exp()`** (mem-util ~0%, 6.05 ms/200k poses ≈ constant across latency/occupancy configs). **Bit-identical headroom is ~1.09×, full stop.** Occupancy (BLOCK/warps) cannot be raised without changing the float reduction (accuracy). So the multi-pose-per-CTA rewrite is also unlikely to help (latency hiding gave only 1.06×; the bottleneck is exp throughput, not stalls).
 
