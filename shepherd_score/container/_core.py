@@ -25,7 +25,7 @@ from shepherd_score.score.pharmacophore_scoring import _SIM_TYPE, get_overlap_ph
 from shepherd_score.alignment import optimize_ROCS_overlay, optimize_ROCS_overlay_analytical, optimize_ROCS_esp_overlay, optimize_ROCS_esp_overlay_analytical, optimize_esp_combo_score_overlay
 from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_overlay_analytical
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
-from shepherd_score.alignment.utils.se3 import quaternion_to_SE3, quaternions_to_SE3_batch
+from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
 
 ### BEGIN size_bucketing #####################################################
 # Every heavy-atom count 3‒150 is mapped to a “band” of 8 atoms
@@ -197,6 +197,32 @@ def _subbatched_align(process, K: int, *, key: tuple,
         print(f"[subbatch] DONE key={key} K={K} nchunks={_nchunks} noom={_noom} "
               f"ks={_ks} final_fp={_PAIR_FOOTPRINT_BYTES.get(key)}", flush=True)
     return torch.cat(sc_parts), torch.cat(q_parts), torch.cat(t_parts)
+
+
+def _scatter_fill(out: torch.Tensor, tensors: list[torch.Tensor], sizes: list[int]) -> None:
+    """Fill a pre-zeroed padded workspace ``out`` of shape ``(K, P_pad, *feat)`` so
+    that ``out[i, :sizes[i]] = tensors[i]`` for each of the ``K`` per-pair tensors.
+
+    Bit-identical to a per-pair ``out[i, :n] = t`` loop / ``pad_sequence`` fill, but
+    it copies via ONE batched ``torch.cat`` + ONE vectorized scatter instead of ``K``
+    launch-bound device copies. That fill is the dominant per-pair *host* cost at
+    large batch -- on an RTX 4050 it drops a K=10000 (ref+fit) fill from ~100 ms to
+    ~3 ms. ``out``'s padding rows are left untouched (the caller zeroes them), so the
+    result is deterministic and exactly equal to the previous fill.
+    """
+    K, P_pad = out.shape[0], out.shape[1]
+    device = out.device
+    n = torch.as_tensor(sizes, device=device, dtype=torch.long)
+    S = int(n.sum())
+    if S == 0:
+        return
+    flat = torch.cat(tensors, dim=0)                       # (S, *feat)
+    starts = torch.cumsum(n, 0) - n                        # (K,) first flat-row of each pair
+    seg = torch.repeat_interleave(starts, n)               # (S,) segment start per flat row
+    local = torch.arange(S, device=device) - seg           # (S,) within-pair row index
+    dst = torch.repeat_interleave(torch.arange(K, device=device) * P_pad, n) + local
+    out.view(K * P_pad, *out.shape[2:])[dst] = flat
+
 
 def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) -> Chem.Mol:
     """
@@ -558,8 +584,10 @@ class MoleculePair:
             M_real = int_buf['M']
 
             # Fill once from CPU lists (one H2D each) -- was per-element GPU writes
-            n_list = [p._ref_xyz_t.shape[0] for p in bucket]
-            m_list = [p._fit_xyz_t.shape[0] for p in bucket]
+            ref_ts = [p._ref_xyz_t for p in bucket]
+            fit_ts = [p._fit_xyz_t for p in bucket]
+            n_list = [t.shape[0] for t in ref_ts]
+            m_list = [t.shape[0] for t in fit_ts]
             N_real.copy_(torch.tensor(n_list, dtype=torch.int32))
             M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
 
@@ -578,13 +606,11 @@ class MoleculePair:
             # but we do clear the padding slices for deterministic results.
             ref_pad.zero_()
             fit_pad.zero_()
-            # Batched pad-fill (was K per-pair GPU copies). pad_sequence pads with 0
-            # to match the zero-init prefix-write -> bit-identical. (R1)
-            _ps = torch.nn.utils.rnn.pad_sequence
-            _rp = _ps([p._ref_xyz_t for p in bucket], batch_first=True)
-            _fp = _ps([p._fit_xyz_t for p in bucket], batch_first=True)
-            ref_pad[:, :_rp.shape[1]] = _rp
-            fit_pad[:, :_fp.shape[1]] = _fp
+            # Batched scatter pad-fill (was K per-pair GPU copies via pad_sequence).
+            # cat+scatter into the zero-init prefix -> bit-identical, launch-count O(1)
+            # in K instead of O(K) (R3: the pad_sequence fill was the top host cost).
+            _scatter_fill(ref_pad, ref_ts, n_list)
+            _scatter_fill(fit_pad, fit_ts, m_list)
 
             # ---- self-overlaps (reused kernel) ---------------------------------
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
@@ -615,9 +641,10 @@ class MoleculePair:
         t_cpu = torch.cat(all_t).cpu()
 
         SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
-        for p, s, S in zip(all_pairs, scores_cpu, SE3_all):
+        scores_list = scores_cpu.tolist()                       # one C call (was K float())
+        for p, s, S in zip(all_pairs, scores_list, SE3_all):
             p.transform_vol_noH = S
-            p.sim_aligned_vol_noH = float(s)
+            p.sim_aligned_vol_noH = s
 
     @staticmethod
     def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 100):
@@ -715,8 +742,10 @@ class MoleculePair:
 
             # Fill once from CPU lists (one H2D each) instead of per-element GPU
             # scalar writes (which were ~8k tiny dispatches/sync per align).
-            n_list = [p._ref_surf_t.shape[0] for p in bucket]
-            m_list = [p._fit_surf_t.shape[0] for p in bucket]
+            ref_ts = [p._ref_surf_t for p in bucket]
+            fit_ts = [p._fit_surf_t for p in bucket]
+            n_list = [t.shape[0] for t in ref_ts]
+            m_list = [t.shape[0] for t in fit_ts]
             N_real.copy_(torch.tensor(n_list, dtype=torch.int32))
             M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
 
@@ -733,16 +762,11 @@ class MoleculePair:
             # Clear padding slices for determinism; write valid prefixes
             ref_pad.zero_()
             fit_pad.zero_()
-            # Batch .item() calls to reduce GPU→CPU sync overhead
-            n_list = N_real.tolist()
-            m_list = M_real.tolist()
-            # Batched pad-fill (was K per-pair GPU copies). pad_sequence zero-pads to
-            # match the zero-init prefix-write -> bit-identical. (R1)
-            _ps = torch.nn.utils.rnn.pad_sequence
-            _rp = _ps([p._ref_surf_t for p in bucket], batch_first=True)
-            _fp = _ps([p._fit_surf_t for p in bucket], batch_first=True)
-            ref_pad[:, :_rp.shape[1]] = _rp
-            fit_pad[:, :_fp.shape[1]] = _fp
+            # Batched scatter pad-fill (was K per-pair GPU copies via pad_sequence).
+            # cat+scatter into the zero-init prefix -> bit-identical, launch-count O(1)
+            # in K instead of O(K) (R3: the pad_sequence fill was the top host cost).
+            _scatter_fill(ref_pad, ref_ts, n_list)
+            _scatter_fill(fit_pad, fit_ts, m_list)
 
             # ---- self-overlaps on surface point clouds ----------------------------
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
@@ -774,9 +798,10 @@ class MoleculePair:
         t_cpu = torch.cat(all_t).cpu()
 
         SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
-        for p, s, S in zip(all_pairs, scores_cpu, SE3_all):
+        scores_list = scores_cpu.tolist()                       # one C call (was K float())
+        for p, s, S in zip(all_pairs, scores_list, SE3_all):
             p.transform_surf = S
-            p.sim_aligned_surf = float(s)
+            p.sim_aligned_surf = s
 
     @staticmethod
     def _align_batch_esp(
@@ -918,8 +943,14 @@ class MoleculePair:
             N_real = ib["N"]
             M_real = ib["M"]
 
-            N_real.copy_(torch.tensor([getattr(p, ref_pts_attr).shape[0] for p in bucket], dtype=torch.int32))
-            M_real.copy_(torch.tensor([getattr(p, fit_pts_attr).shape[0] for p in bucket], dtype=torch.int32))
+            ref_pts_ts = [getattr(p, ref_pts_attr) for p in bucket]
+            fit_pts_ts = [getattr(p, fit_pts_attr) for p in bucket]
+            ref_chg_ts = [getattr(p, ref_chg_attr) for p in bucket]
+            fit_chg_ts = [getattr(p, fit_chg_attr) for p in bucket]
+            n_list = [t.shape[0] for t in ref_pts_ts]
+            m_list = [t.shape[0] for t in fit_pts_ts]
+            N_real.copy_(torch.tensor(n_list, dtype=torch.int32))
+            M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
 
             ws_key = (N_pad, M_pad, K)
             ws = workspaces.get(ws_key)
@@ -941,14 +972,12 @@ class MoleculePair:
             fit_pad.zero_()
             ref_c_pad.zero_()
             fit_c_pad.zero_()
-            # Batch .item() calls to reduce GPU->CPU sync overhead
-            n_list = N_real.tolist()
-            m_list = M_real.tolist()
-            for i, (p, n, m) in enumerate(zip(bucket, n_list, m_list)):
-                ref_pad[i, :n] = getattr(p, ref_pts_attr)
-                fit_pad[i, :m] = getattr(p, fit_pts_attr)
-                ref_c_pad[i, :n] = getattr(p, ref_chg_attr)
-                fit_c_pad[i, :m] = getattr(p, fit_chg_attr)
+            # Batched scatter pad-fill (was a per-pair loop of 4*K device slice-copies).
+            # cat+scatter into the zero-init prefix -> bit-identical, O(1) launches in K.
+            _scatter_fill(ref_pad, ref_pts_ts, n_list)
+            _scatter_fill(fit_pad, fit_pts_ts, m_list)
+            _scatter_fill(ref_c_pad, ref_chg_ts, n_list)
+            _scatter_fill(fit_c_pad, fit_chg_ts, m_list)
 
             trans_centers_batch = None
             trans_centers_real = None
@@ -992,9 +1021,10 @@ class MoleculePair:
         t_cpu = torch.cat(all_t).cpu()
 
         SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
-        for p, s, S in zip(all_pairs, scores_cpu, SE3_all):
+        scores_list = scores_cpu.tolist()                       # one C call (was K float())
+        for p, s, S in zip(all_pairs, scores_list, SE3_all):
             setattr(p, out_tf_attr, S)
-            setattr(p, out_sc_attr, float(s))
+            setattr(p, out_sc_attr, s)
 
     @staticmethod
     def _align_batch_vol_esp(
@@ -1194,47 +1224,54 @@ class MoleculePair:
             N_real_surf_1 = torch.empty(K, device=device, dtype=torch.int32)
             M_real_surf_2 = torch.empty(K, device=device, dtype=torch.int32)
 
-            for i, p in enumerate(bucket):
-                n_wH = p._ref_centers_w_H_t.shape[0]
-                m_wH = p._fit_centers_w_H_t.shape[0]
-                n_surf = p._ref_surf_t.shape[0]
-                m_surf = p._fit_surf_t.shape[0]
-                N_real_atoms_w_H_1[i] = n_wH
-                M_real_atoms_w_H_2[i] = m_wH
-                N_real_surf_1[i] = n_surf
-                M_real_surf_2[i] = m_surf
+            # Gather per-pair tensors once, then batched scatter-fill (was a per-pair
+            # loop of ~10*K device slice-copies + per-element int scalar writes).
+            ref_wH_ts = [p._ref_centers_w_H_t for p in bucket]
+            fit_wH_ts = [p._fit_centers_w_H_t for p in bucket]
+            ref_surf_ts = [p._ref_surf_t for p in bucket]
+            fit_surf_ts = [p._fit_surf_t for p in bucket]
+            n_wH_list = [t.shape[0] for t in ref_wH_ts]
+            m_wH_list = [t.shape[0] for t in fit_wH_ts]
+            n_surf_list = [t.shape[0] for t in ref_surf_ts]
+            m_surf_list = [t.shape[0] for t in fit_surf_ts]
 
-                centers_w_H_1[i, :n_wH] = p._ref_centers_w_H_t
-                centers_w_H_2[i, :m_wH] = p._fit_centers_w_H_t
-                partial_1[i, :n_wH] = p._ref_partial_t
-                partial_2[i, :m_wH] = p._fit_partial_t
-                radii_1[i, :n_wH] = p._ref_radii_t
-                radii_2[i, :m_wH] = p._fit_radii_t
+            N_real_atoms_w_H_1.copy_(torch.tensor(n_wH_list, dtype=torch.int32))
+            M_real_atoms_w_H_2.copy_(torch.tensor(m_wH_list, dtype=torch.int32))
+            N_real_surf_1.copy_(torch.tensor(n_surf_list, dtype=torch.int32))
+            M_real_surf_2.copy_(torch.tensor(m_surf_list, dtype=torch.int32))
 
-                points_1[i, :n_surf] = p._ref_surf_t
-                points_2[i, :m_surf] = p._fit_surf_t
-                point_charges_1[i, :n_surf] = p._ref_surf_esp_t
-                point_charges_2[i, :m_surf] = p._fit_surf_esp_t
+            _scatter_fill(centers_w_H_1, ref_wH_ts, n_wH_list)
+            _scatter_fill(centers_w_H_2, fit_wH_ts, m_wH_list)
+            _scatter_fill(partial_1, [p._ref_partial_t for p in bucket], n_wH_list)
+            _scatter_fill(partial_2, [p._fit_partial_t for p in bucket], m_wH_list)
+            _scatter_fill(radii_1, [p._ref_radii_t for p in bucket], n_wH_list)
+            _scatter_fill(radii_2, [p._fit_radii_t for p in bucket], m_wH_list)
+            _scatter_fill(points_1, ref_surf_ts, n_surf_list)
+            _scatter_fill(points_2, fit_surf_ts, m_surf_list)
+            _scatter_fill(point_charges_1, [p._ref_surf_esp_t for p in bucket], n_surf_list)
+            _scatter_fill(point_charges_2, [p._fit_surf_esp_t for p in bucket], m_surf_list)
 
-                if alpha == 0.81:
-                    n_cent = p._ref_xyz_t.shape[0]
-                    m_cent = p._fit_xyz_t.shape[0]
-                    centers_1[i, :n_cent] = p._ref_xyz_t
-                    centers_2[i, :m_cent] = p._fit_xyz_t
-                    N_real_centers[i] = n_cent
-                    M_real_centers[i] = m_cent
-                else:
-                    centers_1[i, :n_surf] = p._ref_surf_t
-                    centers_2[i, :m_surf] = p._fit_surf_t
-                    N_real_centers[i] = n_surf
-                    M_real_centers[i] = m_surf
+            # "centers" are volumetric atoms when alpha==0.81, else surface points
+            # (constant for the whole call, so the branch is hoisted out of the bucket).
+            if alpha == 0.81:
+                ref_cent_ts = [p._ref_xyz_t for p in bucket]
+                fit_cent_ts = [p._fit_xyz_t for p in bucket]
+                n_cent_list = [t.shape[0] for t in ref_cent_ts]
+                m_cent_list = [t.shape[0] for t in fit_cent_ts]
+            else:
+                ref_cent_ts, fit_cent_ts = ref_surf_ts, fit_surf_ts
+                n_cent_list, m_cent_list = n_surf_list, m_surf_list
+            _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
+            _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
+            N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
+            M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))
 
             trans_centers_batch = None
             trans_centers_real = None
             if trans_init:
-                trans_centers_batch = torch.empty(K, tc, 3, device=device, dtype=torch.float32)
-                for i, p in enumerate(bucket):
-                    trans_centers_batch[i] = p._ref_xyz_t
+                # All pairs in this bucket share exactly tc translation centers (bucket
+                # key), so a single stack is equivalent to the per-pair fill.
+                trans_centers_batch = torch.stack([p._ref_xyz_t for p in bucket])
                 trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
 
             _, q_batch, t_batch, scores = fast_optimize_esp_combo_score_overlay_batch(
@@ -1277,9 +1314,11 @@ class MoleculePair:
         q_cpu = torch.cat(all_q).cpu()
         t_cpu = torch.cat(all_t).cpu()
 
-        for p, s, q, t in zip(all_pairs, scores_cpu, q_cpu, t_cpu):
-                p.transform_esp_combo = quaternion_to_SE3(q, t)
-                p.sim_aligned_esp_combo = float(s)
+        SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair quaternion_to_SE3)
+        scores_list = scores_cpu.tolist()                       # one C call (was K float())
+        for p, s, S in zip(all_pairs, scores_list, SE3_all):
+            p.transform_esp_combo = S
+            p.sim_aligned_esp_combo = s
 
     @staticmethod
     def _align_batch_pharm(
@@ -1388,17 +1427,19 @@ class MoleculePair:
             N_real = torch.empty(K, device=device, dtype=torch.int32)
             M_real = torch.empty(K, device=device, dtype=torch.int32)
 
-            n_list = [p._ref_pharm_ancs_t.shape[0] for p in bucket]
-            m_list = [p._fit_pharm_ancs_t.shape[0] for p in bucket]
+            ref_ancs_ts = [p._ref_pharm_ancs_t for p in bucket]
+            fit_ancs_ts = [p._fit_pharm_ancs_t for p in bucket]
+            n_list = [t.shape[0] for t in ref_ancs_ts]
+            m_list = [t.shape[0] for t in fit_ancs_ts]
             N_real.copy_(torch.tensor(n_list, dtype=torch.int32))   # was per-element GPU writes
             M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
-            for i, (p, n, m) in enumerate(zip(bucket, n_list, m_list)):
-                ref_types[i, :n] = p._ref_pharm_types_t
-                fit_types[i, :m] = p._fit_pharm_types_t
-                ref_ancs[i, :n] = p._ref_pharm_ancs_t
-                fit_ancs[i, :m] = p._fit_pharm_ancs_t
-                ref_vecs[i, :n] = p._ref_pharm_vecs_t
-                fit_vecs[i, :m] = p._fit_pharm_vecs_t
+            # Batched scatter pad-fill (was a per-pair loop of 6*K device slice-copies).
+            _scatter_fill(ref_types, [p._ref_pharm_types_t for p in bucket], n_list)
+            _scatter_fill(fit_types, [p._fit_pharm_types_t for p in bucket], m_list)
+            _scatter_fill(ref_ancs, ref_ancs_ts, n_list)
+            _scatter_fill(fit_ancs, fit_ancs_ts, m_list)
+            _scatter_fill(ref_vecs, [p._ref_pharm_vecs_t for p in bucket], n_list)
+            _scatter_fill(fit_vecs, [p._fit_pharm_vecs_t for p in bucket], m_list)
 
             trans_centers_batch = ref_ancs if trans_init else None
             trans_centers_real = N_real if trans_init else None
@@ -1433,9 +1474,10 @@ class MoleculePair:
         t_cpu = torch.cat(all_t).cpu()
 
         SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
-        for p, s, S in zip(all_pairs, scores_cpu, SE3_all):
+        scores_list = scores_cpu.tolist()                       # one C call (was K float())
+        for p, s, S in zip(all_pairs, scores_list, SE3_all):
             p.transform_pharm = S
-            p.sim_aligned_pharm = float(s)
+            p.sim_aligned_pharm = s
 
     def align_with_vol(self,
                        no_H: bool = True,

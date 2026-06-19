@@ -152,7 +152,29 @@ last decimal.
    clock and a correctly-autotuned kernel.
 
 ### Net result
-True per-mode peak throughput (isolated, single GPU): **vol ≈ 25k**, **surf ≈ 16k**,
-**esp ≈ 6k**, **pharm ≈ 9k** pairs/s — with the shape and surface modes producing results
-that are **bit-identical** to the original implementation. Full experiment log, including
-rejected ideas, is in [`SPEED_EXPERIMENTS.md`](SPEED_EXPERIMENTS.md).
+On a **RTX 4050 laptop GPU**, the Triton engine runs ~10–200× faster than the parallelizable
+JAX/CPU, with the shape and surface modes producing results that are
+bit-identical to the original implementation. Peak aligned **pairs/second** by mode and
+hardware (real drug self-copy pairs, isolated best-of-N):
+
+| mode | RTX 4050 laptop (post-F3) | L40S · 1 GPU (pre-F3) | L40S · N GPU |
+|---|--:|--:|--:|
+| vol   | **54,800** | 58,944 | _pending_ |
+| surf  | **29,400** | 43,062 | _pending_ |
+| esp   | **8,000**  | 18,459 | _pending_ |
+| pharm | **11,800** | 19,645 | _pending_ |
+
+*(laptop: RTX 4050 · Core Ultra 9 185H · torch 2.5.1 / CUDA 12.4. L40S: `pi_melkin` node ·
+Xeon Gold 6542Y · torch 2.11 / CUDA 12.8 · **Triton 3.6** · single GPU, molecule cache on. vs
+JAX/CPU peaks of vol 157, surf 53, esp 31, pharm 12 pairs/s.)*
+
+The laptop column reflects **F3** — removing the per-pair host overhead (the `pad_sequence`
+pad-fill was the single largest cost, *bigger than the kernel* for vol). It roughly **2×**'d the
+shape/surface modes on the laptop and made the align **GPU-bound** rather than host-bound (host
+now ~4 µs/pair). The **L40S figures predate F3** (the host ceiling was exactly what capped the
+laptop→L40S scaling to ~2.5×), so a re-measure should lift them further; it's pending. On the
+L40S the heavier modes **hold throughput flat out to 100k pairs/call** (esp **16.2k** @100k vs
+the laptop's 1.9k) — the laptop's large-batch dip was its power/thermal throttle, which a
+properly-powered datacenter GPU doesn't hit. Shape/surface stay bit-identical; pharm 0.999.
+
+Full experiment log, including rejected ideas, is in [`SPEED_EXPERIMENTS.md`](SPEED_EXPERIMENTS.md).

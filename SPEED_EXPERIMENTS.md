@@ -135,3 +135,50 @@ The headline runs all modes/sizes **sequentially in one process**, so later cell
 **Sparsity measured (cutoff_probe):** mean **0.40** of pairs within range → **~2.5× fewer exp** on average, and it scales with molecule size — imatinib 0.19 (5.2×), sildenafil 0.22 (4.5×), warfarin 0.30 (3.3×); small mols denser (benzene 0.63 → 1.6×). Stacked with the ~1.3× safe wins, this plausibly clears 10k on vol/surf.
 
 **Cost:** real kernel rewrite — spatially sort points so 16×16 tiles are spatial regions, then skip far tile-pairs via bounding boxes (per-lane skip doesn't help SIMT; tile-level does). **Accuracy:** dropped terms sum to ~1e-4 → score change ~1e-5–1e-6 (below the 4-decimal score precision; comparable to fp32 reassociation, which BLOCK=32 already showed at 7e-4). **Effectively** zero but not **exactly** zero — needs a call on whether float-level change counts as "sacrificing accuracy."
+
+---
+
+# F3 — eliminate the per-pair host loops (restore GPU scaling)
+
+**Motivation.** L40S vs RTX 4050 throughput scaled only ~2.5× despite a ~6× faster GPU
+→ the align was **host-overhead-bound, not kernel-bound**, so a faster GPU shrank the kernel
+but not the (hardware-independent) per-pair Python/launch work, capping the speedup. R1
+(batched pad-fill) and R2 (batched SE(3) writeback) were partly done; F3 finishes the job.
+
+**Profile (RTX 4050, batch 10000, self-copy).** Decomposed the align into GPU-region vs pure
+host (`benchmarks/experiments/hostprofile.py`, throwaway). The dominant non-GPU cost was the
+**`pad_sequence` pad-fill** — not the kernel:
+
+| mode | TOTAL | GPU regions | HOST | of which `pad_sequence` (ref+fit) | writeback loop |
+|---|--:|--:|--:|--:|--:|
+| vol  | 422 ms | 162 ms (38%) | **260 ms (62%)** | **~180 ms** | ~14 ms |
+| surf | 607 ms | 324 ms (53%) | **283 ms (47%)** | **~223 ms** | ~26 ms |
+
+`pad_sequence([p._x_t for p in bucket])` issues ~K tiny device copies (launch-bound, ~18 µs
+each). The re-gather in the harness was negligible (<2 ms).
+
+**Fix (bit-identical, zero API change).** A single helper `_scatter_fill(out, tensors, sizes)`
+in `_core.py`: one batched `torch.cat` + one **vectorized scatter** into the pre-zeroed
+workspace (launch count O(1) in K instead of O(K)). Applied to every fill: vol, surf,
+`_esp_bucketed_align` (esp + vol_esp), pharm, esp_combo (also vectorised its per-element int
+counts + hoisted the constant `alpha==0.81` branch out of the loop). Writebacks replace the
+per-pair `float(s)` with one `scores_cpu.tolist()` (R2); esp_combo's per-pair `quaternion_to_SE3`
+→ batched `quaternions_to_SE3_batch`.
+
+Micro (K=10000): the ref+fit fill drops **~100 ms → ~3 ms (~30×)**, `torch.equal` to the old fill.
+
+| # | change | mode | throughput Δ (isolated, RTX 4050) | accuracy | verdict |
+|---|---|---|---|---|---|
+| F3 | `pad_sequence`/per-pair fill → `_scatter_fill` (cat+scatter) + `tolist` writeback | all | **vol 23.7k→54.8k (2.3×), surf 16.5k→28.9k (1.76×), esp 5.7k→8.0k (1.4×), pharm 6.2k→11.8k (1.9×)** | **bit-identical** (parity gate exact for vol/surf/esp/pharm; esp_combo fills `torch.equal`) | **SHIP** |
+
+**Result:** the align is now **GPU-bound** (vol 79% / surf 86% GPU) with host at **3.8–4.9 µs/pair**
+(under the 10 µs/pair = 100k-pairs/s target). The host ceiling that capped L40S scaling is gone,
+so faster GPUs should now convert into throughput. esp_combo's kernel is **nondeterministic
+run-to-run** (pre-existing — confirmed on baseline), so it's gated by `torch.equal` on the fills,
+not an end-to-end score diff. Verified: parity gate (30 distinct pairs) + `test_fast_batch_alignment`
++ `test_batch_alignment` (13 tests) pass.
+
+**Still open (none a slam-dunk, per the log above):** a public `align_batch_tensors(...)`
+tensor-in/out seam (usability, not throughput — host is already <10 µs/pair); spatial cutoff
+(experiment #8: only ~2% tile-skip on drug-sized mols); early seed-prune H1 (needs a distinct-pair
+accuracy harness — invisible to the self-copy gate). esp/pharm kernels are at their accuracy-safe ceiling.
