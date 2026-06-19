@@ -810,7 +810,6 @@ class MoleculePair:
                                     topk=topk, steps_fine=steps_fine, lr=lr)
 
         from shepherd_score.score.constants import LAM_SCALING
-        from shepherd_score.alignment.utils.fast_esp_se3 import fast_optimize_ROCS_esp_overlay_batch
 
         device = pairs[0].device
         lam_scaled = LAM_SCALING * lam
@@ -846,17 +845,59 @@ class MoleculePair:
             if trans_init and getattr(p, "_ref_xyz_t", None) is None:
                 p._ref_xyz_t = torch.as_tensor(p.ref_molec.atom_pos, dtype=torch.float32, device=device)
 
+        MoleculePair._esp_bucketed_align(
+            pairs, alpha=alpha, lam_scaled=lam_scaled,
+            ref_pts_attr="_ref_surf_t", fit_pts_attr="_fit_surf_t",
+            ref_chg_attr="_ref_surf_esp_t", fit_chg_attr="_fit_surf_esp_t",
+            out_tf_attr="transform_esp", out_sc_attr="sim_aligned_esp",
+            subbatch_tag="esp", trans_init=trans_init,
+            num_repeats_per_trans=num_repeats_per_trans, topk=topk,
+            steps_fine=steps_fine, lr=lr,
+        )
+
+    @staticmethod
+    def _esp_bucketed_align(
+        pairs: list["MoleculePair"],
+        *,
+        alpha: float,
+        lam_scaled: float,
+        ref_pts_attr: str,
+        fit_pts_attr: str,
+        ref_chg_attr: str,
+        fit_chg_attr: str,
+        out_tf_attr: str,
+        out_sc_attr: str,
+        subbatch_tag: str,
+        trans_init: bool,
+        num_repeats_per_trans: int,
+        topk: int,
+        steps_fine: int,
+        lr: float,
+    ) -> None:
+        """
+        Shared bucket -> pad -> fused-ESP-kernel -> SE(3) writeback core for the
+        ESP-weighted batch aligners. ``_align_batch_esp`` feeds surface points +
+        surface ESP; ``_align_batch_vol_esp`` feeds (heavy-)atom coords + partial
+        charges. The caller resolves ``lam_scaled`` (esp applies ``LAM_SCALING``,
+        vol_esp uses raw lam) and supplies the cached-tensor attribute names + the
+        output attrs. Translation centers are always the ref atom coords
+        (``_ref_xyz_t``), matching every per-pair ESP optimizer.
+        """
+        from shepherd_score.alignment.utils.fast_esp_se3 import fast_optimize_ROCS_esp_overlay_batch
+
+        device = pairs[0].device
+
         all_pairs: list[MoleculePair] = []
         all_scores: list[torch.Tensor] = []
         all_q: list[torch.Tensor] = []
         all_t: list[torch.Tensor] = []
 
-        # Bucket by padded surface sizes; for translation-seeded mode, also bucket by exact
-        # number of translation centers (legacy uses 10*P + 5 seeds).
+        # Bucket by padded point-cloud sizes; for translation-seeded mode, also bucket
+        # by exact number of translation centers (legacy uses 10*P + 5 seeds).
         buckets: dict[tuple[int, int, int], list[MoleculePair]] = {}
         for p in pairs:
-            n_band = _band_key(p._ref_surf_t.shape[0])
-            m_band = _band_key(p._fit_surf_t.shape[0])
+            n_band = _band_key(getattr(p, ref_pts_attr).shape[0])
+            m_band = _band_key(getattr(p, fit_pts_attr).shape[0])
             tc = int(p._ref_xyz_t.shape[0]) if trans_init else 0
             buckets.setdefault((n_band, m_band, tc), []).append(p)
 
@@ -877,8 +918,8 @@ class MoleculePair:
             N_real = ib["N"]
             M_real = ib["M"]
 
-            N_real.copy_(torch.tensor([p._ref_surf_t.shape[0] for p in bucket], dtype=torch.int32))
-            M_real.copy_(torch.tensor([p._fit_surf_t.shape[0] for p in bucket], dtype=torch.int32))
+            N_real.copy_(torch.tensor([getattr(p, ref_pts_attr).shape[0] for p in bucket], dtype=torch.int32))
+            M_real.copy_(torch.tensor([getattr(p, fit_pts_attr).shape[0] for p in bucket], dtype=torch.int32))
 
             ws_key = (N_pad, M_pad, K)
             ws = workspaces.get(ws_key)
@@ -900,14 +941,14 @@ class MoleculePair:
             fit_pad.zero_()
             ref_c_pad.zero_()
             fit_c_pad.zero_()
-            # Batch .item() calls to reduce GPU→CPU sync overhead
+            # Batch .item() calls to reduce GPU->CPU sync overhead
             n_list = N_real.tolist()
             m_list = M_real.tolist()
             for i, (p, n, m) in enumerate(zip(bucket, n_list, m_list)):
-                ref_pad[i, :n] = p._ref_surf_t
-                fit_pad[i, :m] = p._fit_surf_t
-                ref_c_pad[i, :n] = p._ref_surf_esp_t
-                fit_c_pad[i, :m] = p._fit_surf_esp_t
+                ref_pad[i, :n] = getattr(p, ref_pts_attr)
+                fit_pad[i, :m] = getattr(p, fit_pts_attr)
+                ref_c_pad[i, :n] = getattr(p, ref_chg_attr)
+                fit_c_pad[i, :m] = getattr(p, fit_chg_attr)
 
             trans_centers_batch = None
             trans_centers_real = None
@@ -919,12 +960,12 @@ class MoleculePair:
                     trans_centers_batch[i] = p._ref_xyz_t
                 trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
 
-            # NOTE: seed-gen hoist intentionally NOT applied to esp. Unlike surf/vol
-            # (where it cleanly helps under memory pressure), for esp's heavier
-            # per-chunk footprint the held full-band seeds shaved enough free memory
-            # to tip the sub-batcher into OOM-retry thrash under pressure (esp-same
-            # large-batch went 1912 -> 273 mol/s). Clean-process esp is already fast;
-            # the per-cell subprocess benchmark removes the pressure entirely.
+            # NOTE: seed-gen is intentionally NOT hoisted out of the sub-batch loop for
+            # the ESP-family kernels. Unlike surf/vol (where hoisting cleanly helps under
+            # memory pressure), the heavier per-chunk ESP footprint meant held full-band
+            # seeds shaved enough free memory to tip the sub-batcher into OOM-retry thrash
+            # (esp-same large-batch went 1912 -> 273 mol/s). Clean-process ESP is already
+            # fast; the per-cell subprocess benchmark removes the pressure entirely.
             def _proc(_s, _k):
                 sl = slice(_s, _s + _k)
                 tcb = trans_centers_batch[sl] if trans_centers_batch is not None else None
@@ -939,7 +980,7 @@ class MoleculePair:
                 )
                 return sc, q, t
             scores, q_batch, t_batch = _subbatched_align(
-                _proc, K, key=("esp", N_pad, M_pad, 50))
+                _proc, K, key=(subbatch_tag, N_pad, M_pad, 50))
 
             all_pairs.extend(bucket)
             all_scores.append(scores)
@@ -952,8 +993,80 @@ class MoleculePair:
 
         SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
         for p, s, S in zip(all_pairs, scores_cpu, SE3_all):
-            p.transform_esp = S
-            p.sim_aligned_esp = float(s)
+            setattr(p, out_tf_attr, S)
+            setattr(p, out_sc_attr, float(s))
+
+    @staticmethod
+    def _align_batch_vol_esp(
+        pairs: list["MoleculePair"],
+        *,
+        lam: float,
+        alpha: float = 0.81,
+        trans_init: bool = False,
+        num_repeats: int = 50,
+        num_repeats_per_trans: int = 10,
+        topk: int = 30,
+        steps_fine: int = 100,
+        lr: float = 0.075,
+    ) -> None:
+        """
+        Batched volumetric-ESP alignment: heavy-atom Gaussian overlap weighted by
+        partial charge. Reuses the fused ESP Triton kernel via ``_esp_bucketed_align``,
+        fed atom coords + heavy-atom partial charges instead of surface points + ESP.
+        Heavy-atom only (mirrors ``_align_batch_vol``); ``lam`` is RAW (no
+        ``LAM_SCALING``) to match the per-pair ``align_with_vol_esp``.
+
+        Side effects
+        ------------
+        Writes:
+        - p.transform_vol_esp_noH
+        - p.sim_aligned_vol_esp_noH
+        """
+        if not pairs:
+            return
+        if _should_distribute(pairs):
+            return _run_distributed(MoleculePair._align_batch_vol_esp, pairs,
+                                    lam=lam, alpha=alpha, trans_init=trans_init,
+                                    num_repeats=num_repeats,
+                                    num_repeats_per_trans=num_repeats_per_trans,
+                                    topk=topk, steps_fine=steps_fine, lr=lr)
+
+        device = pairs[0].device
+
+        # Ensure heavy-atom coords (+ heavy-atom partial charges) exist on device.
+        for p in pairs:
+            if p.ref_molec.partial_charges is None or p.fit_molec.partial_charges is None:
+                raise ValueError("Partial charges are None; cannot run _align_batch_vol_esp.")
+
+            rx = getattr(p, "_ref_xyz_t", None)
+            fx = getattr(p, "_fit_xyz_t", None)
+            if rx is None:
+                p._ref_xyz_t = torch.as_tensor(p.ref_molec.atom_pos, dtype=torch.float32, device=device)
+            elif rx.device != device:
+                p._ref_xyz_t = rx.to(device, non_blocking=True)
+            if fx is None:
+                p._fit_xyz_t = torch.as_tensor(p.fit_molec.atom_pos, dtype=torch.float32, device=device)
+            elif fx.device != device:
+                p._fit_xyz_t = fx.to(device, non_blocking=True)
+
+            if getattr(p, "_ref_xyz_esp_t", None) is None:
+                p._ref_xyz_esp_t = torch.as_tensor(
+                    p.ref_molec.partial_charges[p.ref_molec._nonH_atoms_idx],
+                    dtype=torch.float32, device=device)
+            if getattr(p, "_fit_xyz_esp_t", None) is None:
+                p._fit_xyz_esp_t = torch.as_tensor(
+                    p.fit_molec.partial_charges[p.fit_molec._nonH_atoms_idx],
+                    dtype=torch.float32, device=device)
+
+        MoleculePair._esp_bucketed_align(
+            pairs, alpha=alpha, lam_scaled=lam,            # RAW lam (matches per-pair vol_esp)
+            ref_pts_attr="_ref_xyz_t", fit_pts_attr="_fit_xyz_t",
+            ref_chg_attr="_ref_xyz_esp_t", fit_chg_attr="_fit_xyz_esp_t",
+            out_tf_attr="transform_vol_esp_noH", out_sc_attr="sim_aligned_vol_esp_noH",
+            subbatch_tag="vol_esp", trans_init=trans_init,
+            num_repeats_per_trans=num_repeats_per_trans, topk=topk,
+            steps_fine=steps_fine, lr=lr,
+        )
 
     @staticmethod
     def _align_batch_esp_combo(

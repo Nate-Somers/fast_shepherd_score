@@ -395,6 +395,9 @@ class MoleculePairBatch:
                            use_shmap: bool = True,
                            num_buckets: int = 1,
                            verbose: bool = False,
+                           backend: str = "jax",
+                           alpha: float = 0.81,
+                           return_aligned: bool = False,
                            ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using padded masked volumetric ESP similarity via JAX.
 
@@ -452,6 +455,19 @@ class MoleculePairBatch:
             Aligned fit atom coordinates (unpadded) for each pair.
         """
         # Build raw (unpadded) per-pair data tuples (plain numpy — picklable).
+        if backend in self._TRITON_BACKENDS:
+            if not no_H:
+                raise NotImplementedError(
+                    "the Triton vol_esp backend aligns heavy atoms only (no_H=True)")
+            return self._triton_align(
+                MoleculePair._align_batch_vol_esp,
+                dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
+                     trans_init=trans_init, lr=lr, steps_fine=max_num_steps),
+                "sim_aligned_vol_esp_noH", "transform_vol_esp_noH",
+                "_fit_xyz_t", return_aligned)
+        if backend != "jax":
+            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+
         raw_refs, raw_fits, raw_ref_ch, raw_fit_ch, trans_centers_list = [], [], [], [], []
         for pair in self.pairs:
             if no_H:
@@ -876,6 +892,70 @@ class MoleculePairBatch:
             max_num_steps=max_num_steps,
             use_jax=use_jax,
             use_analytical=use_analytical,
+            verbose=verbose,
+        )
+
+    def align_with_esp_combo(self,
+                             alpha: float,
+                             lam: float = 0.001,
+                             probe_radius: float = 1.0,
+                             esp_weight: float = 0.5,
+                             num_repeats: int = 50,
+                             trans_init: bool = False,
+                             lr: float = 0.1,
+                             max_num_steps: int = 200,
+                             verbose: bool = False,
+                             backend: str = "jax",
+                             return_aligned: bool = False,
+                             ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        """Align all pairs using ShaEP-style ESP-combo similarity.
+
+        Results are stored in-place on each MoleculePair:
+        - ``pair.transform_esp_combo`` and ``pair.sim_aligned_esp_combo``
+
+        Parameters
+        ----------
+        alpha, lam, probe_radius, esp_weight : float
+            ShaEP combo parameters (see ``MoleculePair.align_with_esp_combo``).
+        num_repeats, trans_init, lr, max_num_steps, verbose
+            Standard optimization controls.
+        backend : str
+            ``"jax"`` (default) runs the per-pair CPU/torch path sequentially via
+            ``MoleculePair.align_with_esp_combo``. ``"triton"`` (aliases
+            ``"cuda"``/``"gpu"``) routes to the batched
+            ``MoleculePair._align_batch_esp_combo`` GPU kernel (multi-GPU-aware).
+        return_aligned : bool
+            For the Triton backend, build the aligned-fit-surface list when ``True``.
+
+        Returns
+        -------
+        scores : np.ndarray
+            Shape: (N,).
+        aligned_list : list of np.ndarray
+            Aligned fit surface coordinates per pair (``None`` entries unless
+            ``return_aligned=True`` on the Triton backend).
+        """
+        if backend in self._TRITON_BACKENDS:
+            return self._triton_align(
+                MoleculePair._align_batch_esp_combo,
+                dict(alpha=alpha, lam=lam, probe_radius=probe_radius,
+                     esp_weight=esp_weight, trans_init=trans_init,
+                     num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+                "sim_aligned_esp_combo", "transform_esp_combo",
+                "_fit_surf_t", return_aligned)
+        if backend != "jax":
+            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+
+        return self._delegate_alignment(
+            'align_with_esp_combo', 'sim_aligned_esp_combo',
+            alpha=alpha,
+            lam=lam,
+            probe_radius=probe_radius,
+            esp_weight=esp_weight,
+            num_repeats=num_repeats,
+            trans_init=trans_init,
+            lr=lr,
+            max_num_steps=max_num_steps,
             verbose=verbose,
         )
 
