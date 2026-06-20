@@ -9,12 +9,22 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
-from ...score.gaussian_overlap_triton import (
-    overlap_score_grad_se3_batch,
-    fused_adam_qt,
-    fused_adam_qt_with_tangent_proj,
-    _batch_self_overlap
-)
+try:
+    from ...score.gaussian_overlap_triton import (
+        overlap_score_grad_se3_batch,
+        fused_adam_qt,
+        fused_adam_qt_with_tangent_proj,
+        _batch_self_overlap
+    )
+except ImportError:
+    # CPU-only box (no triton): surf uses the SAME Gaussian shape kernel as vol,
+    # so the numba cpu_overlap fallbacks serve it verbatim. GPU path unchanged.
+    from .cpu_overlap import (
+        overlap_score_grad_se3_batch,
+        fused_adam_qt,
+        fused_adam_qt_with_tangent_proj,
+        _batch_self_overlap,
+    )
 from .fast_common import (
     check_gpu_available,
     legacy_seeds_torch,

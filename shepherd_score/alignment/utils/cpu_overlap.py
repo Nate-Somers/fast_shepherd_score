@@ -151,3 +151,92 @@ def fused_surf_step_batch(*args, **kwargs):
     fine loop (guarded by torch.cuda.is_available()), so this should never be called."""
     raise NotImplementedError(
         "fused_surf_step_batch is CUDA-only; the CPU path uses the eager fine loop.")
+
+
+# ===========================================================================
+#  ESP-weighted overlap (esp / vol_esp): shape kernel x charge weight.
+#  Replicates gaussian_overlap_esp_triton._gauss_overlap_esp_se3_tiled:
+#  V = K * sum exp(-a/2 r^2) * exp(-(Ci-Cj)^2/lam), gradient = shape grad scaled
+#  by the (SE(3)-invariant) charge weight (folded into g). The two exps are fused
+#  into one exp(-a/2 r^2 - c2/lam) (algebraically identical; the L5 lever).
+# ===========================================================================
+@njit(parallel=True, fastmath=False, cache=True)
+def _overlap_grad_esp_kernel(A, B, CA, CB, q, t, Nr, Mr, alpha, inv_lam, need_grad):
+    K = A.shape[0]
+    Kc = _K_PI / (2.0 * alpha) ** 1.5
+    a2 = alpha / 2.0
+    V = np.zeros(K, dtype=np.float64)
+    dQ = np.zeros((K, 4), dtype=np.float64)
+    dT = np.zeros((K, 3), dtype=np.float64)
+    for k in prange(K):
+        qr = q[k, 0]; qi = q[k, 1]; qj = q[k, 2]; qk_ = q[k, 3]
+        tx = t[k, 0]; ty = t[k, 1]; tz = t[k, 2]
+        r00 = 1.0 - 2.0 * (qj * qj + qk_ * qk_); r01 = 2.0 * (qi * qj - qk_ * qr); r02 = 2.0 * (qi * qk_ + qj * qr)
+        r10 = 2.0 * (qi * qj + qk_ * qr); r11 = 1.0 - 2.0 * (qi * qi + qk_ * qk_); r12 = 2.0 * (qj * qk_ - qi * qr)
+        r20 = 2.0 * (qi * qk_ - qj * qr); r21 = 2.0 * (qj * qk_ + qi * qr); r22 = 1.0 - 2.0 * (qi * qi + qj * qj)
+        n_real = Nr[k]; m_real = Mr[k]
+        Vacc = 0.0
+        dTx = 0.0; dTy = 0.0; dTz = 0.0
+        dQw = 0.0; dQx = 0.0; dQy = 0.0; dQz = 0.0
+        for m in range(m_real):
+            bx0 = B[k, m, 0]; by0 = B[k, m, 1]; bz0 = B[k, m, 2]; cbm = CB[k, m]
+            bx = r00 * bx0 + r01 * by0 + r02 * bz0 + tx
+            by = r10 * bx0 + r11 * by0 + r12 * bz0 + ty
+            bz = r20 * bx0 + r21 * by0 + r22 * bz0 + tz
+            fxj = 0.0; fyj = 0.0; fzj = 0.0
+            for n in range(n_real):
+                dx = A[k, n, 0] - bx; dy = A[k, n, 1] - by; dz = A[k, n, 2] - bz
+                r2 = dx * dx + dy * dy + dz * dz
+                dc = CA[k, n] - cbm
+                g = Kc * math.exp(-a2 * r2 - dc * dc * inv_lam)
+                Vacc += g
+                if need_grad:
+                    c = alpha * g
+                    fxj += c * dx; fyj += c * dy; fzj += c * dz
+            if need_grad:
+                dTx += fxj; dTy += fyj; dTz += fzj
+                dQw += fxj * (-2.0 * qk_ * by0 + 2.0 * qj * bz0) + fyj * (2.0 * qk_ * bx0 - 2.0 * qi * bz0) + fzj * (-2.0 * qj * bx0 + 2.0 * qi * by0)
+                dQx += fxj * (2.0 * qj * by0 + 2.0 * qk_ * bz0) + fyj * (2.0 * qj * bx0 - 4.0 * qi * by0 - 2.0 * qr * bz0) + fzj * (2.0 * qk_ * bx0 + 2.0 * qr * by0 - 4.0 * qi * bz0)
+                dQy += fxj * (-4.0 * qj * bx0 + 2.0 * qi * by0 + 2.0 * qr * bz0) + fyj * (2.0 * qi * bx0 + 2.0 * qk_ * bz0) + fzj * (-2.0 * qr * bx0 + 2.0 * qk_ * by0 - 4.0 * qj * bz0)
+                dQz += fxj * (-4.0 * qk_ * bx0 - 2.0 * qr * by0 + 2.0 * qi * bz0) + fyj * (2.0 * qr * bx0 - 4.0 * qk_ * by0 + 2.0 * qj * bz0) + fzj * (2.0 * qi * bx0 + 2.0 * qj * by0)
+        V[k] = Vacc
+        dT[k, 0] = dTx; dT[k, 1] = dTy; dT[k, 2] = dTz
+        dQ[k, 0] = dQw; dQ[k, 1] = dQx; dQ[k, 2] = dQy; dQ[k, 3] = dQz
+    return V, dQ, dT
+
+
+def overlap_score_grad_esp_se3_batch(A, B, charges_A, charges_B, q, t, *,
+                                     alpha: float = 0.81, lam: float = 0.3,
+                                     N_real=None, M_real=None, NEED_GRAD: bool = True,
+                                     BLOCK=None, num_warps=None, num_stages=None):
+    """CPU drop-in for the Triton ``overlap_score_grad_esp_se3_batch``."""
+    K, N_pad, _ = A.shape
+    _, M_pad, _ = B.shape
+    dev, dt = A.device, A.dtype
+    An = np.ascontiguousarray(A.detach().cpu().numpy())
+    Bn = np.ascontiguousarray(B.detach().cpu().numpy())
+    CAn = np.ascontiguousarray(charges_A.detach().cpu().numpy())
+    CBn = np.ascontiguousarray(charges_B.detach().cpu().numpy())
+    qn = np.ascontiguousarray(q.detach().cpu().numpy())
+    tn = np.ascontiguousarray(t.detach().cpu().numpy())
+    Nr = (np.full(K, N_pad, np.int64) if N_real is None
+          else N_real.detach().cpu().numpy().astype(np.int64))
+    Mr = (np.full(K, M_pad, np.int64) if M_real is None
+          else M_real.detach().cpu().numpy().astype(np.int64))
+    V, dQ, dT = _overlap_grad_esp_kernel(An, Bn, CAn, CBn, qn, tn, Nr, Mr,
+                                         float(alpha), 1.0 / float(lam), bool(NEED_GRAD))
+    return (torch.as_tensor(V, device=dev, dtype=dt),
+            torch.as_tensor(dQ, device=dev, dtype=dt),
+            torch.as_tensor(dT, device=dev, dtype=dt))
+
+
+@torch.no_grad()
+def _batch_self_overlap_esp(P_pad, charges, N_real, alpha: float = 0.81, lam: float = 0.3):
+    """ESP self-overlap via the identity pose; CPU replica of _batch_self_overlap_esp."""
+    K = P_pad.shape[0]
+    q_id = torch.zeros(K, 4, device=P_pad.device, dtype=P_pad.dtype); q_id[:, 0] = 1.0
+    t_0 = torch.zeros(K, 3, device=P_pad.device, dtype=P_pad.dtype)
+    V, _, _ = overlap_score_grad_esp_se3_batch(P_pad, P_pad, charges, charges, q_id, t_0,
+                                               alpha=alpha, lam=lam, N_real=N_real,
+                                               M_real=N_real, NEED_GRAD=False)
+    return V
