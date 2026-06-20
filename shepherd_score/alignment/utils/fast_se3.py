@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch, math, os
 import torch.nn.functional as F
 from ...score.gaussian_overlap_triton import overlap_score_grad_se3_batch, fused_adam_qt, fused_adam_qt_with_tangent_proj, _batch_self_overlap, fused_surf_step_batch

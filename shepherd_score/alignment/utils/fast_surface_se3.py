@@ -3,6 +3,8 @@
 # Surface alignment uses the same Gaussian overlap math as volumetric,
 # just with surface points and surface-specific alpha values.
 
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional

@@ -2,6 +2,8 @@
 # Fast GPU-accelerated ESP combo alignment.
 # Combines shape overlap (using Triton kernel) with surface ESP comparison.
 
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional

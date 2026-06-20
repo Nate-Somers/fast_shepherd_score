@@ -1,6 +1,8 @@
 # shepherd_score/alignment/utils/fast_esp_se3.py
 # Fast GPU-accelerated ESP alignment using the ESP Triton kernel.
 
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional

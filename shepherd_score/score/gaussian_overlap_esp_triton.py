@@ -2,6 +2,8 @@
 # A fused (forward + backward) ESP-weighted Gaussian-Tanimoto kernel using Triton.
 # Extends the base volumetric kernel to include electrostatic potential weighting.
 #
+from __future__ import annotations
+
 import math
 import triton
 import triton.language as tl

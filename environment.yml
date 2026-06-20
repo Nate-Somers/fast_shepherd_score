@@ -26,6 +26,7 @@ dependencies:
       - git+https://github.com/maurerv/pyzernike
       - e3fp
       - psutil
+      - tqdm
       - pandas
       - scikit-learn
       - mdanalysis
