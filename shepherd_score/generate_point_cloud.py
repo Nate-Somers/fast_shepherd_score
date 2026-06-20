@@ -5,11 +5,26 @@ molecular surfaces.
 Surface generation workflow adapted from Open Drug Discovery Toolkit:
     https://oddt.readthedocs.io/en/latest/_modules/oddt/surface.html
 """
+from __future__ import annotations   # annotations as strings -> o3d not needed at import
+
 from typing import Tuple, List
 
 import numpy as np
 from shepherd_score.score.constants import COULOMB_SCALING
-import open3d as o3d
+
+# Open3D is imported LAZILY (on first real use), not at module load: it is a ~30s
+# cold import and -- importantly -- it is fork-hostile (importing it poisons a later
+# fork+CUDA), so importing it just to pull in shepherd_score would both slow every
+# import and break the fork-based multi-GPU pool (shepherd_score.container.multi_gpu).
+# Only surface generation actually touches Open3D; alignment-only paths never pay it.
+class _LazyOpen3D:
+    def __getattr__(self, attr):
+        import open3d as _o3d
+        globals()["o3d"] = _o3d          # swap the proxy out for the real module
+        return getattr(_o3d, attr)
+
+
+o3d = _LazyOpen3D()
 
 import rdkit
 from rdkit import Chem

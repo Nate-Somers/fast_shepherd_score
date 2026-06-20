@@ -368,6 +368,7 @@ def _adam_qt(
     tl.store(Vt_ptr + offs*3 + 2, vt2, mask=mask)
 
 def fused_adam_qt(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr):
+    _warmup_adam_qt()                       # lazy one-time PTX build (was at import)
     K = q.shape[0]
     grid = (triton.cdiv(K, 256),)
 
@@ -730,8 +731,21 @@ def fused_surf_step_batch(A, B, q, t, m_q, v_q, m_t, v_t, best, best_q, best_t,
     )
 
 
-#  One-time warm-up so the first real call doesn't pay for PTX build #
-if torch.cuda.is_available():
+#  One-time _adam_qt warm-up so the first real call doesn't pay the PTX build.
+#  DEFERRED to first use (see fused_adam_qt) instead of running at import: importing
+#  this module must NOT initialize CUDA -- both to avoid allocating GPU memory just
+#  by importing, and (crucially) so the fork-based multi-GPU pool
+#  (shepherd_score.container.multi_gpu) can fork its workers cheaply, which is only
+#  CUDA-safe when the parent process hasn't initialized CUDA yet. Triton JIT-compiles
+#  on first launch regardless; this only front-loads it.
+_ADAM_QT_WARMED = False
+
+
+def _warmup_adam_qt():
+    global _ADAM_QT_WARMED
+    if _ADAM_QT_WARMED or not torch.cuda.is_available():
+        return
+    _ADAM_QT_WARMED = True
     dummy = torch.zeros(512, 4, device="cuda", dtype=torch.float32)
     _adam_qt[(2,)](                         # 512 // 256 = 2 blocks
         dummy.view(-1), dummy.view(-1),
