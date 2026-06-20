@@ -160,6 +160,42 @@ passes, the honest outcome is **surf/esp hold accuracy but land below 2k/core** 
 aggregate still clears 32k/s — which is *not* the stated bar). This is measured, not assumed: the probe
 below pins the real single-core ceiling.
 
+### Measured single-core ceiling (this box — `benchmarks/experiments/cpu_singlecore_probe.py`, 2026-06-19)
+
+Ran the **device-agnostic batched fine loop** (`compute_analytical_grad_se3_shape`, the exact
+per-step CPU work) single-threaded (`set_num_threads(1)`, `OMP/MKL=1`) on synthetic clouds (timing is
+independent of point distribution). **The numbers are far below the doc's earlier estimates and reset
+the strategy:**
+
+| size | µs / pose-step | quat-grad overhead | pairs/s/core @ nr=50, 100 steps | @ nr=50, 30 steps (early-stop) | gap to 2k/core |
+|---|--:|--:|--:|--:|--:|
+| vol (30×30)   | ~24  | ×1.06 | ~8   | ~27  | **~74×** |
+| surf (75×75)  | ~129 | ×1.02 | ~1.6 | ~5.2 | **~385×** |
+| surf (128×128)| ~361 | ×1.02 | ~0.6 | ~1.9 | **~1080×** |
+
+Three findings that rewrite the plan:
+
+1. **Bit-identical 2k/core is out of reach for EVERY mode**, not just surf/esp. Even `vol`'s bare
+   kernel is ~74× short single-core at nr=50; L1–L3/L5 (which remove overhead, not arithmetic) cannot
+   span that. The earlier "vol needs ~18×" was anchored to the *multi-thread, nr=5* JAX baseline — the
+   true single-core nr=50 baseline is **~8 pairs/s**.
+2. **The quaternion-gradient machinery is NOT the cost** (×1.02–1.10) — the overlap kernel is. Good: a
+   fused kernel attacks the right thing.
+3. **The naive torch kernel runs at <1 GFLOP/s** on small batched grids (24 µs for a ~20 kFLOP
+   30×30 grid) — it's per-op-overhead/memory-bound across ~15 materializing passes. So the **fused
+   single-pass numba kernel (L2) is the single biggest lever for ALL modes** (plausibly ~8–15×, not the
+   ~3–6× I first guessed) — it was mis-scoped as surf-only.
+
+**Revised lever arithmetic** (multiplicative, all gated): fused numba kernel **~10×** + early-stop
+(100→~30 steps) **~3×** + **`num_repeats` 50→5 ~10×** (upstream calls 5 "adequate for non-surface
+modes" — but it's accuracy-risky, must be gated) + (surf only) decimation Nc **~3–4×**.
+- `vol`/`vol_esp`/`pharm`: 8 × 10 × 3 × 10 ≈ **2,400/core** — clears 2k, but **only with gated nr=5**
+  (and fusion). **Not bit-identical.**
+- `surf`/`esp`: 1.9 × 10 × 3 × 10 × 4 ≈ **2,280/core** for the 128² case *if every gated lever lands*,
+  ~600–1000 if nr-reduction or decimation is held back — i.e. **genuinely on the edge, more likely
+  ~2–4× short** when the accuracy gate trims the cuts. Honest expectation: surf/esp hold accuracy and
+  land **below 2k/core**.
+
 ---
 
 ## Bottleneck table (per mode)
@@ -180,7 +216,29 @@ below pins the real single-core ceiling.
 Risk legend: **bit-identical** · **float<1e-5** (score-level, zero winner-changes) · **risky**
 (can shift scores — gated, opt-in only).
 
-### L1 — CPU overlap value+grad behind `_overlap_in_chunks` *(the prime lever)* — bit-identical · M
+> **⚠️ Re-ranked by the single-core probe.** The original ranking assumed L1 (batching) was the prime
+> lever — true for *aggregate*, but the probe shows the per-core kernel is so far from 2k that batching
+> alone is nowhere near enough. The load-bearing per-core levers are now **L2 (fused kernel, ~10×, all
+> modes)** and **L10 (`num_repeats` 50→5, ~10×, gated)** — without *both*, no mode clears 2k/core. L1
+> remains the enabler (it's what lets a single dispatch feed the fused kernel and is needed for the
+> aggregate 16-core number), but it is not sufficient on its own. Read L2/L10 first.
+
+### L10 — `num_repeats` 50→5 *(now load-bearing for every mode; gated)* — risky · S
+**Modes:** all. **Mechanism:** drop `num_repeats` from 50 to 5 (1 identity + 4 PCA seeds — the
+RDKit/PubChem shape-color initialization count; upstream `docs/performance/timings.md` states "for
+non-surface modes, five repeats are typically adequate"). A flat **10×** on every mode — the largest
+accuracy-safe-*looking* lever, and per the probe arithmetic, **mandatory** to reach 2k/core. **Risk:**
+this is the canonical rejected lever — fewer seeds dropped distinct-pair accuracy on the GPU side
+(`SPEED_EXPERIMENTS.md` exp. #3: 50→35 already cost ~0.003–0.01; self stayed 1.0 only because the
+identity seed wins self-copies). The 45 Fibonacci seeds are *coverage*; cutting them risks missing a
+basin on distinct pairs, especially pseudo-symmetric/elongated molecules. **Gate (hard):** on a large
+random distinct cohort (≥5000), require score `max|Δ| < 1e-5` **and zero argmax-seed changes** vs the
+nr=50 reference — *per mode*; surface modes are the most seed-sensitive and likely fail at 5, so sweep
+nr ∈ {50,35,25,15,10,5} and ship the smallest that passes (it may be >5 for surf/esp). **Creative
+angle:** a *smarter* 5–10 seed set (e.g. PCA + a coarse-overlap-ranked subset of the Fibonacci sphere)
+could keep basin coverage at lower count — design and gate it rather than blindly truncating.
+
+### L1 — CPU overlap value+grad behind `_overlap_in_chunks` *(the enabler)* — bit-identical · M
 **Modes:** vol, vol_esp, surf, esp. **Mechanism:** write `overlap_score_grad_se3_batch_cpu` mirroring
 `compute_overlap_and_grad_shape` (`score/analytical_gradients/_torch.py:430`) byte-for-byte —
 `K=(π/2α)^1.5`, `fit_t=bmm(R,B)+t`, `dist_sq=cdist**2`, `E=exp(−α/2·dist_sq)[·pair_weights]`,
@@ -316,22 +374,25 @@ the available cores.**
 
 ## Assessment — is >2k/s on ALL modes reachable, accuracy-safe?
 
-**Per-core bar (2k/s/core): plausible for vol/vol_esp/pharm; NOT bit-identically reachable for
-surf/esp (FLOP-bound) → contingent on a gated work-reduction; NO for `esp_combo`.**
+**Per-core bar (2k/s/core), corrected by the single-core probe: NOT bit-identically reachable for ANY
+mode; reachable for vol/vol_esp/pharm only WITH gated `num_repeats=5` + a fused kernel; surf/esp likely
+land below 2k/core even with every gated lever; NO for `esp_combo`.**
 
-- **`vol`, `vol_esp`, `pharm` — plausible single-core, bit-identical (confirm by probe).** They are
-  dispatch-bound, not compute-bound, so a batched + SIMD-vectorized **single-thread** kernel (L1; pharm
-  via L4; L6 fusion) that amortizes per-pair Python/launch overhead has a real shot at 2k/core. Needs
-  ~18–30× over a multi-thread baseline (so more vs a true single-core baseline) — but the work per pair
-  is tiny, so the headroom is in removing overhead, which batching+vectorization do. **Probe pins it.**
-- **`surf`, `esp` — NOT reachable bit-identically on one core; contingent on a gated work cut.** The
-  single-core FLOP budget puts them **~30–160× short** of 2k/core, and the bit-identical levers
-  (L1–L3, L5) remove overhead/memory traffic, not arithmetic. The *only* path to 2k/core is reducing
-  the work — fewer seeds, decimated points (L8), fewer steps — under the strict gate (score < 1e-5,
-  **zero winner-changes**). Whether a cut that large *passes* the gate is the open empirical question
-  of this effort. Honest outcome space: (a) a creative seed/decimation scheme passes and surf/esp hit
-  2k/core; or (b) nothing large enough passes, and surf/esp **hold accuracy but land below 2k/core**
-  (16-core aggregate still clears 32k/s — not the bar). Do not promise (a) before the gate proves it.
+- **`vol`, `vol_esp`, `pharm` — reachable but NOT bit-identical; needs the gated nr=5.** The measured
+  single-core nr=50 baseline is **~8 pairs/s** (not the ~110 multi-thread figure), so the bare kernel is
+  ~74× short. The bit-identical enablers (L1 batching, L3 caching, L6 fusion) plus early-stop get to
+  only a few hundred/core; clearing 2k/core also requires **`num_repeats` 50→5** (a 10× cut upstream
+  calls "adequate for non-surface modes," but it *shifts scores* unless the gate proves otherwise). So:
+  reachable, **conditional on the nr=5 accuracy gate passing** (score < 1e-5, zero winner-changes), plus
+  the fused numba kernel (L2) which is the biggest single lever (~10× — the naive torch kernel runs at
+  <1 GFLOP/s). pharm easiest mechanically (L4).
+- **`surf`, `esp` — likely below 2k/core even with the full gated stack.** Measured single-core nr=50
+  is **~0.6–1.6 pairs/s** (~385–1080× short). Stacking *every* gated lever — fused kernel ×10,
+  early-stop ×3, nr=5 ×10, decimation ×3–4 — lands ~600–2,300/core depending on how much the accuracy
+  gate trims the seed and point cuts. Realistic expectation: surf/esp **hold accuracy and land below
+  2k/core**; 16-core aggregate still clears ~10–32k/s (not the bar). Reaching 2k/core requires ALL of
+  the risky cuts to pass simultaneously — possible, not likely. Do not promise it before the gate proves
+  it pair-by-pair on a pseudo-symmetric cohort.
 - **`esp_combo` — NOT demonstrably reachable accuracy-safe.** No batched CPU path
   (`fast_optimize_esp_combo_score_overlay_batch` hardcodes `device='cuda'`, falls back to the per-pair
   autograd `optimize_esp_combo_score_overlay`), no analytical gradient, three point-sets/step, and the
@@ -379,7 +440,8 @@ Baseline + every lever recorded here once measured on WSL2 `SimModelEnv`. A chan
 
 | # | lever | mode | throughput Δ | accuracy (self / distinct max\|Δ\| / winner-flips) | verdict |
 |---|---|---|---|---|---|
-| 0 | baseline (CPU, nr=50, isolated) | all | — | 1.000 / 0 / 0 | reference (TODO: measure) |
+| 0 | **measured single-core ceiling** (naive batched torch, nr=50, fixed 100 steps; `cpu_singlecore_probe.py`) | — | **vol ~8/s, surf-75 ~1.6/s, surf-128 ~0.6/s** (per-core) | n/a (timing) | reference — bar is ~74–1080× above this |
+| L10 | `num_repeats` 50→5 (sweep, gated) | all | ~10× (if it passes) | _TBD_ (per-mode nr sweep) | pending (risky — likely fails at 5 for surf) |
 | L1 | CPU `_overlap_in_chunks` kernel + batched driver | vol,vol_esp,surf,esp | _TBD_ | _TBD_ | pending |
 | L4 | pharm batched analytical-grad driver | pharm | _TBD_ | _TBD_ | pending |
 | L2 | numba fused single-pass surf/esp kernel | surf,esp | _TBD_ | _TBD_ | pending |
