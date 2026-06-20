@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import torch, math, os
 import torch.nn.functional as F
-from ...score.gaussian_overlap_triton import overlap_score_grad_se3_batch, fused_adam_qt, fused_adam_qt_with_tangent_proj, _batch_self_overlap, fused_surf_step_batch
+try:
+    from ...score.gaussian_overlap_triton import overlap_score_grad_se3_batch, fused_adam_qt, fused_adam_qt_with_tangent_proj, _batch_self_overlap, fused_surf_step_batch
+    _HAS_TRITON = True
+except ImportError:
+    # CPU-only box (no triton/CUDA): use the numba/torch fallbacks so the entire
+    # batched coarse-to-fine driver runs on CPU. GPU behaviour is unchanged when
+    # triton is present (this except branch never executes).
+    from .cpu_overlap import overlap_score_grad_se3_batch, fused_adam_qt, fused_adam_qt_with_tangent_proj, _batch_self_overlap, fused_surf_step_batch
+    _HAS_TRITON = False
 from .fast_common import batched_seeds_torch
 from .._torch import objective_ROCS_overlay
 from typing import Optional
