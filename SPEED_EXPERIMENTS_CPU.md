@@ -241,6 +241,49 @@ rescue the accuracy-safe goal** — at nr=50 it's ~11–30/s (~70–180× short 
 
 ---
 
+## Byte-identical / exact exploration — how close can a *lossless* change get? (`cpu_byte_identical_probe.py`)
+
+Asked: are there **algorithmic** changes that reach 2k/core while keeping output **byte-identical**?
+Explored and measured to a proof.
+
+**1. Byte-identical locks you to the reference implementation.** The overlap primitives are *not*
+bit-reproducible across implementations: `torch.exp` vs `np.exp` differ in **79078/200000** values;
+`cdist²` vs manual `r²` in **6283/9216**; `np.sum` vs a naive loop differ (reduction order). So a
+numba/numpy kernel can **never** be byte-identical to the torch/JAX reference — byte-identical ⇒ keep
+the exact reference library ops, in the exact order.
+
+**2. Under that lock, the cost is exactly irreducible.** The work is `50 seeds × ~30–50 Adam steps ×
+NxM exp()`. No exact sub-quadratic Gaussian sum exists: the exponent *factors*
+(`exp(−α/2‖q′−p‖²) = e^{−α/2‖q′‖²}·e^{−α/2‖p‖²}·e^{α q′·p}`, verified rel 4e-16) but the cross term
+`e^{α q′·p}` still couples (i,j) → O(NM); the only O(N+M) form (Fast Gauss Transform) is a *truncated
+series* = **approximation**, not byte-identical. Every 2k-class lever (fewer seeds/steps/points, a
+faster/other `exp`, FGT, cutoffs) changes the output bits.
+
+**3. The genuinely byte-identical levers are small or already taken:** cache pose-invariant VAA/VBB
+(already done in the optimized paths), drop provably-dead work (none provable — a low seed can still
+win, measured), and parallelize across whole pairs/seeds (byte-identical — no reduction is split — but
+**multi-core only**, ~5–6× aggregate, nothing for per-core).
+
+**4. So "byte-identical" → ~0 per-core headroom. Relax to "exact (deterministic, no approximation)"**
+— a fused kernel that computes the true overlap to fp precision but with different ULPs — and the
+ceiling is what the kernel probes already showed: **~55–90/core (vol/pharm), ~5/core (surf/esp)**. Two
+exact-kernel micro-findings pin why it can't go higher single-core:
+- **`torch.exp` is the fast exact `exp`: 2,824 Mexp/s** — ~7× faster than numba scalar (396) and ~4×
+  faster than `np.exp` (719). This is *why* the fused numba kernel capped at 3.3× (its scalar `exp`
+  squandered torch's vectorized advantage) — the fastest exact kernel must call `torch.exp`.
+- **GEMM-form `r²` (`‖a‖²+‖b‖²−2a·bᵀ`) is NOT faster than `torch.cdist`** (~1.0×, measured) — cdist is
+  already optimal, so the distance step has no exact headroom either.
+
+**The one untested exact lever: `torch.compile` / a C-compiled fused kernel** (Inductor needs gcc, absent
+on this box — WSL2 only). It would fuse the ~12 eager torch passes into 1–2 while keeping vectorized
+`torch.exp`, plausibly ~2–4× on the dispatch/pass-bound vol/pharm modes → ~100–200/core, surf ~15/core.
+**Still ~10–20× short of 2k/core, but it is the closest exact path and the top WSL2 experiment.**
+
+**Bottom line for the byte-identical question: there is no byte-identical (or even exact) algorithmic
+change that reaches 2k/core.** Closest exact, all levers stacked: vol/pharm ~55–90/core (~150–700/s on
+16 cores), surf/esp ~5/core — a real ~7–9× over today, but the 2k/core bar is ~22–500× away and the
+gap is the physical `exp`-throughput floor, not a missing optimization.
+
 ## Bottleneck table (per mode)
 
 | mode | dominant cost | nature | headroom |
@@ -510,6 +553,10 @@ Baseline + every lever recorded here once measured on WSL2 `SimModelEnv`. A chan
 | L2 | numba fused single-pass kernel (`cpu_numba_kernel_probe.py`) | all | **~3.3× (MEASURED, not ~10×)** — scalar-`exp`-bound, no SVML | VAB rel ~3–9e-6 (fp64), gradR ~1–4e-5; score-cancels | **kept** (real win, but smaller than hoped) |
 | L6 | torch.compile fine body | vol,vol_esp,pharm | _untestable here_ (no MSVC; Inductor needs a C compiler) | — | deferred to WSL2/Linux+gcc |
 | L11 | per-element distance cutoff (`cpu_cutoff_kernel_probe.py`) | surf,esp | **0.76× @40% skip (SLOWER) / 2.4× @90%** — geometry-dependent | SCORE max\|Δ\| ~4e-10 (perfect) | **REJECTED for self-copy benchmark** — branch cost > scalar-exp saved at the ~40% skip of converged self-copies; only wins when clouds are far apart. (CPU *can* per-lane skip unlike GPU SIMT, but it doesn't pay here — same conclusion as GPU exp #8.) |
+| B0 | byte-identical foundation (`cpu_byte_identical_probe.py`) | all | n/a | `torch.exp`≠`np.exp` (79k/200k differ), `cdist²`≠manual, `sum` order matters | **finding** — byte-identical ⇒ locked to reference ops; no cross-impl kernel can match bit-for-bit |
+| B1 | fastest exact `exp` (single-core) | all | `torch.exp` **2824 Mexp/s** vs `np.exp` 719 vs numba-scalar 396 | exact | **finding** — fast exact kernel must use `torch.exp`; explains the numba 3.3× cap |
+| B2 | GEMM-form `r²` vs `torch.cdist` | surf,esp | **~1.0× (no win)** | rel 1.3e-7 | **REJECTED** — cdist already optimal; no exact headroom in the distance step |
+| L6′ | torch.compile fused kernel (exact) | vol,vol_esp,pharm,surf,esp | _untested (no gcc here)_ — est. ~2–4× | exact (verify Inductor reductions) | **top WSL2 experiment** — the one remaining exact lever; still ~10–20× short of 2k/core |
 | L3 | VAA/VBB cache + seed-dim tiling | surf,esp,vol,vol_esp | _TBD_ | _TBD_ | pending |
 | L5 | ESP exponent fusion | esp,vol_esp | _TBD_ | _TBD_ | pending |
 | L6 | torch.compile fine body (per-mode) | vol,vol_esp,pharm | _TBD_ | _TBD_ | pending |
