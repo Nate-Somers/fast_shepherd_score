@@ -70,8 +70,10 @@ scores, aligned = batch.align_with_surf(alpha=0.81, backend="triton")
 - Results are also written **in place** on each pair (e.g. `pair.sim_aligned_surf`,
   `pair.transform_surf`), exactly as in the original API.
 - `backend` accepts `"jax"` (default) or `"triton"` (aliases `"cuda"`/`"gpu"`).
-- **Multi-GPU is automatic:** if several CUDA devices are visible, the batch is sharded
-  across them — no extra arguments.
+- **Multi-GPU is automatic:** if several CUDA devices are visible, large batches are sharded
+  across them — no extra arguments. Sharding only engages above **~4,096 pairs per device**, so
+  small/mid batches deliberately stay on a single GPU (the per-shard overhead isn't worth it
+  below that).
 - `return_aligned=True` (Triton path) also returns the transformed coordinates; it's
   `False` by default to skip that work when you only need scores + transforms.
 
@@ -105,7 +107,8 @@ path runs as before.
 
 ## 3. Strategies Used
 
-Measured on a single RTX 4050 laptop GPU (best-of-N, paired timing). Throughput is in
+The per-step speedups below were measured on a single RTX 4050 laptop GPU (best-of-N,
+paired timing); the cross-GPU peaks are in **Net result** at the end. Throughput is in
 aligned **pairs per second**; "bit-identical" means scores match the reference to the
 last decimal.
 
@@ -116,8 +119,9 @@ last decimal.
 2. **Batched coarse-to-fine SE(3) search.** Seed generation, the Adam fine-tuning loop,
    and top-k selection all run over the whole batch on-GPU, so a 4,096-pair batch is one
    sequence of kernel launches instead of 4,096 independent optimizations.
-3. **Multi-GPU auto-sharding** — batches are split across all visible CUDA devices with no
-   code change.
+3. **Multi-GPU auto-sharding** — large batches are split across all visible CUDA devices with
+   no code change (see **D** for the robustness work that makes this hold up on a real
+   multi-GPU node).
 
 ### B. kill the per-pair overhead 
 4. Profiling showed the alignment was **overhead-bound, not kernel-bound**: per-call setup
@@ -134,47 +138,82 @@ last decimal.
 
 5. **Batched pad-fill** of the workspace tensors (`pad_sequence` instead of per-pair GPU
    copies) — also bit-identical: vol **18.4k → 26k**, surf **16k → 18.2k**.
+6. **F3 — finish the job (`_scatter_fill`).** Profiling showed step 5's `pad_sequence` pad-fill
+   was *itself* the single largest cost — *bigger than the kernel* for vol. Replacing every
+   per-pair fill with one batched `torch.cat` + a vectorized scatter (launch count O(1) in the
+   batch size instead of O(K)), plus a single `tolist()` score write-back, is pure data movement
+   and **bit-identical**:
+
+   | mode | before | after | speedup |
+   |---|--:|--:|:--:|
+   | vol   | 23,700 | **54,800** | 2.3× |
+   | surf  | 16,500 | **29,400** | 1.8× |
+   | esp   | 5,700  | **8,000**  | 1.4× |
+   | pharm | 6,200  | **11,800** | 1.9× |
+
+   This is what made the align **GPU-bound** — host down to ~4 µs/pair (under the 10 µs/pair =
+   100k-pairs/s target), lifting the host ceiling that had been capping GPU scaling.
 
 ### C. Accuracy-safe kernel & loop tuning
-6. **Early-stop trim** (patience 5→2) for the shape/surface modes, which converge fast —
+7. **Early-stop trim** (patience 5→2) for the shape/surface modes, which converge fast —
    bit-identical, ~1.15× (vol) / ~1.28× (surf). (ESP/pharm keep patience 5; they converge
    slower.)
-7. **Kernel occupancy fix** — small tiles (`BLOCK=16`, one warp per CTA) suited to the tiny
+8. **Kernel occupancy fix** — small tiles (`BLOCK=16`, one warp per CTA) suited to the tiny
    per-pose problems; ~3× at large batch over the naive configuration.
-8. **Autotuned kernel schedules** (`num_stages`, `maxnreg`) selected per problem shape and
+9. **Autotuned kernel schedules** (`num_stages`, `maxnreg`) selected per problem shape and
    validated to be bit-identical — a free ~1.09× on the kernel.
 
-### D. Note
-9. The headline benchmark runs **each `(mode, size)` cell in its own fresh subprocess**.
-   A laptop GPU throttles under sustained load (a ~2–3× artifact across a long run) and
-   Triton autotune keys on the per-pose shape (so a process that warms up on a tiny batch
-   would lock in the wrong config). Per-cell isolation gives each measurement a recovered
-   clock and a correctly-autotuned kernel.
+### D. Multi-GPU & very large batches (cluster / L40S work)
+10. **Robust multi-GPU sharding.** Auto-sharding engages only above **~4,096 pairs per device**
+    (so on a 4-GPU node it's a ≥~16k-pair feature; smaller batches stay on one GPU). Making it
+    hold up on a real 4×L40S node took several fixes: a single-threaded **per-device cuSOLVER
+    warm-up** (PyTorch's lazy handle init isn't thread-safe), a **device-keyed CUDA-graph cache**
+    with thread-local capture, and **migrating** the cached `vol_esp`/`esp_combo`/`pharm`
+    workspace tensors onto the active device. CUDA-graphs are turned off on the sharded path
+    (capture races across worker threads), so it runs the eager fine loop — **same scores**, just
+    without the single-GPU graph speedup.
+11. **100k-pairs-per-call batches.** cuSOLVER's batched `eigh` fails past ~8k problems, so the
+    SE(3) seed solve is **chunked to ≤4,096** — numerically identical, but it's what lets a
+    single call align **100,000 pairs** without crashing. This is what backs the flat
+    large-batch throughput on the L40S below.
+
+### E. Note
+12. The headline benchmark runs **each `(mode, size)` cell in its own fresh subprocess**.
+    A laptop GPU throttles under sustained load (a ~2–3× artifact across a long run) and
+    Triton autotune keys on the per-pose shape (so a process that warms up on a tiny batch
+    would lock in the wrong config). Per-cell isolation gives each measurement a recovered
+    clock and a correctly-autotuned kernel.
 
 ### Net result
-On a **RTX 4050 laptop GPU**, the Triton engine runs ~10–200× faster than the parallelizable
-JAX/CPU, with the shape and surface modes producing results that are
-bit-identical to the original implementation. Peak aligned **pairs/second** by mode and
-hardware (real drug self-copy pairs, isolated best-of-N):
+Peak aligned **pairs/second** by mode and GPU — the *same* fork code (Triton/GPU)
+on six devices, taken from the most recent benchmark run on each (real drug
+self-copy pairs, isolated best-of-N; **bold** = fastest per mode):
 
-| mode | RTX 4050 laptop (post-F3) | L40S · 1 GPU (pre-F3) | L40S · N GPU |
-|---|--:|--:|--:|
-| vol   | **54,800** | 58,944 | _pending_ |
-| surf  | **29,400** | 43,062 | _pending_ |
-| esp   | **8,000**  | 18,459 | _pending_ |
-| pharm | **11,800** | 19,645 | _pending_ |
+| mode | RTX 4050 laptop | L40S · 1 GPU | L40S · 4 GPU | RTX PRO 6000 Blackwell | H100 NVL | H200 |
+|---|--:|--:|--:|--:|--:|--:|
+| vol   | 54,200 | 160,500 | 160,200     | 174,400 | **177,600** | 165,700 |
+| surf  | 28,800 | 81,700  | **125,800** | 108,800 | 65,700      | 70,600  |
+| esp   | 8,500  | 32,100  | **72,400**  | 48,900  | 28,500      | 31,800  |
+| pharm | 23,300 | 57,300  | **83,900**  | 64,500  | 67,800      | 74,800  |
 
-*(laptop: RTX 4050 · Core Ultra 9 185H · torch 2.5.1 / CUDA 12.4. L40S: `pi_melkin` node ·
-Xeon Gold 6542Y · torch 2.11 / CUDA 12.8 · **Triton 3.6** · single GPU, molecule cache on. vs
-JAX/CPU peaks of vol 157, surf 53, esp 31, pharm 12 pairs/s.)*
+![Molecular-alignment throughput across GPUs](benchmarks/results/speed_all_hardware.png)
 
-The laptop column reflects **F3** — removing the per-pair host overhead (the `pad_sequence`
-pad-fill was the single largest cost, *bigger than the kernel* for vol). It roughly **2×**'d the
-shape/surface modes on the laptop and made the align **GPU-bound** rather than host-bound (host
-now ~4 µs/pair). The **L40S figures predate F3** (the host ceiling was exactly what capped the
-laptop→L40S scaling to ~2.5×), so a re-measure should lift them further; it's pending. On the
-L40S the heavier modes **hold throughput flat out to 100k pairs/call** (esp **16.2k** @100k vs
-the laptop's 1.9k) — the laptop's large-batch dip was its power/thermal throttle, which a
-properly-powered datacenter GPU doesn't hit. Shape/surface stay bit-identical; pharm 0.999.
+Every datacenter card clears **160k+ vol pairs/s** — roughly **3× the laptop** —
+because the post-F3 host path (~4 µs/pair) finally *feeds* a fast GPU instead of
+starving it; on the laptop the small GPU is the ceiling, so it sits at ~54k. A
+second L40S GPU mostly helps the heavier modes at large batch (surf/esp/pharm at
+100k, where auto-sharding engages above ~4,096 pairs/device); `vol` already
+saturates one card, so 1- and 4-GPU `vol` match.
+
+*(laptop: RTX 4050 · Core Ultra 9 185H · torch 2.5.1 / CUDA 12.4. Cluster cards
+(`pi_melkin` nodes) all on torch 2.11 / CUDA 12.8: L40S 1-/4-GPU · Xeon Gold 6542Y;
+RTX PRO 6000 Blackwell · EPYC 9135; H100 NVL · EPYC 9474F; H200 · Xeon Platinum 8580.
+Molecule cache on; all runs 2026-06-19.)*
 
 Full experiment log, including rejected ideas, is in [`SPEED_EXPERIMENTS.md`](SPEED_EXPERIMENTS.md).
+Reference benchmark outputs (RTX 4050 laptop, L40S 1-/4-GPU, RTX PRO 6000 Blackwell,
+H100 NVL, H200) ship under [`benchmarks/results/`](benchmarks/results/) — one folder per
+device plus a combined [`speed_all_hardware.png`](benchmarks/results/speed_all_hardware.png)
+across all six (regenerate it with `python benchmarks/plot_all_hardware.py`). Re-running a benchmark builds a
+deterministic molecule cache once (`FSS_MOL_CACHE_DIR`, default `benchmarks/molcache/`) so
+repeat runs start fast.
