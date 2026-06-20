@@ -186,15 +186,26 @@ Three findings that rewrite the plan:
    single-pass numba kernel (L2) is the single biggest lever for ALL modes** (plausibly ~8–15×, not the
    ~3–6× I first guessed) — it was mis-scoped as surf-only.
 
-**Revised lever arithmetic** (multiplicative, all gated): fused numba kernel **~10×** + early-stop
-(100→~30 steps) **~3×** + **`num_repeats` 50→5 ~10×** (upstream calls 5 "adequate for non-surface
-modes" — but it's accuracy-risky, must be gated) + (surf only) decimation Nc **~3–4×**.
-- `vol`/`vol_esp`/`pharm`: 8 × 10 × 3 × 10 ≈ **2,400/core** — clears 2k, but **only with gated nr=5**
-  (and fusion). **Not bit-identical.**
-- `surf`/`esp`: 1.9 × 10 × 3 × 10 × 4 ≈ **2,280/core** for the 128² case *if every gated lever lands*,
-  ~600–1000 if nr-reduction or decimation is held back — i.e. **genuinely on the edge, more likely
-  ~2–4× short** when the accuracy gate trims the cuts. Honest expectation: surf/esp hold accuracy and
-  land **below 2k/core**.
+**Lever arithmetic, now with MEASURED kernel speedups** (`cpu_numba_kernel_probe.py`). The fused
+single-pass numba kernel was the linchpin — measured it directly:
+
+- **Fused numba kernel: ~3.3× (MEASURED), not ~10×.** It wins on memory passes (one pass vs torch's
+  ~15) but is **scalar-`exp`-bound** — `fastmath` gave ~0% (no Intel SVML on this box), so it loses
+  torch's vectorized SIMD `exp`. Parity is good: VAB rel ~3–9e-6 (fp64-accumulated — *more* accurate
+  than torch's fp32), grad_R rel ~1–4e-5 (score-cancels per the audit).
+- **torch.compile (L6): untestable on this box** — Inductor's CPU backend needs a C compiler (`cl`/MSVC
+  absent). On WSL2/Linux+gcc it may vectorize `exp` and beat numba; **TODO measure there.** Whichever
+  wins is the kernel lever.
+
+Multiplicative, all gated: numba **~3.3×** + early-stop (100→~15–20 steps) **~5–6×** + **`num_repeats`
+50→5 ~10×** (gated) + (surf only) decimation Nc **~4–7×**. From the measured per-pose-step:
+
+- `vol`/`vol_esp`/`pharm` (~24 µs/pose-step torch → ~7.3 µs numba): nr=5 × ~15 steps ⇒
+  `1/(7.3e-6·5·15) ≈ **1,800/core**` — i.e. **~2k/core only if numba AND gated nr=5 AND aggressive
+  early-stop (~15 steps) ALL land.** On the very edge; realistic ~1–2k/core. **Not bit-identical.**
+- `surf`/`esp` (~105–129 µs/pose-step numba): even nr=5 × 15 steps × decimate ×7 ⇒
+  `1/(105e-6/7·5·15) ≈ **890/core**` — **~2× short with every risky lever maxed.** Honest expectation:
+  surf/esp **hold accuracy and land ~400–900/core** (16-core aggregate ~6–14k/s — not the bar).
 
 ---
 
@@ -444,7 +455,9 @@ Baseline + every lever recorded here once measured on WSL2 `SimModelEnv`. A chan
 | L10 | `num_repeats` 50→5 (sweep, gated) | all | ~10× (if it passes) | _TBD_ (per-mode nr sweep) | pending (risky — likely fails at 5 for surf) |
 | L1 | CPU `_overlap_in_chunks` kernel + batched driver | vol,vol_esp,surf,esp | _TBD_ | _TBD_ | pending |
 | L4 | pharm batched analytical-grad driver | pharm | _TBD_ | _TBD_ | pending |
-| L2 | numba fused single-pass surf/esp kernel | surf,esp | _TBD_ | _TBD_ | pending |
+| L2 | numba fused single-pass kernel (`cpu_numba_kernel_probe.py`) | all | **~3.3× (MEASURED, not ~10×)** — scalar-`exp`-bound, no SVML | VAB rel ~3–9e-6 (fp64), gradR ~1–4e-5; score-cancels | **kept** (real win, but smaller than hoped) |
+| L6 | torch.compile fine body | vol,vol_esp,pharm | _untestable here_ (no MSVC; Inductor needs a C compiler) | — | deferred to WSL2/Linux+gcc |
+| L11 | per-element distance cutoff (`cpu_cutoff_kernel_probe.py`) | surf,esp | **0.76× @40% skip (SLOWER) / 2.4× @90%** — geometry-dependent | SCORE max\|Δ\| ~4e-10 (perfect) | **REJECTED for self-copy benchmark** — branch cost > scalar-exp saved at the ~40% skip of converged self-copies; only wins when clouds are far apart. (CPU *can* per-lane skip unlike GPU SIMT, but it doesn't pay here — same conclusion as GPU exp #8.) |
 | L3 | VAA/VBB cache + seed-dim tiling | surf,esp,vol,vol_esp | _TBD_ | _TBD_ | pending |
 | L5 | ESP exponent fusion | esp,vol_esp | _TBD_ | _TBD_ | pending |
 | L6 | torch.compile fine body (per-mode) | vol,vol_esp,pharm | _TBD_ | _TBD_ | pending |
