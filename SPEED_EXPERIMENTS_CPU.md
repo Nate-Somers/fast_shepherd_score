@@ -6,6 +6,15 @@ per-pair torch CPU paths) past **2,000 aligned pairs/second on every mode** — 
 self-copy score stays **1.000** (pharm ~0.999), and distinct-molecule-pair scores match the current
 path (`max|Δ|` ≈ 0, or provably < 1e-5 float-level).
 
+> **The bar is 2,000 pairs/s PER SINGLE CORE — not aggregate.** Parallelism does **not** count toward
+> the target; the per-core kernel itself must reach 2k/s, and 16 cores then give ~32k/s aggregate. This
+> is a much harder bar than "2k/s using all cores," and it changes the verdict completely: the
+> dispatch-bound modes (vol/vol_esp/pharm) can plausibly get there with a batched, SIMD-vectorized
+> single-thread kernel, but the **compute-bound surface modes (surf/esp) are ~30–160× short of 2k/s on
+> one core by a raw FLOP bound** — so for them, multicore is off the table and the only path is
+> **accuracy-gated algorithmic work reduction** (fewer seeds/points/steps, provably < 1e-5 with zero
+> winner-changes). That is the central creative tension of this effort.
+
 This is the CPU counterpart to the GPU work in [`SPEED_EXPERIMENTS.md`](SPEED_EXPERIMENTS.md). The
 GPU fork hit 50k–180k pairs/s by **batching every pair into one kernel dispatch**. The headline
 finding here is that **the same batched driver already runs on CPU** — it just needs one CPU compute
@@ -31,8 +40,10 @@ numpy 2.1, rdkit are present). So:
   be filled from there.
 - **But the prime CPU lever is jax-free.** The batched optimizer (below) is plain torch, and the
   innermost overlap kernel is independently buildable/testable in **numba** — both run on the Windows
-  box. Kernel microbenchmarks and parity checks can be developed locally; only the end-to-end
-  `pairs/s` numbers need WSL2.
+  box. Kernel microbenchmarks, parity checks, **and single-core throughput probes** can be developed
+  locally (`torch.set_num_threads(1)`); only the end-to-end real-molecule `pairs/s` numbers need WSL2.
+- **16 physical cores available**, but the target is **2k/s per single core** (see Goal) — so the
+  load-bearing measurement is single-thread kernel throughput, which this box can produce directly.
 
 ---
 
@@ -79,15 +90,18 @@ Per-mode CPU throughput at the **default `num_repeats=50`** (the accuracy-load-b
 surface modes need all 50 PCA/Fibonacci seeds to reach self-copy 1.000). The upstream
 [`docs/performance/timings.md`](docs/performance/timings.md) figures are at `num_repeats=5`, so they
 are an **optimistic reference** — at 50 seeds the optimization-bound modes run proportionally slower
-and the real gap is *wider*. Fill the cells from a fresh `--no-original` CPU run.
+and the real gap is *wider*. **These JAX/XLA baselines also already use multiple CPU threads** (XLA
+parallelizes the batched op), so the true **single-core** baseline is *lower* still and the
+**per-core gap is the widest of all**. Fill the `nr=50` cells from a fresh `--no-original` CPU run
+**pinned to one core** (and a 16-core aggregate cell for context).
 
-| mode | JAX-batch 1-proc (ref, nr=5) | 8-cpu spawn (ref, nr=5) | measured nr=50 (TODO) | gap to 2k |
+| mode | JAX-batch 1-proc (ref, nr=5, multi-thread) | 8-cpu spawn (ref, nr=5) | single-core nr=50 (TODO) | gap to **2k/core** |
 |---|--:|--:|--:|--:|
-| vol      | ~110/s  | ~507/s | _TBD_ | ~4–18× |
-| vol_esp  | ~124/s  | ~506/s | _TBD_ | ~4–16× |
-| pharm    | ~67/s   | ~533/s | _TBD_ | ~4–30× |
-| **surf** | **~6.6/s** | ~6.7/s (does not scale) | _TBD_ | **~300×** |
-| **esp**  | **~2.7/s** | — | _TBD_ | **~740×** |
+| vol      | ~110/s  | ~507/s | _TBD_ | ≥~18× |
+| vol_esp  | ~124/s  | ~506/s | _TBD_ | ≥~16× |
+| pharm    | ~67/s   | ~533/s | _TBD_ | ≥~30× |
+| **surf** | **~6.6/s** | ~6.7/s (does not scale) | _TBD_ | **≥~300× (FLOP-bound ~30–160× over a SIMD kernel)** |
+| **esp**  | **~2.7/s** | — | _TBD_ | **≥~740×** |
 | esp_combo | unmeasured (per-pair autograd only) | — | _TBD_ | largest |
 
 ---
@@ -123,6 +137,29 @@ The surface modes need *more* than this: their ~200-point cloud (`num_surf_point
 so ~75–150 pts) makes the NxM overlap ~6–44× heavier per step than `vol`. Batching removes dispatch
 but not the tile — so `surf`/`esp` also need a **fused, single-pass numba kernel** + **seed-tiling**.
 
+### Single-core FLOP budget — why surf/esp can't reach 2k/core bit-identically
+
+At **2,000 pairs/s on one core** the budget is **0.5 ms/pair ≈ 1.5×10⁶ cycles/pair** (3 GHz). The
+fine loop does `~50 seeds × ~80 effective Adam steps × (forward + analytical grad)` per pair:
+
+- **vol/vol_esp/pharm** (~30×30 grid): `50 × 80 × ~30² × O(10)` ≈ a few ×10⁷ op-equiv/pair. Today
+  it's dispatch-bound, not compute-bound — so a batched, SIMD-vectorized single-thread kernel that
+  amortizes per-pair Python/launch overhead has a real shot at 2k/core. **Plausible; confirm by probe.**
+- **surf/esp** (~100×100 grid, `exp` heavy): `50 × 80 × ~100² × O(20)` ≈ **8×10⁸ op-equiv/pair**.
+  At 2k/core that demands ~1.6×10¹² op-equiv/s on one core; realistic sustained single-core
+  (`exp`-bound, AVX2) is ~1–5×10¹⁰/s → **~30–160× short.** No amount of the bit-identical levers
+  (L1–L3, L5) closes that on one core: they remove dispatch and memory traffic, not the arithmetic.
+
+**Consequence.** For surf/esp the per-core 2k bar can only be met by **reducing the work itself** —
+fewer seeds, decimated surface points, fewer steps — the exact levers the GPU log *rejected* for
+shifting scores. So this effort must **re-litigate those levers under a strict accuracy gate**
+(score `max|Δ| < 1e-5`, **zero argmax-seed-changes** on a large pseudo-symmetric cohort) and ship the
+largest cut that provably holds. The bold, creative work is concentrated here: a smaller seed set that
+still covers every basin, or a decimation + full-points re-score that never switches a winner. If none
+passes, the honest outcome is **surf/esp hold accuracy but land below 2k/core** (while 16-core
+aggregate still clears 32k/s — which is *not* the stated bar). This is measured, not assumed: the probe
+below pins the real single-core ceiling.
+
 ---
 
 ## Bottleneck table (per mode)
@@ -151,7 +188,8 @@ Risk legend: **bit-identical** · **float<1e-5** (score-level, zero winner-chang
 `dQ(4)` matching the Triton signature. The pad mask **and** the ESP charge weight both enter the
 existing `pair_weights` slot. Add a CPU branch in `_overlap_in_chunks` (drop the CUDA-only 65535
 grid-z guard). **Expected:** vol/vol_esp 10,000 `while_loop`s → 1 batched dispatch, ~16–30× over
-baseline → clears 2k/s on modest cores. surf/esp: removes dispatch but tile remains (~5–15× alone) —
+baseline **single-thread** (overhead amortization, not parallelism) → plausibly clears 2k/**core** for
+the small-grid modes. surf/esp: removes dispatch but the tile remains (~5–15× alone) —
 *necessary, not sufficient*, see L2. **Gate:** T1 microbench (score-level), then T3 parity on cpu.
 *Why #1:* the batched optimizer **already exists and already selects the eager path on CPU** — this
 is one kernel-swap, reusing already-validated math.
@@ -164,8 +202,13 @@ analogue of Triton's one-CTA-per-pose), stream the NxM grid in register-resident
 `r²` on the fly, accumulate `VAB` and the three gradient contractions in **one pass** in the **same
 fit-outer/ref-inner order** as the torch reference. No `(B,N,M)` temp ever exists. Fold the two ESP
 exponents into one `exp(−α/2·r² − C2/lam)`. Independently buildable/testable on the Windows box.
-**Expected:** fused single-pass + all cores ~8–20× over naïve batched-torch surf; stacked on L1 targets
-the ~300×/~740× gap. **Honest:** 2k/s on surf/esp likely needs ≥16 cores; ~1000–1500/s on 8.
+**Expected (per-core framing):** the fused **single-pass, register-tiled, SIMD** kernel is the
+*single-thread* win (no `(B,N,M)` materialization, no redundant passes, vectorized `exp`) — call it
+~3–6× over the naïve batched-torch surf kernel on **one core**. The `prange` across pose rows is an
+**aggregate** multiplier (×cores) that does **not** count toward the per-core bar. **Honest:** even
+the best single-pass SIMD kernel is, per the FLOP budget, still ~5–30× short of 2k/**core** on surf —
+so L2 alone does **not** reach the bar; it must stack with a gated work cut (L8 / seed reduction). L2
+is still essential: it's what makes the work-reduced kernel fast enough that a *modest* cut suffices.
 **Gate (audit-corrected):** numba **without `fastmath`** (preserve IEEE add order); **gate on the
 score** (`max|Δ| < 1e-5` vs `_align_batch_surf/esp`), **not VAB** (on-the-fly `r²` is ~3e-5 at VAB —
 expected and fine, it cancels in Tanimoto); compute VAA/VBB with the **same** numba kernel so
@@ -248,6 +291,11 @@ sufficient — the winner-change count is the real gate. **Deploy only if L1–L
 the available cores.**
 
 ### L9 — JAX-path systems levers (split the bundle) — mixed · M
+> **Aggregate only — does NOT count toward the per-core 2k bar.** Multiprocessing/`shard_map`/thread
+> scaling multiplies *aggregate* throughput across the 16 cores; it cannot raise single-core
+> throughput. Keep it for the 16-core aggregate number (~32k/s once per-core 2k is hit), but the
+> per-core target must be met by the kernel/algorithm levers (L1–L8), not by L9.
+
 **Modes:** vol, vol_esp, pharm (does nothing for surf/esp — they are compute-bound). The audit
 **splits this into two independently-gated halves:**
 - **L9a — persistent pre-warmed JAX worker pool + core-pinning** (`OMP_NUM_THREADS=1`/worker,
@@ -268,17 +316,22 @@ the available cores.**
 
 ## Assessment — is >2k/s on ALL modes reachable, accuracy-safe?
 
-**CONDITIONAL YES for 5 of 6 modes; NO (as currently coded) for `esp_combo`.**
+**Per-core bar (2k/s/core): plausible for vol/vol_esp/pharm; NOT bit-identically reachable for
+surf/esp (FLOP-bound) → contingent on a gated work-reduction; NO for `esp_combo`.**
 
-- **`vol`, `vol_esp`, `pharm` — HIGH confidence, bit-identical.** Dispatch-bound, so cross-pair
-  batching (L1; pharm via L4) plus modest parallelism clears 2k/s on roughly a **16–24 physical-core**
-  node (~18× vol, ~16× vol_esp, ~30× pharm at near-linear scaling once spawn/oversubscription are
-  removed). pharm is the easiest — its batched analytical grad already runs on a CPU tensor.
-- **`surf`, `esp` — reachable but TIGHT and core-budget-dependent, float<1e-5.** Compute-bound on the
-  ~200×200 tile (~44× vol), so batching is necessary-not-sufficient. The numba fused kernel (L2) +
-  seed-tiling (L3) + ESP fusion (L5) get them there on a **≥16–32-core** box at score-level < 1e-5,
-  but likely only **~1000–1500/s on 8 cores**. If cores are fixed at 8, the gated downsampling (L8,
-  < 1e-5 + zero winner-changes) is the lever that closes the last ~1.5–2×.
+- **`vol`, `vol_esp`, `pharm` — plausible single-core, bit-identical (confirm by probe).** They are
+  dispatch-bound, not compute-bound, so a batched + SIMD-vectorized **single-thread** kernel (L1; pharm
+  via L4; L6 fusion) that amortizes per-pair Python/launch overhead has a real shot at 2k/core. Needs
+  ~18–30× over a multi-thread baseline (so more vs a true single-core baseline) — but the work per pair
+  is tiny, so the headroom is in removing overhead, which batching+vectorization do. **Probe pins it.**
+- **`surf`, `esp` — NOT reachable bit-identically on one core; contingent on a gated work cut.** The
+  single-core FLOP budget puts them **~30–160× short** of 2k/core, and the bit-identical levers
+  (L1–L3, L5) remove overhead/memory traffic, not arithmetic. The *only* path to 2k/core is reducing
+  the work — fewer seeds, decimated points (L8), fewer steps — under the strict gate (score < 1e-5,
+  **zero winner-changes**). Whether a cut that large *passes* the gate is the open empirical question
+  of this effort. Honest outcome space: (a) a creative seed/decimation scheme passes and surf/esp hit
+  2k/core; or (b) nothing large enough passes, and surf/esp **hold accuracy but land below 2k/core**
+  (16-core aggregate still clears 32k/s — not the bar). Do not promise (a) before the gate proves it.
 - **`esp_combo` — NOT demonstrably reachable accuracy-safe.** No batched CPU path
   (`fast_optimize_esp_combo_score_overlay_batch` hardcodes `device='cuda'`, falls back to the per-pair
   autograd `optimize_esp_combo_score_overlay`), no analytical gradient, three point-sets/step, and the
@@ -287,9 +340,12 @@ the available cores.**
   CPU driver** before any speed lever applies, and cannot meet the bit-identical gate today. **Scope it
   separately; do not block the other five modes on it.**
 
-**Assumptions:** ≥16 physical cores for surf/esp at 2k/s (8 → ~1000–1500/s); torch 2.6 CPU + numba
-0.61 (jax-free, so L1/L2 are independently buildable on the Windows box); row-major reduction preserved
-(no GEMM `cdist`); seed set, steps, `alpha`, `lam` held bit-for-bit.
+**Assumptions:** the bar is **2k/s per single core** (16 cores available → ~32k/s aggregate, but
+parallelism does not count toward the bar); torch 2.6 CPU + numba 0.61 (jax-free, so L1/L2 + the
+single-core probe are buildable on the Windows box); for bit-identical levers, row-major reduction
+preserved (no GEMM `cdist`), seed set / steps / `alpha` / `lam` held bit-for-bit; for surf/esp the
+work-reduction levers are gated on score < 1e-5 **and** zero argmax-seed-changes over a large
+pseudo-symmetric distinct cohort.
 
 ---
 
@@ -307,8 +363,9 @@ the available cores.**
    exponents fused. Microbench (score < 1e-5) + `exp(a+b)` check first.
 4. **L3 (memory enabler — ship with step 3).** Seed-dim tiling + assert VAA/VBB cached. Verify
    `tiled==untiled`. Pin `torch.set_num_threads` to physical cores; BLAS single-threaded inside numba.
-5. **Measure, then decide.** Benchmark surf/esp on the target core budget. ≥2k/s → done. Short →
-   deploy L7/L8 **gated** (winner-change harness), and L6 per-mode where it passes < 1e-5.
+5. **Measure single-core, then decide.** Benchmark surf/esp **pinned to one core** (`set_num_threads(1)`).
+   ≥2k/core → done. Short (expected) → deploy L7/L8 **gated** (winner-change harness) and re-measure;
+   L6 per-mode where it passes < 1e-5. Track 16-core aggregate separately for context, not as the bar.
 6. **`esp_combo` (separate track).** Decide: (a) deterministic batched CPU combo kernel + driver, or
    (b) document out-of-scope for the bit-identical 2k/s target. Don't block the other five.
 7. **(Optional) L9** for jax-only deployments — L9a (pool) freely, L9b (scan-default) gated.
@@ -340,8 +397,11 @@ Baseline + every lever recorded here once measured on WSL2 `SimModelEnv`. A chan
 
 1. **`esp_combo`:** build a deterministic batched CPU kernel + driver, or formally scope it out of the
    bit-identical 2k/s target? Its nondeterminism means it cannot meet the standard gate as written.
-2. **Core budget?** The whole surf/esp verdict hinges on it — state the assumed physical-core count up
-   front. vol/vol_esp/pharm clear 2k/s at ~16–24 cores; surf/esp need ~16–32 with L2+L3.
+2. **How large a work cut passes the gate?** *(Resolved input: bar = 2k/s per single core; 16 cores
+   available for aggregate.)* The surf/esp verdict now hinges entirely on how much the seed/point/step
+   count can be reduced while holding score < 1e-5 with zero winner-changes — measure the largest safe
+   cut on a big pseudo-symmetric cohort. If the safe cut isn't ~30–160×, surf/esp hold accuracy below
+   2k/core.
 3. **Memory wall timing:** does the L1 torch eager path OOM at surface scale *before* L2 lands? If so,
    L3 (tiling) must ship *with* L1 for surf/esp — needs a quick `(B,50,200,200)` measurement.
 4. **numba reduction parity:** will fit-outer/ref-inner `r²` (no fastmath, fp64 accumulate) hold
