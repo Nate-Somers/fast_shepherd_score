@@ -9,6 +9,9 @@ original API and behavior, and adds a single opt-in seam.
 - **Backward compatible:** the default backend is still the original JAX/CPU path, so
   existing code behaves exactly as before. Triton is an **optional** dependency — if it
   (or a GPU) isn't present, everything falls back transparently.
+- **CPU too:** when Triton/CUDA isn't present, the *same* batched driver runs on a
+  Triton-free **numba** kernel (`cpu_overlap.py`) — numerically exact and **~25× faster than
+  the original per-pair CPU path** on `vol` (all batched modes except `esp_combo`).
 
 ---
 
@@ -154,7 +157,7 @@ paired timing); the cross-GPU peaks are in **Net result** at the end. Throughput
 aligned **pairs per second**; "bit-identical" means scores match the reference to the
 last decimal.
 
-### A. The engine — batched GPU optimization
+### A. The engine — batched optimization (GPU + CPU)
 1. **Triton value+gradient kernels** for shape, ESP, and pharmacophore
    overlap (`gaussian_overlap_triton.py`, `gaussian_overlap_esp_triton.py`,
    `pharmacophore_overlap_triton.py`, `pharmacophore_grad_triton.py`). One CTA per pose
@@ -167,10 +170,19 @@ last decimal.
    4-GPU column below uses) for convenience; plus a separate, opt-in one-process-per-GPU
    driver (`multi_gpu.py`) that sidesteps the GIL for closer-to-N× scaling on large screens
    (see **D** for the robustness work behind the automatic path).
-4. **CPU fallback engine.** When Triton is unavailable, the batched drivers (vol/surf/esp/
-   pharm) run against a numba (`@njit(parallel=True)`) value+SE(3)-gradient implementation
-   (`cpu_overlap.py`) — a drop-in for the Triton kernels, so the GPU path is untouched.
-   (`esp_combo` currently has no CPU fallback and is GPU-only.)
+4. **CPU engine (numba) — the same batched driver, Triton-free.** When Triton/CUDA is
+   absent, the batched drivers (all modes except `esp_combo`) drop in a numba
+   (`@njit(parallel=True)`) value+SE(3)-gradient kernel (`cpu_overlap.py`) that replicates
+   the Triton kernel operation-for-operation. It is **numerically exact** (computes the true
+   overlap+gradient; not bit-identical, since `math.exp` ≠ Triton's `exp2`), so self-copy
+   stays 1.000 and distinct-pair scores match. This is a real speedup of the CPU path, not
+   just a safety net: on `vol` it reaches **~161 pairs/s/core, ~25× over the original torch
+   per-pair CPU path** (and ~5–15× over JAX-batch single-core); `vol_esp` ~162–182/core,
+   `pharm` ~11/core. The compute-bound surface modes (`surf`/`esp`) stay slow — they are
+   FLOP-bound on `exp`. The GPU path is untouched: the CPU kernel loads only in the
+   `except ImportError` branch. (A push for >2,000 pairs/s/core was explored and found
+   physically out of reach for `surf`/`esp`; full log in
+   [`SPEED_EXPERIMENTS_CPU.md`](SPEED_EXPERIMENTS_CPU.md).)
 
 ### B. Kill the per-pair overhead
 5. Profiling showed the alignment was **overhead-bound, not kernel-bound**: per-call setup
