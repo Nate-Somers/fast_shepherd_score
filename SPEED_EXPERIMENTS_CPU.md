@@ -297,6 +297,31 @@ change that reaches 2k/core.** Closest exact, all levers stacked: vol/pharm ~55�
 16 cores), surf/esp ~5/core — a real ~7–9× over today, but the 2k/core bar is ~22–500× away and the
 gap is the physical `exp`-throughput floor, not a missing optimization.
 
+## Language / tooling investigation — would a different language give more? (`cpu_language_investigation.py`)
+
+The shipped numba kernel hits 161/core for vol but is **~74% `exp`-bound** (measured: diff the kernel
+against an identical one with `exp` → a cheap polynomial). numba uses **scalar** `math.exp` (396
+Mexp/s) because there's no Intel SVML on this box; `torch.exp` gets **2,824 Mexp/s** via SIMD. So the
+question is purely: can another language/tool give the kernel a *vectorized* `exp` while keeping the
+fused single pass? Amdahl with a 7× SIMD `exp` ⇒ **~2.8× ceiling** (vol ~161→~450/core, surf ~5→~14).
+
+| option | `exp` | est. vs numba | effort | notes |
+|---|---|--:|---|---|
+| **numba + Intel SVML** (`pip install icc_rt`) | SIMD (SVML) | **~2.8×** | **LOW — no language change** | numba auto-vectorizes `exp` w/ `fastmath` when SVML present. **Try first.** |
+| **torch.compile** (Inductor → C++/OpenMP) | SIMD (SLEEF) | ~2–3× | LOW (needs gcc → WSL2) | also fuses the non-kernel ops; untested here (no compiler) |
+| C++/SLEEF + OpenMP, or Rust (rayon), or Julia (LoopVectorization.jl) | SIMD | ~2.8× | HIGH — toolchain + bindings | same ceiling as SVML for far more work |
+| Cython | scalar libm | ~1.3× | MED | `exp` stays scalar unless you hand-write SIMD intrinsics |
+| JAX-CPU (XLA) | SIMD | **<1×** | LOW | single XLA:CPU device doesn't multicore these per-pair ops (≈11–30/core at nr=50) — *worse* |
+| Mojo | SIMD (claims) | ~C++? | HIGH | immature; not worth it now |
+
+**Verdict.** A language change buys at most **~2.8×** (vol ~450/core), because every language shares
+the same `O(50·steps·NxM)` `exp` count and the win is only recovering SIMD-`exp` throughput. The
+cheapest route is **not a language change at all** — `pip install icc_rt` to give numba SVML (~2.8×,
+keep the exact kernel). `torch.compile` on WSL2 is the next lever (and also speeds the non-kernel ops).
+C++/Rust/Julia hit the same ceiling for much more effort. **No language reaches 2k/core** — even at the
+~2.8× ceiling vol lands ~450/core (~4.4× short), surf/esp far worse; the `exp`-throughput floor is
+language-independent.
+
 ## Bottleneck table (per mode)
 
 | mode | dominant cost | nature | headroom |
@@ -570,6 +595,7 @@ Baseline + every lever recorded here once measured on WSL2 `SimModelEnv`. A chan
 | B1 | fastest exact `exp` (single-core) | all | `torch.exp` **2824 Mexp/s** vs `np.exp` 719 vs numba-scalar 396 | exact | **finding** — fast exact kernel must use `torch.exp`; explains the numba 3.3× cap |
 | B2 | GEMM-form `r²` vs `torch.cdist` | surf,esp | **~1.0× (no win)** | rel 1.3e-7 | **REJECTED** — cdist already optimal; no exact headroom in the distance step |
 | L6′ | torch.compile fused kernel (exact) | vol,vol_esp,pharm,surf,esp | _untested (no gcc here)_ — est. ~2–4× | exact (verify Inductor reductions) | **top WSL2 experiment** — the one remaining exact lever; still ~10–20× short of 2k/core |
+| LANG | language/tool investigation (`cpu_language_investigation.py`) | all | kernel **74% exp-bound**; SIMD-exp ceiling **~2.8×** (vol ~450/core) | exact | **finding** — `pip install icc_rt` (numba+SVML, no lang change) is the cheapest ~2.8×; C++/Rust/Julia same ceiling; JAX-CPU worse; no language reaches 2k/core |
 | L3 | VAA/VBB cache + seed-dim tiling | surf,esp,vol,vol_esp | _TBD_ | _TBD_ | pending |
 | L5 | ESP exponent fusion | esp,vol_esp | _TBD_ | _TBD_ | pending |
 | L6 | torch.compile fine body (per-mode) | vol,vol_esp,pharm | _TBD_ | _TBD_ | pending |
