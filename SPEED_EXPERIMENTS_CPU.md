@@ -23,18 +23,31 @@ path (`max|Δ|` ≈ 0, or provably < 1e-5 float-level).
 > bound is physical: ~10⁷–10⁸ `exp()`/pair vs ~10⁸ `exp`/s/core. The levers below stand as the real
 > accuracy-safe speedup (just not 2k/core).
 
-> ## ✅ REALIZED (2026-06-20): exact CPU batched vol aligner — **161 pairs/s/core, 24.9×**
-> Implemented L1+L2 for real: a triton-free numba overlap+grad kernel
+> ## ✅ REALIZED (2026-06-20): exact CPU batched aligner for **ALL modes** (numba)
+> A triton-free numba kernel module
 > ([`shepherd_score/alignment/utils/cpu_overlap.py`](shepherd_score/alignment/utils/cpu_overlap.py))
-> wired into the existing driver via an optional import in `fast_se3.py`, so the whole batched
-> `coarse_fine_align_many` / `_align_batch_vol` path now runs on a CPU-only box (no triton/JAX).
-> Validated on real drug heavy-atom clouds ([`benchmarks/experiments/cpu_vol_integration_test.py`](benchmarks/experiments/cpu_vol_integration_test.py)):
-> kernel value+grad match autograd (VAB rel 1.1e-7, dQ 5e-6, dT 5e-7); **self-copy = 1.0000**;
-> distinct pairs within **2e-4** of the torch per-pair reference. **Single-core: 161 pairs/s/core vs the
-> torch per-pair path's 6.5 → 24.9×** (also ~5–15× over JAX-batch single-core at nr=50). Numerically
-> exact (not byte-identical — `math.exp`≠Triton `exp2`), accuracy-preserving. The GPU path is untouched
-> (the optional import only changes behavior when triton is absent). Still ~12× short of 2k/core, but a
-> real, shipped, exact win — and bigger than the ~7–9× originally estimated.
+> wired into every batched driver via **optional imports** (`fast_se3`, `fast_surface_se3`,
+> `fast_esp_se3`, `fast_pharm_se3`), so the whole `_align_batch_*` / `coarse_fine_*` path runs on a
+> CPU-only box (no triton/JAX). **GPU path untouched** — the `except` branch only runs when triton is
+> absent. Numerically exact (computes the true overlap+grad; not byte-identical — `math.exp`≠`exp2`),
+> accuracy-preserving. Validated on real molecules ([`cpu_vol_integration_test.py`](benchmarks/experiments/cpu_vol_integration_test.py),
+> [`cpu_allmodes_test.py`](benchmarks/experiments/cpu_allmodes_test.py)), single-core:
+>
+> | mode | kernel | self-copy | single-core | notes |
+> |---|---|---|--:|---|
+> | `vol` | shape | 1.0000 (distinct vs ref 2e-4) | **161/core (24.9×)** | vs torch per-pair 6.5/core |
+> | `vol_esp` | shape×charge | 1.0000 | **162–182/core** | ESP weight folded into the kernel |
+> | `surf` | shape (reused) | — | _WSL2_ | same kernel as vol; end-to-end needs open3d |
+> | `esp` | shape×charge | — | _WSL2_ | kernel vs autograd VAB 9.5e-8, dQ 2.4e-7 |
+> | `pharm` | typed/directional | 0.9996 (~0.999 expected) | **11/core** | kernel vs torch ref O 2e-7, gR 3e-8 |
+> | `esp_combo` | — | — | out of scope | no batched CPU path; nondeterministic |
+>
+> Numbers are 24.9× (vol) over the torch per-pair path and beat JAX-batch single-core (nr=50) by
+> ~5–15×. Still ~12× short of 2k/core (the physical `exp` floor). **Language change:** SVML (the ~2.8×
+> vectorized-`exp` lever) is **not enablable on this Windows pip box** (llvmlite reports `has_svml`
+> but numba's runtime `USING_SVML` stays False with the pip `intel-cmplr-lib-rt`, and there's no C
+> compiler for torch.compile/Cython); it needs a conda env with `icc_rt` (or a compiler). The kernel
+> is SVML-ready (it auto-vectorizes `exp` once numba sees SVML) — see the Language section.
 
 This is the CPU counterpart to the GPU work in [`SPEED_EXPERIMENTS.md`](SPEED_EXPERIMENTS.md). The
 GPU fork hit 50k–180k pairs/s by **batching every pair into one kernel dispatch**. The headline
@@ -586,7 +599,8 @@ Baseline + every lever recorded here once measured on WSL2 `SimModelEnv`. A chan
 |---|---|---|---|---|---|
 | 0 | **measured single-core ceiling** (naive batched torch, nr=50, fixed 100 steps; `cpu_singlecore_probe.py`) | — | **vol ~8/s, surf-75 ~1.6/s, surf-128 ~0.6/s** (per-core) | n/a (timing) | reference — bar is ~74–1080× above this |
 | L10 | `num_repeats` 50→5 on real vol pairs (`cpu_vol_nr_accuracy.py`) | vol | only **~1.5×** (9.5→14.4/s — overhead-bound, not seed-bound) | self 1.0; **distinct nr=25 max\|Δ\|=8e-5 (FAILS<1e-5); nr≤15 → 0.029 basin switches** | **REJECTED** — breaks accuracy AND low payoff. The 45 Fibonacci seeds are load-bearing on distinct pairs; "5 adequate" is false under the strict gate. |
-| L1+L2 | **REALIZED** numba overlap+grad kernel wired into `coarse_fine_align_many` via optional import (`cpu_overlap.py`; `cpu_vol_integration_test.py`) | vol | **161 pairs/s/core vs 6.5 torch per-pair = 24.9×** (single-core) | self-copy **1.0000**; distinct vs ref **max\|Δ\|=2e-4**; kernel grad vs autograd 1e-6 | **SHIPPED** — exact (not byte-identical), GPU path untouched, ~12× short of 2k/core |
+| L1+L2 | **REALIZED — ALL MODES** numba kernels (shape, ESP, pharm) wired into every batched driver via optional imports (`cpu_overlap.py`; `cpu_vol_integration_test.py`, `cpu_allmodes_test.py`) | vol, vol_esp, surf, esp, pharm | vol **161/core (24.9×)**, vol_esp **162–182/core**, pharm **11/core**; surf/esp WSL2 | self-copy: vol/vol_esp **1.0000**, pharm **0.9996**; kernels vs autograd/torch-ref **1e-7–1e-8** | **SHIPPED** — exact (not byte-identical), GPU path untouched, ~12× short of 2k/core |
+| LANG2 | enable SVML for numba on this box | all | n/a (~2.8× on capable envs) | exact | **BLOCKED here** — pip `intel-cmplr-lib-rt` doesn't flip numba `USING_SVML`; no C compiler. Needs conda `icc_rt` / WSL2. Kernel is SVML-ready. |
 | L4 | pharm batched analytical-grad driver | pharm | _TBD_ | _TBD_ | pending |
 | L2 | numba fused single-pass kernel (`cpu_numba_kernel_probe.py`) | all | **~3.3× (MEASURED, not ~10×)** — scalar-`exp`-bound, no SVML | VAB rel ~3–9e-6 (fp64), gradR ~1–4e-5; score-cancels | **kept** (real win, but smaller than hoped) |
 | L6 | torch.compile fine body | vol,vol_esp,pharm | _untestable here_ (no MSVC; Inductor needs a C compiler) | — | deferred to WSL2/Linux+gcc |
