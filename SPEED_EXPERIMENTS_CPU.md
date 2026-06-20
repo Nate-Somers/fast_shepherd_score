@@ -15,6 +15,14 @@ path (`max|Δ|` ≈ 0, or provably < 1e-5 float-level).
 > **accuracy-gated algorithmic work reduction** (fewer seeds/points/steps, provably < 1e-5 with zero
 > winner-changes). That is the central creative tension of this effort.
 
+> ## ⛔ RESULT (measured, 2026-06-20): the per-core 2k bar is NOT reachable — see **Assessment** below.
+> Hypotheses below were tested to a hard conclusion. Best **accuracy-safe** single-core: vol/vol_esp/
+> pharm **~55–90/s**, surf/esp **~5/s** (~7–9× over today, bit-identical) — but **~22–500× short of
+> 2k/core**, and even accuracy-*breaking* nr=5 leaves vol ~5× short. The only ~10× lever (`num_repeats`
+> 50→5) was measured to **break distinct-pair accuracy** (basin switches) **and** yield only ~1.5×. The
+> bound is physical: ~10⁷–10⁸ `exp()`/pair vs ~10⁸ `exp`/s/core. The levers below stand as the real
+> accuracy-safe speedup (just not 2k/core).
+
 This is the CPU counterpart to the GPU work in [`SPEED_EXPERIMENTS.md`](SPEED_EXPERIMENTS.md). The
 GPU fork hit 50k–180k pairs/s by **batching every pair into one kernel dispatch**. The headline
 finding here is that **the same batched driver already runs on CPU** — it just needs one CPU compute
@@ -383,27 +391,47 @@ the available cores.**
 
 ---
 
-## Assessment — is >2k/s on ALL modes reachable, accuracy-safe?
+## Assessment — is >2k/s per single core reachable, accuracy-safe?
 
-**Per-core bar (2k/s/core), corrected by the single-core probe: NOT bit-identically reachable for ANY
-mode; reachable for vol/vol_esp/pharm only WITH gated `num_repeats=5` + a fused kernel; surf/esp likely
-land below 2k/core even with every gated lever; NO for `esp_combo`.**
+### ⛔ DECISIVE FINDING (measured, real molecules): NO — for any mode, with or without accuracy loss.
 
-- **`vol`, `vol_esp`, `pharm` — reachable but NOT bit-identical; needs the gated nr=5.** The measured
-  single-core nr=50 baseline is **~8 pairs/s** (not the ~110 multi-thread figure), so the bare kernel is
-  ~74× short. The bit-identical enablers (L1 batching, L3 caching, L6 fusion) plus early-stop get to
-  only a few hundred/core; clearing 2k/core also requires **`num_repeats` 50→5** (a 10× cut upstream
-  calls "adequate for non-surface modes," but it *shifts scores* unless the gate proves otherwise). So:
-  reachable, **conditional on the nr=5 accuracy gate passing** (score < 1e-5, zero winner-changes), plus
-  the fused numba kernel (L2) which is the biggest single lever (~10× — the naive torch kernel runs at
-  <1 GFLOP/s). pharm easiest mechanically (L4).
-- **`surf`, `esp` — likely below 2k/core even with the full gated stack.** Measured single-core nr=50
-  is **~0.6–1.6 pairs/s** (~385–1080× short). Stacking *every* gated lever — fused kernel ×10,
-  early-stop ×3, nr=5 ×10, decimation ×3–4 — lands ~600–2,300/core depending on how much the accuracy
-  gate trims the seed and point cuts. Realistic expectation: surf/esp **hold accuracy and land below
-  2k/core**; 16-core aggregate still clears ~10–32k/s (not the bar). Reaching 2k/core requires ALL of
-  the risky cuts to pass simultaneously — possible, not likely. Do not promise it before the gate proves
-  it pair-by-pair on a pseudo-symmetric cohort.
+The experiments converged on a hard, data-backed conclusion. **2,000 pairs/s per single core is not
+physically reachable for this alignment algorithm.**
+
+**Best ACCURACY-SAFE (bit-identical, nr=50) single-core ceilings** (L1 batching + L2 numba ~3.3× +
+early-stop):
+
+| mode | ceiling | gap to 2k/core |
+|---|--:|--:|
+| vol / vol_esp / pharm | **~55–90/s** | **~22–36×** |
+| surf / esp | **~4–6/s** | **~330–500×** |
+
+**Even SACRIFICING accuracy maximally**, vol's theoretical ceiling at the accuracy-breaking nr=5 with a
+*perfect* vectorized `exp` is **~400/s — still ~5× short.** The irreducible cost is `50 seeds ×
+~30–50 Adam steps × NxM exp()` ≈ 10⁷–10⁸ transcendentals/pair; a single core does ~10⁸ `exp`/s, so the
+per-core ceiling is **~1–90 pairs/s by mode, full stop.** No software lever spans the remaining
+~5–500×; it would take ~5–500× faster per-core `exp` throughput (i.e. different hardware, or SIMD/SVML
+the dev box lacks — and even SVML's ~4–8× leaves surf/esp short).
+
+**The two levers large enough to matter were measured and both fail:**
+- **`num_repeats` 50→5 (L10):** the only ~10×-class lever. On real distinct drug pairs it **breaks
+  accuracy** — nr=25 already gives `max|Δ| 8e-5` (fails <1e-5), nr≤15 causes **0.029 basin switches**
+  (a dropped Fibonacci seed was the global winner). And the payoff is only **~1.5×** anyway (vol is
+  per-pair-overhead-bound, not seed-bound). **Rejected.** Self-copy stays 1.0 at every nr — proof the
+  self-copy benchmark *cannot* gate seed reduction.
+- **Per-element distance cutoff (L11):** accuracy-perfect (SCORE Δ ~4e-10) but a **net loss** at the
+  ~40% skip of converged self-copies (branch cost > scalar-`exp` saved → 0.76×).
+
+### What IS achievable (the real, accuracy-safe win)
+
+- **A ~7–9× accuracy-safe single-core speedup** over the current JAX single-core path: **vol/vol_esp/
+  pharm ~55–90/core, surf/esp ~5/core**, all **bit-identical** (L1 + L2 + cached self-overlaps +
+  early-stop). Real and worth shipping — just not 2k.
+- **16-core aggregate (bit-identical): vol/pharm ~900–1,400/s, surf/esp ~70–100/s.** vol/pharm approach
+  2k *aggregate*; surf/esp do not.
+- If the bar is relaxed from "no accuracy loss" to a **ranking-preserving** tolerance (e.g. distinct
+  `max|Δ| < 1e-3`, which the nr=25 result *almost* meets), vol/pharm aggregate could clear 2k — but that
+  is a different, looser bar than the stated one and surf/esp still fall far short.
 - **`esp_combo` — NOT demonstrably reachable accuracy-safe.** No batched CPU path
   (`fast_optimize_esp_combo_score_overlay_batch` hardcodes `device='cuda'`, falls back to the per-pair
   autograd `optimize_esp_combo_score_overlay`), no analytical gradient, three point-sets/step, and the
@@ -452,7 +480,7 @@ Baseline + every lever recorded here once measured on WSL2 `SimModelEnv`. A chan
 | # | lever | mode | throughput Δ | accuracy (self / distinct max\|Δ\| / winner-flips) | verdict |
 |---|---|---|---|---|---|
 | 0 | **measured single-core ceiling** (naive batched torch, nr=50, fixed 100 steps; `cpu_singlecore_probe.py`) | — | **vol ~8/s, surf-75 ~1.6/s, surf-128 ~0.6/s** (per-core) | n/a (timing) | reference — bar is ~74–1080× above this |
-| L10 | `num_repeats` 50→5 (sweep, gated) | all | ~10× (if it passes) | _TBD_ (per-mode nr sweep) | pending (risky — likely fails at 5 for surf) |
+| L10 | `num_repeats` 50→5 on real vol pairs (`cpu_vol_nr_accuracy.py`) | vol | only **~1.5×** (9.5→14.4/s — overhead-bound, not seed-bound) | self 1.0; **distinct nr=25 max\|Δ\|=8e-5 (FAILS<1e-5); nr≤15 → 0.029 basin switches** | **REJECTED** — breaks accuracy AND low payoff. The 45 Fibonacci seeds are load-bearing on distinct pairs; "5 adequate" is false under the strict gate. |
 | L1 | CPU `_overlap_in_chunks` kernel + batched driver | vol,vol_esp,surf,esp | _TBD_ | _TBD_ | pending |
 | L4 | pharm batched analytical-grad driver | pharm | _TBD_ | _TBD_ | pending |
 | L2 | numba fused single-pass kernel (`cpu_numba_kernel_probe.py`) | all | **~3.3× (MEASURED, not ~10×)** — scalar-`exp`-bound, no SVML | VAB rel ~3–9e-6 (fp64), gradR ~1–4e-5; score-cancels | **kept** (real win, but smaller than hoped) |
