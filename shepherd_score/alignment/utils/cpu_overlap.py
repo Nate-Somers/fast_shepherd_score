@@ -230,6 +230,118 @@ def overlap_score_grad_esp_se3_batch(A, B, charges_A, charges_B, q, t, *,
             torch.as_tensor(dT, device=dev, dtype=dt))
 
 
+# ===========================================================================
+#  Pharmacophore overlap value+grad (pharm). Replicates pharmacophore_grad_triton
+#  ._pharm_score_grad_kernel op-for-op: typed Gaussians (per-type alpha/K/cat),
+#  directional weighting w (cat 1 = (clamp(D,0,1)+2)/3, cat 2 = (|D|+2)/3, else 1),
+#  type-match + non-dummy(cat!=3) masking; returns O, grad_R (3x3), grad_t. FIT=i
+#  (rotated by R,t), REF=j (fixed); type/alpha/K/cat from FIT.
+# ===========================================================================
+@njit(parallel=True, fastmath=False, cache=True)
+def _pharm_grad_kernel(RaA, FaB, RvA, FvB, RtA, FtB, R, t, alphas, Ks, cats, Nr, Mr, need_grad):
+    P = RaA.shape[0]
+    O = np.zeros(P, dtype=np.float64)
+    gR = np.zeros((P, 3, 3), dtype=np.float64)
+    gt = np.zeros((P, 3), dtype=np.float64)
+    for p in prange(P):
+        r00 = R[p, 0, 0]; r01 = R[p, 0, 1]; r02 = R[p, 0, 2]
+        r10 = R[p, 1, 0]; r11 = R[p, 1, 1]; r12 = R[p, 1, 2]
+        r20 = R[p, 2, 0]; r21 = R[p, 2, 1]; r22 = R[p, 2, 2]
+        tx = t[p, 0]; ty = t[p, 1]; tz = t[p, 2]
+        n_real = Nr[p]; m_real = Mr[p]
+        Oacc = 0.0
+        gtx = 0.0; gty = 0.0; gtz = 0.0
+        g00 = 0.0; g01 = 0.0; g02 = 0.0; g10 = 0.0; g11 = 0.0; g12 = 0.0; g20 = 0.0; g21 = 0.0; g22 = 0.0
+        for i in range(m_real):  # FIT
+            fax0 = FaB[p, i, 0]; fay0 = FaB[p, i, 1]; faz0 = FaB[p, i, 2]
+            fvx = FvB[p, i, 0]; fvy = FvB[p, i, 1]; fvz = FvB[p, i, 2]
+            fnorm = math.sqrt(fvx * fvx + fvy * fvy + fvz * fvz)
+            finv = 1.0 / (fnorm if fnorm > 1e-12 else 1e-12)
+            fvxn = fvx * finv; fvyn = fvy * finv; fvzn = fvz * finv
+            ityp = FtB[p, i]
+            ialpha = alphas[ityp]; iK = Ks[ityp]; icat = cats[ityp]
+            if icat == 3:
+                continue
+            fatx = r00 * fax0 + r01 * fay0 + r02 * faz0 + tx
+            faty = r10 * fax0 + r11 * fay0 + r12 * faz0 + ty
+            fatz = r20 * fax0 + r21 * fay0 + r22 * faz0 + tz
+            fvtx = r00 * fvxn + r01 * fvyn + r02 * fvzn
+            fvty = r10 * fvxn + r11 * fvyn + r12 * fvzn
+            fvtz = r20 * fvxn + r21 * fvyn + r22 * fvzn
+            for j in range(n_real):  # REF
+                if RtA[p, j] != ityp:
+                    continue
+                rax = RaA[p, j, 0]; ray = RaA[p, j, 1]; raz = RaA[p, j, 2]
+                rvx = RvA[p, j, 0]; rvy = RvA[p, j, 1]; rvz = RvA[p, j, 2]
+                rnorm = math.sqrt(rvx * rvx + rvy * rvy + rvz * rvz)
+                rinv = 1.0 / (rnorm if rnorm > 1e-12 else 1e-12)
+                rvxn = rvx * rinv; rvyn = rvy * rinv; rvzn = rvz * rinv
+                dx = fatx - rax; dy = faty - ray; dz = fatz - raz
+                r2 = dx * dx + dy * dy + dz * dz
+                E = math.exp(-ialpha * 0.5 * r2)
+                D = fvtx * rvxn + fvty * rvyn + fvtz * rvzn
+                if icat == 1:
+                    Dcl = 0.0 if D < 0.0 else (1.0 if D > 1.0 else D)
+                    w = (Dcl + 2.0) / 3.0
+                elif icat == 2:
+                    w = (abs(D) + 2.0) / 3.0
+                else:
+                    w = 1.0
+                KwE = iK * w * E
+                Oacc += KwE
+                if need_grad:
+                    aKwE = -ialpha * KwE
+                    gtx += aKwE * dx; gty += aKwE * dy; gtz += aKwE * dz
+                    g00 += aKwE * dx * fax0; g01 += aKwE * dx * fay0; g02 += aKwE * dx * faz0
+                    g10 += aKwE * dy * fax0; g11 += aKwE * dy * fay0; g12 += aKwE * dy * faz0
+                    g20 += aKwE * dz * fax0; g21 += aKwE * dz * fay0; g22 += aKwE * dz * faz0
+                    if icat == 1:
+                        c = 1.0 if (D > 0.0 and D < 1.0) else 0.0
+                    elif icat == 2:
+                        c = 1.0 if D > 0.0 else (-1.0 if D < 0.0 else 0.0)
+                    else:
+                        c = 0.0
+                    coeff = (1.0 / 3.0) * iK * E * c
+                    g00 += coeff * rvxn * fvxn; g01 += coeff * rvxn * fvyn; g02 += coeff * rvxn * fvzn
+                    g10 += coeff * rvyn * fvxn; g11 += coeff * rvyn * fvyn; g12 += coeff * rvyn * fvzn
+                    g20 += coeff * rvzn * fvxn; g21 += coeff * rvzn * fvyn; g22 += coeff * rvzn * fvzn
+        O[p] = Oacc
+        gt[p, 0] = gtx; gt[p, 1] = gty; gt[p, 2] = gtz
+        gR[p, 0, 0] = g00; gR[p, 0, 1] = g01; gR[p, 0, 2] = g02
+        gR[p, 1, 0] = g10; gR[p, 1, 1] = g11; gR[p, 1, 2] = g12
+        gR[p, 2, 0] = g20; gR[p, 2, 1] = g21; gR[p, 2, 2] = g22
+    return O, gR, gt
+
+
+def pharm_score_grad_se3_batch(R, t, ref_types, fit_types, ref_anchors, fit_anchors,
+                               ref_vectors, fit_vectors, alphas, Ks, cats, *,
+                               N_real=None, M_real=None, NEED_GRAD: bool = True,
+                               BLOCK=None, num_warps=1):
+    """CPU drop-in for the Triton ``pharm_score_grad_se3_batch``. Returns (O, grad_R, grad_t)."""
+    P, N_pad, _ = ref_anchors.shape
+    _, M_pad, _ = fit_anchors.shape
+    dev, dt = ref_anchors.device, ref_anchors.dtype
+
+    def _np(x):
+        return np.ascontiguousarray(x.detach().cpu().numpy())
+    RaA = _np(ref_anchors); FaB = _np(fit_anchors)
+    RvA = _np(ref_vectors); FvB = _np(fit_vectors)
+    RtA = ref_types.detach().cpu().numpy().astype(np.int64)
+    FtB = fit_types.detach().cpu().numpy().astype(np.int64)
+    Rn = _np(R); tn = _np(t)
+    al = alphas.detach().cpu().numpy().astype(np.float64)
+    Ksn = Ks.detach().cpu().numpy().astype(np.float64)
+    cn = cats.detach().cpu().numpy().astype(np.int64)
+    Nr = (np.full(P, N_pad, np.int64) if N_real is None
+          else N_real.detach().cpu().numpy().astype(np.int64))
+    Mr = (np.full(P, M_pad, np.int64) if M_real is None
+          else M_real.detach().cpu().numpy().astype(np.int64))
+    O, gR, gt = _pharm_grad_kernel(RaA, FaB, RvA, FvB, RtA, FtB, Rn, tn, al, Ksn, cn, Nr, Mr, bool(NEED_GRAD))
+    return (torch.as_tensor(O, device=dev, dtype=dt),
+            torch.as_tensor(gR, device=dev, dtype=dt),
+            torch.as_tensor(gt, device=dev, dtype=dt))
+
+
 @torch.no_grad()
 def _batch_self_overlap_esp(P_pad, charges, N_real, alpha: float = 0.81, lam: float = 0.3):
     """ESP self-overlap via the identity pose; CPU replica of _batch_self_overlap_esp."""
