@@ -215,6 +215,30 @@ Multiplicative, all gated: numba **~3.3×** + early-stop (100→~15–20 steps) 
   `1/(105e-6/7·5·15) ≈ **890/core**` — **~2× short with every risky lever maxed.** Honest expectation:
   surf/esp **hold accuracy and land ~400–900/core** (16-core aggregate ~6–14k/s — not the bar).
 
+### Threading check — were the upstream baselines multi-threaded? (NO — effectively single-core)
+
+Verified, because it sets where "single-core" actually sits. **The upstream `docs/performance/timings.md`
+"Jax Batch (1 bucket)" rows are effectively single-core**, on three independent lines of evidence:
+
+1. **Their own scaling data.** vol nr=5 n=10000: 1-bucket **110/s** → "4 cpus/4 buckets" **484/s
+   (4.38×)** → "8 cpus" **507/s (4.58×)**. A near-linear 1→4 jump is **impossible if 1-bucket already
+   used 4 cores** — so 1-bucket ran on ~1 effective core. (It saturates by ~4–8 procs.)
+2. **The design.** Multi-core in JAX-on-CPU requires the *explicit* `shard_map` +
+   `XLA_FLAGS=--xla_force_host_platform_device_count=N` machinery (`alignment/_jax_parallel.py`). The
+   repo *built* that precisely because a single XLA:CPU device does **not** auto-parallelize these tiny
+   per-pair `vmap`/`scan` ops across cores. The "N cpus" rows use it; "1 bucket" does not.
+3. **Measured threading scaling here.** The same torch overlap kernel goes 1→16 threads = only
+   **4.7× (vol) / 5.8× (surf)** — sublinear (memory-bandwidth-bound), matching the upstream's ~4.6×
+   saturation. So even *aggregate* 16-core scaling is ~5–6×, **not 16×**.
+
+**Consequences:** (a) the upstream single-core baselines (nr=5) are vol ~110/s, vol_esp ~124, pharm ~67,
+surf ~6.6, surf+esp ~2.7 — i.e. **my single-core framing was right, and my ~8/s probe is consistent**
+with JAX single-core at the accuracy-safe **nr=50** (~11–30/s; the nr=5 numbers are ~10× higher but
+nr=5 breaks accuracy). (b) Because multi-thread scaling is only ~5–6×, **even the 16-core *aggregate*
+is ~5–6× single-core, not 16×** — so accuracy-safe aggregate is ~150–700/s (vol), revising my earlier
+optimistic ~900–1,400/s down. The threading answer **raises the nr=5 single-core number but does not
+rescue the accuracy-safe goal** — at nr=50 it's ~11–30/s (~70–180× short of 2k/core).
+
 ---
 
 ## Bottleneck table (per mode)
