@@ -6,7 +6,7 @@ import torch
 
 from benchmarks.benchmark import _build_molecule, DRUGS
 from shepherd_score.container import MoleculePair as MP
-import shepherd_score.container._core as cc
+import shepherd_score.container._batch_align as cc
 
 KW = {"vol": dict(alpha=0.81, steps_fine=100), "surf": dict(alpha=0.81, steps_fine=100),
       "esp": dict(alpha=0.81, lam=0.3, num_repeats=50, topk=30, steps_fine=100, lr=0.075),

@@ -23,7 +23,7 @@ from benchmarks.benchmark import make_real_cohort, _build_molecule, DRUGS
 from shepherd_score.container import MoleculePair as MP
 import shepherd_score.alignment.utils.fast_se3 as fse3
 import shepherd_score.alignment.utils.fast_common as fcom
-import shepherd_score.container._core as cc
+import shepherd_score.container._batch_align as cc
 
 dev = torch.device("cuda")
 ATTR = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf",

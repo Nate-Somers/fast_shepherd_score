@@ -281,7 +281,7 @@ def make_real_cohort(mode: str, *, n_pairs: int, bucket_kind: str,
                  (the most populated band) -> single GPU bucket.
       'cross' -> sample across the whole size range -> many buckets.
     """
-    from shepherd_score.container._core import _band_key
+    from shepherd_score.container._batch_align import _band_key
     rng = np.random.default_rng(seed)
 
     mols = [_build_molecule(smi, surf_per_atom=surf_per_atom) for _, smi, _ in DRUGS]
@@ -328,7 +328,7 @@ _SCORE_ATTR = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf",
 
 def _fork_pool_smiles(mode, bucket):
     """SMILES pool a (mode, bucket) cohort samples from, mirroring make_real_cohort."""
-    from shepherd_score.container._core import _band_key
+    from shepherd_score.container._batch_align import _band_key
     tbl = molecule_table(mode, surf_per_atom=SURF_PER_ATOM)        # (name, heavy, count)
     bands = [_band_key(c) for _, _, c in tbl]
     if bucket == "same":
@@ -384,7 +384,7 @@ def _fork_time(mode, pairs, cfg):
 def _fork_clear():
     import torch
     try:
-        import shepherd_score.container._core as cc
+        import shepherd_score.container._batch_align as cc
         cc._ALIGN_WORKSPACES.clear(); cc._INT_BUFFER_CACHE.clear()
     except Exception:
         pass
