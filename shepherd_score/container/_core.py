@@ -198,13 +198,15 @@ def _mgpu_proc_worker(gpu_id, mode, shard_arrays, kwargs, out_q):
     physical GPU, rebuilds stand-ins from numpy, runs the unmodified batched aligner,
     and returns (scores, transforms) as numpy via the queue."""
     try:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)   # before first CUDA call
         import numpy as _np
         import torch as _torch
         from shepherd_score.container._core import (
-            MoleculePair as _MP, _MODE_SPEC as _SPEC, _ProcStandIn as _SI)
+            MoleculePair as _MP, _MODE_SPEC as _SPEC, _ProcStandIn as _SI,
+            _DISPATCH_LOCAL as _DL)
 
-        dev = _torch.device("cuda:0")                      # the one visible GPU
+        _torch.cuda.set_device(gpu_id)
+        _DL.active = True                  # this worker owns ONE GPU -> never re-distribute
+        dev = _torch.device("cuda", gpu_id)
         spec = _SPEC[mode]
         tnames = spec["tensors"]
         standins = []
