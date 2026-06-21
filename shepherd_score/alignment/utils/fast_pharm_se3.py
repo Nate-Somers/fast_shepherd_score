@@ -110,6 +110,37 @@ def coarse_fine_pharm_align_many(
         M_real = anchors_2.new_full((BATCH,), M_pad, dtype=torch.int32)
 
     # ------------------------------------------------------------------
+    # 0) center both pharmacophore clouds (translation-invariant optimisation)
+    # ------------------------------------------------------------------
+    # The SE(3) optimiser couples quaternion + translation in one Adam step. For a
+    # tiny molecule (few pharmacophores -> narrow overlap basin) sitting far from the
+    # origin, a large initial translation offset lets the coupled update drift out of
+    # that narrow basin to a wrong local optimum (more fine steps do not help -- it is
+    # a basin, not a convergence, problem). Centering each cloud on its own centroid
+    # (over REAL points only) makes the optimisation translation-invariant, so the fit
+    # starts on top of the ref and the basin is wide. The overlap SCORE is unchanged
+    # by this shift (translation-invariant); we fold the centroids back into the
+    # returned translation so the transform still maps the ORIGINAL fit -> ORIGINAL
+    # ref. Direction VECTORS are NOT shifted (they are not positions).
+    _N_real_l = N_real.to(device=device, dtype=anchors_1.dtype)
+    _M_real_l = M_real.to(device=device, dtype=anchors_2.dtype)
+    _mask_n = (torch.arange(N_pad, device=device)[None] <
+               _N_real_l[:, None]).to(anchors_1.dtype)                  # (BATCH, N_pad)
+    _mask_m = (torch.arange(M_pad, device=device)[None] <
+               _M_real_l[:, None]).to(anchors_2.dtype)                  # (BATCH, M_pad)
+    c_ref = (anchors_1 * _mask_n.unsqueeze(-1)).sum(1) / \
+        _N_real_l.clamp(min=1).unsqueeze(-1)                            # (BATCH, 3)
+    c_fit = (anchors_2 * _mask_m.unsqueeze(-1)).sum(1) / \
+        _M_real_l.clamp(min=1).unsqueeze(-1)                            # (BATCH, 3)
+    anchors_1 = anchors_1 - c_ref[:, None, :]
+    anchors_2 = anchors_2 - c_fit[:, None, :]
+    # Legacy translation-seeded path: trans_centers are points in the ORIGINAL ref
+    # frame, so they must be shifted into the centered ref frame too (else the
+    # seeded translations would be off by c_ref).
+    if trans_centers is not None:
+        trans_centers = trans_centers - c_ref[:, None, :]
+
+    # ------------------------------------------------------------------
     # 1) pose hypotheses
     # ------------------------------------------------------------------
     if trans_centers is None:
@@ -324,9 +355,21 @@ def coarse_fine_pharm_align_many(
     best = final_score.argmax(dim=1)
     sel = best + torch.arange(BATCH, device=device) * P
 
-    return (final_score.flatten()[sel],
-            best_q[sel],
-            best_t[sel])
+    out_score = final_score.flatten()[sel]
+    out_q = best_q[sel]
+    out_t = best_t[sel]
+
+    # Fold the centering back into the returned translation so the SE(3) transform
+    # still maps ORIGINAL fit -> ORIGINAL ref (row-vector convention,
+    # aligned = fit @ R.T + t). On centered clouds we solved
+    #   (fit - c_fit) @ R.T + t_c  ~=  (ref - c_ref)
+    # => fit @ R.T + (t_c - R @ c_fit + c_ref) ~= ref, so the original-frame
+    # translation is  t = t_c - R @ c_fit + c_ref.
+    R_out = _rotation_matrix_from_unit_quat(
+        torch.nn.functional.normalize(out_q, dim=1))                   # (BATCH, 3, 3)
+    out_t = out_t - torch.einsum('bij,bj->bi', R_out, c_fit) + c_ref
+
+    return (out_score, out_q, out_t)
 
 
 def fast_optimize_pharm_overlay(
