@@ -1,17 +1,14 @@
 """
-Figure 4 — the electrostatic term carries information orthogonal to shape.
+Figure 4 — ESP carries information orthogonal to shape (with uncertainty + a polarity axis).
 
-Left : ESP similarity of each benzene-analog (shape-aligned to benzene) vs the ESP
-       weight. At the default lam=0.3 ESP ≈ shape (all analogs bunched); as the ESP
-       weight increases (lam ↓) the lines fan out — polar analogs (nitrobenzene,
-       benzaldehyde) are pushed down, nonpolar ones (toluene) stay put.
-Right: shape vs ESP similarity at a discriminating weight (lam=0.003). Shape ranks
-       every analog ~0.6-0.7 (all benzene-shaped); ESP pushes the polar analogs
-       below the diagonal — electrostatic information shape cannot see.
-
-Honest point: ESP's effect on the Tanimoto score is weight-dependent and modest at
-the default lam; its discriminative value is real but must be surfaced by lam (and
-physical xTB charges). The decisive utility test is retrieval enrichment (fig5).
+  A  ESP similarity to benzene vs ESP weight λ, one line per shape-matched analog
+     (mean ± SD over replicates), coloured by polarity.  Default λ=0.3 marked — there the
+     lines are bunched (ESP ~inert); they fan out only at small λ.
+  B  Discrimination = SD across analogs, for ESP(λ) (mean ± SD band) vs the shape-only
+     baseline.  ESP exceeds shape only at small λ — the honest, quantified version of the
+     "ESP adds information" claim.
+  C  ESP signal (shape − ESP at the discriminating λ) vs molecular dipole magnitude
+     (from xTB charges).  The separation tracks electrostatics, not residual shape.
 """
 import json
 import os
@@ -23,64 +20,74 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from paper.common import set_style, save_fig  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CLS_COLOR = {"nonpolar": "#1a9850", "weak": "#1f6fb2", "polar": "#e08e2a", "strong": "#c0392b"}
-CLS_ORDER = ["nonpolar", "weak", "polar", "strong"]
+CLS_COLOR = {"nonpolar": "#1a9850", "weak": "#66bd63", "polar": "#f46d43", "strong": "#a50026"}
+DISC_LAM = 0.003   # the discriminating weight used for panel C
 
 
 def main():
     plt = set_style()
     with open(os.path.join(HERE, "analog_esp.json")) as fh:
-        data = json.load(fh)
-    rows = data["rows"]
-    lams = data["lams"]
+        d = json.load(fh)
+    lams = d["lams"]; rows = d["rows"]; nrep = d.get("n_rep", 1)
 
-    fig, (axA, axB) = plt.subplots(1, 2, figsize=(13.5, 5.6))
+    fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(16.5, 5.2))
 
-    # ---- A: ESP vs weight (lam), one line per analog ----
-    x = np.array(lams)
+    # ---- A: esp vs lam per analog, mean +/- SD ----
     for r in rows:
-        ys = [r["esp"][str(l)] if str(l) in r["esp"] else r["esp"][l] for l in lams]
-        # JSON keys may be floats stringified; handle both
-        ys = [r["esp"].get(l, r["esp"].get(str(l))) for l in lams]
-        axA.plot(x, ys, marker="o", ms=4, lw=1.8, color=CLS_COLOR[r["cls"]], alpha=0.9)
-        axA.annotate(r["name"], (x[-1], ys[-1]), fontsize=7, color=CLS_COLOR[r["cls"]],
-                     xytext=(3, 0), textcoords="offset points", va="center")
-    axA.set_xscale("log")
-    axA.invert_xaxis()                                   # stronger ESP (smaller lam) -> right
-    axA.axvline(0.3, color="#888", ls=":", lw=1.2)
-    axA.text(0.3, axA.get_ylim()[1], " default\n lam=0.3", fontsize=7.5, color="#888",
-             va="top", ha="left")
-    axA.set_xlabel("ESP weight:  lam (log, decreasing →  stronger electrostatics)")
-    axA.set_ylabel("ESP similarity to benzene (at shape pose)")
-    axA.set_title("ESP discrimination emerges as the ESP weight increases")
-    handles = [plt.Line2D([0], [0], color=CLS_COLOR[c], lw=2.4, label=c) for c in CLS_ORDER]
-    axA.legend(handles=handles, title="polarity", fontsize=8.5, loc="lower left")
+        ys = np.array([r["esp_mean"][str(l)] for l in lams])
+        es = np.array([r["esp_std"][str(l)] for l in lams])
+        col = CLS_COLOR[r["cls"]]
+        axA.plot(lams, ys, "-o", color=col, ms=3.5, lw=1.4, alpha=0.85)
+        axA.fill_between(lams, ys - es, ys + es, color=col, alpha=0.13, lw=0)
+        axA.text(lams[-1] * 0.92, ys[-1], r["name"], fontsize=7.2, va="center", ha="right", color=col)
+    axA.set_xscale("log"); axA.invert_xaxis()
+    axA.axvline(0.3, color="#444", ls="--", lw=1.1)
+    axA.text(0.3, axA.get_ylim()[0], " default λ=0.3", fontsize=8, va="bottom", ha="left", color="#444")
+    axA.set_xlabel("ESP weight λ  (→ stronger ESP)")
+    axA.set_ylabel("ESP similarity to benzene")
+    axA.set_title("A · ESP(λ) per shape-matched analog")
 
-    # ---- B: shape vs ESP at a discriminating lam ----
-    lam_b = 0.003
-    sh = np.array([r["shape"] for r in rows])
-    ep = np.array([r["esp"].get(lam_b, r["esp"].get(str(lam_b))) for r in rows])
-    lo, hi = min(sh.min(), ep.min()) - 0.03, max(sh.max(), ep.max()) + 0.03
-    axB.plot([lo, hi], [lo, hi], color="#999", ls="--", lw=1.2, zorder=1)
-    for r, s, e in zip(rows, sh, ep):
-        axB.scatter(s, e, s=70, color=CLS_COLOR[r["cls"]], alpha=0.85, edgecolor="white",
-                    linewidth=0.6, zorder=2)
-        axB.annotate(r["name"], (s, e), fontsize=7, xytext=(5, -1),
-                     textcoords="offset points", color="#444")
-    axB.set_xlim(lo, hi); axB.set_ylim(lo, hi); axB.set_aspect("equal")
-    axB.set_xlabel("shape similarity to benzene (surf Tanimoto)")
-    axB.set_ylabel(f"shape+ESP similarity (esp Tanimoto, lam={lam_b})")
-    axB.set_title("Shape ranks all analogs alike; ESP separates by polarity")
-    axB.text(0.04, 0.96, "polar analogs fall\nbelow the diagonal\n(ESP penalty)",
-             transform=axB.transAxes, ha="left", va="top", fontsize=8.5, color="#666",
-             style="italic")
+    # ---- B: discrimination vs lam ----
+    dm = np.array([d["discrimination"][str(l)]["mean"] for l in lams])
+    ds = np.array([d["discrimination"][str(l)]["std"] for l in lams])
+    axB.plot(lams, dm, "-o", color="#1a9850", lw=1.8, label="ESP discrimination")
+    axB.fill_between(lams, dm - ds, dm + ds, color="#1a9850", alpha=0.15, lw=0)
+    sh = d["shape_discrimination"]
+    axB.axhline(sh["mean"], color="#7b3294", ls="--", lw=1.4, label="shape-only baseline")
+    axB.fill_between(lams, sh["mean"] - sh["std"], sh["mean"] + sh["std"], color="#7b3294", alpha=0.10, lw=0)
+    axB.set_xscale("log"); axB.invert_xaxis()
+    axB.axvline(0.3, color="#444", ls="--", lw=1.0)
+    axB.set_xlabel("ESP weight λ  (→ stronger ESP)")
+    axB.set_ylabel("discrimination = SD across analogs")
+    axB.set_title("B · ESP out-discriminates shape only at small λ")
+    axB.legend(fontsize=8.5, loc="upper left")
 
-    fig.suptitle("The electrostatic term carries information orthogonal to shape "
-                 "(benzene-analog series, xTB charges)", fontsize=12.5, y=1.01)
+    # ---- C: ESP signal vs dipole ----
+    x = np.array([r["dipole_mean"] for r in rows])
+    xe = np.array([r["dipole_std"] for r in rows])
+    drop = np.array([r["shape_mean"] - r["esp_mean"][str(DISC_LAM)] for r in rows])
+    drop_e = []
+    for r in rows:
+        per = np.array(r["shape_all"]) - np.array(r["esp_all"][str(DISC_LAM)])
+        drop_e.append(float(np.std(per)))
+    drop_e = np.array(drop_e)
+    for r, xi, xei, yi, yei in zip(rows, x, xe, drop, drop_e):
+        col = CLS_COLOR[r["cls"]]
+        axC.errorbar(xi, yi, xerr=xei, yerr=yei, fmt="o", color=col, ms=7, capsize=2)
+        axC.annotate(r["name"], (xi, yi), fontsize=7, xytext=(4, 3), textcoords="offset points")
+    if np.std(x) > 0:
+        rho = float(np.corrcoef(x, drop)[0, 1])
+        axC.text(0.04, 0.96, f"Pearson r = {rho:.2f}", transform=axC.transAxes, va="top", fontsize=9,
+                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#ccc", alpha=0.9))
+    axC.set_xlabel("molecular dipole magnitude (Debye, xTB)")
+    axC.set_ylabel(f"ESP signal = shape − ESP@λ={DISC_LAM:g}")
+    axC.set_title("C · the separation tracks electrostatics")
+
+    fig.suptitle("ESP carries electrostatic information orthogonal to shape — weight-dependent, quantified",
+                 fontsize=13, y=1.02, fontweight="bold")
     fig.text(0.5, -0.04,
-             "shape-matched analogs: shape similarity is ~uniform; ESP (appropriately "
-             "weighted) separates nonpolar from polar.  Effect is modest at the default "
-             "lam=0.3 — see README.",
+             f"benzene-analog series · xTB charges · {nrep} replicates (conformer seed + surface resampling) · "
+             f"shape-first alignment, ESP scored at the fixed shape pose · {d.get('gpu','')}",
              ha="center", fontsize=8, color="#777")
     fig.tight_layout()
     save_fig(fig, os.path.join(HERE, "fig4_esp_value"))

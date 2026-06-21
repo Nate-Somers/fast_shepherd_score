@@ -1,0 +1,66 @@
+{
+  "fss": {
+    "gpu": "NVIDIA L40S",
+    "n_queries": 8,
+    "n_library": 3986,
+    "fss_seeds": 50,
+    "steps": 100,
+    "throughput": {
+      "vol": {
+        "n_pairs": 31888,
+        "prep_s": 1.7653309300076216,
+        "compute_s": 0.46960705899982713,
+        "reps": 5,
+        "compute_pairs_per_s": 67903.578936644,
+        "endtoend_pairs_per_s": 14267.957391588157
+      },
+      "surf": {
+        "n_pairs": 31888,
+        "prep_s": 1.8027208240237087,
+        "compute_s": 16.180341817991575,
+        "reps": 2,
+        "compute_pairs_per_s": 1970.7865481891392,
+        "endtoend_pairs_per_s": 1773.224096183566
+      }
+    },
+    "selfcopy": {
+      "vol": {
+        "mean": 1.0000000262260438,
+        "min": 0.9999995827674866,
+        "p10": 1.0,
+        "n": 500
+      },
+      "surf": {
+        "mean": 0.8591940100193024,
+        "min": 0.807210385799408,
+        "p10": 0.8423181891441345,
+        "n": 500
+      }
+    }
+  },
+  "roshambo2": {
+    "gpu": "NVIDIA L40S",
+    "n_queries": 8,
+    "n_library": 3986,
+    "start_mode": 2,
+    "steps": 100,
+    "throughput": {
+      "shape": {
+        "n_pairs": 31888,
+        "prep_s": 1.5597308480064385,
+        "compute_s": 1.801703829987673,
+        "reps": 5,
+        "compute_pairs_per_s": 17698.802360995243,
+        "endtoend_pairs_per_s": 9486.425605339655
+      }
+    },
+    "selfcopy": {
+      "shape": {
+        "mean": 1.0000001952648163,
+        "min": 0.9999984502792358,
+        "p10": 0.9999991655349731,
+        "n": 500
+      }
+    }
+  }
+}

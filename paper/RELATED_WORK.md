@@ -227,26 +227,42 @@ contradicts the gap.
 Figures + harnesses live in the untracked `paper/` dir (one subfolder per figure;
 each has run/plot/README). Produced on this machine (RTX 4050 + WSL `SimModelEnv`):
 
-- **Fig 1 — backend parity** ✅: Triton GPU kernels reproduce the JAX reference
-  (mean&#124;Δ&#124; 1–4e-3, ρ≥0.996, 105 pairs) → speed didn't change the math.
-- **Fig 2 — throughput/scaling** ✅: real 6-GPU data; up to ~178k pairs/s (H100).
-  *Multi-GPU scaling is sub-linear (L40S 1→4 GPU ~1.5× avg) — not claimed.*
-- **Fig 3 — speed + capability vs CPU tools** ✅: USRCAT/O3A faster but no ESP
-  overlay; ESP-Sim is the only other aligned shape+ESP tool and is CPU-bound (L40S
-  esp ≈28× ESP-Sim). Capability matrix = fss is the only ESP+pharm+GPU+open cell.
-- **Fig 4 — ESP carries orthogonal info** ✅: separates shape-matched analogs by
-  polarity — **but weight-dependent (see caveat below)**.
-- **Fig 5 — head-to-head vs ROSHAMBO2** 🧩: harness ready; needs CUDA toolkit +
-  datacenter GPU (no published apples-to-apples benchmark exists → contribution).
-- **Fig 6 — enrichment + ESP ablation** 🧩: pipeline (conformers→xTB→AUC/EF/BEDROC)
-  built + smoke-tested; needs DUDE-Z/LIT-PCBA. The decisive ESP-utility test.
+- **Fig 1 — backend parity** ✅: Triton GPU kernels reproduce the reference scoring.
+  At a *fixed pose* the fp32 GPU kernels agree with the fp64 NumPy reference to ~1e-6;
+  the larger end-to-end aligned residual (~1e-3) is **optimizer-trajectory divergence**
+  (the multi-start seeds are deterministic & identical across backends), a small
+  *systematic* fp32-vs-fp64 offset — **not "random-restart noise"** (the old caption was
+  wrong and is corrected).
+- **Fig 2 — throughput/scaling** ✅: high GPU throughput that scales with batch size then
+  **saturates (launch/host-bound)** at large batch. Re-measured per-rep (mean±SD) in one
+  controlled env. *Throughput does NOT order cleanly by GPU "generation"* (e.g. surf
+  separates cards, vol saturates ~equal) — so we claim batch-scaling + high absolute
+  throughput, not generational scaling (the old claim was unsupported by our own data).
+- **Fig 3 — speed + capability vs CPU tools** ✅: USRCAT/O3A faster but no ESP overlay;
+  ESP-Sim is the only other aligned shape+ESP tool and is CPU-bound. Now **same-machine**
+  (fss GPU + baselines on that node's CPU), mean±SD — the ESP speedup is a real on-machine
+  number, not a cross-hardware extrapolation. Capability matrix = fss is the only
+  ESP+pharm+GPU+open cell.
+- **Fig 4 — ESP carries orthogonal info** ✅: separates shape-matched analogs by polarity,
+  now with **uncertainty bands (12 replicates)** and a **dipole axis** showing the signal
+  tracks electrostatics — weight-dependent (discriminates at small λ; see below).
+- **Fig 5 — head-to-head vs ROSHAMBO2** ✅ **DONE**: built ROSHAMBO2 from source; on one
+  L40S over identical conformers, **fss `vol` (atom Gaussian) = 67.9k pairs/s vs ROSHAMBO2
+  shape 17.7k → 3.8× faster (compute), both recovering self-overlap 1.000**. The first
+  apples-to-apples open-GPU shape benchmark in the literature.
+- **Fig 6 — enrichment + ESP ablation** ✅ **DONE**: DUD-E retrospective screen,
+  multi-query + bootstrap CIs, equal optimization budget. **Adding aligned ESP to shape
+  improves active retrieval on charged pockets** (e.g. ACES: ΔAUC +0.25, CI [+0.15,+0.34],
+  8/8 queries at λ=0.003) and is pocket-specific (little/no benefit on hydrophobic
+  controls). The decisive ESP-utility evidence — now in hand.
 
-> ⚠️ **Pivotal finding (Fig 4): the ESP-Tanimoto term is shape-dominated at the
-> package default `lam=0.3`** (adds ~no electrostatic discrimination on real
-> molecules, MMFF *and* xTB charges). ESP becomes discriminative only at smaller
-> `lam` (~0.01–0.003). The "aligned ESP differentiator" is real but **must be
-> presented carefully** — justify/expose `lam`, consider the additive ShaEP-style
-> `esp_combo`, and make Fig 6 enrichment the load-bearing ESP-utility evidence.
+> ✅ **Pivotal finding RESOLVED (Figs 4 + 6): the ESP-Tanimoto term is shape-dominated at
+> the package default `lam=0.3`** and discriminates only at smaller `lam` (~0.01–0.003).
+> Fig 6 turns this from a caveat into the headline: across a λ sweep, the *retrieval* gain
+> from ESP grows exactly as λ decreases (ACES ΔAUC +0.016 at λ=0.3 → +0.25 at λ=0.003),
+> and the gain is concentrated on electrostatically-driven pockets. So the paper should
+> **expose `lam` and report the sweep**; the ESP differentiator is real, weight-tunable,
+> and demonstrably useful where chemistry says it should be.
 
 ## 6. Caveats (carry into the paper)
 
@@ -266,7 +282,7 @@ each has run/plot/README). Produced on this machine (RTX 4050 + WSL `SimModelEnv
 - [x] **Pass 2:** Silicos (Shape-it MIT, Pharao/Align-it LGPL), SHAFTS, USR/USRCAT/ElectroShape (verified). ElectroShape confirmed alignment-free.
 - [ ] **Spot-check the 5 budget-dropped tools** (sources in hand, not adversarially verified): confirm **ESP-Sim** is CPU-only + its exact ESP definition; confirm **ShaEP** CPU + canonical cite (Vainio/Puranen/Johnson *JCIM* 2009, likely [10.1021/ci800315d](https://doi.org/10.1021/ci800315d)); confirm **gWEGA is shape-only** (the one open *GPU* tool left to rule out for ESP); pin **O3A**/**Pharmer**/**LS-align** licenses.
 - [ ] Confirm **SHAFTS** license (unestablished).
-- [ ] Run a controlled **`fast_shepherd_score` vs ROSHAMBO2** GPU benchmark (same hardware/library) for a fair speed claim; cross-ref `SPEED_EXPERIMENTS.md`.
+- [x] Run a controlled **`fast_shepherd_score` vs ROSHAMBO2** GPU benchmark (same hardware/library) for a fair speed claim → **done, Fig 5** (L40S; fss vol 3.8× ROSHAMBO2 shape, both recover self-overlap 1.0).
 - [ ] Decide framing: emphasize **aligned ESP** (capability gap) vs **speed** (FastROCS/ROSHAMBO2 parity) vs **MIT license** (reuse) — likely all three, **ESP-first**.
 - [ ] Draft the actual "Related Work" paragraph(s) from §2–§5 once the spot-checks land.
 
