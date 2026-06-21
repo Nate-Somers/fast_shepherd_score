@@ -1,0 +1,11 @@
+import torch
+def s(l): print(f"  {l}: cuda_init={torch.cuda.is_initialized()}", flush=True)
+s("start")
+import shepherd_score.score.constants as _; s("score.constants")
+import shepherd_score.generate_point_cloud as _; s("generate_point_cloud")
+import shepherd_score.score.gaussian_overlap as _; s("score.gaussian_overlap")
+import shepherd_score.score.electrostatic_scoring as _; s("score.electrostatic_scoring")
+import shepherd_score.score.pharmacophore_scoring as _; s("score.pharmacophore_scoring")
+import shepherd_score.alignment as _; s("alignment")
+import shepherd_score.alignment.utils.fast_se3 as _; s("alignment.utils.fast_se3")
+import shepherd_score.alignment.utils.fast_common as _; s("alignment.utils.fast_common")

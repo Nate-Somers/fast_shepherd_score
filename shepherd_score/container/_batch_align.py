@@ -859,11 +859,12 @@ def _esp_bucketed_align(
                 N_real=N_real[sl], M_real=M_real[sl],
                 trans_centers_batch=tcb, trans_centers_real=tcr,
                 num_repeats_per_trans=num_repeats_per_trans,
+                num_seeds=(_NUM_SEEDS or 50),
                 topk=topk, steps_fine=steps_fine, lr=lr,
             )
             return sc, q, t
         scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=(subbatch_tag, N_pad, M_pad, 50))
+            _proc, K, key=(subbatch_tag, N_pad, M_pad, (_NUM_SEEDS or 50)))
 
         all_pairs.extend(bucket)
         all_scores.append(scores)

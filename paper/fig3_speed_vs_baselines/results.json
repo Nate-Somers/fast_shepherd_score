@@ -1,0 +1,18 @@
+{
+  "_meta": {
+    "gpu": "NVIDIA GeForce RTX 4050 Laptop GPU",
+    "n_pairs": 30,
+    "n_cpu_pairs": 16
+  },
+  "throughput": {
+    "USRCAT": 360420.9947317574,
+    "RDKit O3A": 1440.5940088936898,
+    "ESP-Sim": 1032.524770971731,
+    "fss (CPU) esp": 2.0135621725856283,
+    "fss (GPU) vol": 27999.53647253754,
+    "fss (GPU) surf": 8336.24550723845,
+    "fss (GPU) esp": 1647.1743110968087,
+    "fss (GPU) pharm": 2912.147743835797
+  },
+  "scores": {}
+}
