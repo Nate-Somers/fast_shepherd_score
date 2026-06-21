@@ -158,10 +158,12 @@ Notes:
   Triton. (Numerically exact vs the Triton path: GPU-vs-CPU agreement ~1e-3, self-copy
   stays 1.000.) All five modes (`vol`/`vol_esp`/`surf`/`esp`/`pharm`) run the numba batched
   kernel on CPU; `pharm` falls back to the per-pair legacy optimizer only when numba is
-  absent. (Like the GPU batched path, the batched `pharm` aligner is slightly less robust
-  than the per-pair optimizer for molecules with very few pharmacophores — `numba` and
-  `triton` can land in different basins there.) `esp_combo` is **excluded** (its CPU path
-  is not tuned/validated) and raises `NotImplementedError`.
+  absent. (The batched `pharm` aligner now **centers each pair's clouds** before the
+  coarse-to-fine optimization — a translation-invariant fix that recovers self-copy to
+  ~1.0 even for molecules with very few pharmacophores, on both backends, at no throughput
+  cost; this also removes a `numba`-vs-`triton` basin divergence in that regime.)
+  `esp_combo` is **excluded** (its CPU path is not tuned/validated) and raises
+  `NotImplementedError`.
 - The Triton/numba `vol`/`vol_esp` backends align **heavy atoms only** (`no_H=True`); passing
   `no_H=False` raises `NotImplementedError`.
 - `max_num_steps` maps to the Triton optimizer's fine-step count.
