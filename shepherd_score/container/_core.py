@@ -1226,7 +1226,8 @@ class MoleculePair:
 
         # -------------------------- NumPy -----------------------------------
         else:  # 'np' / 'numpy'
-            import numpy as np
+            # NB: do NOT `import numpy as np` here — it would shadow the module-level
+            # `np` and make the jax branch's `np.array(score)` raise UnboundLocalError.
             from shepherd_score.score.gaussian_overlap_np import get_overlap_np
 
             score = get_overlap_np(
