@@ -28,8 +28,8 @@ shepherd_score/
 │   ├── gaussian_overlap_triton.py          # NEW: fused value+gradient shape (ROCS) overlap
 │   ├── gaussian_overlap_esp_triton.py      # NEW: + electrostatic-potential (ESP) weighting
 │   ├── pharmacophore_overlap_triton.py     # NEW: typed/directional pharmacophore overlap
-│   ├── pharmacophore_grad_triton.py        # NEW: pharmacophore value+SE(3) gradient
-│   └── __init__.py                         # modified: lazy convenience wrapper (gaussian_tanimoto)
+│   │                                       #   (pure PyTorch despite the _triton filename)
+│   └── pharmacophore_grad_triton.py        # NEW: the Triton pharmacophore value+SE(3) gradient kernel
 │
 ├── alignment/utils/                    # ── Layer 2: batched coarse-to-fine optimizers
 │   ├── fast_common.py                      # NEW: batched SE(3) seed generation, quaternion ops
@@ -66,7 +66,7 @@ not tuned or validated).
 
 ### Changes to existing upstream files
 
-The 14 modules above are **new**. Beyond them, the fork touches only **8 existing upstream
+The 13 modules above are **new**. Beyond them, the fork touches only **6 existing upstream
 files**; the table below accounts for every one (Δlines = real diff vs
 [`coleygroup/shepherd-score`](https://github.com/coleygroup/shepherd-score), ignoring
 line-ending noise). Everything else in the package is byte-identical to upstream, and **no
@@ -74,12 +74,10 @@ upstream file was deleted**.
 
 | File | Δlines | What changed |
 |---|--:|---|
-| `container/_batch.py` | +218 | **The public seam.** Adds `_TRITON_BACKENDS` and the `_triton_align()` router, plus a `backend="jax"` (default) argument on every `align_with_*` method. `backend` in `{"triton","cuda","gpu"}` routes to the batched `MoleculePair._align_batch_*` GPU path; `"jax"` runs the original path unchanged; any other value raises. |
+| `container/_batch.py` | +218 | **The public seam.** Adds `_TRITON_BACKENDS` and the `_triton_align()` router, plus a `backend="jax"` (default) argument on every `align_with_*` method (and a brand-new `align_with_esp_combo` batch method — the other five already existed upstream). `backend` in `{"triton","cuda","gpu"}` routes to the batched `MoleculePair._align_batch_*` GPU path; `"jax"` runs the original path unchanged; any other value raises. |
 | `container/_core.py` | +276 | Binds the `_align_batch_*` static methods (defined in the new `_batch_align.py`) onto `MoleculePair`; adds an **opt-in** `use_fast=False` kwarg gating the per-pair Triton fast path on `align_with_esp` / `align_with_esp_combo` / `align_with_pharm` (default preserves the original torch/analytical behavior and honors `use_analytical`); adds a `score_with_vol()` helper. |
 | `alignment/utils/se3.py` | +84 | Adds batched SE(3) builders `quaternion_to_SE3` / `quaternions_to_SE3_batch` (the GPU write-back uses the batched form); reworks `apply_SE3_transform` to a single fused `baddbmm` that collapses a singleton batch — the upstream parameter name (`SE3_transform`) and the three shape-validation checks are retained. |
-| `score/__init__.py` | +19 | Adds a `gaussian_tanimoto()` convenience wrapper that uses the Triton kernel when CUDA + Triton are present and otherwise falls back to the original torch `get_overlap`. |
 | `generate_point_cloud.py` | +17 | Makes the Open3D import **lazy** (`from __future__ import annotations` + a `_LazyOpen3D` proxy). Open3D is a ~30 s cold import and is fork-hostile (it breaks a later `fork`+CUDA), so deferring it keeps `import shepherd_score` fast and lets the fork-based multi-GPU pool work. Behavior is identical on first real surface use. |
-| `objective.py` | +2 | One import line: `get_overlap` now resolves to the new `score.gaussian_tanimoto` wrapper instead of `gaussian_overlap.get_overlap`. |
 | `protonation/protonate.py` | +2 | Adds `from __future__ import annotations` (deferred annotation evaluation; no behavior change). |
 | `alignment/_torch.py` | +8 | Cosmetic only — three trailing commas, one blank line, one comment. (The previously-added dead `VAA_const` parameter was removed, restoring the exact upstream `objective_ROCS_overlay` signature.) |
 
@@ -234,7 +232,7 @@ last decimal.
    | mode | before | after | speedup |
    |---|--:|--:|:--:|
    | vol   | 23,700 | **54,800** | 2.3× |
-   | surf  | 16,500 | **29,400** | 1.8× |
+   | surf  | 16,500 | **28,900** | 1.76× |
    | esp   | 5,700  | **8,000**  | 1.4× |
    | pharm | 6,200  | **11,800** | 1.9× |
 
@@ -246,7 +244,7 @@ last decimal.
    bit-identical, ~1.15× (vol) / ~1.28× (surf). (ESP/pharm keep patience 5; they converge
    slower.) This is exposed as a tunable (`FINE_ES_PATIENCE`) used by the speed-lab harness.
 9. **Kernel occupancy & schedule tuning.** Small tiles (one warp per CTA) suit the tiny
-   per-pose problems; the BLOCK size and kernel schedules (`num_stages`, `maxnreg`) are now
+   per-pose problems; the BLOCK size and kernel schedule (`num_warps`, `num_stages`) are now
    selected per problem shape via `@triton.autotune` and validated to be bit-identical.
 
 ### D. Multi-GPU & very large batches (cluster / L40S work)
@@ -284,7 +282,7 @@ on a 4-GPU node, not the explicit `multi_gpu.py` driver; **bold** = fastest per 
 |---|--:|--:|--:|--:|--:|--:|
 | vol   | 54,200 | 160,500 | 160,200     | 174,400 | **177,600** | 165,700 |
 | surf  | 28,800 | 81,700  | **125,800** | 108,800 | 65,700      | 70,600  |
-| esp   | 8,500  | 32,100  | **72,400**  | 48,900  | 28,500      | 31,800  |
+| esp   | 8,500  | 32,100  | **70,500**  | 48,900  | 28,500      | 31,800  |
 | pharm | 23,300 | 57,300  | **83,900**  | 64,500  | 67,800      | 74,800  |
 
 ![Molecular-alignment throughput across GPUs](benchmarks/results/speed_all_hardware.png)
@@ -294,7 +292,7 @@ because the post-F3 host path (~4 µs/pair) finally *feeds* a fast GPU instead o
 starving it; on the laptop the small GPU is the ceiling, so it sits at ~54k. A
 second-through-fourth L40S GPU mostly helps the heavier modes at large batch (surf/esp/pharm
 at 100k, where automatic sharding engages above ~4,096 pairs/device — though, being
-host/GIL-bound, it gains only ~1.5–2.3× there, not ~4×); `vol` already saturates one card,
+host/GIL-bound, it gains only ~1.0–2.3× there, not ~4×); `vol` already saturates one card,
 so 1- and 4-GPU `vol` match.
 
 *(laptop: RTX 4050 · Core Ultra 9 185H · torch 2.5.1 / CUDA 12.4. Cluster cards
