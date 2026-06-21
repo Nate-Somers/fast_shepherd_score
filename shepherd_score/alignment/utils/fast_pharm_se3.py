@@ -9,13 +9,9 @@ from ...score.pharmacophore_overlap_triton import (
     batch_pharm_self_overlap,
     pharm_similarity_from_overlaps,
 )
-try:
-    from ...score.gaussian_overlap_triton import fused_adam_qt
-    from ...score.pharmacophore_grad_triton import pharm_score_grad_se3_batch
-except ImportError:
-    # CPU-only box (no triton): numba pharm value+grad kernel + torch Adam.
-    # (pharmacophore_overlap_triton is pure PyTorch, so its imports above need no guard.)
-    from .cpu_overlap import fused_adam_qt, pharm_score_grad_se3_batch
+# Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
+# (pharmacophore_overlap_triton, imported above, is pure PyTorch and needs no dispatch.)
+from .kernel_dispatch import fused_adam_qt, pharm_score_grad_se3_batch
 from ...score.analytical_gradients._torch import build_lookup_tables
 from . import fast_common as _fc
 from .fast_common import (
@@ -207,8 +203,11 @@ def coarse_fine_pharm_align_many(
     # faster, and -- unlike the analytical torch path -- it handles N_real/M_real
     # masking, so it also covers padded buckets (which previously fell back to the
     # slow per-step autograd path). It implements the base overlap; extended_points
-    # keeps the analytical/autograd fallback.
-    use_kernel = (not extended_points) and anchors_1_k.is_cuda
+    # keeps the analytical/autograd fallback. The kernel is device-dispatched (Triton on
+    # CUDA, numba on CPU via kernel_dispatch), so it runs on both -- no is_cuda gate.
+    # Self- and cross-overlaps both go through it, so the Tanimoto convention stays
+    # consistent on either device.
+    use_kernel = (not extended_points)
     use_analytical = use_kernel or bool((N_k == N_pad).all() and (M_k == M_pad).all())
     _pk_tables = None
     if use_analytical:

@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import torch, math, os
 import torch.nn.functional as F
-try:
-    from ...score.gaussian_overlap_triton import overlap_score_grad_se3_batch, fused_adam_qt, fused_adam_qt_with_tangent_proj, _batch_self_overlap, fused_surf_step_batch
-    _HAS_TRITON = True
-except ImportError:
-    # CPU-only box (no triton/CUDA): use the numba/torch fallbacks so the entire
-    # batched coarse-to-fine driver runs on CPU. GPU behaviour is unchanged when
-    # triton is present (this except branch never executes).
-    from .cpu_overlap import overlap_score_grad_se3_batch, fused_adam_qt, fused_adam_qt_with_tangent_proj, _batch_self_overlap, fused_surf_step_batch
-    _HAS_TRITON = False
+# Kernels are dispatched per-call by tensor device (Triton on CUDA, numba on CPU) via
+# kernel_dispatch, so one process can run both -- e.g. backend="numba" runs CPU tensors
+# through the numba kernels even on a GPU box. ``_HAS_TRITON`` is kept for external /
+# diagnostic consumers; it no longer drives kernel selection (the device does).
+from .kernel_dispatch import (
+    overlap_score_grad_se3_batch, fused_adam_qt, fused_adam_qt_with_tangent_proj,
+    _batch_self_overlap, fused_surf_step_batch, _HAS_TRITON,
+)
 from .fast_common import batched_seeds_torch
 from .._torch import objective_ROCS_overlay
 from typing import Optional
@@ -398,7 +397,7 @@ def coarse_fine_align_many(
     # Takes priority when enabled; targets the launch-bound regime the graph
     # path doesn't cover (large P). Same per-step math + early-stop as the eager
     # reference, so it is a drop-in. Disabled by default (FINE_FUSED_STEP).
-    if (_FINE_FUSED and torch.cuda.is_available() and A_batch.dtype == torch.float32):
+    if (_FINE_FUSED and A_batch.is_cuda and A_batch.dtype == torch.float32):
         try:
             best_score, best_q, best_t = _run_fused_fine(
                 A_k, B_k, q_seed, t_seed, N_k, M_k, VAA_plus_VBB, alpha, lr, steps_fine)
@@ -406,7 +405,7 @@ def coarse_fine_align_many(
             best_score = None                              # fused failed -> graph/eager
 
     # --- CUDA-graph fast path for the launch-bound small-batch regime --------
-    if (best_score is None and _FINE_GRAPHS and torch.cuda.is_available() and P <= _GRAPH_MAX_P
+    if (best_score is None and _FINE_GRAPHS and A_batch.is_cuda and P <= _GRAPH_MAX_P
             and A_batch.dtype == torch.float32):
         try:
             best_score, best_q, best_t = _run_graphed_fine(

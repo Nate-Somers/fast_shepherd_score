@@ -7,21 +7,13 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
-try:
-    from ...score.gaussian_overlap_esp_triton import (
-        overlap_score_grad_esp_se3_batch,
-        _batch_self_overlap_esp,
-        fused_adam_qt,
-        fused_adam_qt_with_tangent_proj
-    )
-except ImportError:
-    # CPU-only box (no triton): numba ESP overlap (shape kernel x charge weight).
-    from .cpu_overlap import (
-        overlap_score_grad_esp_se3_batch,
-        _batch_self_overlap_esp,
-        fused_adam_qt,
-        fused_adam_qt_with_tangent_proj,
-    )
+# Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
+from .kernel_dispatch import (
+    overlap_score_grad_esp_se3_batch,
+    _batch_self_overlap_esp,
+    fused_adam_qt,
+    fused_adam_qt_with_tangent_proj,
+)
 from . import fast_common as _fc
 from .fast_common import (
     check_gpu_available,

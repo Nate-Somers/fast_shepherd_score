@@ -273,7 +273,7 @@ def _run_distributed_procs(align_fn, pairs, **kwargs):
         raise RuntimeError("multi-GPU (process) align failed:\n" + "\n".join(errs))
 
 
-def _subbatched_align(process, K: int, *, key: tuple,
+def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
                       safety: float = 0.7, init_cap: int = 1024):
     """Drive ``process(start, count) -> (scores, q, t)`` over ``K`` independent
     pairs in GPU-memory-safe sub-batches and concatenate the per-pair results.
@@ -293,7 +293,10 @@ def _subbatched_align(process, K: int, *, key: tuple,
     it); an OOM halves the chunk and retries. Off CUDA (or if a single pair won't
     fit) it just calls ``process`` once.
     """
-    if not torch.cuda.is_available():
+    if device.type != "cuda":
+        # CPU (or any non-CUDA) tensors: memory-safe chunking is a GPU concern, so run
+        # the whole batch in one call. Keys off the *data* device, not machine
+        # capability, so a CUDA box driving CPU tensors (e.g. backend="numba") is CPU.
         return process(0, K)
 
     key = (torch.cuda.current_device(),) + tuple(key)   # device-scope the footprint cache
@@ -485,7 +488,7 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
                 N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine,
                 seeds=(seeds_q[sl], seeds_t[sl]))
         scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=("vol", N_pad, M_pad, 50))
+            _proc, K, key=("vol", N_pad, M_pad, 50), device=device)
 
         all_pairs.extend(bucket)
         all_scores.append(scores)
@@ -641,7 +644,7 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
                 N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine,
                 seeds=(seeds_q[sl], seeds_t[sl]))
         scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=("surf", N_pad, M_pad, 50))
+            _proc, K, key=("surf", N_pad, M_pad, 50), device=device)
 
         all_pairs.extend(bucket)
         all_scores.append(scores)
@@ -864,7 +867,7 @@ def _esp_bucketed_align(
             )
             return sc, q, t
         scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=(subbatch_tag, N_pad, M_pad, (_NUM_SEEDS or 50)))
+            _proc, K, key=(subbatch_tag, N_pad, M_pad, (_NUM_SEEDS or 50)), device=device)
 
         all_pairs.extend(bucket)
         all_scores.append(scores)
@@ -1199,8 +1202,18 @@ def _align_batch_pharm(
                                 num_repeats=num_repeats, topk=topk,
                                 steps_fine=steps_fine, lr=lr)
 
-    if not torch.cuda.is_available():
-        # Slow fallback: per-pair legacy optimizer
+    # The batched pharm kernel runs on CUDA (Triton) and on CPU (numba) via device-driven
+    # dispatch. Fall back to the per-pair legacy optimizer only when neither is available
+    # -- a CPU box without numba -- so backend="numba"/"triton" get the fast batched kernel
+    # on every box (including forcing CPU on a GPU box).
+    _use_batch = pairs[0].device.type == "cuda"
+    if not _use_batch:
+        try:
+            import numba  # noqa: F401
+            _use_batch = True
+        except ImportError:
+            _use_batch = False
+    if not _use_batch:
         for p in pairs:
             p.align_with_pharm(
                 similarity=similarity,
@@ -1331,7 +1344,7 @@ def _align_batch_pharm(
             )
             return sc, q, t
         scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=("pharm", N_pad, M_pad, num_repeats))
+            _proc, K, key=("pharm", N_pad, M_pad, num_repeats), device=device)
 
         all_pairs.extend(bucket)
         all_scores.append(scores)

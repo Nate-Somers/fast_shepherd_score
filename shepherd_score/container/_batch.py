@@ -69,6 +69,31 @@ class MoleculePairBatch:
 
     # Backend names that route to the Triton/CUDA MoleculePair._align_batch_* path.
     _TRITON_BACKENDS = ("triton", "cuda", "gpu")
+    # Backend names that force the batched **CPU numba** path: the *same*
+    # coarse-to-fine drivers the Triton path uses, with the numba kernels in place
+    # of Triton. This is the explicit, portable counterpart to relying on the
+    # Triton path's import-time CPU fallback.
+    _NUMBA_BACKENDS = ("numba", "cpu")
+
+    def _prepare_numba(self):
+        """Force the batched CPU numba path for a ``backend="numba"`` call.
+
+        Moves every pair onto CPU. Kernel selection is per-call and device-driven
+        (see :mod:`shepherd_score.alignment.utils.kernel_dispatch`), so the CPU
+        tensors run the numba kernels **even in a process that also has the Triton
+        GPU kernels loaded** -- e.g. to reserve the GPU for another task or to run a
+        deterministic CPU pass on a GPU box.
+        """
+        import torch
+        try:
+            import numba  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "backend='numba' needs the 'numba' package (pip install "
+                "'shepherd-score[cpu]').") from exc
+        cpu = torch.device("cpu")
+        for p in self.pairs:
+            p.device = cpu
 
     def _triton_align(self, align_fn, align_kwargs, score_attr, transform_attr,
                       fit_attr, return_aligned):
@@ -245,22 +270,27 @@ class MoleculePairBatch:
             ``"jax"`` (default) uses the JAX/XLA path below. ``"triton"`` (aliases
             ``"cuda"``/``"gpu"``) routes to the Triton ``MoleculePair._align_batch_vol``
             kernel path (heavy-atom only), which also handles multi-GPU internally via
-            ``_should_distribute``. ``max_num_steps`` maps to the Triton ``steps_fine``.
+            ``_should_distribute``. ``"numba"`` (alias ``"cpu"``) runs that *same*
+            batched driver on CPU with the numba kernels -- it forces every pair onto
+            CPU and requires a Triton-free process (otherwise use ``"triton"``).
+            ``max_num_steps`` maps to the ``steps_fine`` count.
         return_aligned : bool
             For the Triton backend, skip building ``aligned_list`` when ``False``
             (pure delegation, zero overhead over a direct ``_align_batch_vol`` call).
         """
-        if backend in self._TRITON_BACKENDS:
+        if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
+            if backend in self._NUMBA_BACKENDS:
+                self._prepare_numba()
             if not no_H:
                 raise NotImplementedError(
-                    "the Triton vol backend aligns heavy atoms only (no_H=True)")
+                    "the Triton/numba vol backend aligns heavy atoms only (no_H=True)")
             return self._triton_align(
                 MoleculePair._align_batch_vol,
                 dict(alpha=alpha, steps_fine=max_num_steps),
                 "sim_aligned_vol_noH", "transform_vol_noH",
                 "_fit_xyz_t", return_aligned)
         if backend != "jax":
-            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+            raise ValueError(f"unknown backend {backend!r}; use 'jax', 'triton', or 'numba'")
 
         # build raw (unpadded) position arrays for every pair
         raw_refs, raw_fits, trans_centers_list = [], [], []
@@ -455,10 +485,12 @@ class MoleculePairBatch:
             Aligned fit atom coordinates (unpadded) for each pair.
         """
         # Build raw (unpadded) per-pair data tuples (plain numpy — picklable).
-        if backend in self._TRITON_BACKENDS:
+        if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
+            if backend in self._NUMBA_BACKENDS:
+                self._prepare_numba()
             if not no_H:
                 raise NotImplementedError(
-                    "the Triton vol_esp backend aligns heavy atoms only (no_H=True)")
+                    "the Triton/numba vol_esp backend aligns heavy atoms only (no_H=True)")
             return self._triton_align(
                 MoleculePair._align_batch_vol_esp,
                 dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
@@ -466,7 +498,7 @@ class MoleculePairBatch:
                 "sim_aligned_vol_esp_noH", "transform_vol_esp_noH",
                 "_fit_xyz_t", return_aligned)
         if backend != "jax":
-            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+            raise ValueError(f"unknown backend {backend!r}; use 'jax', 'triton', or 'numba'")
 
         raw_refs, raw_fits, raw_ref_ch, raw_fit_ch, trans_centers_list = [], [], [], [], []
         for pair in self.pairs:
@@ -685,14 +717,16 @@ class MoleculePairBatch:
             routes to ``MoleculePair._align_batch_surf`` (multi-GPU-aware). ``return_aligned``
             controls building the aligned-surface list (off by default = pure delegation).
         """
-        if backend in self._TRITON_BACKENDS:
+        if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
+            if backend in self._NUMBA_BACKENDS:
+                self._prepare_numba()
             return self._triton_align(
                 MoleculePair._align_batch_surf,
                 dict(alpha=alpha, steps_fine=max_num_steps),
                 "sim_aligned_surf", "transform_surf",
                 "_fit_surf_t", return_aligned)
         if backend != "jax":
-            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+            raise ValueError(f"unknown backend {backend!r}; use 'jax', 'triton', or 'numba'")
 
         n_pairs = len(self.pairs)
         pair_data = [
@@ -818,7 +852,9 @@ class MoleculePairBatch:
             same internal LAM_SCALING as this path, so ``lam`` is consistent across
             backends). ``return_aligned`` controls the aligned-surface list.
         """
-        if backend in self._TRITON_BACKENDS:
+        if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
+            if backend in self._NUMBA_BACKENDS:
+                self._prepare_numba()
             return self._triton_align(
                 MoleculePair._align_batch_esp,
                 dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
@@ -826,7 +862,7 @@ class MoleculePairBatch:
                 "sim_aligned_esp", "transform_esp",
                 "_fit_surf_t", return_aligned)
         if backend != "jax":
-            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+            raise ValueError(f"unknown backend {backend!r}; use 'jax', 'triton', or 'numba'")
 
         from shepherd_score.score.constants import LAM_SCALING
         lam_scaled = float(LAM_SCALING * lam)
@@ -935,6 +971,11 @@ class MoleculePairBatch:
             Aligned fit surface coordinates per pair (``None`` entries unless
             ``return_aligned=True`` on the Triton backend).
         """
+        if backend in self._NUMBA_BACKENDS:
+            raise NotImplementedError(
+                "backend='numba' does not support esp_combo: its CPU/numba path is "
+                "not tuned or validated (esp_combo stays GPU-targeted). Use "
+                "backend='triton' on a GPU, or backend='jax' on CPU.")
         if backend in self._TRITON_BACKENDS:
             return self._triton_align(
                 MoleculePair._align_batch_esp_combo,
@@ -944,7 +985,7 @@ class MoleculePairBatch:
                 "sim_aligned_esp_combo", "transform_esp_combo",
                 "_fit_surf_t", return_aligned)
         if backend != "jax":
-            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+            raise ValueError(f"unknown backend {backend!r}; use 'jax', 'triton', or 'numba'")
 
         return self._delegate_alignment(
             'align_with_esp_combo', 'sim_aligned_esp_combo',
@@ -1100,7 +1141,9 @@ class MoleculePairBatch:
             ``return_aligned=True`` the aligned anchors (rotate+translate) and vectors
             (rotate only) are rebuilt GPU-batched from the cached fit tensors.
         """
-        if backend in self._TRITON_BACKENDS:
+        if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
+            if backend in self._NUMBA_BACKENDS:
+                self._prepare_numba()
             MoleculePair._align_batch_pharm(
                 self.pairs, similarity=similarity, extended_points=extended_points,
                 only_extended=only_extended, trans_init=trans_init,
@@ -1130,7 +1173,7 @@ class MoleculePairBatch:
                     vectors[i] = vec_al[j, :vec[j].shape[0]]
             return scores, anchors, vectors
         if backend != "jax":
-            raise ValueError(f"unknown backend {backend!r}; use 'jax' or 'triton'")
+            raise ValueError(f"unknown backend {backend!r}; use 'jax', 'triton', or 'numba'")
 
         # Validate pharmacophore data and collect raw arrays for all pairs.
         for idx, pair in enumerate(self.pairs):
