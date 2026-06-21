@@ -258,33 +258,44 @@ def side_fss(args):
 # ===========================================================================
 # ROSHAMBO2 side  (roshambo2 env)
 # ===========================================================================
-def _roshambo_shape(query_sdf, dataset_sdf):
-    """Construct (prep) + compute (align) ROSHAMBO2 shape overlay; return (prep_s, compute_fn,
-    read_fn). compute_fn() runs one shape alignment of all queries vs dataset; read_fn() returns
-    the per-pair tanimoto_shape array from the last compute."""
+def _roshambo_mode(query_sdf, dataset_sdf, mode):
+    """ROSHAMBO2 in `mode` = 'shape' (Gaussian volume only) or 'combo' (shape+color — the
+    ComboTanimoto mode ROSHAMBO is typically run in). Returns (make, compute, read):
+    make()->(r, prep_s); compute(r) aligns all queries vs dataset; read() returns the per-pair
+    similarity on a 0-1 scale (tanimoto_shape for shape; tanimoto_combination, else
+    tanimoto_combo_legacy/2, for combo)."""
     from roshambo2 import Roshambo2
+    use_color = (mode == "combo")
     holder = {}
 
     def make():
         t0 = time.perf_counter()
-        r = Roshambo2(query_sdf, dataset_sdf, color=False)
+        r = Roshambo2(query_sdf, dataset_sdf, color=use_color)
         return r, time.perf_counter() - t0
 
     def compute(r):
-        res = r.compute(backend="cuda", start_mode=ROSH_START_MODE, color_scores=False,
-                        optim_mode="shape", n_gpus=1, write_scores=False,
-                        optimizer_settings={"lr_q": 0.1, "lr_t": 0.1, "steps": STEPS})
-        holder["res"] = res
-        return res
+        holder["res"] = r.compute(
+            backend="cuda", start_mode=ROSH_START_MODE, color_scores=use_color,
+            optim_mode=("combination" if use_color else "shape"),
+            n_gpus=1, write_scores=False,
+            optimizer_settings={"lr_q": 0.1, "lr_t": 0.1, "steps": STEPS})
+        return holder["res"]
 
-    def read_shape():
+    def read():
+        prefs = (["tanimoto_combination", "tanimoto_combo_legacy", "tanimoto_shape"]
+                 if use_color else ["tanimoto_shape"])
         vals = []
         for _, df in holder.get("res", {}).items():
-            if "tanimoto_shape" in df:
-                vals += list(df["tanimoto_shape"].values)
+            col = next((c for c in prefs if c in df), None)
+            if col is None:
+                continue
+            v = np.array(df[col].values, dtype=float)
+            if col == "tanimoto_combo_legacy":
+                v = v / 2.0                          # 0-2 -> 0-1
+            vals += list(v)
         return np.array(vals, dtype=float)
 
-    return make, compute, read_shape
+    return make, compute, read
 
 
 def side_roshambo2(args):
@@ -292,30 +303,30 @@ def side_roshambo2(args):
     with open(os.path.join(HERE, "_prep.json")) as fh:
         meta = json.load(fh)
     Q, N = meta["n_queries"], meta["n_library"]
-
+    npairs = Q * N
     out = {"gpu": gpu, "n_queries": Q, "n_library": N,
            "start_mode": ROSH_START_MODE, "steps": STEPS, "throughput": {}, "selfcopy": {}}
 
-    # ---- throughput ----
-    make, compute, read_shape = _roshambo_shape(Q_SDF, D_SDF)
-    r, prep = make()
-    best, nrep = best_of_n(lambda: compute(r), reps=args.reps, budget=args.budget)
-    npairs = Q * N
-    out["throughput"]["shape"] = {
-        "n_pairs": npairs, "prep_s": prep, "compute_s": best, "reps": nrep,
-        "compute_pairs_per_s": npairs / best, "endtoend_pairs_per_s": npairs / (best + prep),
-    }
-    print(f"roshambo2 shape: {npairs/best:,.0f} pairs/s compute  "
-          f"{npairs/(best+prep):,.0f} end-to-end  (prep {prep:.1f}s, compute {best:.2f}s)", flush=True)
-
-    # ---- quality: recovered self-overlap ----
-    makec, computec, read_shapec = _roshambo_shape(SC_Q_SDF, SC_D_SDF)
-    rc, _ = makec(); computec(rc)
-    sc = read_shapec()
-    if len(sc):
-        out["selfcopy"]["shape"] = {"mean": float(np.mean(sc)), "min": float(np.min(sc)),
-                                    "p10": float(np.percentile(sc, 10)), "n": len(sc)}
-        print(f"roshambo2 self-copy recovered shape Tanimoto: mean={np.mean(sc):.3f} min={np.min(sc):.3f}", flush=True)
+    for mode in args.rosh_modes:
+        try:
+            make, compute, read = _roshambo_mode(Q_SDF, D_SDF, mode)
+            r, prep = make()
+            best, nrep = best_of_n(lambda: compute(r), reps=args.reps, budget=args.budget)
+            out["throughput"][mode] = {
+                "n_pairs": npairs, "prep_s": prep, "compute_s": best, "reps": nrep,
+                "compute_pairs_per_s": npairs / best, "endtoend_pairs_per_s": npairs / (best + prep)}
+            print(f"roshambo2 {mode}: {npairs/best:,.0f} pairs/s compute  "
+                  f"{npairs/(best+prep):,.0f} end-to-end  (prep {prep:.1f}s, compute {best:.2f}s)", flush=True)
+            # quality: recovered self-overlap (optimum 1.0)
+            makec, computec, readc = _roshambo_mode(SC_Q_SDF, SC_D_SDF, mode)
+            rc, _ = makec(); computec(rc); sc = readc()
+            if len(sc):
+                out["selfcopy"][mode] = {"mean": float(np.mean(sc)), "min": float(np.min(sc)),
+                                         "p10": float(np.percentile(sc, 10)), "n": len(sc)}
+                print(f"roshambo2 {mode} self-copy recovered: mean={np.mean(sc):.3f} min={np.min(sc):.3f}", flush=True)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f"roshambo2 {mode} FAILED: {type(e).__name__}: {e}", flush=True)
 
     with open(ROSH_OUT, "w") as fh:
         json.dump(out, fh, indent=2)
@@ -349,7 +360,9 @@ def main():
     ap.add_argument("--n", type=int, default=4000, help="dataset (library) size")
     ap.add_argument("--queries", type=int, default=8)
     ap.add_argument("--n-selfcopy", type=int, default=500)
-    ap.add_argument("--modes", nargs="+", default=["vol", "surf"])
+    ap.add_argument("--modes", nargs="+", default=["vol", "surf"], help="fss modes")
+    ap.add_argument("--rosh-modes", nargs="+", default=["shape", "combo"],
+                    help="ROSHAMBO2 modes: shape (Gaussian volume) and/or combo (shape+color)")
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--budget", type=float, default=30.0)
     a = ap.parse_args()

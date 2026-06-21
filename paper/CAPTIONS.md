@@ -109,11 +109,14 @@ warm-up, best-of-N and CUDA synchronisation. Because the two optimisers differ (
 seeds × 100 steps; ROSHAMBO2: start_mode = 2 × 100 steps), effort is pinned and reported, and
 the fairness anchor is recovered self-overlap on rigid SE(3) self-copies (known optimum 1.0).
 **(Left)** fss `vol` sustains 67.9k pairs/s versus ROSHAMBO2's 17.7k compute-only — **3.8×
-faster** — and 1.5× end-to-end, despite fss performing more search per pair (50 vs 10 starts).
-**(Right)** both tools recover a self-overlap Tanimoto of 1.000 on self-copies, confirming the
-throughput is measured at matched, fully-solved alignment quality rather than by one tool
-cutting corners. fss additionally offers the ESP and pharmacophore overlays ROSHAMBO2 lacks
-(Figs 3, 4, 6).
+faster** — and 1.5× end-to-end, despite fss performing more search per pair (50 vs 10 starts);
+ROSHAMBO2's typical combo (shape+color) mode is ~6× slower still (3.0k pairs/s), so the matched
+3.8× is not an artifact of benchmarking only ROSHAMBO2's fastest path. **(Right)** all three
+recover a self-overlap Tanimoto of 1.000 on self-copies, confirming the throughput is measured
+at matched, fully-solved alignment quality rather than by one tool cutting corners. ROSHAMBO2's
+"color" is a pharmacophore-feature overlay (fss's analog is `pharm`); fss additionally offers an
+electrostatic (ESP) channel ROSHAMBO2 has no equivalent for — the differentiator developed in
+Figs 3, 4 and 6.
 
 ## Figure 6 — Adding aligned ESP to shape improves active retrieval where electrostatics matter
 

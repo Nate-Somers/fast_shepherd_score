@@ -31,6 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SERIES = [  # (label, json-tool-key, throughput-mode-key, selfcopy-mode-key, color)
     ("fss · vol (atom Gaussian)", "fss", "vol", "vol", "#c0392b"),
     ("ROSHAMBO2 · shape", "roshambo2", "shape", "shape", "#7b3294"),
+    ("ROSHAMBO2 · combo (shape+color)", "roshambo2", "combo", "combo", "#b07cc6"),
 ]
 
 
@@ -77,13 +78,20 @@ def main():
     axL.set_title("Shape-alignment throughput on one GPU")
     axL.legend(loc="lower right", fontsize=9)
 
-    # speedup annotation: fss vol vs roshambo2
+    # speedup annotation: fss vol vs ROSHAMBO2 shape (matched) and vs combo (its typical mode)
     fv = next((r for r in rows if r["label"].startswith("fss · vol")), None)
-    rb = next((r for r in rows if r["label"].startswith("ROSHAMBO2")), None)
-    if fv and rb and rb["compute"] > 0:
-        axL.text(0.02, 0.02, f"fss vol / ROSHAMBO2 (compute) = {fv['compute']/rb['compute']:.1f}×",
-                 transform=axL.transAxes, fontsize=9.5, color="#c0392b",
-                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#c0392b", alpha=0.9))
+    rsh = next((r for r in rows if r["label"] == "ROSHAMBO2 · shape"), None)
+    rcb = next((r for r in rows if r["label"].startswith("ROSHAMBO2 · combo")), None)
+    if fv:
+        lines = []
+        if rsh and rsh["compute"] > 0:
+            lines.append(f"fss vol / ROSHAMBO2 shape = {fv['compute']/rsh['compute']:.1f}×  (matched)")
+        if rcb and rcb["compute"] > 0:
+            lines.append(f"fss vol / ROSHAMBO2 combo = {fv['compute']/rcb['compute']:.1f}×")
+        if lines:
+            axL.text(0.02, 0.02, "\n".join(lines), transform=axL.transAxes, fontsize=8.8,
+                     color="#c0392b", va="bottom",
+                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#c0392b", alpha=0.9))
 
     # ---- Right: self-copy recovered overlap (quality anchor) ----
     for yy, r in zip(y, rows):

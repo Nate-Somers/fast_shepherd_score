@@ -14,11 +14,14 @@ warm-up, best-of-N and CUDA synchronisation. Because the two optimisers differ (
 seeds × 100 steps; ROSHAMBO2: start_mode = 2 × 100 steps), effort is pinned and reported, and
 the fairness anchor is recovered self-overlap on rigid SE(3) self-copies (known optimum 1.0).
 **(Left)** fss `vol` sustains 67.9k pairs/s versus ROSHAMBO2's 17.7k compute-only — **3.8×
-faster** — and 1.5× end-to-end, despite fss performing more search per pair (50 vs 10 starts).
-**(Right)** both tools recover a self-overlap Tanimoto of 1.000 on self-copies, confirming the
-throughput is measured at matched, fully-solved alignment quality rather than by one tool
-cutting corners. fss additionally offers the ESP and pharmacophore overlays ROSHAMBO2 lacks
-(Figs 3, 4, 6).
+faster** — and 1.5× end-to-end, despite fss performing more search per pair (50 vs 10 starts);
+ROSHAMBO2's typical combo (shape+color) mode is ~6× slower still (3.0k pairs/s), so the matched
+3.8× is not an artifact of benchmarking only ROSHAMBO2's fastest path. **(Right)** all three
+recover a self-overlap Tanimoto of 1.000 on self-copies, confirming the throughput is measured
+at matched, fully-solved alignment quality rather than by one tool cutting corners. ROSHAMBO2's
+"color" is a pharmacophore-feature overlay (fss's analog is `pharm`); fss additionally offers an
+electrostatic (ESP) channel ROSHAMBO2 has no equivalent for — the differentiator developed in
+Figs 3, 4 and 6.
 
 **Claim defended:** on identical molecules and identical hardware, `fast_shepherd_score`
 is competitive with / faster than **ROSHAMBO2** — the closest open-source GPU comparator
@@ -29,21 +32,27 @@ tool), so this is a genuine contribution.
 ## Result (NVIDIA L40S, 8 query actives × 3,986-molecule library)
 | tool · mode | compute-only | end-to-end | recovered self-overlap |
 |---|--:|--:|--:|
-| **fss · vol** (atom Gaussian) | **67,904 pairs/s** | 14,268 pairs/s | **1.000** |
-| **ROSHAMBO2 · shape** (atom Gaussian) | 17,699 pairs/s | 9,486 pairs/s | **1.000** |
+| **fss · vol** (atom Gaussian shape) | **67,904 pairs/s** | 14,268 pairs/s | **1.000** |
+| **ROSHAMBO2 · shape** (atom Gaussian) | 17,734 pairs/s | 8,002 pairs/s | **1.000** |
+| ROSHAMBO2 · combo (shape+color) | 3,007 pairs/s | 1,754 pairs/s | **1.000** |
 
-**fss is 3.8× faster on the matched shape comparison (compute-only), 1.5× end-to-end, and
-both tools recover the optimum (1.000) on rigid SE(3) self-copies** — so the speed is at
-matched, solved alignment quality, not one tool cutting corners. fss does *more* search per
-pair here (50 SE(3) seeds vs ROSHAMBO2's `start_mode=2` = 10 discrete starts) and is still
-faster.
+**On the representation-matched comparison (Gaussian shape vs Gaussian shape) fss is 3.8×
+faster compute-only**, both tools recover the optimum (1.000) on rigid SE(3) self-copies, and
+fss does *more* search per pair (50 SE(3) seeds vs ROSHAMBO2's `start_mode=2` = 10 discrete
+starts). ROSHAMBO2 in its **typical combo (ComboTanimoto, shape+color) mode is ~6× slower than
+its own shape mode** (3,007 vs 17,734 pairs/s) — so no one can argue we benchmarked only
+ROSHAMBO2's fast path. The **matched 3.8× (shape-vs-shape) is the honest headline**; the
+22.6× over combo compares fss shape-only to ROSHAMBO2 shape+color and is *not* like-for-like.
 
-## Why `vol` is the comparison (not `surf`)
-ROSHAMBO2 overlays **atom-centred Gaussian volumes**. The representation-matched fss mode is
-therefore `vol` (atomic-Gaussian volume overlap), not the surface-point `surf` mode. fss's
-`surf` is a heavier, different representation (sampled surface points) that *additionally*
-carries the ESP and pharmacophore overlays ROSHAMBO2 lacks — that capability gap is the
-subject of Figs 3, 4 and 6, so Fig 5 stays a clean shape-vs-shape throughput test.
+## What is and isn't matched (shape vs "color")
+ROSHAMBO2 overlays **atom-centred Gaussian volumes** for shape, so the representation-matched
+fss mode is `vol` (atomic-Gaussian volume), not the surface-point `surf` mode. ROSHAMBO2's
+**"color"** is a pharmacophore-feature Gaussian overlay — its closest fss analog is `pharm`,
+**not** ESP. fss's electrostatic-potential (`esp`) channel has **no ROSHAMBO2 equivalent at
+all**. So a true "combo-vs-combo" would pit fss shape+`pharm` (and the extra fss `esp`) against
+ROSHAMBO2 shape+color; that multi-feature capability comparison is the subject of Figs 3, 4 and
+6 (where the ESP channel is the differentiator), which is why Fig 5 stays a clean shape-vs-shape
+*throughput* test with combo shown only as the slower upper-bound of ROSHAMBO2's usual mode.
 
 ## Design (fair, built to survive review)
 - **Identical molecules:** both tools read the SAME conformers (RDKit ETKDG+MMFF, embedded
