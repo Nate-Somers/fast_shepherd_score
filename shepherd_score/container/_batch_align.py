@@ -1231,6 +1231,7 @@ def _align_batch_pharm(
                 lr=lr,
                 max_num_steps=steps_fine,
                 use_jax=False,
+                use_fast=True,
                 verbose=False,
             )
         return

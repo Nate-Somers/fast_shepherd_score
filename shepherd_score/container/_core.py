@@ -654,6 +654,7 @@ class MoleculePair:
                        max_num_steps: int = 200,
                        use_jax: bool = False,
                        use_analytical: bool = True,
+                       use_fast: bool = False,
                        verbose: bool = False) -> np.ndarray:
         """
         Align fit_molec to ref_molec using ESP+surface similarity.
@@ -721,8 +722,8 @@ class MoleculePair:
             self.transform_esp = np.array(se3_transform)
             self.sim_aligned_esp = np.array(score)
             return np.array(aligned_fit_points)
-        else: # Use Torch implementation (fast path on CUDA if available)
-            if torch.cuda.is_available():
+        else: # Use Torch implementation (opt-in CUDA fast path via use_fast)
+            if use_fast and torch.cuda.is_available():
                 try:
                     from shepherd_score.alignment.utils.fast_esp_se3 import fast_optimize_ROCS_esp_overlay
                 except ImportError:
@@ -794,6 +795,7 @@ class MoleculePair:
                              lr: float = 0.1,
                              max_num_steps: int = 200,
                              use_jax: bool = False,
+                             use_fast: bool = False,
                              verbose: bool = False):
         """
         Align using ShaEP similarity score.
@@ -882,7 +884,7 @@ class MoleculePair:
                 ref_centers = torch.from_numpy(self.ref_molec.surf_pos).to(torch.float32).to(self.device)
                 fit_centers = torch.from_numpy(self.fit_molec.surf_pos).to(torch.float32).to(self.device)
 
-            if torch.cuda.is_available():
+            if use_fast and torch.cuda.is_available():
                 try:
                     from shepherd_score.alignment.utils.fast_esp_combo_se3 import fast_optimize_esp_combo_score_overlay
                 except ImportError:
@@ -995,6 +997,7 @@ class MoleculePair:
                          verbose: bool = False,
                          use_vectorized: bool = True,
                          use_analytical: bool = True,
+                         use_fast: bool = False,
                          ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Align fit_molec to ref_molec using pharmacophore similarity.
@@ -1080,8 +1083,8 @@ class MoleculePair:
             self.sim_aligned_pharm = np.array(score)
             return np.array(aligned_fit_anchors), np.array(aligned_fit_vectors)
 
-        # PyTorch (fast path on CUDA if available)
-        if torch.cuda.is_available():
+        # PyTorch (opt-in CUDA fast path via use_fast)
+        if use_fast and torch.cuda.is_available():
             try:
                 from shepherd_score.alignment.utils.fast_pharm_se3 import fast_optimize_pharm_overlay
             except ImportError:

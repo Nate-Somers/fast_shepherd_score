@@ -25,7 +25,6 @@ def objective_ROCS_overlay(se3_params: torch.Tensor,
                            ref_points: torch.Tensor,
                            fit_points: torch.Tensor,
                            alpha: float,
-                           VAA_const=None,
                            precomputed_U: Optional[torch.Tensor] = None,
                           ) -> torch.Tensor:
     """
