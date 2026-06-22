@@ -347,14 +347,15 @@ is the **upstream JAX batch path** — `MoleculePairBatch` with its documented
 `surf`/`esp`); upstream publishes no timings, so this is its *own* intended accelerated path,
 measured here under JAX 0.10. Real-drug self-copy pairs, self-accuracy ~1.000 throughout.
 
-Peak aligned **pairs/s** (best over batch size) at 96 cores, with scaling vs 1 core:
+Peak aligned **pairs/s** (best over batch size) — single-core on *each* CPU, and the EPYC
+swept to 96 cores (pool scaling is vs the EPYC's own 1 core):
 
-| mode | 1 core | threads · 96c | **pool · 96c** | pool scaling | pool ÷ threads |
-|---|--:|--:|--:|--:|--:|
-| vol   | 476   | 8,232 | **16,153** | ~34× | 2.0× |
-| surf  | 60    | 2,477 | **3,374**  | ~56× | 1.4× |
-| esp   | 25    | 1,034 | **1,651**  | ~66× | 1.6× |
-| pharm | 1,575 | 4,483 | **21,572** | ~14× | **4.8×** |
+| mode | 185H · 1c (laptop) | EPYC · 1c | EPYC threads · 96c | EPYC pool · 96c | pool scaling | pool ÷ threads |
+|---|--:|--:|--:|--:|--:|--:|
+| vol   | 838   | 476   | 8,232 | **16,153** | ~34× | 2.0× |
+| surf  | 102   | 60    | 2,477 | **3,374**  | ~56× | 1.4× |
+| esp   | 38    | 25    | 1,034 | **1,651**  | ~66× | 1.6× |
+| pharm | 1,916 | 1,575 | 4,483 | **21,572** | ~14× | **4.8×** |
 
 Two headlines:
 - **The process pool is the multi-core lever.** It removes the thread path's per-step
@@ -365,9 +366,10 @@ Two headlines:
   actually peak slightly higher at 48–64c — 16.5k / 20.3k — then flatten across the NUMA
   boundary.)
 - **Per core, a fast laptop still wins.** The EPYC 9474F is ~**1.2–1.8× slower per core** than
-  the laptop's Core Ultra 9 185H (higher boost clock + client µarch); the cluster wins purely
-  by *stacking* cores, so the large scaling factors ride on a low per-core baseline — the
-  honest figure is the absolute peak above.
+  the laptop's Core Ultra 9 185H (the **185H · 1c** vs **EPYC · 1c** columns: 838 vs 476 on
+  `vol`, 1,916 vs 1,575 on `pharm`) — higher boost clock + client µarch. The cluster wins
+  purely by *stacking* cores, so the large scaling factors ride on a low per-core baseline —
+  the honest figure is the absolute peak above.
 
 vs the upstream JAX path on the same node: numba is **~2.4–11.7× at 1 core** and **~22× (`vol`)
 at 48 cores**. The upstream `surf`/`esp` multiprocessing path *collapses* at high worker counts
