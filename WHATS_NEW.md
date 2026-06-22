@@ -98,12 +98,21 @@ from shepherd_score.container import Molecule, MoleculePair, MoleculePairBatch
 pairs = [MoleculePair(ref, fit) for ref, fit in my_pairs]
 batch = MoleculePairBatch(pairs)
 
-# Original behavior (unchanged): JAX/CPU
-scores, aligned = batch.align_with_surf(alpha=0.81)
-
-# NEW: same call, GPU-accelerated
-scores, aligned = batch.align_with_surf(alpha=0.81, backend="triton")
+# The ONLY thing that changes between engines is the `backend=` argument.
+scores, aligned = batch.align_with_surf(alpha=0.81)                     # default: original JAX/CPU
+scores, aligned = batch.align_with_surf(alpha=0.81, backend="triton")   # GPU (Triton)  — aliases "cuda"/"gpu"
+scores, aligned = batch.align_with_surf(alpha=0.81, backend="numba")    # fast CPU (numba) — alias "cpu"
 ```
+
+**Which backend?**
+
+| You want… | Use | What it does |
+|---|---|---|
+| Exactly the upstream behavior (no new deps) | *(omit `backend`)* or `backend="jax"` | Original per-pair JAX/XLA CPU path. |
+| Maximum throughput on a CUDA GPU | `backend="triton"` | Batched coarse-to-fine drivers on the Triton GPU kernels. |
+| A fast CPU run (no GPU, or to keep the GPU free) | `backend="numba"` | The **same** batched drivers, run on the numba CPU kernels. ~25× over the original CPU path on `vol`. |
+
+`backend="numba"` forces every pair onto CPU and **works on any machine** — even a GPU box with Triton installed — because the kernel is chosen *per call by tensor device* (CPU→numba, CUDA→Triton). So you don't have to uninstall Triton to get a deterministic CPU pass. (`esp_combo` is the one mode with no numba path — it raises `NotImplementedError`; use `"triton"` or `"jax"` for it.)
 
 - `scores` → `np.ndarray` of shape `(N,)`.
 - Results are also written **in place** on each pair (e.g. `pair.sim_aligned_surf`,
