@@ -139,48 +139,6 @@ def apply_so3_transform(vectors: torch.Tensor,
         return torch.einsum('bni,bji->bnj', vectors, R)
 
 
-def legacy_seeds_torch(ref_xyz: torch.Tensor,
-                       fit_xyz: torch.Tensor,
-                       *,
-                       num_repeats: int = 50) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Return the exact legacy seeds as (q, t) on the same device/dtype as ref_xyz.
-
-    Parameters
-    ----------
-    ref_xyz : torch.Tensor (N, 3)
-        Reference coordinates
-    fit_xyz : torch.Tensor (M, 3)
-        Fit coordinates
-    num_repeats : int
-        Number of random seeds
-
-    Returns
-    -------
-    q : torch.Tensor (num_repeats, 4)
-        Quaternions
-    t : torch.Tensor (num_repeats, 3)
-        Translations
-    """
-    from .._torch import _initialize_se3_params as _legacy_init
-
-    # Legacy helper wants CPU tensors
-    ref_cpu = ref_xyz.detach().cpu()
-    fit_cpu = fit_xyz.detach().cpu()
-
-    se3 = _legacy_init(ref_points=ref_cpu,
-                       fit_points=fit_cpu,
-                       num_repeats=num_repeats)  # (R, 7) float32 CPU
-
-    # Move back to caller's device/dtype
-    se3 = se3.to(dtype=ref_xyz.dtype, device=ref_xyz.device)
-    # _initialize_se3_params returns (7,) for num_repeats==1; normalise to (R, 7)
-    if se3.dim() == 1:
-        se3 = se3.unsqueeze(0)
-    q, t = se3[:, :4], se3[:, 4:]
-    return F.normalize(q, dim=1), t
-
-
 def legacy_seeds_with_translations_torch(
     ref_xyz: torch.Tensor,
     fit_xyz: torch.Tensor,

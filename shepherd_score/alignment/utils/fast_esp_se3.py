@@ -4,23 +4,19 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from typing import Tuple, Optional
 
 # Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
 from .kernel_dispatch import (
     overlap_score_grad_esp_se3_batch,
     _batch_self_overlap_esp,
-    fused_adam_qt,
     fused_adam_qt_with_tangent_proj,
 )
 from . import fast_common as _fc
 from .fast_common import (
     check_gpu_available,
-    legacy_seeds_torch,
     build_coarse_grid,
     batched_seeds_torch,
-    quat_mul,
     apply_se3_transform,
     quaternion_to_rotation_matrix
 )

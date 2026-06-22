@@ -156,8 +156,6 @@ class Molecule:
                     scale=1.
                 )
 
-        self._shape_cache: dict[float, float] = {}
-
     def get_partial_charges(self) -> np.ndarray:
         """
         Get the partial charges on each atom using MMFF.
@@ -338,7 +336,6 @@ class MoleculePair:
     _align_batch_vol       = staticmethod(_ba._align_batch_vol)
     _align_batch_surf      = staticmethod(_ba._align_batch_surf)
     _align_batch_esp       = staticmethod(_ba._align_batch_esp)
-    _esp_bucketed_align    = staticmethod(_ba._esp_bucketed_align)
     _align_batch_vol_esp   = staticmethod(_ba._align_batch_vol_esp)
     _align_batch_esp_combo = staticmethod(_ba._align_batch_esp_combo)
     _align_batch_pharm     = staticmethod(_ba._align_batch_pharm)

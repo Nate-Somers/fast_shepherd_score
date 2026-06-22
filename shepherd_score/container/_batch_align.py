@@ -69,13 +69,6 @@ def _dev_idx(device: torch.device) -> int:
 # faster on one GPU. Calibrated on 4x L40S (sub-linear; crossover a few k pairs/device).
 _MIN_SHARD_PER_DEVICE = 4096
 
-# Multi-GPU execution backend (opt-in). "thread" (default) shards across one Python
-# process with a worker THREAD per GPU -- simple, but the per-pair host work is
-# GIL-serialized, so light/host-bound modes (vol/surf) barely scale past 1 GPU.
-# "process" shards across one PROCESS per GPU (each its own interpreter/GIL), so the
-# host work parallelises too -> near-linear scaling. Set via env FSS_MGPU_BACKEND.
-_MGPU_BACKEND = os.environ.get("FSS_MGPU_BACKEND", "thread").lower()
-
 
 def _should_distribute(pairs) -> bool:
     """True when `pairs` should be sharded across multiple CUDA devices."""
@@ -88,19 +81,8 @@ def _should_distribute(pairs) -> bool:
     return len(pairs) >= _MIN_SHARD_PER_DEVICE * torch.cuda.device_count()
 
 
+
 def _run_distributed(align_fn, pairs, **kwargs):
-    """Dispatch the multi-GPU align to the configured backend (``_MGPU_BACKEND``).
-
-    Default ``"thread"`` keeps the original behaviour exactly. ``"process"`` routes to
-    the process-per-GPU path for modes it supports (``_MODE_SPEC``), falling back to
-    threads otherwise. Results are written in-place to the pairs either way."""
-    if _MGPU_BACKEND == "process" and \
-            align_fn.__name__.replace("_align_batch_", "") in _MODE_SPEC:
-        return _run_distributed_procs(align_fn, pairs, **kwargs)
-    return _run_distributed_threads(align_fn, pairs, **kwargs)
-
-
-def _run_distributed_threads(align_fn, pairs, **kwargs):
     """Shard `pairs` across ALL visible CUDA devices and run `align_fn` on each in
     parallel (CUDA ops release the GIL); results are written in-place to the pairs.
     The per-device workspace/footprint caches are device-keyed so concurrent
@@ -145,11 +127,11 @@ def _run_distributed_threads(align_fn, pairs, **kwargs):
         raise RuntimeError(f"multi-GPU align failed on device(s) {list(errs)}: {errs}")
 
 
-# --- process-per-GPU multi-GPU path (opt-in via FSS_MGPU_BACKEND=process) ----
-# Each mode that the process path supports declares how to (a) pull its per-pair
+# --- per-mode tensor spec used by the CPU process pool (_cpu_pool.py) ----
+# Each mode declares how to (a) pull its per-pair
 # inputs off the Molecule objects as picklable numpy arrays, (b) rebuild the cached
 # device tensors inside a worker, and (c) read the results back. ``extract`` and
-# ``tensors`` are positional-aligned. Modes absent here fall back to the thread path.
+# ``tensors`` are positional-aligned. Modes absent here are not run via the CPU pool.
 _MODE_SPEC = {
     "vol": {
         "extract": [("ref_molec", "atom_pos"), ("fit_molec", "atom_pos")],
@@ -189,88 +171,6 @@ class _ProcStandIn:
     def __init__(self, device):
         self.device = device
 
-
-def _mgpu_proc_worker(gpu_id, mode, shard_arrays, kwargs, out_q):
-    """Worker entry point (top-level so it is spawn-picklable). Pins itself to one
-    physical GPU, rebuilds stand-ins from numpy, runs the unmodified batched aligner,
-    and returns (scores, transforms) as numpy via the queue."""
-    try:
-        import numpy as _np
-        import torch as _torch
-        import shepherd_score.container._batch_align as _bm
-        _SPEC = _bm._MODE_SPEC; _SI = _bm._ProcStandIn; _DL = _bm._DISPATCH_LOCAL
-
-        _torch.cuda.set_device(gpu_id)
-        _DL.active = True                  # this worker owns ONE GPU -> never re-distribute
-        dev = _torch.device("cuda", gpu_id)
-        spec = _SPEC[mode]
-        tnames = spec["tensors"]
-        standins = []
-        for row in shard_arrays:                           # row: one numpy per extract entry
-            s = _SI(dev)
-            for (tname, dt), arr in zip(tnames, row):
-                setattr(s, tname, _torch.as_tensor(arr, dtype=dt, device=dev))
-            standins.append(s)
-
-        getattr(_bm, "_align_batch_" + mode)(standins, **kwargs)
-        _torch.cuda.synchronize()
-
-        tf_attr, sc_attr = spec["out"]
-        scores = _np.array([float(getattr(s, sc_attr)) for s in standins], dtype=_np.float64)
-        transforms = _np.stack([
-            _torch.as_tensor(getattr(s, tf_attr)).detach().cpu().numpy().astype(_np.float32)
-            for s in standins])
-        out_q.put((scores, transforms))
-    except Exception:                                      # noqa: BLE001 - relayed to parent
-        import traceback
-        out_q.put(("__ERR__", traceback.format_exc()))
-
-
-def _run_distributed_procs(align_fn, pairs, **kwargs):
-    """Process-per-GPU multi-GPU: shard pairs round-robin, hand each shard's numpy
-    inputs to a worker process pinned to one GPU, and write results back in-place.
-
-    Each worker has its own interpreter/GIL, so the per-pair host work parallelises
-    across GPUs (unlike the thread path). Only the small per-pair input arrays cross
-    the process boundary -- no RDKit objects, no CUDA tensors."""
-    import torch.multiprocessing as _mp
-
-    mode = align_fn.__name__.replace("_align_batch_", "")
-    spec = _MODE_SPEC[mode]
-    ndev = torch.cuda.device_count()
-
-    # Pull picklable per-pair inputs (numpy) once, in original order.
-    per_pair = [tuple(np.asarray(getattr(getattr(p, m), a)) for (m, a) in spec["extract"])
-                for p in pairs]
-
-    ctx = _mp.get_context("spawn")
-    jobs = []
-    for gpu_id in range(ndev):
-        idxs = list(range(gpu_id, len(pairs), ndev))       # round-robin (matches thread path)
-        if not idxs:
-            continue
-        q = ctx.Queue()
-        shard = [per_pair[i] for i in idxs]
-        pr = ctx.Process(target=_mgpu_proc_worker,
-                         args=(gpu_id, mode, shard, dict(kwargs), q))
-        pr.start()
-        jobs.append((pr, idxs, q))
-
-    tf_attr, sc_attr = spec["out"]
-    errs = []
-    for pr, idxs, q in jobs:
-        res = q.get()                                      # drain BEFORE join (large items)
-        pr.join()
-        if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], str) \
-                and res[0] == "__ERR__":
-            errs.append(res[1])
-            continue
-        scores, transforms = res
-        for j, i in enumerate(idxs):
-            setattr(pairs[i], tf_attr, torch.as_tensor(transforms[j], dtype=torch.float32))
-            setattr(pairs[i], sc_attr, float(scores[j]))
-    if errs:
-        raise RuntimeError("multi-GPU (process) align failed:\n" + "\n".join(errs))
 
 
 def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,

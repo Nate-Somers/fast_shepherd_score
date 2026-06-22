@@ -1,21 +1,16 @@
 from __future__ import annotations
 
 import torch, math, os
-import torch.nn.functional as F
 # Kernels are dispatched per-call by tensor device (Triton on CUDA, numba on CPU) via
 # kernel_dispatch, so one process can run both -- e.g. backend="numba" runs CPU tensors
 # through the numba kernels even on a GPU box. ``_HAS_TRITON`` is kept for external /
 # diagnostic consumers; it no longer drives kernel selection (the device does).
 from .kernel_dispatch import (
-    overlap_score_grad_se3_batch, fused_adam_qt, fused_adam_qt_with_tangent_proj,
+    overlap_score_grad_se3_batch, fused_adam_qt_with_tangent_proj,
     _batch_self_overlap, fused_surf_step_batch, _HAS_TRITON,
 )
 from .fast_common import batched_seeds_torch
-from .._torch import objective_ROCS_overlay
 from typing import Optional
-from .._torch import _initialize_se3_params as _legacy_init
-from pathlib import Path
-from contextlib import suppress
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -83,71 +78,6 @@ def _self_overlap_in_chunks(P_pad, N_real, alpha=0.81):
             P_pad[s:e], N_real[s:e], alpha)   # ← original function
     return V_all
 
-
-
-def _fallback_quats(num: int, device, dtype):
-    # Deterministic small set of “reasonable” rotations
-    s2 = math.sqrt(0.5)
-    base = torch.tensor([
-        [1.0, 0.0, 0.0, 0.0],          # identity
-        [0.0, 1.0, 0.0, 0.0],          # 180° about x
-        [0.0, 0.0, 1.0, 0.0],          # 180° about y
-        [0.0, 0.0, 0.0, 1.0],          # 180° about z
-        [s2,  s2, 0.0, 0.0],           # 90° about x
-        [s2, 0.0,  s2, 0.0],           # 90° about y
-        [s2, 0.0, 0.0,  s2],           # 90° about z
-        [0.0,  s2,  s2, 0.0],          # 180° about (x+y)
-        [0.0,  s2, 0.0,  s2],          # 180° about (x+z)
-        [0.0, 0.0,  s2,  s2],          # 180° about (y+z)
-    ], device=device, dtype=dtype)
-
-    if base.size(0) >= num:
-        q = base[:num].clone()
-    else:
-        reps = (num + base.size(0) - 1) // base.size(0)
-        q = base.repeat(reps, 1)[:num].clone()
-
-    return F.normalize(q, dim=1)
-
-@torch.no_grad()
-def _legacy_seeds_torch(ref_xyz: torch.Tensor,
-                        fit_xyz: torch.Tensor,
-                        *,
-                        num_repeats: int = 50) -> tuple[torch.Tensor, torch.Tensor]:
-
-    # Move to CPU for legacy PCA routine, but guard against degenerate inputs
-    ref_cpu = ref_xyz.detach().cpu()
-    fit_cpu = fit_xyz.detach().cpu()
-
-    def fallback(reason: str):
-        # COM-to-COM translation seed
-        ref_com = ref_cpu.mean(dim=0) if ref_cpu.numel() else torch.zeros(3)
-        fit_com = fit_cpu.mean(dim=0) if fit_cpu.numel() else torch.zeros(3)
-        t0 = (ref_com - fit_com).to(device=ref_xyz.device, dtype=ref_xyz.dtype)
-        t  = t0.unsqueeze(0).repeat(num_repeats, 1)
-        q  = _fallback_quats(num_repeats, device=ref_xyz.device, dtype=ref_xyz.dtype)
-        return q, t
-
-    # Minimal sanity checks (common culprits)
-    if ref_cpu.shape[0] < 3 or fit_cpu.shape[0] < 3:
-        return fallback("too_few_points")
-    if (not torch.isfinite(ref_cpu).all()) or (not torch.isfinite(fit_cpu).all()):
-        return fallback("non_finite_coords")
-
-    try:
-        se3 = _legacy_init(ref_points=ref_cpu, fit_points=fit_cpu, num_repeats=num_repeats)
-
-        # Catch NaNs/Infs coming back from PCA
-        if not torch.isfinite(se3).all():
-            return fallback("legacy_init_non_finite")
-
-        se3 = se3.to(dtype=ref_xyz.dtype, device=ref_xyz.device)
-        q, t = se3[:, :4], se3[:, 4:]
-        return F.normalize(q, dim=1), t
-
-    except Exception:
-        # Includes numpy.linalg.LinAlgError from PCA
-        return fallback("legacy_init_exception")
 
 # ----------------------------------------------------------------------------
 # CUDA-graph fast path for the surf/vol fine loop (gaussian kernel).

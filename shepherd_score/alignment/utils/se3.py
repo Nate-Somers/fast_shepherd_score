@@ -11,39 +11,10 @@ and PyTorch's implementations.
 """
 import torch
 import torch.nn.functional as F
-import numpy as np
-
-
-def quaternion_to_SE3(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """
-    q : (4,) torch tensor, already normalised (r,i,j,k)
-    t : (3,) torch tensor, translation
-    Returns: (4,4) torch.float32 on same device as q
-    """
-    r, i, j, k = q
-    two = q.new_tensor(2.0)                      
-    R = torch.stack(
-        (
-            1 - two * (j * j + k * k),
-            two * (i * j - k * r),
-            two * (i * k + j * r),
-            two * (i * j + k * r),
-            1 - two * (i * i + k * k),
-            two * (j * k - i * r),
-            two * (i * k - j * r),
-            two * (j * k + i * r),
-            1 - two * (i * i + j * j),
-        ),
-        dim=0,
-    ).view(3, 3)
-    SE3 = torch.eye(4, dtype=q.dtype, device=q.device)
-    SE3[:3, :3] = R
-    SE3[:3,  3] = t
-    return SE3
 
 
 def quaternions_to_SE3_batch(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """Batched, bit-identical to quaternion_to_SE3 applied row-wise.
+    """Batched (q,t)->(K,4,4) SE(3) builder, applied row-wise.
     q : (K, 4) normalised (r,i,j,k); t : (K, 3) -> (K, 4, 4)."""
     r, i, j, k = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     two = 2.0
