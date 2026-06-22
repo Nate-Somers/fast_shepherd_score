@@ -9,7 +9,7 @@ from ..kernels.dispatch import (
     overlap_score_grad_se3_batch, fused_adam_qt_with_tangent_proj,
     _batch_self_overlap, fused_surf_step_batch, _HAS_TRITON,
 )
-from ._common import batched_seeds_torch
+from ._common import batched_seeds_torch, _update_best
 from typing import Optional
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -370,13 +370,7 @@ def coarse_fine_align_many(
             score = VAB / denom
             scale = VAA_plus_VBB / (denom * denom)
 
-            better = score > best_score  # boolean mask, no .any()
-
-            # Masked assignment via torch.where: fixed-shape and SYNC-FREE.
-            best_score = torch.where(better, score, best_score)
-            mask_q = better.unsqueeze(1)
-            best_q = torch.where(mask_q, q_k, best_q)
-            best_t = torch.where(mask_q, t_k, best_t)
+            best_score, best_q, best_t = _update_best(score, q_k, t_k, best_score, best_q, best_t)
 
             # --- early seed-prune (H1): keep only top-KEEP seeds/pair, finish those ---
             if _PRUNE_AFTER and _PRUNE_KEEP and step == _PRUNE_AFTER - 1 and S > _PRUNE_KEEP:

@@ -261,11 +261,7 @@ def coarse_fine_esp_align_many(
 
         # Track best via torch.where (fixed-shape, sync-free; boolean
         # index-assignment was measured slower due to a per-step device sync).
-        better = score > best_score
-        best_score = torch.where(better, score, best_score)
-        mask_q = better.unsqueeze(1)
-        best_q = torch.where(mask_q, q_k, best_q)
-        best_t = torch.where(mask_q, t_k, best_t)
+        best_score, best_q, best_t = _fc._update_best(score, q_k, t_k, best_score, best_q, best_t)
 
         # Early stopping check every 5 iterations to reduce GPU→CPU sync overhead
         if step % 5 == 0:

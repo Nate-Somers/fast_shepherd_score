@@ -19,7 +19,8 @@ from ._common import (
     check_gpu_available,
     batched_seeds_torch,
     apply_se3_transform,
-    quaternion_to_rotation_matrix
+    quaternion_to_rotation_matrix,
+    _update_best,
 )
 
 
@@ -205,12 +206,8 @@ def coarse_fine_surface_align_many(
         score = VAB / denom
         scale = VAA_plus_VBB / (denom * denom)
 
-        # Track best
-        better = score > best_score
-        best_score = torch.where(better, score, best_score)
-        mask_q = better.unsqueeze(1)
-        best_q = torch.where(mask_q, q_k, best_q)
-        best_t = torch.where(mask_q, t_k, best_t)
+        # Track best (q, t) per pose by score
+        best_score, best_q, best_t = _update_best(score, q_k, t_k, best_score, best_q, best_t)
 
         # Early stopping check every 5 iterations to reduce GPU→CPU sync overhead
         if step % 5 == 0:

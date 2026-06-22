@@ -18,6 +18,18 @@ def check_gpu_available() -> bool:
     return torch.cuda.is_available()
 
 
+def _update_best(score, q_k, t_k, best_score, best_q, best_t):
+    """Track the best (q, t) per pose by score -- the sync-free ``torch.where``
+    update shared by the coarse-to-fine drivers. Returns the updated
+    ``(best_score, best_q, best_t)``; bit-identical to the inline block."""
+    better = score > best_score
+    best_score = torch.where(better, score, best_score)
+    mask_q = better.unsqueeze(1)
+    best_q = torch.where(mask_q, q_k, best_q)
+    best_t = torch.where(mask_q, t_k, best_t)
+    return best_score, best_q, best_t
+
+
 def quat_mul(q: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
     """
     Hamilton product of two quaternions (or batches of quaternions).
