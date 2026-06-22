@@ -236,8 +236,9 @@ last decimal.
    just a safety net: on `vol` it reaches **~161 pairs/s/core, ~25× over the original torch
    per-pair CPU path** (and ~5–15× over JAX-batch single-core); `vol_esp` ~162–182/core,
    `pharm` **~237/core** (the numba pharm kernel, ~20× over the previous per-pair-legacy CPU
-   fallback). The compute-bound surface modes (`surf`/`esp`) stay slow — they are
-   FLOP-bound on `exp`. The GPU path is untouched: for CUDA tensors the dispatcher always
+   fallback). The compute-bound surface modes (`surf`/`esp`) stay slow *per core* — they are
+   FLOP-bound on `exp` — but they parallelise well: across 96 cores they reach ~3.4k / 1.7k
+   pairs/s (see **Net result (CPU — multi-core)** below). The GPU path is untouched: for CUDA tensors the dispatcher always
    selects the Triton kernels (the previous behavior). (A push for >2,000 pairs/s/core was explored and found
    physically out of reach for `surf`/`esp`; full log in
    [`SPEED_EXPERIMENTS_CPU.md`](SPEED_EXPERIMENTS_CPU.md).)
@@ -333,6 +334,55 @@ so 1- and 4-GPU `vol` match.
 (`pi_melkin` nodes) all on torch 2.11 / CUDA 12.8: L40S 1-/4-GPU · Xeon Gold 6542Y;
 RTX PRO 6000 Blackwell · EPYC 9135; H100 NVL · EPYC 9474F; H200 · Xeon Platinum 8580.
 Molecule cache on; all runs 2026-06-19.)*
+
+### Net result (CPU — multi-core)
+
+The numba CPU path was also swept across a full core ladder (1→96) on an **exclusive
+96-core AMD EPYC 9474F** node (2×48 cores, MIT Engaging), through the same public
+`MoleculePairBatch.align_with_*(backend="numba", num_workers=N)` call. Two multi-core
+mechanisms are compared: the default **thread** path (`@njit(parallel=True)` prange) and the
+persistent **process pool** (`accel/cpu_pool.py`, engaged by `num_workers>1`). The baseline
+is the **upstream JAX batch path** — `MoleculePairBatch` with its documented
+`use_shmap`/`num_workers` defaults (shard_map for `vol`/`pharm`, multiprocessing for
+`surf`/`esp`); upstream publishes no timings, so this is its *own* intended accelerated path,
+measured here under JAX 0.10. Real-drug self-copy pairs, self-accuracy ~1.000 throughout.
+
+Peak aligned **pairs/s** (best over batch size) at 96 cores, with scaling vs 1 core:
+
+| mode | 1 core | threads · 96c | **pool · 96c** | pool scaling | pool ÷ threads |
+|---|--:|--:|--:|--:|--:|
+| vol   | 476   | 8,232 | **16,153** | ~34× | 2.0× |
+| surf  | 60    | 2,477 | **3,374**  | ~56× | 1.4× |
+| esp   | 25    | 1,034 | **1,651**  | ~66× | 1.6× |
+| pharm | 1,575 | 4,483 | **21,572** | ~14× | **4.8×** |
+
+Two headlines:
+- **The process pool is the multi-core lever.** It removes the thread path's per-step
+  `prange` barrier + torch-pool oversubscription, beating threads by up to **4.8× (pharm)**
+  / ~2× (vol) and scaling the compute-bound modes to **56–66× on 96 cores**. (On the hybrid
+  laptop the pool gained only pharm +53% / vol +10% — its 6 P + 8 E cores cap thread scaling
+  at ~5–6×; a homogeneous many-core server is where the pool pays off. `vol`/`pharm` pool
+  actually peak slightly higher at 48–64c — 16.5k / 20.3k — then flatten across the NUMA
+  boundary.)
+- **Per core, a fast laptop still wins.** The EPYC 9474F is ~**1.2–1.8× slower per core** than
+  the laptop's Core Ultra 9 185H (higher boost clock + client µarch); the cluster wins purely
+  by *stacking* cores, so the large scaling factors ride on a low per-core baseline — the
+  honest figure is the absolute peak above.
+
+vs the upstream JAX path on the same node: numba is **~2.4–11.7× at 1 core** and **~22× (`vol`)
+at 48 cores**. The upstream `surf`/`esp` multiprocessing path *collapses* at high worker counts
+(~1 pair/s at 48 workers — 48 processes each re-import JAX and re-JIT per call), so those
+ratios balloon into the hundreds; that gap is the upstream's process-spawn overhead, **not** a
+like-for-like kernel comparison.
+
+![CPU throughput across core counts](benchmarks/results_cpu/engaging/speed_all_cores_cpu.png)
+
+*(MIT Engaging `mit_normal`, exclusive AMD EPYC 9474F node; numba side torch 2.5.1 / numba
+0.59 (`SimModelEnv`), upstream side JAX 0.10 (`fss` env); real drug self-SE(3)-copy pairs,
+isolated best-of-N, 2026-06-21. Per-cell tables under
+[`benchmarks/results_cpu/`](benchmarks/results_cpu/) — `eng_threads/`, `eng_pool/`,
+`eng_vs_jax/`, plus a laptop-vs-cluster overview in `engaging/`; regenerate the panels with
+`benchmarks/results_cpu/engaging/plot_all_cores.py`.)*
 
 Full experiment log, including rejected ideas, is in [`SPEED_EXPERIMENTS.md`](SPEED_EXPERIMENTS.md);
 the CPU-fallback experiments are in [`SPEED_EXPERIMENTS_CPU.md`](SPEED_EXPERIMENTS_CPU.md).
