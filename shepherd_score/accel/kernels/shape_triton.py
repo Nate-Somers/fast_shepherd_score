@@ -243,6 +243,7 @@ def _adam_qt(
     beta2: tl.constexpr = 0.999,
     eps:   tl.constexpr = 1e-8,      
     BLOCK: tl.constexpr = 256,     # threads per CTA (must divide 1024)
+    PROJECT: tl.constexpr = False, # if True, tangent-project dQ: dQ -= q*(dQ.q)
 ):
     pid   = tl.program_id(0)
     offs  = pid * BLOCK + tl.arange(0, BLOCK)
@@ -260,6 +261,13 @@ def _adam_qt(
     dq1 = tl.load(dQ_ptr + offs*4 + 1, mask=mask)
     dq2 = tl.load(dQ_ptr + offs*4 + 2, mask=mask)
     dq3 = tl.load(dQ_ptr + offs*4 + 3, mask=mask)
+
+    if PROJECT:                      # tangent-space projection: dQ -= q*(dQ.q)
+        radial = dq0*q0 + dq1*q1 + dq2*q2 + dq3*q3
+        dq0 = dq0 - q0 * radial
+        dq1 = dq1 - q1 * radial
+        dq2 = dq2 - q2 * radial
+        dq3 = dq3 - q3 * radial
 
     # first-moment & second-moment for q
     mq0 = tl.load(Mq_ptr + offs*4 + 0, mask=mask)
@@ -353,129 +361,6 @@ def fused_adam_qt(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr):
     )
 
 
-#  Fused Adam with tangent-space projection (avoids allocating dQ_tan tensor)
-@triton.jit
-def _adam_qt_with_tangent_proj(
-    Q_ptr, T_ptr,
-    dQ_ptr, dT_ptr,
-    Mq_ptr, Vq_ptr,
-    Mt_ptr, Vt_ptr,
-    K,
-    lr: tl.constexpr,
-    beta1: tl.constexpr = 0.9,
-    beta2: tl.constexpr = 0.999,
-    eps:   tl.constexpr = 1e-8,
-    BLOCK: tl.constexpr = 256,
-):
-    """
-    Adam update with built-in tangent-space projection for quaternion gradients.
-    Fuses: dQ_tan = dQ - q * (dQ · q)  with the Adam update.
-    """
-    pid   = tl.program_id(0)
-    offs  = pid * BLOCK + tl.arange(0, BLOCK)
-    mask  = offs < K
-
-    # ---------------- load q (quaternion parameters) -----------------------
-    q0 = tl.load(Q_ptr + offs*4 + 0, mask=mask)
-    q1 = tl.load(Q_ptr + offs*4 + 1, mask=mask)
-    q2 = tl.load(Q_ptr + offs*4 + 2, mask=mask)
-    q3 = tl.load(Q_ptr + offs*4 + 3, mask=mask)
-
-    # ---------------- load raw dQ (before tangent projection) --------------
-    dq0 = tl.load(dQ_ptr + offs*4 + 0, mask=mask)
-    dq1 = tl.load(dQ_ptr + offs*4 + 1, mask=mask)
-    dq2 = tl.load(dQ_ptr + offs*4 + 2, mask=mask)
-    dq3 = tl.load(dQ_ptr + offs*4 + 3, mask=mask)
-
-    # ---------------- tangent-space projection (in-register) ---------------
-    # radial = dQ · q (project gradient onto quaternion direction)
-    radial = dq0*q0 + dq1*q1 + dq2*q2 + dq3*q3
-    # dQ_tan = dQ - q * radial (remove radial component)
-    dq0 = dq0 - q0 * radial
-    dq1 = dq1 - q1 * radial
-    dq2 = dq2 - q2 * radial
-    dq3 = dq3 - q3 * radial
-
-    # ---------------- load Adam moments for q ------------------------------
-    mq0 = tl.load(Mq_ptr + offs*4 + 0, mask=mask)
-    mq1 = tl.load(Mq_ptr + offs*4 + 1, mask=mask)
-    mq2 = tl.load(Mq_ptr + offs*4 + 2, mask=mask)
-    mq3 = tl.load(Mq_ptr + offs*4 + 3, mask=mask)
-
-    vq0 = tl.load(Vq_ptr + offs*4 + 0, mask=mask)
-    vq1 = tl.load(Vq_ptr + offs*4 + 1, mask=mask)
-    vq2 = tl.load(Vq_ptr + offs*4 + 2, mask=mask)
-    vq3 = tl.load(Vq_ptr + offs*4 + 3, mask=mask)
-
-    # ---------------- load t and dT ----------------------------------------
-    t0 = tl.load(T_ptr + offs*3 + 0, mask=mask)
-    t1 = tl.load(T_ptr + offs*3 + 1, mask=mask)
-    t2 = tl.load(T_ptr + offs*3 + 2, mask=mask)
-
-    dt0 = tl.load(dT_ptr + offs*3 + 0, mask=mask)
-    dt1 = tl.load(dT_ptr + offs*3 + 1, mask=mask)
-    dt2 = tl.load(dT_ptr + offs*3 + 2, mask=mask)
-
-    mt0 = tl.load(Mt_ptr + offs*3 + 0, mask=mask)
-    mt1 = tl.load(Mt_ptr + offs*3 + 1, mask=mask)
-    mt2 = tl.load(Mt_ptr + offs*3 + 2, mask=mask)
-
-    vt0 = tl.load(Vt_ptr + offs*3 + 0, mask=mask)
-    vt1 = tl.load(Vt_ptr + offs*3 + 1, mask=mask)
-    vt2 = tl.load(Vt_ptr + offs*3 + 2, mask=mask)
-
-    # ---------------- Adam update (using tangent-projected dq) -------------
-    mq0 = beta1*mq0 + (1-beta1)*dq0;  vq0 = beta2*vq0 + (1-beta2)*dq0*dq0
-    mq1 = beta1*mq1 + (1-beta1)*dq1;  vq1 = beta2*vq1 + (1-beta2)*dq1*dq1
-    mq2 = beta1*mq2 + (1-beta1)*dq2;  vq2 = beta2*vq2 + (1-beta2)*dq2*dq2
-    mq3 = beta1*mq3 + (1-beta1)*dq3;  vq3 = beta2*vq3 + (1-beta2)*dq3*dq3
-
-    q0 = q0 - lr * mq0 / tl.sqrt(vq0 + eps)
-    q1 = q1 - lr * mq1 / tl.sqrt(vq1 + eps)
-    q2 = q2 - lr * mq2 / tl.sqrt(vq2 + eps)
-    q3 = q3 - lr * mq3 / tl.sqrt(vq3 + eps)
-
-    mt0 = beta1*mt0 + (1-beta1)*dt0; vt0 = beta2*vt0 + (1-beta2)*dt0*dt0
-    mt1 = beta1*mt1 + (1-beta1)*dt1; vt1 = beta2*vt1 + (1-beta2)*dt1*dt1
-    mt2 = beta1*mt2 + (1-beta1)*dt2; vt2 = beta2*vt2 + (1-beta2)*dt2*dt2
-
-    t0 = t0 - lr * mt0 / tl.sqrt(vt0 + eps)
-    t1 = t1 - lr * mt1 / tl.sqrt(vt1 + eps)
-    t2 = t2 - lr * mt2 / tl.sqrt(vt2 + eps)
-
-    # ---------------- renormalise quaternion -----------------------------
-    inv_norm = 1.0 / tl.sqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3)
-    q0 *= inv_norm; q1 *= inv_norm; q2 *= inv_norm; q3 *= inv_norm
-
-    # ---------------- stores ---------------------------------------------
-    tl.store(Q_ptr + offs*4 + 0, q0, mask=mask)
-    tl.store(Q_ptr + offs*4 + 1, q1, mask=mask)
-    tl.store(Q_ptr + offs*4 + 2, q2, mask=mask)
-    tl.store(Q_ptr + offs*4 + 3, q3, mask=mask)
-
-    tl.store(Mq_ptr + offs*4 + 0, mq0, mask=mask)
-    tl.store(Mq_ptr + offs*4 + 1, mq1, mask=mask)
-    tl.store(Mq_ptr + offs*4 + 2, mq2, mask=mask)
-    tl.store(Mq_ptr + offs*4 + 3, mq3, mask=mask)
-
-    tl.store(Vq_ptr + offs*4 + 0, vq0, mask=mask)
-    tl.store(Vq_ptr + offs*4 + 1, vq1, mask=mask)
-    tl.store(Vq_ptr + offs*4 + 2, vq2, mask=mask)
-    tl.store(Vq_ptr + offs*4 + 3, vq3, mask=mask)
-
-    tl.store(T_ptr + offs*3 + 0, t0, mask=mask)
-    tl.store(T_ptr + offs*3 + 1, t1, mask=mask)
-    tl.store(T_ptr + offs*3 + 2, t2, mask=mask)
-
-    tl.store(Mt_ptr + offs*3 + 0, mt0, mask=mask)
-    tl.store(Mt_ptr + offs*3 + 1, mt1, mask=mask)
-    tl.store(Mt_ptr + offs*3 + 2, mt2, mask=mask)
-
-    tl.store(Vt_ptr + offs*3 + 0, vt0, mask=mask)
-    tl.store(Vt_ptr + offs*3 + 1, vt1, mask=mask)
-    tl.store(Vt_ptr + offs*3 + 2, vt2, mask=mask)
-
-
 def fused_adam_qt_with_tangent_proj(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr):
     """
     Fused Adam update with tangent-space projection for quaternion gradients.
@@ -494,11 +379,11 @@ def fused_adam_qt_with_tangent_proj(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr):
     K = q.shape[0]
     grid = (triton.cdiv(K, 256),)
 
-    _adam_qt_with_tangent_proj[grid](
+    _adam_qt[grid](
         q.contiguous().view(-1),  t.contiguous().view(-1),
         dQ.contiguous().view(-1), dT.contiguous().view(-1),
         m_q.view(-1), v_q.view(-1), m_t.view(-1), v_t.view(-1),
-        K, lr=lr
+        K, lr=lr, PROJECT=True
     )
 
 # ---------------------------------------------------------------------------
