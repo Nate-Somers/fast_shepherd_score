@@ -568,7 +568,6 @@ def optimize_ROCS_overlay(ref_points: torch.Tensor,
         best_alignment = aligned_points.cpu()[best_idx]
         best_transform = SE3_transform.cpu()[best_idx]
         best_score = scores.cpu()[best_idx]
-
     return best_alignment, best_transform, best_score
 
 
@@ -656,7 +655,7 @@ def optimize_ROCS_esp_overlay(ref_points: torch.Tensor,
                               trans_centers: Union[torch.Tensor, None] = None,
                               lr: float = 0.1,
                               max_num_steps: int = 200,
-                              verbose: bool = False,
+                              verbose: bool = False
                               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Optimize alignment of fit_points with respect to ref_points using SE(3) transformations and
@@ -881,12 +880,11 @@ def optimize_esp_combo_score_overlay(ref_centers_w_H: torch.Tensor,
                                      trans_centers: Union[torch.Tensor, None] = None,
                                      lr: float = 0.1,
                                      max_num_steps: int = 200,
-                                     verbose: bool = False,
+                                     verbose: bool = False
                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Optimize alignment using ESP combo score.
     """
-    # Initial guess for SE(3) parameters (quaternion followed by translation)
     if trans_centers is None:
         se3_params = _initialize_se3_params(ref_points=ref_points, fit_points=fit_points, num_repeats=num_repeats)
     else:
@@ -1132,7 +1130,7 @@ def optimize_pharm_overlay(ref_pharms: torch.Tensor,
                            trans_centers: Union[torch.Tensor, None] = None,
                            lr: float = 0.1,
                            max_num_steps: int = 200,
-                           verbose: bool = False,
+                           verbose: bool = False
                            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Optimize alignment of fit_anchors with respect to ref_anchors using SE(3) transformations and
