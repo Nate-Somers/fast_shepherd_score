@@ -52,13 +52,13 @@ def _mod(tag: str):
     m = _MODS.get(tag)
     if m is None:
         if tag == "cpu":
-            from . import cpu_overlap as m
+            from . import cpu as m
         elif tag == "shape":
-            from ...score import gaussian_overlap_triton as m
+            from . import shape_triton as m
         elif tag == "esp":
-            from ...score import gaussian_overlap_esp_triton as m
+            from . import esp_triton as m
         elif tag == "pharm":
-            from ...score import pharmacophore_grad_triton as m
+            from . import pharm_triton as m
         else:  # pragma: no cover - defensive
             raise KeyError(tag)
         _MODS[tag] = m

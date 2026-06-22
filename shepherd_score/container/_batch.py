@@ -79,7 +79,7 @@ class MoleculePairBatch:
         """Force the batched CPU numba path for a ``backend="numba"`` call.
 
         Moves every pair onto CPU. Kernel selection is per-call and device-driven
-        (see :mod:`shepherd_score.alignment.utils.kernel_dispatch`), so the CPU
+        (see :mod:`shepherd_score.accel.kernels.dispatch`), so the CPU
         tensors run the numba kernels **even in a process that also has the Triton
         GPU kernels loaded** -- e.g. to reserve the GPU for another task or to run a
         deterministic CPU pass on a GPU box.
@@ -101,7 +101,7 @@ class MoleculePairBatch:
         path with ZERO extra alignment work.
 
         ``num_workers > 1`` on the CPU (numba) path shards the pairs across a persistent
-        single-threaded process pool (:mod:`shepherd_score.container._cpu_pool`) for
+        single-threaded process pool (:mod:`shepherd_score.accel.cpu_pool`) for
         near-linear multi-core scaling; results are bit-identical (pairs are
         independent). It is ignored on CUDA tensors and for modes the pool does not
         cover (those run the original single call).
@@ -123,7 +123,7 @@ class MoleculePairBatch:
         mode = align_fn.__name__.replace("_align_batch_", "")
         if (num_workers and num_workers > 1 and pairs
                 and pairs[0].device.type == "cpu"):
-            from shepherd_score.container import _cpu_pool
+            from shepherd_score.accel import cpu_pool as _cpu_pool
             if mode in _cpu_pool.POOL_MODES:
                 _cpu_pool.align_pairs(mode, pairs, num_workers, align_kwargs)
             else:
@@ -1166,7 +1166,7 @@ class MoleculePairBatch:
                     and self.pairs[0].device.type == "cpu"):
                 # CPU multi-core: shard pairs across the persistent single-threaded pool
                 # (bit-identical; align_pairs also caches _*_pharm_*_t for return_aligned).
-                from shepherd_score.container import _cpu_pool
+                from shepherd_score.accel import cpu_pool as _cpu_pool
                 _cpu_pool.align_pairs("pharm", self.pairs, num_workers, _pharm_kw)
             else:
                 MoleculePair._align_batch_pharm(self.pairs, **_pharm_kw)

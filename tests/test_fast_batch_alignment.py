@@ -18,7 +18,7 @@ def _require_fast_cuda():
 def test_fast_esp_batch_matches_single():
     _require_fast_cuda()
 
-    from shepherd_score.alignment.utils.fast_esp_se3 import (
+    from shepherd_score.accel.drivers.esp import (
         fast_optimize_ROCS_esp_overlay,
         fast_optimize_ROCS_esp_overlay_batch,
     )
@@ -79,7 +79,7 @@ def test_fast_esp_batch_matches_single():
 def test_fast_esp_combo_padding_masks_stable():
     _require_fast_cuda()
 
-    from shepherd_score.alignment.utils.fast_esp_combo_se3 import (
+    from shepherd_score.accel.drivers.esp_combo import (
         fast_optimize_esp_combo_score_overlay_batch,
     )
 
@@ -226,7 +226,7 @@ def test_fast_esp_combo_padding_masks_stable():
 
 
 def test_pharm_similarity_matches_legacy():
-    from shepherd_score.score.pharmacophore_overlap_triton import batch_pharm_similarity
+    from shepherd_score.accel.drivers.pharm_overlap import batch_pharm_similarity
     from shepherd_score.score.pharmacophore_scoring import get_overlap_pharm
 
     torch.manual_seed(0)
@@ -288,7 +288,7 @@ def test_pharm_similarity_matches_legacy():
 def test_fast_pharm_batch_smoke_flags():
     _require_fast_cuda()
 
-    from shepherd_score.alignment.utils.fast_pharm_se3 import fast_optimize_pharm_overlay_batch
+    from shepherd_score.accel.drivers.pharm import fast_optimize_pharm_overlay_batch
 
     torch.manual_seed(0)
     device = torch.device("cuda")

@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 import torch
 
-from .gaussian_overlap_triton import _OVERLAP_CONFIGS
+from .shape_triton import _OVERLAP_CONFIGS
 
 
 # Self-tunes per (N_pad, M_pad) on the actual device -- no GPU-specific hardcoding.

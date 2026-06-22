@@ -2,7 +2,7 @@
 
 These let the batched coarse-to-fine driver (``fast_se3.coarse_fine_align_many`` and
 ``_align_batch_vol``) run on a CPU-only box with **no Triton/CUDA**. ``fast_se3`` imports
-these when ``shepherd_score.score.gaussian_overlap_triton`` (which hard-requires triton)
+these when ``shepherd_score.accel.kernels.shape_triton`` (which hard-requires triton)
 fails to import.
 
 Design / correctness

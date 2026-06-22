@@ -8,8 +8,8 @@ import torch
 
 pytest.importorskip("numba")
 
-from shepherd_score.container import _cpu_pool
-from shepherd_score.container import _batch_align as bm
+from shepherd_score.accel import cpu_pool as _cpu_pool
+from shepherd_score.accel import batch as bm
 
 ALPHA = 0.81
 _KW = {

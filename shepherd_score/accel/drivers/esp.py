@@ -7,13 +7,13 @@ import torch
 from typing import Tuple, Optional
 
 # Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
-from .kernel_dispatch import (
+from ..kernels.dispatch import (
     overlap_score_grad_esp_se3_batch,
     _batch_self_overlap_esp,
     fused_adam_qt_with_tangent_proj,
 )
-from . import fast_common as _fc
-from .fast_common import (
+from . import _common as _fc
+from ._common import (
     check_gpu_available,
     build_coarse_grid,
     batched_seeds_torch,
@@ -351,7 +351,7 @@ def fast_optimize_ROCS_esp_overlay(
     """
     if not check_gpu_available():
         # Fallback to CPU implementation
-        from .._torch import optimize_ROCS_esp_overlay
+        from ...alignment._torch import optimize_ROCS_esp_overlay
         return optimize_ROCS_esp_overlay(
             ref_points, fit_points, ref_charges, fit_charges,
             alpha, lam, num_repeats, **kwargs)

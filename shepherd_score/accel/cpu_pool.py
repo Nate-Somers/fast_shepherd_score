@@ -21,8 +21,8 @@ Design
   JIT-cache load + heavy imports are paid once, not per call. This is the missing
   piece of the GPU ``FSS_MGPU_BACKEND=process`` path, which spawned per call and was
   therefore too slow to be the default.
-* Reuses :data:`shepherd_score.container._batch_align._MODE_SPEC` and
-  :class:`~shepherd_score.container._batch_align._ProcStandIn` -- the same per-mode
+* Reuses :data:`shepherd_score.accel.batch._MODE_SPEC` and
+  :class:`~shepherd_score.accel.batch._ProcStandIn` -- the same per-mode
   ``extract`` / ``tensors`` / ``out`` declarations the GPU process path uses -- so only
   small numpy arrays cross the boundary (no RDKit / ``Molecule`` objects, no tensors).
 * Opt-in via ``MoleculePairBatch.align_with_*(backend="numba", num_workers=N)`` with
@@ -88,7 +88,7 @@ def _worker_loop(task_q, res_q):
         numba.set_num_threads(1)
     except Exception:
         pass
-    from shepherd_score.container import _batch_align as bm
+    from shepherd_score.accel import batch as bm
     bm._DISPATCH_LOCAL.active = True                  # never re-distribute inside a worker
     while True:
         task = task_q.get()
@@ -198,7 +198,7 @@ def align_pairs(mode, pairs, num_workers, align_kwargs):
     single-process path would. Results are in-place; returns nothing.
     """
     import torch
-    from shepherd_score.container import _batch_align as bm
+    from shepherd_score.accel import batch as bm
     spec = bm._MODE_SPEC[mode]
     extract, tnames = spec["extract"], spec["tensors"]
     tf_attr, sc_attr = spec["out"]

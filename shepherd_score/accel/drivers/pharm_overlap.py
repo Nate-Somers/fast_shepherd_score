@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
-from .constants import P_TYPES, P_ALPHAS
+from ...score.constants import P_TYPES, P_ALPHAS
 
 # Lowercase type names for indexing
 P_TYPES_LOWER = tuple(map(str.lower, P_TYPES))
@@ -392,7 +392,7 @@ def batch_pharm_cross_overlap_with_transform(
     """
     Compute cross-overlap VAB after applying SE(3) transform to fit molecule.
     """
-    from ..alignment.utils.fast_common import apply_se3_transform, apply_so3_transform
+    from ._common import apply_se3_transform, apply_so3_transform
 
     anchors_2_t = apply_se3_transform(anchors_2, q, t)
     vectors_2_t = apply_so3_transform(vectors_2, q)

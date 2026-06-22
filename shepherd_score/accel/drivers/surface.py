@@ -10,12 +10,12 @@ from typing import Tuple, Optional
 
 # Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
 # surf uses the SAME Gaussian shape kernel as vol.
-from .kernel_dispatch import (
+from ..kernels.dispatch import (
     overlap_score_grad_se3_batch,
     fused_adam_qt_with_tangent_proj,
     _batch_self_overlap,
 )
-from .fast_common import (
+from ._common import (
     check_gpu_available,
     batched_seeds_torch,
     apply_se3_transform,
@@ -285,7 +285,7 @@ def fast_optimize_ROCS_overlay(
     """
     if not check_gpu_available():
         # Fallback to CPU implementation
-        from .._torch import optimize_ROCS_overlay
+        from ...alignment._torch import optimize_ROCS_overlay
         return optimize_ROCS_overlay(ref_points, fit_points, alpha, num_repeats, **kwargs)
 
     device = torch.device('cuda')

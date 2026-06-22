@@ -708,7 +708,7 @@ def fused_surf_step_batch(A, B, q, t, m_q, v_q, m_t, v_t, best, best_q, best_t,
 #  DEFERRED to first use (see fused_adam_qt) instead of running at import: importing
 #  this module must NOT initialize CUDA -- both to avoid allocating GPU memory just
 #  by importing, and (crucially) so the fork-based multi-GPU pool
-#  (shepherd_score.container.multi_gpu) can fork its workers cheaply, which is only
+#  (shepherd_score.accel.multi_gpu) can fork its workers cheaply, which is only
 #  CUDA-safe when the parent process hasn't initialized CUDA yet. Triton JIT-compiles
 #  on first launch regardless; this only front-loads it.
 _ADAM_QT_WARMED = False

@@ -98,7 +98,7 @@ def _run_distributed(align_fn, pairs, **kwargs):
     # CUDA-graph capture is not safe across the per-device worker threads (the RNG
     # generator-registration state races -> "graph should be registered to the state").
     # Use the eager fine loop for the multi-GPU path; per-pair results are unchanged.
-    import shepherd_score.alignment.utils.fast_se3 as _fse3
+    import shepherd_score.accel.drivers.shape as _fse3
     _fse3._FINE_GRAPHS = False
     shards = [sh for sh in (pairs[i::ndev] for i in range(ndev)) if sh]
     errs = {}
@@ -302,8 +302,8 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
         return _run_distributed(_align_batch_vol, pairs,
                                 alpha=alpha, steps_fine=steps_fine)
 
-    from shepherd_score.alignment.utils.fast_se3 import coarse_fine_align_many, _self_overlap_in_chunks
-    from shepherd_score.alignment.utils.fast_common import batched_seeds_torch
+    from shepherd_score.accel.drivers.shape import coarse_fine_align_many, _self_overlap_in_chunks
+    from shepherd_score.accel.drivers._common import batched_seeds_torch
 
     device = pairs[0].device
     # --- move coords once (skip if already there & right dtype) -------------
@@ -440,8 +440,8 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
         return _run_distributed(_align_batch_surf, pairs,
                                 alpha=alpha, steps_fine=steps_fine)
 
-    from shepherd_score.alignment.utils.fast_se3 import coarse_fine_align_many, _self_overlap_in_chunks
-    from shepherd_score.alignment.utils.fast_common import batched_seeds_torch
+    from shepherd_score.accel.drivers.shape import coarse_fine_align_many, _self_overlap_in_chunks
+    from shepherd_score.accel.drivers._common import batched_seeds_torch
 
     device = pairs[0].device
 
@@ -665,7 +665,7 @@ def _esp_bucketed_align(
     output attrs. Translation centers are always the ref atom coords
     (``_ref_xyz_t``), matching every per-pair ESP optimizer.
     """
-    from shepherd_score.alignment.utils.fast_esp_se3 import fast_optimize_ROCS_esp_overlay_batch
+    from shepherd_score.accel.drivers.esp import fast_optimize_ROCS_esp_overlay_batch
 
     device = pairs[0].device
 
@@ -894,7 +894,7 @@ def _align_batch_esp_combo(
                                 num_repeats_per_trans=num_repeats_per_trans,
                                 topk=topk, steps_fine=steps_fine, lr=lr)
 
-    from shepherd_score.alignment.utils.fast_esp_combo_se3 import fast_optimize_esp_combo_score_overlay_batch
+    from shepherd_score.accel.drivers.esp_combo import fast_optimize_esp_combo_score_overlay_batch
 
     device = pairs[0].device
 
@@ -1129,7 +1129,7 @@ def _align_batch_pharm(
         return
 
     try:
-        from shepherd_score.alignment.utils.fast_pharm_se3 import fast_optimize_pharm_overlay_batch
+        from shepherd_score.accel.drivers.pharm import fast_optimize_pharm_overlay_batch
     except ImportError:
         fast_optimize_pharm_overlay_batch = None
 

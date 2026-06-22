@@ -15,7 +15,7 @@ from shepherd_score.score.constants import COULOMB_SCALING
 # Open3D is imported LAZILY (on first real use), not at module load: it is a ~30s
 # cold import and -- importantly -- it is fork-hostile (importing it poisons a later
 # fork+CUDA), so importing it just to pull in shepherd_score would both slow every
-# import and break the fork-based multi-GPU pool (shepherd_score.container.multi_gpu).
+# import and break the fork-based multi-GPU pool (shepherd_score.accel.multi_gpu).
 # Only surface generation actually touches Open3D; alignment-only paths never pay it.
 class _LazyOpen3D:
     def __getattr__(self, attr):

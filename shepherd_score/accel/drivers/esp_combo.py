@@ -11,13 +11,13 @@ from typing import Tuple, Optional
 # esp_combo reuses the SAME Gaussian shape kernel (vol overlap) as fast_se3/surface.
 # Note: the batch backend="numba" path excludes esp_combo (its CPU execution is not
 # tuned/validated); this import keeps the module importable and GPU behaviour intact.
-from .kernel_dispatch import (
+from ..kernels.dispatch import (
     overlap_score_grad_se3_batch,
     fused_adam_qt_with_tangent_proj,
     _batch_self_overlap,
 )
 from ...score.constants import COULOMB_SCALING, LAM_SCALING
-from .fast_common import (
+from ._common import (
     check_gpu_available,
     build_coarse_grid,
     batched_seeds_torch,
@@ -508,7 +508,7 @@ def fast_optimize_esp_combo_score_overlay(
         Best combo score
     """
     if not check_gpu_available():
-        from .._torch import optimize_esp_combo_score_overlay
+        from ...alignment._torch import optimize_esp_combo_score_overlay
         return optimize_esp_combo_score_overlay(
             ref_centers_w_H, fit_centers_w_H,
             ref_centers, fit_centers,

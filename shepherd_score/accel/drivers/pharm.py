@@ -4,17 +4,17 @@
 import torch
 from typing import Tuple, Optional
 
-from ...score.pharmacophore_overlap_triton import (
+from .pharm_overlap import (
     batch_pharm_cross_overlap_with_transform,
     batch_pharm_self_overlap,
     pharm_similarity_from_overlaps,
 )
 # Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
 # (pharmacophore_overlap_triton, imported above, is pure PyTorch and needs no dispatch.)
-from .kernel_dispatch import fused_adam_qt, pharm_score_grad_se3_batch
+from ..kernels.dispatch import fused_adam_qt, pharm_score_grad_se3_batch
 from ...score.analytical_gradients._torch import build_lookup_tables
-from . import fast_common as _fc
-from .fast_common import (
+from . import _common as _fc
+from ._common import (
     check_gpu_available,
     build_coarse_grid,
     batched_seeds_torch,
@@ -436,7 +436,7 @@ def fast_optimize_pharm_overlay(
         Best similarity score
     """
     if not check_gpu_available():
-        from .._torch import optimize_pharm_overlay
+        from ...alignment._torch import optimize_pharm_overlay
         return optimize_pharm_overlay(
             ref_pharms, fit_pharms,
             ref_anchors, fit_anchors,

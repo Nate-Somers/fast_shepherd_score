@@ -152,7 +152,7 @@ def legacy_seeds_with_translations_torch(
     This mirrors `alignment._initialize_se3_params_with_translations`, which is used when
     legacy code is called with `trans_centers!=None` (aka `trans_init=True`).
     """
-    from .._torch import _initialize_se3_params_with_translations as _legacy_init_trans
+    from ...alignment._torch import _initialize_se3_params_with_translations as _legacy_init_trans
 
     ref_cpu = ref_xyz.detach().cpu()
     fit_cpu = fit_xyz.detach().cpu()

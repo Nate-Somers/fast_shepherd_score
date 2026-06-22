@@ -10,8 +10,8 @@ import torch
 pytest.importorskip("numba")
 _rdkit = pytest.importorskip("rdkit")
 
-from shepherd_score.alignment.utils import kernel_dispatch as KD
-from shepherd_score.alignment.utils import cpu_overlap
+from shepherd_score.accel.kernels import dispatch as KD
+from shepherd_score.accel.kernels import cpu as cpu_overlap
 
 ALPHA = 0.81
 _SMILES = [
@@ -65,7 +65,7 @@ def test_kernel_dispatch_cpu_matches_cpu_overlap():
 
 def test_numba_vol_self_copy_and_distinct():
     """The numba batched vol driver: self-copy ~1.0 and bounded distinct-pair scores."""
-    from shepherd_score.alignment.utils.fast_se3 import coarse_fine_align_many
+    from shepherd_score.accel.drivers.shape import coarse_fine_align_many
 
     mols = [_heavy_xyz(s, i) for i, s in enumerate(_SMILES)]
     refs = mols
@@ -107,7 +107,7 @@ def test_numba_pharm_self_copy():
     from rdkit import Chem
     from shepherd_score.pharm_utils.pharmacophore import get_pharmacophores
     from shepherd_score.score.analytical_gradients._torch import build_lookup_tables
-    from shepherd_score.alignment.utils.fast_pharm_se3 import coarse_fine_pharm_align_many
+    from shepherd_score.accel.drivers.pharm import coarse_fine_pharm_align_many
 
     DUMMY = 8
     smis = ["CC(=O)Oc1ccccc1C(=O)O", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",

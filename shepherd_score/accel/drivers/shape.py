@@ -5,11 +5,11 @@ import torch, math, os
 # kernel_dispatch, so one process can run both -- e.g. backend="numba" runs CPU tensors
 # through the numba kernels even on a GPU box. ``_HAS_TRITON`` is kept for external /
 # diagnostic consumers; it no longer drives kernel selection (the device does).
-from .kernel_dispatch import (
+from ..kernels.dispatch import (
     overlap_score_grad_se3_batch, fused_adam_qt_with_tangent_proj,
     _batch_self_overlap, fused_surf_step_batch, _HAS_TRITON,
 )
-from .fast_common import batched_seeds_torch
+from ._common import batched_seeds_torch
 from typing import Optional
 
 torch.backends.cuda.matmul.allow_tf32 = True

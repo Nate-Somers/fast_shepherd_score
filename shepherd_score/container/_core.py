@@ -24,7 +24,7 @@ from shepherd_score.score.pharmacophore_scoring import _SIM_TYPE, get_overlap_ph
 from shepherd_score.alignment import optimize_ROCS_overlay, optimize_ROCS_overlay_analytical, optimize_ROCS_esp_overlay, optimize_ROCS_esp_overlay_analytical, optimize_esp_combo_score_overlay
 from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_overlay_analytical
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
-from shepherd_score.container import _batch_align as _ba
+from shepherd_score.accel import batch as _ba
 
 
 def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) -> Chem.Mol:
@@ -722,7 +722,7 @@ class MoleculePair:
         else: # Use Torch implementation (opt-in CUDA fast path via use_fast)
             if use_fast and torch.cuda.is_available():
                 try:
-                    from shepherd_score.alignment.utils.fast_esp_se3 import fast_optimize_ROCS_esp_overlay
+                    from shepherd_score.accel.drivers.esp import fast_optimize_ROCS_esp_overlay
                 except ImportError:
                     fast_optimize_ROCS_esp_overlay = None
 
@@ -883,7 +883,7 @@ class MoleculePair:
 
             if use_fast and torch.cuda.is_available():
                 try:
-                    from shepherd_score.alignment.utils.fast_esp_combo_se3 import fast_optimize_esp_combo_score_overlay
+                    from shepherd_score.accel.drivers.esp_combo import fast_optimize_esp_combo_score_overlay
                 except ImportError:
                     fast_optimize_esp_combo_score_overlay = None
 
@@ -1083,7 +1083,7 @@ class MoleculePair:
         # PyTorch (opt-in CUDA fast path via use_fast)
         if use_fast and torch.cuda.is_available():
             try:
-                from shepherd_score.alignment.utils.fast_pharm_se3 import fast_optimize_pharm_overlay
+                from shepherd_score.accel.drivers.pharm import fast_optimize_pharm_overlay
             except ImportError:
                 fast_optimize_pharm_overlay = None
 

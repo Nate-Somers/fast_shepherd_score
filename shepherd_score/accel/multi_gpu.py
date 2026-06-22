@@ -66,7 +66,7 @@ def _worker(rank, mode, backend, do_center, threads, align_kwargs, shard_mols, o
         from shepherd_score.container import MoleculePair, MoleculePairBatch
         # dispatch-local lives in _batch_align (refactored) or _core (committed).
         try:
-            from shepherd_score.container._batch_align import _DISPATCH_LOCAL
+            from shepherd_score.accel.batch import _DISPATCH_LOCAL
         except Exception:
             from shepherd_score.container._core import _DISPATCH_LOCAL
 
@@ -236,7 +236,7 @@ def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
         import torch
         from shepherd_score.container import MoleculePair, MoleculePairBatch
         try:
-            from shepherd_score.container._batch_align import _DISPATCH_LOCAL
+            from shepherd_score.accel.batch import _DISPATCH_LOCAL
         except Exception:
             from shepherd_score.container._core import _DISPATCH_LOCAL
 
