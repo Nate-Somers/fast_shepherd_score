@@ -79,7 +79,7 @@ upstream file was deleted, and `alignment/_torch.py` is byte-identical to upstre
 
 | File | Δlines | What changed |
 |---|--:|---|
-| `container/_batch.py` | +283 | **The public seam.** Adds `_TRITON_BACKENDS` / `_NUMBA_BACKENDS`, the `_triton_align()` router and a `_prepare_numba()` guard, plus a `backend="jax"` (default) argument on every `align_with_*` method (and a new `align_with_esp_combo` batch method). `backend` in `{"triton","cuda","gpu"}` routes to the batched GPU path; `{"numba","cpu"}` runs that same batched driver on CPU; `"jax"` runs the original path unchanged; any other value raises. |
+| `container/_batch.py` | +299 | **The public seam.** Adds `_TRITON_BACKENDS` / `_NUMBA_BACKENDS`, the `_triton_align()` router and a `_prepare_numba()` guard, plus a `backend="jax"` (default) argument on every `align_with_*` method (and a new `align_with_esp_combo` batch method). `backend` in `{"triton","cuda","gpu"}` routes to the batched GPU path; `{"numba","cpu"}` runs that same batched driver on CPU; `"jax"` runs the original path unchanged; any other value raises. |
 | `container/_core.py` | +272 / −4 | Binds the `_align_batch_*` static methods (defined in `accel/batch/`) onto `MoleculePair`; adds an **opt-in** `use_fast=False` kwarg gating the per-pair Triton fast path on `align_with_esp` / `esp_combo` / `pharm` (default preserves the original torch/analytical behaviour and honours `use_analytical`); adds a `score_with_vol()` helper. |
 | `alignment/utils/se3.py` | +35 / −20 | Adds the batched SE(3) builder `quaternions_to_SE3_batch` (the GPU write-back uses it) and reworks `apply_SE3_transform` to a single fused `baddbmm`; the upstream parameter name (`SE3_transform`) and shape-validation checks are retained. |
 | `container/__init__.py` | +7 / −1 | Exports the explicit multi-GPU driver `align_multi_gpu` / `MultiGPUAligner` (defined in `accel/multi_gpu.py`). |
@@ -126,25 +126,36 @@ scores, aligned = batch.align_with_surf(alpha=0.81, backend="numba")    # fast C
 
 ### Multi-GPU
 
-Two paths exist, with different trade-offs:
+The alignment is **host-bound**, so driving N GPUs from one process serialises the per-pair
+host work on the GIL and tops out at ~1–2×. The path that scales is **one OS process per
+GPU** — each worker owns a shard, rebuilds its tensors on its own GPU, and runs the
+*unmodified* aligner, so the host work parallelises too. **Verified 3.50–3.79× on 4×L40S
+(node3615), bit-exact vs single-GPU** (vol 3.58×, surf 3.50×, esp 3.79×, pharm 3.63×).
 
-- **Automatic in-library sharding** (no extra arguments — the default). If several CUDA
-  devices are visible, large batches are auto-sharded across them on a worker-thread path.
-  Sharding only engages above **~4,096 pairs per device**, so small/mid batches deliberately
-  stay on a single GPU. Because the alignment is *host-bound*, this thread path is
-  GIL-limited and yields only roughly **~1.0–2.3×** on 4 GPUs in these runs — it helps the
-  heavier modes (surf/esp/pharm) at very large batch but does not reach ~N×, and `vol`
-  (which already saturates one card) is unchanged. **This automatic path is what produced
-  the 4-GPU column in the results table below.**
-- **Explicit data-parallel driver** (`shepherd_score.accel.multi_gpu` —
-  `align_multi_gpu` / `MultiGPUAligner`). A separate, opt-in path that launches **one OS
-  process per GPU**, each owning its shard end-to-end (build + align, data resident on its
-  GPU) with CPU threads capped to `cores/ndev` to avoid oversubscription. By sidestepping
-  the GIL it scales closer to linear (**~3.5–3.9× on 4×L40S** in separate experiments). It
-  is a one-shot launcher (pays a fixed spawn cost once), so it is aimed at large screens. It
-  is **not** what the table below reflects. It is now exported from
-  `container/__init__.py` and `shepherd_score.accel` (also importable directly as
-  `shepherd_score.accel.multi_gpu`).
+- **`MultiGPUAligner` — the multi-GPU path** (`shepherd_score.accel.multi_gpu`, also exported
+  from `shepherd_score.container`). A persistent one-process-per-GPU **pool**: it builds each
+  GPU's shard once and aligns the resident data on every call (CPU threads capped to
+  `cores/ndev` to avoid MKL/OMP oversubscription — the lever that otherwise collapses scaling
+  to <1×), so repeated screening runs at the full steady-state scaling above.
+
+  ```python
+  from shepherd_score.container import MoleculePair, MultiGPUAligner
+  pairs = [MoleculePair(a, b, device="cpu") for a, b in mols]   # build on CPU first
+  with MultiGPUAligner(pairs) as pool:                          # one process per GPU
+      vol_scores, _ = pool.align("vol", alpha=0.81)
+      esp_scores, _ = pool.align("esp", alpha=0.81, lam=0.3)
+  ```
+
+  `align_multi_gpu(pairs, mode, ...)` is the one-shot equivalent for a single huge batch.
+
+- **Transparent `align_with_*` does not silently shard.** A plain call on a multi-GPU box runs
+  on a **single GPU** (with a one-time pointer to `MultiGPUAligner`): a library can't safely
+  `spawn` worker processes behind your back, because `spawn` re-imports your `__main__` module
+  and breaks any entry script lacking an `if __name__ == "__main__":` guard. Opt in with
+  `FSS_MGPU_BACKEND=process` to route the transparent path through the (bit-exact) process
+  backend from a guarded script.
+
+The earlier **thread-sharding** default (GIL-bound, ~1.0–2.3×) has been **removed**.
 
 ### The backend matrix
 
@@ -221,10 +232,10 @@ last decimal.
 2. **Batched coarse-to-fine SE(3) search.** Seed generation, the Adam fine-tuning loop,
    and per-pair selection all run over the whole batch on-GPU, so a 4,096-pair batch is one
    sequence of kernel launches instead of 4,096 independent optimizations.
-3. **Two-tier multi-GPU.** Automatic in-library thread sharding (the default, and what the
-   4-GPU column below uses) for convenience; plus a separate, opt-in one-process-per-GPU
-   driver (`accel/multi_gpu.py`) that sidesteps the GIL for closer-to-N× scaling on large screens
-   (see **D** for the robustness work behind the automatic path).
+3. **Multi-GPU = process-per-GPU.** The host-bound align doesn't scale with thread sharding
+   (GIL-bound, ~1–2×; that default has been removed). The persistent one-process-per-GPU pool
+   (`accel/multi_gpu.py` `MultiGPUAligner`) builds each GPU's shard once and reaches
+   **3.50–3.79× on 4×L40S** (verified on node3615, bit-exact vs single-GPU). See **D**.
 4. **CPU engine (numba) — the same batched driver, on CPU.** The batched drivers (all
    modes except `esp_combo`) have a numba (`@njit(parallel=True)`) value+SE(3)-gradient
    kernel (`accel/kernels/cpu.py`) that replicates the Triton kernel operation-for-operation.
@@ -239,9 +250,8 @@ last decimal.
    fallback). The compute-bound surface modes (`surf`/`esp`) stay slow *per core* — they are
    FLOP-bound on `exp` — but they parallelise well: across 96 cores they reach ~3.4k / 1.7k
    pairs/s (see **Net result (CPU — multi-core)** below). The GPU path is untouched: for CUDA tensors the dispatcher always
-   selects the Triton kernels (the previous behavior). (A push for >2,000 pairs/s/core was explored and found
-   physically out of reach for `surf`/`esp`; full log in
-   [`SPEED_EXPERIMENTS_CPU.md`](SPEED_EXPERIMENTS_CPU.md).)
+   selects the Triton kernels (the previous behavior). (A push for >2,000 pairs/s/core was explored and
+   found physically out of reach for `surf`/`esp` — they are bound by per-core `exp` throughput.)
 
 ### B. Kill the per-pair overhead
 5. Profiling showed the alignment was **overhead-bound, not kernel-bound**: per-call setup
@@ -283,17 +293,15 @@ last decimal.
    selected per problem shape via `@triton.autotune` and validated to be bit-identical.
 
 ### D. Multi-GPU & very large batches (cluster / L40S work)
-10. **Robust multi-GPU sharding.** Automatic sharding engages only above **~4,096 pairs per
-    device** (so on a 4-GPU node it's a ≥~16k-pair feature; smaller batches stay on one GPU).
-    Making it hold up on a real 4×L40S node took several fixes: a single-threaded **per-device
-    cuSOLVER warm-up** (PyTorch's lazy handle init isn't thread-safe), a **device-keyed
-    CUDA-graph cache** with thread-local capture, and **migrating** the cached
-    `vol_esp`/`esp_combo`/`pharm` workspace tensors onto the active device. CUDA-graphs are
-    turned off on the sharded path (capture races across worker threads), so it runs the eager
-    fine loop — **same scores**, just without the single-GPU graph speedup. This automatic
-    thread path is what the 4-GPU column below uses; being GIL-limited it gains only
-    ~1.0–2.3× there. The separate `accel/multi_gpu.py` one-process-per-GPU driver is the path that
-    reaches closer-to-N× scaling, but it is **not** reflected in that table.
+10. **Multi-GPU = one process per GPU (verified).** The transparent thread-sharding path was
+    host/GIL-bound (~1.0–2.3× on 4×L40S) and has been **removed**. Multi-GPU now runs through
+    the persistent `MultiGPUAligner` pool (`accel/multi_gpu.py`): one OS process per GPU, each
+    owning its shard (build + align, data resident on its GPU), CPU threads capped to
+    `cores/ndev` to avoid the MKL/OMP oversubscription that otherwise collapsed scaling to <1×.
+    **Verified 3.50–3.79× on 4×L40S (node3615), bit-exact vs single-GPU** — vol 3.58×, surf
+    3.50×, esp 3.79×, pharm 3.63× (`benchmarks/experiments/mgpu_parity.py` asserts the process
+    path is bit-exact: max|Δscore|<1e-6). A transparent `align_with_*` runs single-GPU by default
+    (no silent `spawn`); `FSS_MGPU_BACKEND=process` opts into transparent process sharding.
 11. **100k-pairs-per-call batches.** cuSOLVER's batched `eigh` fails past ~8k problems, so the
     SE(3) seed solve is **chunked to ≤4,096** — numerically identical, but it's what lets a
     single call align **100,000 pairs** without crashing. This is what backs the flat
@@ -309,9 +317,11 @@ last decimal.
 ### Net result
 Peak aligned **pairs/second** by mode and GPU — the *same* fork code (Triton/GPU)
 on six devices, taken from the most recent benchmark run on each (real drug
-self-copy pairs, isolated best-of-N; the 4-GPU column is the automatic in-library
-thread-sharding path — the same `MoleculePairBatch.align_with_*(backend="triton")` call run
-on a 4-GPU node, not the explicit `accel/multi_gpu.py` driver; **bold** = fastest per mode):
+self-copy pairs, isolated best-of-N; **bold** = fastest per mode). **Note:** the
+**L40S · 4 GPU** column reflects the now-removed thread-sharding path (host/GIL-bound,
+~1.0–2.3×) and is kept only as the single-GPU-per-card baseline; the current multi-GPU
+path is the `MultiGPUAligner` process pool, **verified 3.50–3.79× over 1 GPU on the same
+node** (see **D**):
 
 | mode | RTX 4050 laptop | L40S · 1 GPU | L40S · 4 GPU | RTX PRO 6000 Blackwell | H100 NVL | H200 |
 |---|--:|--:|--:|--:|--:|--:|
@@ -324,11 +334,10 @@ on a 4-GPU node, not the explicit `accel/multi_gpu.py` driver; **bold** = fastes
 
 Every datacenter card clears **160k+ vol pairs/s** — roughly **3× the laptop** —
 because the post-F3 host path (~4 µs/pair) finally *feeds* a fast GPU instead of
-starving it; on the laptop the small GPU is the ceiling, so it sits at ~54k. A
-second-through-fourth L40S GPU mostly helps the heavier modes at large batch (surf/esp/pharm
-at 100k, where automatic sharding engages above ~4,096 pairs/device — though, being
-host/GIL-bound, it gains only ~1.0–2.3× there, not ~4×); `vol` already saturates one card,
-so 1- and 4-GPU `vol` match.
+starving it; on the laptop the small GPU is the ceiling, so it sits at ~54k. The **L40S · 4 GPU** column predates the multi-GPU rework and shows the old
+thread path's weak scaling (host/GIL-bound, ~1.0–2.3×; `vol`, already saturating one card, is
+unchanged). The current path — the `MultiGPUAligner` process pool — reaches **3.50–3.79×** over
+a single GPU across vol/surf/esp/pharm on that same 4×L40S node (node3615; verified, bit-exact).
 
 *(laptop: RTX 4050 · Core Ultra 9 185H · torch 2.5.1 / CUDA 12.4. Cluster cards
 (`pi_melkin` nodes) all on torch 2.11 / CUDA 12.8: L40S 1-/4-GPU · Xeon Gold 6542Y;
@@ -386,8 +395,6 @@ isolated best-of-N, 2026-06-21. Per-cell tables under
 `eng_vs_jax/`, plus a laptop-vs-cluster overview in `engaging/`; regenerate the panels with
 `benchmarks/results_cpu/engaging/plot_all_cores.py`.)*
 
-Full experiment log, including rejected ideas, is in [`SPEED_EXPERIMENTS.md`](SPEED_EXPERIMENTS.md);
-the CPU-fallback experiments are in [`SPEED_EXPERIMENTS_CPU.md`](SPEED_EXPERIMENTS_CPU.md).
 Reference benchmark outputs (RTX 4050 laptop, L40S 1-/4-GPU, RTX PRO 6000 Blackwell,
 H100 NVL, H200) ship under [`benchmarks/results/`](benchmarks/results/) — one folder per
 device plus a combined [`speed_all_hardware.png`](benchmarks/results/speed_all_hardware.png)
