@@ -96,9 +96,15 @@ class MoleculePairBatch:
             p.device = cpu
 
     def _triton_align(self, align_fn, align_kwargs, score_attr, transform_attr,
-                      fit_attr, return_aligned):
+                      fit_attr, return_aligned, num_workers: int = 1):
         """Route a batch alignment through the Triton ``MoleculePair._align_batch_*``
         path with ZERO extra alignment work.
+
+        ``num_workers > 1`` on the CPU (numba) path shards the pairs across a persistent
+        single-threaded process pool (:mod:`shepherd_score.container._cpu_pool`) for
+        near-linear multi-core scaling; results are bit-identical (pairs are
+        independent). It is ignored on CUDA tensors and for modes the pool does not
+        cover (those run the original single call).
 
         ``align_fn(self.pairs, **align_kwargs)`` is byte-identical to calling the
         Triton static method directly, so alignment throughput is unchanged (and it
@@ -113,8 +119,17 @@ class MoleculePairBatch:
         device so multi-GPU shards (whose tensors live on different devices) are
         handled correctly.
         """
-        align_fn(self.pairs, **align_kwargs)                 # <- identical to standalone Triton call
         pairs = self.pairs
+        mode = align_fn.__name__.replace("_align_batch_", "")
+        if (num_workers and num_workers > 1 and pairs
+                and pairs[0].device.type == "cpu"):
+            from shepherd_score.container import _cpu_pool
+            if mode in _cpu_pool.POOL_MODES:
+                _cpu_pool.align_pairs(mode, pairs, num_workers, align_kwargs)
+            else:
+                align_fn(pairs, **align_kwargs)          # mode not pooled -> single call
+        else:
+            align_fn(pairs, **align_kwargs)              # <- identical to standalone Triton call
         scores = np.array([float(getattr(p, score_attr)) for p in pairs])
         if not return_aligned:
             return scores, [None] * len(pairs)
@@ -288,7 +303,7 @@ class MoleculePairBatch:
                 MoleculePair._align_batch_vol,
                 dict(alpha=alpha, steps_fine=max_num_steps),
                 "sim_aligned_vol_noH", "transform_vol_noH",
-                "_fit_xyz_t", return_aligned)
+                "_fit_xyz_t", return_aligned, num_workers=num_workers)
         if backend != "jax":
             raise ValueError(f"unknown backend {backend!r}; use 'jax', 'triton', or 'numba'")
 
@@ -724,7 +739,7 @@ class MoleculePairBatch:
                 MoleculePair._align_batch_surf,
                 dict(alpha=alpha, steps_fine=max_num_steps),
                 "sim_aligned_surf", "transform_surf",
-                "_fit_surf_t", return_aligned)
+                "_fit_surf_t", return_aligned, num_workers=num_workers)
         if backend != "jax":
             raise ValueError(f"unknown backend {backend!r}; use 'jax', 'triton', or 'numba'")
 
@@ -860,7 +875,7 @@ class MoleculePairBatch:
                 dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
                      trans_init=trans_init, lr=lr, steps_fine=max_num_steps),
                 "sim_aligned_esp", "transform_esp",
-                "_fit_surf_t", return_aligned)
+                "_fit_surf_t", return_aligned, num_workers=num_workers)
         if backend != "jax":
             raise ValueError(f"unknown backend {backend!r}; use 'jax', 'triton', or 'numba'")
 
@@ -1144,10 +1159,17 @@ class MoleculePairBatch:
         if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
             if backend in self._NUMBA_BACKENDS:
                 self._prepare_numba()
-            MoleculePair._align_batch_pharm(
-                self.pairs, similarity=similarity, extended_points=extended_points,
-                only_extended=only_extended, trans_init=trans_init,
-                num_repeats=num_repeats, steps_fine=max_num_steps, lr=lr)
+            _pharm_kw = dict(similarity=similarity, extended_points=extended_points,
+                             only_extended=only_extended, trans_init=trans_init,
+                             num_repeats=num_repeats, steps_fine=max_num_steps, lr=lr)
+            if (num_workers and num_workers > 1 and self.pairs
+                    and self.pairs[0].device.type == "cpu"):
+                # CPU multi-core: shard pairs across the persistent single-threaded pool
+                # (bit-identical; align_pairs also caches _*_pharm_*_t for return_aligned).
+                from shepherd_score.container import _cpu_pool
+                _cpu_pool.align_pairs("pharm", self.pairs, num_workers, _pharm_kw)
+            else:
+                MoleculePair._align_batch_pharm(self.pairs, **_pharm_kw)
             pairs = self.pairs
             n = len(pairs)
             scores = np.array([float(p.sim_aligned_pharm) for p in pairs])
