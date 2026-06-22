@@ -42,8 +42,10 @@ shepherd_score/
 │   │   ├── esp_combo.py                    # ShaEP-style combo driver
 │   │   ├── pharm.py                        # pharmacophore driver
 │   │   └── pharm_overlap.py                # pharmacophore overlap scoring (pure PyTorch)
-│   ├── batch.py                        #    Layer 3 — orchestration: bucketing, sub-batching,
-│   │                                   #      scatter-fill, _align_batch_* drivers, multi-GPU sharding
+│   ├── batch/                          #    Layer 3 — batch orchestration (package):
+│   │                                   #      _pad (bucketing/sub-batching/scatter-fill),
+│   │                                   #      _dispatch (multi-GPU sharding + CPU-pool spec),
+│   │                                   #      aligners (the six _align_batch_* drivers)
 │   ├── cpu_pool.py                         # persistent multi-core CPU (numba) process pool
 │   └── multi_gpu.py                        # explicit one-process-per-GPU data-parallel driver
 │
@@ -68,7 +70,7 @@ not tuned or validated).
 
 ### Changes to existing upstream files
 
-The 18 modules under `accel/` are **new** -- a brand-new subpackage, so upstream's
+The 21 modules under `accel/` are **new** -- a brand-new subpackage, so upstream's
 `score/`, `alignment/utils/`, and `container/` file sets are otherwise untouched.
 Beyond them, the fork modifies only **6 existing upstream files**; the table below
 accounts for every one (Δlines = real diff vs
