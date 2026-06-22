@@ -1,4 +1,4 @@
-# shepherd_score/alignment/utils/fast_surface_se3.py
+# shepherd_score/accel/drivers/surface.py
 # Fast GPU-accelerated surface alignment using the existing Triton kernel.
 # Surface alignment uses the same Gaussian overlap math as volumetric,
 # just with surface points and surface-specific alpha values.

@@ -1,4 +1,4 @@
-# shepherd_score/alignment/utils/fast_esp_combo_se3.py
+# shepherd_score/accel/drivers/esp_combo.py
 # Fast GPU-accelerated ESP combo alignment.
 # Combines shape overlap (using Triton kernel) with surface ESP comparison.
 

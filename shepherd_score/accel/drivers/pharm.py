@@ -1,4 +1,4 @@
-# shepherd_score/alignment/utils/fast_pharm_se3.py
+# shepherd_score/accel/drivers/pharm.py
 # Fast GPU-accelerated pharmacophore alignment.
 
 import torch

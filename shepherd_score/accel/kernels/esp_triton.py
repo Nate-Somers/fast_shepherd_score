@@ -1,4 +1,4 @@
-# shepherd_score/score/gaussian_overlap_esp_triton.py
+# shepherd_score/accel/kernels/esp_triton.py
 # A fused (forward + backward) ESP-weighted Gaussian-Tanimoto kernel using Triton.
 # Extends the base volumetric kernel to include electrostatic potential weighting.
 #

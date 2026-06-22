@@ -1,4 +1,4 @@
-# shepherd_score/alignment/utils/fast_common.py
+# shepherd_score/accel/drivers/_common.py
 # Common utilities shared across fast GPU-accelerated alignment methods.
 
 import os

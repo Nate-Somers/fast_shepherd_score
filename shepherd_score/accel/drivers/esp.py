@@ -1,4 +1,4 @@
-# shepherd_score/alignment/utils/fast_esp_se3.py
+# shepherd_score/accel/drivers/esp.py
 # Fast GPU-accelerated ESP alignment using the ESP Triton kernel.
 
 from __future__ import annotations

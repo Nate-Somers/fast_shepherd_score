@@ -11,8 +11,8 @@ original API and behavior, and adds a single opt-in seam.
   existing code behaves exactly as before. Triton is an **optional** dependency — if it
   (or a GPU) isn't present, everything falls back transparently.
 - **CPU too:** the *same* batched driver runs on a Triton-free **numba** kernel
-  (`cpu_overlap.py`) for CPU tensors — selected **per call by tensor device**
-  (`kernel_dispatch.py`), so it runs whether or not Triton is installed (CUDA tensors →
+  (`accel/kernels/cpu.py`) for CPU tensors — selected **per call by tensor device**
+  (`accel/kernels/dispatch.py`), so it runs whether or not Triton is installed (CUDA tensors →
   Triton, CPU tensors → numba, in one process). Numerically exact and **~25× faster than
   the original per-pair CPU path** on `vol` (all batched modes except `esp_combo`).
 
@@ -27,63 +27,62 @@ was modified in place.**
 
 ```
 shepherd_score/
-├── score/                              # ── Layer 1: Triton kernels (the raw compute)
-│   ├── gaussian_overlap_triton.py          # NEW: fused value+gradient shape (ROCS) overlap
-│   ├── gaussian_overlap_esp_triton.py      # NEW: + electrostatic-potential (ESP) weighting
-│   ├── pharmacophore_overlap_triton.py     # NEW: typed/directional pharmacophore overlap
-│   │                                       #   (pure PyTorch despite the _triton filename)
-│   └── pharmacophore_grad_triton.py        # NEW: the Triton pharmacophore value+SE(3) gradient kernel
+├── accel/                              # ── NEW: all GPU/CPU acceleration, one subpackage
+│   ├── kernels/                        #    Layer 1 — raw compute cores
+│   │   ├── dispatch.py                     # per-call device routing (Triton on CUDA, numba on CPU)
+│   │   ├── shape_triton.py                 # fused value+gradient shape (ROCS) overlap (Triton)
+│   │   ├── esp_triton.py                   # + electrostatic-potential (ESP) weighting (Triton)
+│   │   ├── pharm_triton.py                 # typed/directional pharmacophore value+SE(3) grad (Triton)
+│   │   └── cpu.py                          # numba CPU mirrors of all three kernels
+│   ├── drivers/                        #    Layer 2 — batched coarse-to-fine SE(3) optimizers
+│   │   ├── _common.py                      # batched SE(3) seed generation, quaternion ops
+│   │   ├── shape.py                        # volumetric (atom-cloud) driver (also drives surf)
+│   │   ├── surface.py                      # surface-point driver
+│   │   ├── esp.py                          # ESP-weighted driver
+│   │   ├── esp_combo.py                    # ShaEP-style combo driver
+│   │   ├── pharm.py                        # pharmacophore driver
+│   │   └── pharm_overlap.py                # pharmacophore overlap scoring (pure PyTorch)
+│   ├── batch.py                        #    Layer 3 — orchestration: bucketing, sub-batching,
+│   │                                   #      scatter-fill, _align_batch_* drivers, multi-GPU sharding
+│   ├── cpu_pool.py                         # persistent multi-core CPU (numba) process pool
+│   └── multi_gpu.py                        # explicit one-process-per-GPU data-parallel driver
 │
-├── alignment/utils/                    # ── Layer 2: batched coarse-to-fine optimizers
-│   ├── fast_common.py                      # NEW: batched SE(3) seed generation, quaternion ops
-│   ├── fast_se3.py                         # NEW: volumetric (atom-cloud) alignment driver
-│   ├── fast_surface_se3.py                 # NEW: surface-point alignment driver
-│   ├── fast_esp_se3.py                     # NEW: ESP-weighted alignment driver
-│   ├── fast_pharm_se3.py                   # NEW: pharmacophore alignment driver
-│   ├── fast_esp_combo_se3.py               # NEW: ShaEP-style combo alignment driver
-│   ├── cpu_overlap.py                      # NEW: numba CPU kernels for the batched fast_* drivers
-│   ├── kernel_dispatch.py                  # NEW: per-call device routing (Triton on CUDA, numba on CPU)
-│   └── se3.py                              # modified: batched (q,t)→SE(3) helper added
-│
-└── container/                          # ── Layer 3: integration (the public seam)
-    ├── _batch_align.py  (NEW)              # NEW: all batch orchestration — size bucketing,
-    │                                       #   sub-batching, scatter-fill, _esp_bucketed_align,
-    │                                       #   _align_batch_* drivers, multi-GPU sharding
-    ├── multi_gpu.py     (NEW)              # NEW: explicit one-process-per-GPU data-parallel
-    │                                       #   driver (align_multi_gpu / MultiGPUAligner)
-    ├── _batch.py        → MoleculePairBatch  # modified: PUBLIC seam align_with_*(backend="triton")
-    └── _core.py         → MoleculePair       # modified: binds the _align_batch_* statics from
-                                            #   _batch_align.py; opt-in per-pair fast path (use_fast)
+└── container/                          # ── integration (existing upstream files; the public seam)
+    ├── _batch.py   → MoleculePairBatch     # modified: PUBLIC seam align_with_*(backend="triton"/"numba")
+    ├── _core.py    → MoleculePair          # modified: binds accel.batch._align_batch_* onto MoleculePair;
+    │                                       #   opt-in per-pair fast path (use_fast)
+    └── __init__.py                         # modified: exports align_multi_gpu / MultiGPUAligner
 ```
 
 **Why this shape.** The speedup is a *batch* phenomenon — it comes from optimizing many
 pairs at once in a single GPU dispatch, which amortizes the per-pair Python/launch
 overhead. So the public entry point is the **batch** container (`MoleculePairBatch`); the
 per-pair `MoleculePair` is a public class whose batch-orchestration helpers
-(`_align_batch_*`) are private internals re-exported from the new `_batch_align.py`. The
+(`_align_batch_*`) are private internals re-exported from the new `accel/batch.py`. The
 kernels and optimizers are pure internals, gated behind a `try/except ImportError` so the
 package imports fine without Triton, and each batched driver additionally falls back to a
-**numba CPU** implementation (`cpu_overlap.py`) when Triton is unavailable. All five `fast_*`
-modules import on a CPU-only box; the validated CPU aligners are `vol`/`vol_esp`/`surf`/`esp`/`pharm`,
+**numba CPU** implementation (`accel/kernels/cpu.py`) when Triton is unavailable. All five mode
+drivers import on a CPU-only box; the validated CPU aligners are `vol`/`vol_esp`/`surf`/`esp`/`pharm`,
 while `esp_combo` reuses the same numba shape kernel but stays GPU-targeted (its CPU path is
 not tuned or validated).
 
 ### Changes to existing upstream files
 
-The 14 modules above are **new**. Beyond them, the fork touches only **6 existing upstream
-files**; the table below accounts for every one (Δlines = real diff vs
-[`coleygroup/shepherd-score`](https://github.com/coleygroup/shepherd-score), ignoring
-line-ending noise). Everything else in the package is byte-identical to upstream, and **no
-upstream file was deleted**.
+The 18 modules under `accel/` are **new** -- a brand-new subpackage, so upstream's
+`score/`, `alignment/utils/`, and `container/` file sets are otherwise untouched.
+Beyond them, the fork modifies only **6 existing upstream files**; the table below
+accounts for every one (Δlines = real diff vs
+[`coleygroup/shepherd-score`](https://github.com/coleygroup/shepherd-score)). No
+upstream file was deleted, and `alignment/_torch.py` is byte-identical to upstream.
 
 | File | Δlines | What changed |
 |---|--:|---|
-| `container/_batch.py` | +218 | **The public seam.** Adds `_TRITON_BACKENDS` / `_NUMBA_BACKENDS`, the `_triton_align()` router and a `_prepare_numba()` guard, plus a `backend="jax"` (default) argument on every `align_with_*` method (and a brand-new `align_with_esp_combo` batch method — the other five already existed upstream). `backend` in `{"triton","cuda","gpu"}` routes to the batched `MoleculePair._align_batch_*` GPU path; `{"numba","cpu"}` runs that **same** batched driver on CPU with the numba kernels (forces CPU; works on **any** box — kernels are selected per call by tensor device via `kernel_dispatch.py`, so it runs even on a GPU box; excludes `esp_combo`); `"jax"` runs the original path unchanged; any other value raises. |
-| `container/_core.py` | +276 | Binds the `_align_batch_*` static methods (defined in the new `_batch_align.py`) onto `MoleculePair`; adds an **opt-in** `use_fast=False` kwarg gating the per-pair Triton fast path on `align_with_esp` / `align_with_esp_combo` / `align_with_pharm` (default preserves the original torch/analytical behavior and honors `use_analytical`); adds a `score_with_vol()` helper. |
-| `alignment/utils/se3.py` | +84 | Adds batched SE(3) builders `quaternion_to_SE3` / `quaternions_to_SE3_batch` (the GPU write-back uses the batched form); reworks `apply_SE3_transform` to a single fused `baddbmm` that collapses a singleton batch — the upstream parameter name (`SE3_transform`) and the three shape-validation checks are retained. |
-| `generate_point_cloud.py` | +17 | Makes the Open3D import **lazy** (`from __future__ import annotations` + a `_LazyOpen3D` proxy). Open3D is a ~30 s cold import and is fork-hostile (it breaks a later `fork`+CUDA), so deferring it keeps `import shepherd_score` fast and lets the fork-based multi-GPU pool work. Behavior is identical on first real surface use. |
-| `protonation/protonate.py` | +2 | Adds `from __future__ import annotations` (deferred annotation evaluation; no behavior change). |
-| `alignment/_torch.py` | +8 | Cosmetic only — three trailing commas, one blank line, one comment. (The previously-added dead `VAA_const` parameter was removed, restoring the exact upstream `objective_ROCS_overlay` signature.) |
+| `container/_batch.py` | +283 | **The public seam.** Adds `_TRITON_BACKENDS` / `_NUMBA_BACKENDS`, the `_triton_align()` router and a `_prepare_numba()` guard, plus a `backend="jax"` (default) argument on every `align_with_*` method (and a new `align_with_esp_combo` batch method). `backend` in `{"triton","cuda","gpu"}` routes to the batched GPU path; `{"numba","cpu"}` runs that same batched driver on CPU; `"jax"` runs the original path unchanged; any other value raises. |
+| `container/_core.py` | +272 / −4 | Binds the `_align_batch_*` static methods (defined in `accel/batch.py`) onto `MoleculePair`; adds an **opt-in** `use_fast=False` kwarg gating the per-pair Triton fast path on `align_with_esp` / `esp_combo` / `pharm` (default preserves the original torch/analytical behaviour and honours `use_analytical`); adds a `score_with_vol()` helper. |
+| `alignment/utils/se3.py` | +35 / −20 | Adds the batched SE(3) builder `quaternions_to_SE3_batch` (the GPU write-back uses it) and reworks `apply_SE3_transform` to a single fused `baddbmm`; the upstream parameter name (`SE3_transform`) and shape-validation checks are retained. |
+| `container/__init__.py` | +7 / −1 | Exports the explicit multi-GPU driver `align_multi_gpu` / `MultiGPUAligner` (defined in `accel/multi_gpu.py`). |
+| `generate_point_cloud.py` | +16 / −1 | Makes the Open3D import **lazy** (`from __future__ import annotations` + a `_LazyOpen3D` proxy). Open3D is a ~30 s cold import and is fork-hostile (it breaks a later `fork`+CUDA), so deferring it keeps `import shepherd_score` fast and lets the fork-based multi-GPU pool work. Behaviour is identical on first real surface use. |
+| `protonation/protonate.py` | +2 | Adds `from __future__ import annotations` (no behaviour change). |
 
 ---
 
@@ -135,14 +134,15 @@ Two paths exist, with different trade-offs:
   heavier modes (surf/esp/pharm) at very large batch but does not reach ~N×, and `vol`
   (which already saturates one card) is unchanged. **This automatic path is what produced
   the 4-GPU column in the results table below.**
-- **Explicit data-parallel driver** (`shepherd_score.container.multi_gpu` —
+- **Explicit data-parallel driver** (`shepherd_score.accel.multi_gpu` —
   `align_multi_gpu` / `MultiGPUAligner`). A separate, opt-in path that launches **one OS
   process per GPU**, each owning its shard end-to-end (build + align, data resident on its
   GPU) with CPU threads capped to `cores/ndev` to avoid oversubscription. By sidestepping
   the GIL it scales closer to linear (**~3.5–3.9× on 4×L40S** in separate experiments). It
   is a one-shot launcher (pays a fixed spawn cost once), so it is aimed at large screens. It
-  is **not** what the table below reflects, and it is not yet exported from
-  `container/__init__.py` (reachable via the deep `shepherd_score.container.multi_gpu` path).
+  is **not** what the table below reflects. It is now exported from
+  `container/__init__.py` and `shepherd_score.accel` (also importable directly as
+  `shepherd_score.accel.multi_gpu`).
 
 ### The backend matrix
 
@@ -161,7 +161,7 @@ Notes:
 - **`backend="numba"`** (alias `"cpu"`) runs the *same* batched coarse-to-fine drivers
   as the Triton path, but with the numba CPU kernels instead of Triton. It forces every
   pair onto CPU and **works on any box** — including a GPU box where Triton is installed —
-  because kernel selection is **per call, by tensor device** (`alignment/utils/kernel_dispatch.py`):
+  because kernel selection is **per call, by tensor device** (`accel/kernels/dispatch.py`):
   CUDA tensors dispatch to Triton, CPU tensors to numba, in the same process. This lets you
   reserve the GPU for another task or run a deterministic CPU pass without uninstalling
   Triton. (Numerically exact vs the Triton path: GPU-vs-CPU agreement ~1e-3, self-copy
@@ -212,8 +212,8 @@ last decimal.
 
 ### A. The engine — batched optimization (GPU + CPU)
 1. **Triton value+gradient kernels** for shape, ESP, and pharmacophore
-   overlap (`gaussian_overlap_triton.py`, `gaussian_overlap_esp_triton.py`,
-   `pharmacophore_overlap_triton.py`, `pharmacophore_grad_triton.py`). One CTA per pose
+   overlap (`accel/kernels/shape_triton.py`, `accel/kernels/esp_triton.py`,
+   `accel/drivers/pharm_overlap.py`, `accel/kernels/pharm_triton.py`). One CTA per pose
    computes the overlap *and* its SE(3) gradient in a single fused pass — replacing the
    per-pair CPU/JAX optimization loop.
 2. **Batched coarse-to-fine SE(3) search.** Seed generation, the Adam fine-tuning loop,
@@ -221,12 +221,12 @@ last decimal.
    sequence of kernel launches instead of 4,096 independent optimizations.
 3. **Two-tier multi-GPU.** Automatic in-library thread sharding (the default, and what the
    4-GPU column below uses) for convenience; plus a separate, opt-in one-process-per-GPU
-   driver (`multi_gpu.py`) that sidesteps the GIL for closer-to-N× scaling on large screens
+   driver (`accel/multi_gpu.py`) that sidesteps the GIL for closer-to-N× scaling on large screens
    (see **D** for the robustness work behind the automatic path).
 4. **CPU engine (numba) — the same batched driver, on CPU.** The batched drivers (all
    modes except `esp_combo`) have a numba (`@njit(parallel=True)`) value+SE(3)-gradient
-   kernel (`cpu_overlap.py`) that replicates the Triton kernel operation-for-operation.
-   Kernel choice is **per call, by tensor device** (`kernel_dispatch.py`): CUDA tensors run
+   kernel (`accel/kernels/cpu.py`) that replicates the Triton kernel operation-for-operation.
+   Kernel choice is **per call, by tensor device** (`accel/kernels/dispatch.py`): CUDA tensors run
    the Triton kernels, CPU tensors the numba ones — so the numba path runs whenever the data
    is on CPU, whether or not Triton is installed (e.g. `backend="numba"` on a GPU box). It is **numerically exact** (computes the true
    overlap+gradient; not bit-identical, since `math.exp` ≠ Triton's `exp2`), so self-copy
@@ -289,7 +289,7 @@ last decimal.
     turned off on the sharded path (capture races across worker threads), so it runs the eager
     fine loop — **same scores**, just without the single-GPU graph speedup. This automatic
     thread path is what the 4-GPU column below uses; being GIL-limited it gains only
-    ~1.0–2.3× there. The separate `multi_gpu.py` one-process-per-GPU driver is the path that
+    ~1.0–2.3× there. The separate `accel/multi_gpu.py` one-process-per-GPU driver is the path that
     reaches closer-to-N× scaling, but it is **not** reflected in that table.
 11. **100k-pairs-per-call batches.** cuSOLVER's batched `eigh` fails past ~8k problems, so the
     SE(3) seed solve is **chunked to ≤4,096** — numerically identical, but it's what lets a
@@ -308,7 +308,7 @@ Peak aligned **pairs/second** by mode and GPU — the *same* fork code (Triton/G
 on six devices, taken from the most recent benchmark run on each (real drug
 self-copy pairs, isolated best-of-N; the 4-GPU column is the automatic in-library
 thread-sharding path — the same `MoleculePairBatch.align_with_*(backend="triton")` call run
-on a 4-GPU node, not the explicit `multi_gpu.py` driver; **bold** = fastest per mode):
+on a 4-GPU node, not the explicit `accel/multi_gpu.py` driver; **bold** = fastest per mode):
 
 | mode | RTX 4050 laptop | L40S · 1 GPU | L40S · 4 GPU | RTX PRO 6000 Blackwell | H100 NVL | H200 |
 |---|--:|--:|--:|--:|--:|--:|

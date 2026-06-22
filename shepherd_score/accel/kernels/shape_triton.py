@@ -1,4 +1,4 @@
-# shepherd_score/score/gaussian_overlap_triton.py
+# shepherd_score/accel/kernels/shape_triton.py
 # A fused (forward + backward) Gaussian‐Tanimoto kernel using Triton.
 #
 from __future__ import annotations

@@ -1,4 +1,4 @@
-# shepherd_score/score/pharmacophore_overlap_triton.py
+# shepherd_score/accel/drivers/pharm_overlap.py
 # Fast GPU-accelerated pharmacophore overlap scoring.
 #
 # This module intentionally stays in PyTorch (rather than Triton) because pharmacophore

@@ -1,4 +1,4 @@
-# shepherd_score/score/pharmacophore_grad_triton.py
+# shepherd_score/accel/kernels/pharm_triton.py
 # Triton value + SE(3) gradient for the typed/directional pharmacophore overlap.
 # Mirrors score.analytical_gradients._torch.compute_overlap_and_grad_pharm
 # (extended_points=False) so its outputs (O_AB, grad_R, grad_t) are a drop-in
