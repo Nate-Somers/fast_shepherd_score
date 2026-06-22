@@ -186,5 +186,6 @@ shepherd-score-original-repo/
 benchmarks/molcache/
 # Benchmark run logs (transient; the plot/table/json under results*/ are the outputs).
 benchmarks/results_cpu/*.log
+benchmarks/results_cpu/**/slurm-*.out
 # Personal conda env (upstream environment.yml is the canonical one)
 environment.local.yml
