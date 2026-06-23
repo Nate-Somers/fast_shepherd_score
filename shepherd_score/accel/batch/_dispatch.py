@@ -45,8 +45,16 @@ _WARNED_SINGLE_GPU = False          # emit the "transparent multi-GPU is off" no
 
 def _dev_idx(device: torch.device) -> int:
     """Cache-key component so per-device workspaces/buffers never collide under
-    the multi-GPU dispatcher. Constant 0 on a single GPU -> no behaviour change."""
-    return device.index if (device.type == "cuda" and device.index is not None) else -1
+    the multi-GPU dispatcher. Constant 0 on a single GPU -> no behaviour change.
+
+    A bare ``torch.device("cuda")`` has ``index is None``; it must still resolve to
+    a concrete GPU index (the current device), NOT to the CPU sentinel -1 -- else a
+    CUDA batch built with an indexless device shares a cache key with a CPU
+    (backend="numba") batch, and the second reuses the first's wrong-device
+    workspace (RuntimeError: tensors on cuda:0 and cpu)."""
+    if device.type == "cuda":
+        return device.index if device.index is not None else torch.cuda.current_device()
+    return -1
 
 
 # Minimum pairs PER DEVICE before multi-GPU sharding is even considered. Below this a
