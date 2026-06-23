@@ -11,7 +11,7 @@ from .pharm_overlap import (
 )
 # Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
 # (pharmacophore_overlap_triton, imported above, is pure PyTorch and needs no dispatch.)
-from ..kernels.dispatch import fused_adam_qt, pharm_score_grad_se3_batch
+from ..kernels.dispatch import fused_adam_qt, pharm_score_grad_se3_batch, pharm_grad_dq_se3_batch
 from ...score.analytical_gradients._torch import build_lookup_tables
 from . import _common as _fc
 from ._common import (
@@ -252,11 +252,14 @@ def coarse_fine_pharm_align_many(
         if use_kernel:
             _pk_tables = build_lookup_tables(device, anchors_1_k.dtype)
             _al, _Ks, _cats = _pk_tables
-            VAA_an, _, _ = pharm_score_grad_se3_batch(
-                _I3, _z, types_1_k, types_1_k, anchors_1_k, anchors_1_k, vectors_1_k, vectors_1_k,
+            # Identity quaternion for the dQ kernel's value-only self-overlaps.
+            _q0 = torch.zeros(_P, 4, device=device, dtype=anchors_1_k.dtype)
+            _q0[:, 0] = 1.0
+            VAA_an, _, _ = pharm_grad_dq_se3_batch(
+                _q0, _z, types_1_k, types_1_k, anchors_1_k, anchors_1_k, vectors_1_k, vectors_1_k,
                 _al, _Ks, _cats, N_real=N_k, M_real=N_k, NEED_GRAD=False)
-            VBB_an, _, _ = pharm_score_grad_se3_batch(
-                _I3, _z, types_2_k, types_2_k, anchors_2_k, anchors_2_k, vectors_2_k, vectors_2_k,
+            VBB_an, _, _ = pharm_grad_dq_se3_batch(
+                _q0, _z, types_2_k, types_2_k, anchors_2_k, anchors_2_k, vectors_2_k, vectors_2_k,
                 _al, _Ks, _cats, N_real=M_k, M_real=M_k, NEED_GRAD=False)
         else:
             VAA_an, _, _ = compute_overlap_and_grad_pharm(
@@ -272,31 +275,49 @@ def coarse_fine_pharm_align_many(
         if use_analytical:
             # One fused value+grad pass, no autograd graph, no per-step host sync.
             q_unit = torch.nn.functional.normalize(q_param, dim=1)
-            R = _rotation_matrix_from_unit_quat(q_unit)
             if use_kernel:
+                # In-register dQ kernel: takes the unit quaternion and returns the
+                # overlap value + dO/dq (and dO/dt) DIRECTLY -- no (PK,3,3) grad_R,
+                # no apply_*_chain_rule on a matrix, no project_grad_R_to_quaternion.
                 _al, _Ks, _cats = _pk_tables
-                O_AB, grad_R, grad_t = pharm_score_grad_se3_batch(
-                    R, t_param, types_1_k, types_2_k,
+                O_AB, dQ_raw, dT_raw = pharm_grad_dq_se3_batch(
+                    q_unit, t_param, types_1_k, types_2_k,
                     anchors_1_k, anchors_2_k, vectors_1_k, vectors_2_k,
                     _al, _Ks, _cats, N_real=N_k, M_real=M_k)
+                score = pharm_similarity_from_overlaps(O_AB, VAA_an, VBB_an, similarity=similarity)
+                # Tanimoto/Tversky chain rule applied straight to dO/dq: the matrix->
+                # quaternion projection commutes with the scalar scale, so projecting
+                # then scaling (old path) == scaling dO/dq directly (here).
+                if similarity == 'tanimoto':
+                    denom = (VAA_an + VBB_an) - O_AB
+                    scale = -(VAA_an + VBB_an) / (denom * denom)
+                else:
+                    sigma = _PHARM_SIGMA_MAP[similarity]
+                    D = sigma * VAA_an + (1.0 - sigma) * VBB_an
+                    active = (O_AB < D).to(dtype=dQ_raw.dtype)
+                    scale = -active / D
+                sgrad_q_unit = scale.unsqueeze(1) * dQ_raw
+                sgrad_t = scale.unsqueeze(1) * dT_raw
             else:
+                # extended_points: keep the analytical grad_R + projection path.
+                R = _rotation_matrix_from_unit_quat(q_unit)
                 O_AB, grad_R, grad_t = compute_overlap_and_grad_pharm(
                     R, t_param, types_1_k, types_2_k,
                     anchors_1_k, anchors_2_k, vectors_1_k, vectors_2_k,
                     extended_points=extended_points, only_extended=only_extended,
                 )
-            score = pharm_similarity_from_overlaps(O_AB, VAA_an, VBB_an, similarity=similarity)
-            if similarity == 'tanimoto':
-                _, sgrad_R, sgrad_t = apply_tanimoto_chain_rule(O_AB, VAA_an + VBB_an, grad_R, grad_t)
-            else:
-                sigma = _PHARM_SIGMA_MAP[similarity]
-                D = sigma * VAA_an + (1.0 - sigma) * VBB_an
-                _, sgrad_R, sgrad_t = apply_tversky_chain_rule(O_AB, D, grad_R, grad_t)
+                score = pharm_similarity_from_overlaps(O_AB, VAA_an, VBB_an, similarity=similarity)
+                if similarity == 'tanimoto':
+                    _, sgrad_R, sgrad_t = apply_tanimoto_chain_rule(O_AB, VAA_an + VBB_an, grad_R, grad_t)
+                else:
+                    sigma = _PHARM_SIGMA_MAP[similarity]
+                    D = sigma * VAA_an + (1.0 - sigma) * VBB_an
+                    _, sgrad_R, sgrad_t = apply_tversky_chain_rule(O_AB, D, grad_R, grad_t)
+                sgrad_q_unit = project_grad_R_to_quaternion(sgrad_R, q_unit)
             # grad w.r.t. unit quat -> raw quat (normalisation Jacobian); this
             # already lies in the tangent space, so the projection below is a no-op.
-            grad_q_unit = project_grad_R_to_quaternion(sgrad_R, q_unit)
             qn = q_param.norm(dim=1, keepdim=True).clamp(min=1e-12)
-            dQ = (grad_q_unit - q_unit * (q_unit * grad_q_unit).sum(1, keepdim=True)) / qn
+            dQ = (sgrad_q_unit - q_unit * (q_unit * sgrad_q_unit).sum(1, keepdim=True)) / qn
             dT = sgrad_t
         else:
             q_var = q_param.detach().requires_grad_(True)

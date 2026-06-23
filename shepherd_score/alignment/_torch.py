@@ -1291,3 +1291,258 @@ def optimize_pharm_overlay(ref_pharms: torch.Tensor,
         best_transform = SE3_transform.cpu()[best_idx]
         best_score = scores.cpu()[best_idx]
     return best_alignment, best_aligned_vectors, best_transform, best_score
+
+
+def objective_vol_color_overlay(se3_params: torch.Tensor,
+                                ref_centers: torch.Tensor,
+                                fit_centers: torch.Tensor,
+                                ref_pharms: torch.Tensor,
+                                fit_pharms: torch.Tensor,
+                                ref_anchors: torch.Tensor,
+                                fit_anchors: torch.Tensor,
+                                ref_vectors: torch.Tensor,
+                                fit_vectors: torch.Tensor,
+                                alpha: float = 0.81,
+                                color_weight: float = 0.5,
+                                similarity: _SIM_TYPE = 'tanimoto',
+                                directional: bool = False,
+                                extended_points: bool = False,
+                                only_extended: bool = False,
+                                ) -> torch.Tensor:
+    """
+    Objective for the ROCS/ROSHAMBO-style ``vol_color`` overlay: a weighted combination of
+    atom-centred Gaussian *shape* (volume) Tanimoto and *color* (pharmacophore) Tanimoto.
+    Supports batched and non-batched inputs; for a batch the loss is the average.
+
+    The combined similarity is ``(1 - color_weight) * shape + color_weight * color``. With
+    ``directional=False`` (default) the color channel is scored as isotropic point
+    Gaussians (ROCS/ROSHAMBO "color"). The shape channel is always Tanimoto-scored.
+
+    Parameters
+    ----------
+    se3_params : torch.Tensor (7,) or (B, 7)
+        SE(3) parameters (quaternion (r,i,j,k) followed by translation (x,y,z)).
+    ref_centers, fit_centers : torch.Tensor (N,3)/(M,3) or batched (B,N,3)/(B,M,3)
+        Atom coordinates (heavy atoms) used for the Gaussian shape overlap.
+    ref_pharms, fit_pharms : torch.Tensor (P,)/(Q,) or batched
+        Pharmacophore type indices (order of ``P_TYPES``).
+    ref_anchors, fit_anchors : torch.Tensor (P,3)/(Q,3) or batched
+        Pharmacophore anchor coordinates.
+    ref_vectors, fit_vectors : torch.Tensor (P,3)/(Q,3) or batched
+        Pharmacophore orientation vectors (ignored when ``directional=False``).
+    alpha : float
+        Gaussian width for the shape overlap (0.81 = volumetric).
+    color_weight : float
+        Weight of the color channel in [0, 1]; shape gets ``1 - color_weight``.
+
+    Returns
+    -------
+    loss : torch.Tensor
+        ``1 - combined_similarity`` (mean over the batch if batched).
+    """
+    if len(fit_centers.shape) - 1 != len(se3_params.shape):
+        err_mssg = f'Instead these shapes were given: fit_centers {fit_centers.shape} and se3_params {se3_params.shape}'
+        if len(fit_centers.shape) == 2:  # expect single instance
+            raise ValueError(f'Since "fit_centers" is a single point cloud, there should only be one set of "se3_params". {err_mssg}')
+        elif len(fit_centers.shape) == 3:  # expect batch
+            raise ValueError(f'Since "fit_centers" is batched, there should be a row of "se3_params" for each batch. {err_mssg}')
+
+    se3_matrix = get_SE3_transform(se3_params)
+    fit_centers = apply_SE3_transform(fit_centers, se3_matrix)
+    fit_anchors = apply_SE3_transform(fit_anchors, se3_matrix)
+    fit_vectors = apply_SO3_transform(fit_vectors, se3_matrix)
+
+    shape_sim = get_overlap(ref_centers, fit_centers, alpha)
+    color_sim = get_overlap_pharm(ptype_1=ref_pharms,
+                                  ptype_2=fit_pharms,
+                                  anchors_1=ref_anchors,
+                                  anchors_2=fit_anchors,
+                                  vectors_1=ref_vectors,
+                                  vectors_2=fit_vectors,
+                                  similarity=similarity,
+                                  extended_points=extended_points,
+                                  only_extended=only_extended,
+                                  directional=directional)
+    combo = (1 - color_weight) * shape_sim + color_weight * color_sim
+
+    # Single instance
+    if len(se3_params.shape) == 1:
+        return 1 - combo
+    # Batch
+    elif len(se3_params.shape) == 2:
+        return 1 - combo.mean()
+
+
+def optimize_vol_color_overlay(ref_centers: torch.Tensor,
+                               fit_centers: torch.Tensor,
+                               ref_pharms: torch.Tensor,
+                               fit_pharms: torch.Tensor,
+                               ref_anchors: torch.Tensor,
+                               fit_anchors: torch.Tensor,
+                               ref_vectors: torch.Tensor,
+                               fit_vectors: torch.Tensor,
+                               alpha: float = 0.81,
+                               color_weight: float = 0.5,
+                               similarity: _SIM_TYPE = 'tanimoto',
+                               directional: bool = False,
+                               extended_points: bool = False,
+                               only_extended: bool = False,
+                               num_repeats: int = 50,
+                               trans_centers: Union[torch.Tensor, None] = None,
+                               lr: float = 0.1,
+                               max_num_steps: int = 200,
+                               verbose: bool = False
+                               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Optimize a ROCS/ROSHAMBO-style combined shape (atom-centred Gaussian volume) + color
+    (pharmacophore) overlay over SE(3), maximizing
+    ``(1 - color_weight) * shape_Tanimoto + color_weight * color_Tanimoto``.
+
+    Multi-start (identity + 4 principal-component + Fibonacci rotations, all COM-aligned)
+    with Adam; the best-scoring pose by the combined similarity is returned. The shape SE(3)
+    seed comes from ``ref_centers``/``fit_centers`` (the atom clouds), matching the ``vol``
+    optimizer. Self-overlaps are recomputed every step, so directionless scoring is
+    internally consistent (no precomputed-self-overlap collision).
+
+    Parameters
+    ----------
+    ref_centers, fit_centers : torch.Tensor (N,3) / (M,3)
+        Heavy-atom coordinates for the Gaussian shape overlap.
+    ref_pharms, fit_pharms : torch.Tensor (P,) / (Q,)
+        Pharmacophore type indices (order of ``P_TYPES``).
+    ref_anchors, fit_anchors : torch.Tensor (P,3) / (Q,3)
+        Pharmacophore anchor coordinates.
+    ref_vectors, fit_vectors : torch.Tensor (P,3) / (Q,3)
+        Pharmacophore orientation vectors (ignored when ``directional=False``).
+    alpha : float (default=0.81)
+        Gaussian width for the shape overlap (0.81 = volumetric).
+    color_weight : float (default=0.5)
+        Weight of the color channel in [0, 1].
+    similarity : str (default='tanimoto')
+        Similarity for the color channel ('tanimoto', 'tversky', 'tversky_ref', 'tversky_fit').
+    directional : bool (default=False)
+        ``False`` scores color as isotropic point Gaussians (ROCS/ROSHAMBO); ``True`` keeps
+        the fss orientation-vector cosine weighting.
+    extended_points, only_extended : bool
+        Forwarded to the color scorer (ignored when ``directional=False``).
+    num_repeats : int (default=50)
+        Number of SE(3) initializations.
+    trans_centers : torch.Tensor (T,3) or None
+        Optional translation seed centers (10 rotations per center); otherwise COM-aligned.
+    lr : float (default=0.1)
+        Adam learning rate.
+    max_num_steps : int (default=200)
+        Maximum optimization steps.
+    verbose : bool (default=False)
+        Print progress.
+
+    Returns
+    -------
+    aligned_fit_centers : torch.Tensor (M,3)
+        Transformed fit atom coordinates under the best SE(3).
+    SE3_transform : torch.Tensor (4,4)
+        Best SE(3) transformation.
+    score : torch.Tensor
+        Best combined (vol + color) similarity.
+    """
+    # Seed SE(3) from the shape point clouds (consistent with the vol/ROCS optimizer).
+    if trans_centers is None:
+        se3_params = _initialize_se3_params(ref_points=ref_centers, fit_points=fit_centers, num_repeats=num_repeats)
+    else:
+        se3_params = _initialize_se3_params_with_translations(
+            ref_points=ref_centers,
+            fit_points=fit_centers,
+            trans_centers=trans_centers,
+            num_repeats_per_trans=10)
+    num_repeats = len(se3_params) if len(se3_params.shape) == 2 else 1
+
+    optimizer = optim.Adam([se3_params], lr=lr)
+
+    # Repeat per-molecule tensors across the seed batch (squeeze(0) -> single instance).
+    ref_centers_rep = ref_centers.repeat((num_repeats, 1, 1)).squeeze(0)
+    fit_centers_rep = fit_centers.repeat((num_repeats, 1, 1)).squeeze(0)
+    ref_pharms_rep = ref_pharms.repeat((num_repeats, 1)).squeeze(0)
+    fit_pharms_rep = fit_pharms.repeat((num_repeats, 1)).squeeze(0)
+    ref_anchors_rep = ref_anchors.repeat((num_repeats, 1, 1)).squeeze(0)
+    fit_anchors_rep = fit_anchors.repeat((num_repeats, 1, 1)).squeeze(0)
+    ref_vectors_rep = ref_vectors.repeat((num_repeats, 1, 1)).squeeze(0)
+    fit_vectors_rep = fit_vectors.repeat((num_repeats, 1, 1)).squeeze(0)
+
+    if verbose:
+        init_shape = get_overlap(ref_centers, fit_centers, alpha)
+        init_color = get_overlap_pharm(ref_pharms, fit_pharms, ref_anchors, fit_anchors,
+                                       ref_vectors, fit_vectors, similarity=similarity,
+                                       extended_points=extended_points,
+                                       only_extended=only_extended, directional=directional)
+        init_score = (1 - color_weight) * init_shape + color_weight * init_color
+        print(f'Initial vol_color similarity score: {float(init_score):.3f}')
+
+    last_loss = 1
+    counter = 0
+    for step in range(max_num_steps):
+        loss = objective_vol_color_overlay(
+            se3_params=se3_params,
+            ref_centers=ref_centers_rep,
+            fit_centers=fit_centers_rep,
+            ref_pharms=ref_pharms_rep,
+            fit_pharms=fit_pharms_rep,
+            ref_anchors=ref_anchors_rep,
+            fit_anchors=fit_anchors_rep,
+            ref_vectors=ref_vectors_rep,
+            fit_vectors=fit_vectors_rep,
+            alpha=alpha,
+            color_weight=color_weight,
+            similarity=similarity,
+            directional=directional,
+            extended_points=extended_points,
+            only_extended=only_extended,
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if verbose and step % 100 == 0:
+            print(f"Step {step}, Score: {1 - loss.item()}")
+
+        # early stopping
+        if abs(loss - last_loss) > 1e-5:
+            counter = 0
+        else:
+            counter += 1
+        last_loss = loss
+        if counter > 10:
+            break
+
+    optimized_se3_params = se3_params.detach()
+    SE3_transform = get_SE3_transform(optimized_se3_params)
+    aligned_fit_centers = apply_SE3_transform(fit_centers_rep, SE3_transform)
+    aligned_fit_anchors = apply_SE3_transform(fit_anchors_rep, SE3_transform)
+    aligned_fit_vectors = apply_SO3_transform(fit_vectors_rep, SE3_transform)
+
+    shape_sim = get_overlap(ref_centers_rep, aligned_fit_centers, alpha)
+    color_sim = get_overlap_pharm(ptype_1=ref_pharms_rep,
+                                  ptype_2=fit_pharms_rep,
+                                  anchors_1=ref_anchors_rep,
+                                  anchors_2=aligned_fit_anchors,
+                                  vectors_1=ref_vectors_rep,
+                                  vectors_2=aligned_fit_vectors,
+                                  similarity=similarity,
+                                  extended_points=extended_points,
+                                  only_extended=only_extended,
+                                  directional=directional)
+    scores = (1 - color_weight) * shape_sim + color_weight * color_sim
+
+    if num_repeats == 1:
+        if verbose:
+            print(f'Optimized vol_color similarity score: {float(scores):.3f}')
+        best_alignment = aligned_fit_centers.cpu()
+        best_transform = SE3_transform.cpu()
+        best_score = scores.detach().cpu()
+    else:
+        if verbose:
+            print(f'Optimized vol_color similarity -- max: {scores.max():.3f} | mean: {scores.mean():.3f} | min: {scores.min():.3f}')
+        best_idx = torch.argmax(scores.detach().cpu())
+        best_alignment = aligned_fit_centers.cpu()[best_idx]
+        best_transform = SE3_transform.cpu()[best_idx]
+        best_score = scores.detach().cpu()[best_idx]
+    return best_alignment, best_transform, best_score

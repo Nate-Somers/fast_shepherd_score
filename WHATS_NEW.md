@@ -2,7 +2,9 @@
 
 This fork adds a **Triton GPU engine** for molecular alignment on top of upstream
 [`shepherd-score`](https://github.com/coleygroup/shepherd-score). It keeps the entire
-original API and behavior, and adds a single opt-in seam.
+original API and behavior, and adds opt-in, **additive** surfaces — the GPU/CPU
+`backend=` seam, and an out-of-core streaming-screen module — that leave existing
+behavior untouched.
 
 - **One new public knob:** a `backend=` argument on the existing
   `MoleculePairBatch.align_with_*` methods — `"triton"` for the GPU path, or `"numba"`
@@ -15,6 +17,19 @@ original API and behavior, and adds a single opt-in seam.
   (`accel/kernels/dispatch.py`), so it runs whether or not Triton is installed (CUDA tensors →
   Triton, CPU tensors → numba, in one process). Numerically exact and **~25× faster than
   the original per-pair CPU path** on `vol` (all batched modes except `esp_combo`).
+- **Out-of-core screening:** a new top-level `shepherd_score.screen` module streams a
+  precomputed, on-disk library of interaction profiles past a query through the
+  *unchanged* batch API, so you can screen sets far larger than RAM (a billion
+  `Molecule` objects ≈ ~10 TB). It is **purely additive — zero edits to any existing
+  file**. See [§2 Streaming](#streaming--out-of-core-screening-libraries-larger-than-ram)
+  and [`docs/STREAMING_DESIGN.md`](docs/STREAMING_DESIGN.md).
+- **Mesh-free smooth surfacer (opt-in):** a new `surface_method="smooth_sdf"` on `Molecule`
+  builds the surface point cloud **without Open3D** — it projects sampled points onto a smooth-min
+  implicit iso-surface that rounds the concave atom-border "crimps", keeping the surface smooth +
+  stochastic so it does not leak atom centers (for the generative pipeline). **Default is unchanged
+  (`"mesh"`, the Open3D ball-pivoting surface).** A new `shepherd_score.surface_diagnostics` module
+  quantifies crimp/leak for any surfacer. See
+  [§2 Smooth surface](#mesh-free-smooth-surface-generative-pipeline).
 
 ---
 
@@ -49,12 +64,20 @@ shepherd_score/                         #  accel/ = 21 new modules, ~7,100 LOC t
 │   ├── cpu_pool.py                         #  214 L  persistent multi-core CPU (numba) process pool
 │   └── multi_gpu.py                        #  432 L  explicit one-process-per-GPU data-parallel driver
 │
-└── container/                          # ── integration (existing upstream files; the public seam)
-    ├── _batch.py   → MoleculePairBatch     # modified: PUBLIC seam align_with_*(backend="triton"/"numba")
-    ├── _core.py    → MoleculePair          # modified: binds accel.batch._align_batch_* onto MoleculePair;
-    │                                       #   opt-in per-pair fast path (use_fast)
-    └── __init__.py                         # modified: exports align_multi_gpu / MultiGPUAligner
+├── container/                          # ── integration (existing upstream files; the public seam)
+│   ├── _batch.py   → MoleculePairBatch     # modified: PUBLIC seam align_with_*(backend="triton"/"numba")
+│   ├── _core.py    → MoleculePair          # modified: binds accel.batch._align_batch_* onto MoleculePair;
+│   │                                       #   opt-in per-pair fast path (use_fast); Molecule(surface_method=)
+│   └── __init__.py                         # modified: exports align_multi_gpu / MultiGPUAligner
+├── screen.py  → ProfileStore/MoleculeProfile/screen()  # ── NEW: out-of-core streaming screen
+│                                           #   (0 edits to existing files; reuses the batch API by duck typing)
+└── surface_diagnostics.py → leak/crimp metrics  # ── NEW: validate any surfacer for atom-leak (Open3D-free)
 ```
+
+> `screen.py` and `surface_diagnostics.py` are **new top-level modules**, not part of the `accel/`
+> subpackage, and they change no existing file — so the "21 new `accel/` modules" and "6 modified
+> upstream files" accounting below is unchanged. Tests: [`tests/test_screen.py`](tests/test_screen.py),
+> [`tests/test_smooth_surface.py`](tests/test_smooth_surface.py).
 
 **Why this shape.** The speedup is a *batch* phenomenon — it comes from optimizing many
 pairs at once in a single GPU dispatch, which amortizes the per-pair Python/launch
@@ -80,10 +103,10 @@ upstream file was deleted, and `alignment/_torch.py` is byte-identical to upstre
 | File | Δlines | What changed |
 |---|--:|---|
 | `container/_batch.py` | +299 | **The public seam.** Adds `_TRITON_BACKENDS` / `_NUMBA_BACKENDS`, the `_triton_align()` router and a `_prepare_numba()` guard, plus a `backend="jax"` (default) argument on every `align_with_*` method (and a new `align_with_esp_combo` batch method). `backend` in `{"triton","cuda","gpu"}` routes to the batched GPU path; `{"numba","cpu"}` runs that same batched driver on CPU; `"jax"` runs the original path unchanged; any other value raises. |
-| `container/_core.py` | +272 / −4 | Binds the `_align_batch_*` static methods (defined in `accel/batch/`) onto `MoleculePair`; adds an **opt-in** `use_fast=False` kwarg gating the per-pair Triton fast path on `align_with_esp` / `esp_combo` / `pharm` (default preserves the original torch/analytical behaviour and honours `use_analytical`); adds a `score_with_vol()` helper. |
+| `container/_core.py` | +272 / −4 | Binds the `_align_batch_*` static methods (defined in `accel/batch/`) onto `MoleculePair`; adds an **opt-in** `use_fast=False` kwarg gating the per-pair Triton fast path on `align_with_esp` / `esp_combo` / `pharm` (default preserves the original torch/analytical behaviour and honours `use_analytical`); adds a `score_with_vol()` helper; adds the opt-in `Molecule(surface_method='mesh')` kwarg threaded to `get_pc` (default `'mesh'` unchanged; `'smooth_sdf'` selects the mesh-free surfacer, `density` mode stays mesh-only). |
 | `alignment/utils/se3.py` | +35 / −20 | Adds the batched SE(3) builder `quaternions_to_SE3_batch` (the GPU write-back uses it) and reworks `apply_SE3_transform` to a single fused `baddbmm`; the upstream parameter name (`SE3_transform`) and shape-validation checks are retained. |
 | `container/__init__.py` | +7 / −1 | Exports the explicit multi-GPU driver `align_multi_gpu` / `MultiGPUAligner` (defined in `accel/multi_gpu.py`). |
-| `generate_point_cloud.py` | +16 / −1 | Makes the Open3D import **lazy** (`from __future__ import annotations` + a `_LazyOpen3D` proxy). Open3D is a ~30 s cold import and is fork-hostile (it breaks a later `fork`+CUDA), so deferring it keeps `import shepherd_score` fast and lets the fork-based multi-GPU pool work. Behaviour is identical on first real surface use. |
+| `generate_point_cloud.py` | +210 / −2 | **(1)** Makes the Open3D import **lazy** (`from __future__ import annotations` + a `_LazyOpen3D` proxy). Open3D is a ~30 s cold import and is fork-hostile (it breaks a later `fork`+CUDA), so deferring it keeps `import shepherd_score` fast and lets the fork-based multi-GPU pool work; behaviour is identical on first real surface use. **(2)** Adds the **opt-in mesh-free smooth surfacer** (`get_molecular_surface_smooth_sdf` + the `_farthest_point_sample` / `_get_masked_surface_candidates` / `_smoothmin_sdf_project` helpers) and a `method=` dispatch on `get_molecular_surface`. `method='mesh'` (default) is the original ball-pivoting code, **unchanged** and the out-of-the-box default; the opt-in `'smooth_sdf'` path (alias `'fast'`) imports **no Open3D**. |
 | `protonation/protonate.py` | +2 | Adds `from __future__ import annotations` (no behaviour change). |
 
 ---
@@ -157,6 +180,144 @@ GPU** — each worker owns a shard, rebuilds its tensors on its own GPU, and run
 
 The earlier **thread-sharding** default (GIL-bound, ~1.0–2.3×) has been **removed**.
 
+### Streaming / out-of-core screening (libraries larger than RAM)
+
+`MoleculePairBatch` and the multi-GPU drivers assume the whole pair list fits in host
+RAM. At ~10 KB per `Molecule` (the RDKit `Mol` is ~⅔ of it), that wall is ~25 M molecules
+on a 256 GB node — a billion-molecule library is ~10 TB. The new **`shepherd_score.screen`**
+module screens libraries of effectively unbounded size: precompute each molecule's numeric
+interaction profile **once**, persist it to a sharded on-disk store, then stream shards back
+through the **unchanged** `align_with_*` / `align_multi_gpu` API — only one shard is resident
+at a time.
+
+It is purely additive — **zero edits to any existing file**. A new `MoleculeProfile` (an
+RDKit-free, duck-typed stand-in for `Molecule` holding just the arrays the aligners read)
+drops the RDKit `Mol`, which is what keeps shard reload at array-copy speed — storing/reloading
+`Mol`s would cost ~5–15 s per 100 k shard, dwarfing the ~1 s GPU alignment of that shard. The
+batched kernels, size-bucketing, GPU-memory sub-batching, and every backend are reused as-is.
+
+```python
+from shepherd_score.container import Molecule
+from shepherd_score.screen import ProfileStore, screen, screen_many
+
+# 1) BUILD THE STORE ONCE — the real cost at scale is this profile construction, not the
+#    alignment (see docs/MOLECULE_CONSTRUCTION_PROBLEM.md; use surface_method="smooth_sdf"
+#    to build it ~3–4× faster and Open3D-free). A store dir is single-writer; for a cluster
+#    build give each worker its OWN store dir and screen across them (shards are independent).
+with ProfileStore.create("library.fss", num_surf_points=200,
+                         modes=("surf", "esp", "pharm"),   # only these arrays are stored
+                         dtype="float16") as store:         # fp16 ≈ 2 TB for 1e9; fp32 ≈ 4 TB
+    for mol in library_rdkit_mols:
+        store.add(Molecule(mol, num_surf_points=200, pharm_multi_vector=False,
+                           surface_method="smooth_sdf"))
+
+# 2a) SCREEN ONE QUERY — streamed; the library is never all in RAM at once.
+query = Molecule(query_mol, num_surf_points=200, pharm_multi_vector=False,
+                 surface_method="smooth_sdf")
+hits = screen(query, ProfileStore.open("library.fss"), mode="esp",
+              lam=0.3, num_repeats=50, top_k=1000)    # backend auto: triton on GPU, numba on CPU
+hits[0].score, hits[0].id, hits[0].transform          # best match; hits sorted desc
+
+# 2b) SCREEN A QUERY PANEL — each shard is read ONCE and aligned against EVERY query
+#     (the library streams once for the whole panel, not once per query).
+panel = screen_many([q1, q2, q3], store, mode="esp", lam=0.3, top_k=1000)   # panel[j] = query j's hits
+
+# multi-GPU: persistent one-process-per-GPU pool, spawned ONCE, that streams shards
+# (NOT respawned per shard). Fast modes vol/surf/esp/pharm/vol_color.
+hits = screen(query, store, mode="vol", ndev=4, top_k=1000)
+
+# ROCS/ROSHAMBO-style shape + directionless-color (vol_color): needs only a pharm
+# store (atoms + pharmacophore anchors); no surfaces required.
+hits = screen(query, store, mode="vol_color", color_weight=0.5, top_k=1000)
+
+# full score vector (restart-friendly): every score in library order to a memmap (single-process)
+import numpy as np
+allscores = np.memmap("scores.f32", mode="w+", dtype="float32", shape=(len(store),))
+screen(query, store, mode="esp", scores_out=allscores, top_k=1000)
+```
+
+**The engine (what removes the streaming-layer bottlenecks).** For the fast modes
+(`vol/surf/esp/pharm/vol_color`) on a pre-centered store, `screen()`/`screen_many()` take a
+**direct array → kernel** path: each shard's fit arrays are loaded **once** as device tensors and
+the batched aligner (`_align_batch_*`) is fed lightweight `_FastPair`s whose fit tensors are
+*views* into them and whose ref tensors are the *shared* query — **no per-molecule
+`MoleculeProfile`/`MoleculePair`, no numpy→torch per pair**. (`vol_esp`/`esp_combo` use the
+per-pair compatibility path.) Concretely:
+- **`screen_many` (query panels)** builds each shard's fit tensors once and swaps only the query
+  across the panel, so the library is read once per *campaign*, not once per query.
+- **`ndev>1`** uses a persistent shard-parallel pool (one process per GPU, spawned once, shards
+  pulled off a queue) instead of re-spawning workers per shard.
+
+Notes:
+- **`modes=` decides what's stored.** Only the arrays the listed modes need are written
+  (`"vol"` works from *any* store — `atom_pos` is always kept; `vol_color` needs only a pharm
+  store, no surfaces). Valid: `vol vol_esp surf esp pharm esp_combo vol_color`.
+- **fp16 storage** (default) halves disk + IO at ~0.01 Å error — the surface-resampling noise
+  floor — and is upcast to fp32 in RAM; pass `dtype="float32"` for an exact store.
+- **`pre_centered=True`** (default) centers each profile to its own COM at build time, so the
+  screen runs `do_center=False` (RDKit-free) yet matches `MoleculePair(do_center=True)`
+  global-alignment semantics; the query is auto-centered once (a copy — the caller's query is
+  never mutated). The fast path requires a pre-centered store.
+- Surface `alpha` defaults to `ALPHA(num_surf_points)` for `surf`/`esp` (keeping the
+  calibration correct); `lam`, `num_repeats`, `similarity`, … pass straight to the aligner.
+- The fast direct path is **score-equivalent to the per-pair object path** on identical inputs,
+  and a panel screen equals per-query screens (`tests/test_screen.py`). Design + rationale:
+  [`docs/STREAMING_DESIGN.md`](docs/STREAMING_DESIGN.md); the one-time build cost it feeds:
+  [`docs/MOLECULE_CONSTRUCTION_PROBLEM.md`](docs/MOLECULE_CONSTRUCTION_PROBLEM.md).
+
+### Mesh-free smooth surface (generative pipeline)
+
+`Molecule(..., surface_method="smooth_sdf")` builds the surface point cloud **without Open3D**. The
+default is unchanged — `surface_method="mesh"` is the original Open3D ball-pivoting + Poisson surface
+(same code path).
+
+Why it exists: the surface fed to the **generative** model must be *smooth* and *stochastic* so a
+network can't read atom centers off it (a "leak"). A point sitting exactly on an atom's (vdW+probe)
+sphere reveals that atom's position, and the concave seams where two spheres meet ("crimps") mark the
+atom borders. The mesh path hides these by meshing + resampling; `smooth_sdf` does it mesh-free:
+sample the union-of-spheres envelope (stochastic) → project the points onto a **smooth-min implicit
+iso-surface** that rounds the crimps → even (farthest-point) resample to the exact count.
+
+```python
+from shepherd_score.container import Molecule
+
+# Default is unchanged — the original Open3D ball-pivoting mesh surface:
+mol = Molecule(rdkit_mol, num_surf_points=200)            # surface_method="mesh"
+
+# Opt in to the mesh-free smooth + stochastic surface (no Open3D needed); "fast" is an alias:
+mol = Molecule(rdkit_mol, num_surf_points=200, surface_method="smooth_sdf")  # or "fast"
+```
+
+- **Tunable** via `generate_point_cloud.get_molecular_surface_smooth_sdf(..., s=, iters=, knn=,
+  jitter=, even=, num_samples_per_atom=, seed=)` (defaults in the `SMOOTH_SDF_*` module constants).
+  `s` is the smooth-min sharpness: smaller rounds the crimps more / pushes points farther off the
+  spheres (less leak); larger → sharp on-sphere union. The default `s=10` reproduces the mesh
+  surface's ~0.010 Å off-sphere level. The smooth path samples a sparser candidate cloud than the
+  mesh (`SMOOTH_SDF_NSPA=15` vs 25 — it doesn't need a dense cloud to mesh), which ~halves the cost
+  at the same blue-noise evenness.
+- **Stochastic** by default (varies run-to-run, like the unseeded Poisson resample); pass `seed=`
+  for a reproducible surface.
+- **Validate any surfacer** with the new `shepherd_score.surface_diagnostics` module
+  (`leak_metrics`, `crimp_points`, `center_recovery_attack`, `summarize`) — all Open3D-free.
+  Measured at the default on drug-like molecules: median off-sphere ~0.005–0.012 Å (vs the mesh's
+  ~0.010 Å), and an atom-center **recovery-attack** error of ~0.06–0.09 Å versus **0.000 Å** for an
+  on-sphere surface — i.e. the smooth surface hides atom centers; an on-sphere / FPS surface does not.
+- **Speed.** End-to-end ~3–4× faster than the mesh surface on drug-sized molecules (~12–18 ms vs
+  ~54 ms; the implicit-surface projection replaces the ~50 ms ball-pivoting, and the sparser
+  candidate cloud shrinks the remaining sampling + farthest-point-resample cost).
+- **Open3D-free at the call level.** The `smooth_sdf`/`fast` surfacer imports **no Open3D**, so a
+  surface build via `Molecule(..., surface_method="smooth_sdf")` never triggers Open3D's ~30 s cold
+  import or its fork-hostility — useful for a forked, multi-process generative precompute. (Open3D
+  remains a normal dependency for the **default** `mesh` surface; if you want a run that never even
+  imports it, build `Molecule(surface_method="smooth_sdf")` directly rather than going through
+  `objective.py` / `extract_profiles.py`, which import Open3D eagerly at module load as upstream does.)
+
+> **Caveat — opt-in for a reason.** Using `smooth_sdf` on the generative path is a distribution
+> shift versus a diffusion model trained on the Open3D mesh surface (the model lives in the separate
+> [`coleygroup/shepherd`](https://github.com/coleygroup/shepherd) repo). The Open3D-free checks above
+> are necessary but **not sufficient**; the binding gate is the external `ConditionalEval` / retrain
+> on the new surfacer's output. Tests: [`tests/test_smooth_surface.py`](tests/test_smooth_surface.py).
+
 ### The backend matrix
 
 Every alignment mode is reachable from the batch API across all three backends:
@@ -213,6 +374,195 @@ pip install shepherd-score[cpu]   # numba   — CPU fallback for the batched dri
 `triton` is guarded behind a `try/except ImportError` and `numba` is imported lazily (only
 when the CPU fallback actually runs), so with neither installed `import shepherd_score` still
 succeeds and the original per-pair JAX/CPU path runs exactly as before.
+
+**Open3D stays a required dependency** (as upstream), since it powers the **default** `mesh`
+molecular surface. The opt-in `surface_method="smooth_sdf"` (alias `"fast"`) surfacer needs no
+extra dependency and imports no Open3D itself — so it's both faster and Open3D-free at the call
+level — but it does **not** change the default or remove the Open3D requirement.
+
+---
+
+## 2b. New alignment mode — `vol_color` (ROCS/ROSHAMBO-style shape + directionless color)
+
+A new first-class alignment mode that mirrors **OpenEye ROCS** and **ROSHAMBO2**: it overlays
+two molecules by jointly optimizing **atom-centred Gaussian shape** + **directionless
+pharmacophore "color"**, and reports a weighted combined Tanimoto (the `TanimotoCombo`
+analogue). It is **purely additive** — every existing scorer/aligner default is byte-identical.
+
+### What it computes
+
+$$\text{score} \;=\; (1-w_{\text{color}})\cdot \text{Tanimoto}_{\text{shape}} \;+\; w_{\text{color}}\cdot \text{Tanimoto}_{\text{color}}$$
+
+- **Shape** — atom-centred Gaussian volume overlap (`alpha=0.81`, heavy atoms), the same
+  Grant–Pickup form as the `vol` mode (≈ ROSHAMBO's `KAPPA/1.7²`). Scored by Tanimoto.
+- **Color** — per-type Gaussian overlap of pharmacophore features, **same-type only**, scored
+  *directionless*: each feature is an **isotropic point Gaussian** with no orientation vector
+  (exactly ROCS "color atoms" / ROSHAMBO's RDKit-feature color). At `alpha=1.0` a color pair's
+  overlap is numerically identical to ROSHAMBO2's `exp(-½d²)(π/2)^{3/2}`.
+- **`color_weight`** (default `0.5`) is the ROCS/ROSHAMBO 50/50 mix; the joint objective is
+  optimized over SE(3) (not shape-then-rescore), like ROSHAMBO2's `optim_mode="combination"`.
+
+> **Directionless ≠ zero vectors.** Feeding zero vectors through the directional scorer does
+> *not* give directionless scoring — a zero vector yields cosine weight `(0+2)/3 = 2/3` on
+> cross terms but `1` on self terms, which does **not** cancel in the Tanimoto. The mode routes
+> every type through the genuine point-only overlap instead (the path the hydrophobe/ion types
+> already use).
+
+### ROCS color vs ROSHAMBO color — what `vol_color` follows
+
+Both ROCS and ROSHAMBO descend from the same Mills–Dean pharmacophore lineage: ~6 **directionless**
+"color" feature types (donor, acceptor, cation, anion, ring/aromatic, hydrophobe), scored by a
+**same-type-only** Gaussian overlap + Tanimoto. They differ in three ways that matter for an
+implementation choice:
+
+| | **ROCS / FastROCS** (OpenEye) | **ROSHAMBO / ROSHAMBO2** (open) | **`vol_color` (this fork)** |
+|---|---|---|---|
+| Feature definitions | proprietary **Implicit Mills Dean** `.cff` SMARTS | RDKit **`BaseFeatures.fdef`** SMARTS | RDKit `BaseFeatures.fdef` (`feature_set='rdkit_base'`) — matches ROSHAMBO; or fss's own `.fdef` (`'shepherd'`) |
+| Protonation / pKa | **implicit pKa model @ pH 7** (ionization inferred regardless of input); *Explicit* variant turns it off | **no pKa model** — uses the input protonation as-is | no pKa model (follows ROSHAMBO / ROCS-Explicit); standardize protonation upstream |
+| Combine + optimize | `TanimotoCombo = shape + color` (0–2); default optimizes the **joint** shape+color overlay (`-optchem true`). FastROCS: shape-optimized + color scored at the inertial starts | `(1-m)·shape + m·color` (0–1); `combination` mode mixes the shape+color **gradient** | `(1-color_weight)·shape + color_weight·color`; **joint gradient** (matches ROSHAMBO2 `combination` and ROCS `-optchem true`) |
+
+So `vol_color` follows the **ROSHAMBO** conventions (RDKit features, no pKa model, weighted
+0–1 combo, joint-gradient optimization), and is feature-compatible with ROCS *Explicit* Mills
+Dean. The main caveat for a faithful ROCS comparison is the **pKa model**: ROCS's default
+Implicit Mills Dean can place different cation/anion/donor/acceptor atoms than the input
+protonation implies, so standardize protonation before a head-to-head. (fss's color Gaussian
+also keeps the per-type Pharao widths — α=1.0 except aromatic/hydrophobe=0.7 — vs ROCS's single
+~1 Å width and ROSHAMBO's uniform α=1.0; a uniform-α ROCS preset is noted under future work.)
+
+### How to use it
+
+```python
+from shepherd_score.container import Molecule, MoleculePair
+
+# Build molecules with RDKit's stock BaseFeatures.fdef, as isotropic color atoms
+# (the 6 ROCS/ROSHAMBO types: Donor, Acceptor, Aromatic, Hydrophobe, Cation, Anion).
+ref = Molecule(rdmol_a, pharm_multi_vector=False, feature_set='rdkit_base', directionless=True)
+fit = Molecule(rdmol_b, pharm_multi_vector=False, feature_set='rdkit_base', directionless=True)
+
+mp = MoleculePair(ref, fit, do_center=True)
+aligned = mp.align_with_vol_color(color_weight=0.5)   # ROCS-style combo
+mp.sim_aligned_vol_color      # combined vol+color Tanimoto
+mp.transform_vol_color        # optimal 4×4 SE(3)
+```
+
+New public surface (all defaults preserve existing behavior):
+
+| API | What's new |
+|---|---|
+| `Molecule(..., feature_set='shepherd'\|'rdkit_base', directionless=False)` | `'rdkit_base'` uses RDKit's stock `BaseFeatures.fdef` reduced to the 6 ROCS/ROSHAMBO color types (`PosIonizable→Cation`, `NegIonizable→Anion`, `LumpedHydrophobe→Hydrophobe`); `directionless=True` emits zero-vector color atoms for **all** families. |
+| `MoleculePair.align_with_vol_color(color_weight=0.5, alpha=0.81, similarity='tanimoto', directional=False, num_repeats=50, trans_init=False, lr=0.1, max_num_steps=200)` | The new mode (per-pair). Writes `sim_aligned_vol_color` / `transform_vol_color`. |
+| `MoleculePairBatch.align_with_vol_color(..., backend='jax'\|'triton'\|'numba')` | Batched path: `"triton"` (CUDA) / `"numba"` (CPU) run the `accel/drivers/vol_color.py` driver; `"jax"` (default) runs the per-pair path sequentially. |
+| `get_overlap_pharm(..., directional=True)` (torch + numpy) | `directional=False` scores all types as isotropic point Gaussians (ROCS color). |
+| `get_pharm_combo_score(..., color_weight=0.5, directional=True)` (torch + numpy) | Weighted shape+color combo (`color_weight=0.5` == the previous unweighted average). |
+| `optimize_vol_color_overlay(...)` / `objective_vol_color_overlay(...)` (`shepherd_score.alignment`) | The SE(3) optimizer/objective behind the mode (templated on the `esp_combo` combo path). |
+
+### How it works internally
+
+`vol_color` is the pharmacophore twin of the existing `esp_combo` blended-combo path. The
+optimizer (`alignment/_torch.py::optimize_vol_color_overlay`) multi-starts SE(3) (identity + 4
+principal-component + Fibonacci rotations, COM-aligned — the same inertial-frame starts ROCS
+uses), runs Adam on the joint objective, and selects the best-scoring pose by the combined
+similarity. Self-overlaps are recomputed every step, so the directionless self/cross terms stay
+consistent (a `directional=False` + precomputed-self-overlap combination is rejected by design,
+avoiding a Tanimoto-corrupting collision).
+
+The **batched** driver (`accel/drivers/vol_color.py`, reached via
+`MoleculePairBatch.align_with_vol_color(backend="triton"|"numba")`) is templated on
+`esp_combo` and — like every other mode — runs **both channels on fused value/gradient
+kernels** (Triton on CUDA, numba on CPU, via `accel/kernels/dispatch.py`):
+- **shape** → the fused volumetric kernel (`overlap_score_grad_se3_batch`, the same one
+  `vol`/`esp_combo` use); returns the overlap **value + quaternion gradient** `dO_s/dq`.
+- **color** → a **specialized directionless color kernel** (`pharm_color_score_grad_se3_batch`,
+  Triton + numba, built with `build_lookup_tables(directionless=True)`): a same-type-only
+  isotropic Gaussian (per-type α/K, no vectors/weights) that takes the quaternion `q` directly
+  and **emits `dO_c/dq` in-register** — the validated `dR/dq` tail of the shape kernel. Called
+  with `NEED_GRAD=True`, so value + gradient come from **one launch** (no extra dispatch).
+
+**Joint gradient (ROSHAMBO2 `combination` mode).** The SE(3) step descends on the full
+combined objective `(1-w)·shape_T + w·color_T`, so **both** channels steer the pose. Because the
+color kernel now emits `dO_c/dq` directly (in the *same* quaternion convention as the shape
+kernel — q is unit each step, the adam renormalizes it), the combine is just
+`(1-w)·(-scale_s·dQ_s) + w·(-scale_c·dQ_c)` and the whole host-side rotation→quaternion
+projection tail is **gone** (no `apply_tanimoto_chain_rule` / `project_grad_R_to_quaternion` /
+four `(PK,3,3)` Jacobians / normalization Jacobian / host `R`-build). The color kernel's `dQ`
+is **validated to ~1e-17 against autograd** (and Triton-vs-numba to fp32 on an RTX 4050), and the
+batched result matches the per-pair autograd
+optimizer to 4 decimals on distinct molecules.
+
+Padded pharmacophore slots are typed `Dummy` and masked by `N_real`, so padding is free.
+Because both kernels device-dispatch, the whole driver runs on CPU (numba) too — which is how
+it is unit-tested — and the per-pair `MoleculePair.align_with_vol_color(use_fast=True)` routes
+through the same batched driver, exactly like `align_with_pharm`/`align_with_esp`.
+
+### Status & tests
+
+- **Both a per-pair path and a batched GPU/CPU driver ship, both on fused kernels, both
+  joint-gradient.** `MoleculePair.align_with_vol_color` is the per-pair torch optimizer (joint
+  autograd gradient; `use_fast=True` routes to the batched driver).
+  `MoleculePairBatch.align_with_vol_color(backend=...)` runs the batched
+  `accel/drivers/vol_color.py` driver — **shape** on the fused volumetric kernel and
+  **directionless color** on the fused pharmacophore kernel
+  (`build_lookup_tables(directionless=True)`), `"triton"` on CUDA / `"numba"` on CPU, with the
+  **combined shape+color gradient** steering each SE(3) step (ROSHAMBO2 `combination` mode). Both
+  recover self-copy **1.000** and agree to 4 decimals on distinct molecules.
+- **Tested:** `tests/test_vol_color.py` — directionless torch↔numpy parity across sizes/
+  similarities; directionless self-overlap = 1.0; the precompute guard; `color_weight` combos;
+  RDKit `rdkit_base` featurization; the per-pair **and batched (numba, fused-kernel)**
+  `align_with_vol_color` recovering Tanimoto **1.000** on real drug molecules. All existing tests
+  pass unchanged.
+- **Throughput (NVIDIA L40S, real drug self-copy pairs, `same` bucket, best-of-N).** Both
+  modes recover self-overlap **1.000**:
+
+  | pairs / call | 1 | 10 | 100 | 1,000 | 10,000 |
+  |---|--:|--:|--:|--:|--:|
+  | `vol_color` (joint gradient, **in-register color kernel**) | 114 | 1,131 | 10,476 | 60,155 | **95,638** |
+  | `vol_color` (joint gradient, *eager projection* — prior) | 35 | 354 | 3,405 | 27,714 | 56,749 |
+  | `vol` (shape only, reference) | 216 | 2,046 | 18,613 | 104,127 | **196,776** |
+
+  With both channels on fused kernels — and the **directionless color kernel now emitting its
+  SE(3) quaternion gradient in-register** (no host rotation→quaternion projection tail; see
+  *How it works internally*) — `vol_color` reaches **~96k pairs/s** at 10k, **~1.7× the earlier
+  eager-projection joint gradient** (~57k) and now within **~2× of pure shape**, so color is no
+  longer the bottleneck. That is **~40× the original pure-PyTorch color implementation** (which
+  plateaued ~2.4k) and **~32× ROSHAMBO2's combo (shape+color) mode** (~3.0k pairs/s on L40S,
+  Fig 5) — the first open shape+color combo at this throughput. The joint gradient is now nearly
+  free over a shape-gradient-only variant: the color kernel computes its SE(3) gradient in the
+  *same* launch and already in quaternion space, so optimizing the true combined objective costs
+  little. (On an RTX 4050 laptop GPU the same code reaches ~36k/10k, vs ~52k for `vol`.) (Batched
+  sweep: `python -m benchmarks.benchmark --modes vol_color --no-original`; per-pair:
+  `python -m benchmarks.benchmark_vol_color`.)
+- **Future work:** a jax mirror of the mode, and a uniform-α ROCS color preset (single Gaussian
+  width across types, vs the current per-type Pharao widths) for exact OpenEye/ROSHAMBO width
+  parity. (The gradient-mixed batched optimizer — ROSHAMBO2 `combination` mode — is now done; see
+  above.)
+
+### Carried over to the other modes (`pharm` / `esp_combo` / `surface`)
+
+The three optimizations behind `vol_color`'s speedup were audited against every other mode and
+applied where they were missing (the shape-family modes — `vol`/`surf`/`esp`/`vol_esp` — already
+had all three):
+
+- **In-register `dQ` for `pharm` (the big one).** `pharm` was the *only* other mode still doing
+  the per-step host rotation→quaternion projection tail (`apply_*_chain_rule` on a `(PK,3,3)`
+  matrix → `project_grad_R_to_quaternion` → normalization Jacobian). A new **directional**
+  `pharm_grad_dq_se3_batch` kernel (Triton + numba) takes the unit quaternion and emits `dO/dq`
+  directly, reusing the validated shape `dR/dq` tail **twice** — once for the positional gradient
+  (force ⊗ fit-anchor) and once for the directional **weight** gradient (Σⱼ coeff·ref-vec ⊗
+  fit-vec, the cat-1/cat-2 term). The driver drops the matrix projection entirely (scaling
+  `dO/dq` is identical to projecting-then-scaling, since the projection is linear). **Validated:
+  numba `dQ` matches autograd to ~1e-17** (directional, incl. the weight gradient), **Triton ==
+  numba to fp32** on an RTX 4050, **self-copy 1.000** (tanimoto + tversky), distinct molecules
+  match the per-pair autograd optimizer. Measured **~1.4× at 10k / ~1.6× at 100–1k pairs** on an
+  RTX 4050 (e.g. 24.3k → 33.7k pairs/s at 10k), the same projection-tail win `vol_color` saw on
+  the L40S.
+- **Early-stop override wiring.** `esp_combo` and `surface` were the only drivers not honoring the
+  `FINE_ES_PATIENCE` env override (`esp`/`pharm`/`shape` already did). Now wired in both — a free
+  consistency fix (no behavior change unless the env var is set). The patience-`5→2` *default* was
+  **not** transferred: `esp`/`pharm`/`esp_combo`/`surf` deliberately keep `5` (they converge
+  slower than the fast shape modes).
+- **`exp2` in the directional `pharm` kernel.** The directional `pharm_triton` kernel was the last
+  one still using `tl.exp`; switched to `tl.exp2(x·log₂e)` (hardware `ex2.approx`), matching the
+  shape/esp/color kernels (bit-close; self-copy safe via the exact-cancellation identity).
 
 ---
 
@@ -401,6 +751,7 @@ device plus a combined [`speed_all_hardware.png`](benchmarks/results/speed_all_h
 across all six (regenerate it with `python benchmarks/plot_all_hardware.py`). Re-running a benchmark builds a
 deterministic molecule cache once (`FSS_MOL_CACHE_DIR`, default `benchmarks/molcache/`) so
 repeat runs start fast.
+
 ---
 
 ## Seed strategy — structured starts + per-mode optimal counts

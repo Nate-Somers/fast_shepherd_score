@@ -15,6 +15,6 @@ from ._dispatch import (
 )
 from .aligners import (
     _align_batch_vol, _align_batch_surf, _align_batch_esp, _align_batch_vol_esp,
-    _align_batch_esp_combo, _align_batch_pharm, _esp_bucketed_align,
+    _align_batch_esp_combo, _align_batch_pharm, _align_batch_vol_color, _esp_bucketed_align,
     _ALIGN_WORKSPACES, _INT_BUFFER_CACHE, _NUM_SEEDS,
 )

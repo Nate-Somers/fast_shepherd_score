@@ -342,6 +342,221 @@ def pharm_score_grad_se3_batch(R, t, ref_types, fit_types, ref_anchors, fit_anch
             torch.as_tensor(gt, device=dev, dtype=dt))
 
 
+# ===========================================================================
+#  DIRECTIONLESS pharmacophore "color" overlap value + QUATERNION gradient
+#  (vol_color mode). Same same-type-only typed Gaussian as the pharm kernel, but
+#  (a) DIRECTIONLESS (every real type is an isotropic point Gaussian: w=1, no
+#  vector machinery, no weight gradient), and (b) emits dV/dq DIRECTLY in-register
+#  -- exactly like the shape kernel _overlap_grad_kernel -- so the driver needs no
+#  rotation-matrix -> quaternion projection / normalization-Jacobian tail.
+#  q is assumed unit (the adam renormalizes it each step), matching the shape kernel.
+#  A = ref anchors, B = fit anchors (rotated by R(q),t); At/Bt = ref/fit type idx.
+#  dx = A - rot(B): identical sign convention to _overlap_grad_kernel, so the dV/dq
+#  tail below is byte-identical to the (validated) shape-kernel tail.
+# ===========================================================================
+@njit(parallel=True, fastmath=False, cache=True)
+def _pharm_color_grad_kernel(A, B, q, t, At, Bt, alphas, Ks, cats, Nr, Mr, need_grad):
+    P = A.shape[0]
+    O = np.zeros(P, dtype=np.float64)
+    dQ = np.zeros((P, 4), dtype=np.float64)
+    dT = np.zeros((P, 3), dtype=np.float64)
+    for p in prange(P):
+        qr = q[p, 0]; qi = q[p, 1]; qj = q[p, 2]; qk_ = q[p, 3]
+        tx = t[p, 0]; ty = t[p, 1]; tz = t[p, 2]
+        r00 = 1.0 - 2.0 * (qj * qj + qk_ * qk_); r01 = 2.0 * (qi * qj - qk_ * qr); r02 = 2.0 * (qi * qk_ + qj * qr)
+        r10 = 2.0 * (qi * qj + qk_ * qr); r11 = 1.0 - 2.0 * (qi * qi + qk_ * qk_); r12 = 2.0 * (qj * qk_ - qi * qr)
+        r20 = 2.0 * (qi * qk_ - qj * qr); r21 = 2.0 * (qj * qk_ + qi * qr); r22 = 1.0 - 2.0 * (qi * qi + qj * qj)
+        n_real = Nr[p]; m_real = Mr[p]
+        Oacc = 0.0
+        dTx = 0.0; dTy = 0.0; dTz = 0.0
+        dQw = 0.0; dQx = 0.0; dQy = 0.0; dQz = 0.0
+        for m in range(m_real):  # FIT
+            bx0 = B[p, m, 0]; by0 = B[p, m, 1]; bz0 = B[p, m, 2]
+            ityp = Bt[p, m]
+            if cats[ityp] == 3:   # dummy / pad -> skip
+                continue
+            ialpha = alphas[ityp]; iK = Ks[ityp]
+            a2 = ialpha * 0.5
+            bx = r00 * bx0 + r01 * by0 + r02 * bz0 + tx
+            by = r10 * bx0 + r11 * by0 + r12 * bz0 + ty
+            bz = r20 * bx0 + r21 * by0 + r22 * bz0 + tz
+            fxj = 0.0; fyj = 0.0; fzj = 0.0
+            for n in range(n_real):  # REF (same-type only)
+                if At[p, n] != ityp:
+                    continue
+                dx = A[p, n, 0] - bx; dy = A[p, n, 1] - by; dz = A[p, n, 2] - bz
+                r2 = dx * dx + dy * dy + dz * dz
+                g = iK * math.exp(-a2 * r2)
+                Oacc += g
+                if need_grad:
+                    c = ialpha * g
+                    fxj += c * dx; fyj += c * dy; fzj += c * dz
+            if need_grad:
+                dTx += fxj; dTy += fyj; dTz += fzj
+                dQw += fxj * (-2.0 * qk_ * by0 + 2.0 * qj * bz0) + fyj * (2.0 * qk_ * bx0 - 2.0 * qi * bz0) + fzj * (-2.0 * qj * bx0 + 2.0 * qi * by0)
+                dQx += fxj * (2.0 * qj * by0 + 2.0 * qk_ * bz0) + fyj * (2.0 * qj * bx0 - 4.0 * qi * by0 - 2.0 * qr * bz0) + fzj * (2.0 * qk_ * bx0 + 2.0 * qr * by0 - 4.0 * qi * bz0)
+                dQy += fxj * (-4.0 * qj * bx0 + 2.0 * qi * by0 + 2.0 * qr * bz0) + fyj * (2.0 * qi * bx0 + 2.0 * qk_ * bz0) + fzj * (-2.0 * qr * bx0 + 2.0 * qk_ * by0 - 4.0 * qj * bz0)
+                dQz += fxj * (-4.0 * qk_ * bx0 - 2.0 * qr * by0 + 2.0 * qi * bz0) + fyj * (2.0 * qr * bx0 - 4.0 * qk_ * by0 + 2.0 * qj * bz0) + fzj * (2.0 * qi * bx0 + 2.0 * qj * by0)
+        O[p] = Oacc
+        dT[p, 0] = dTx; dT[p, 1] = dTy; dT[p, 2] = dTz
+        dQ[p, 0] = dQw; dQ[p, 1] = dQx; dQ[p, 2] = dQy; dQ[p, 3] = dQz
+    return O, dQ, dT
+
+
+def pharm_color_score_grad_se3_batch(A, B, q, t, ref_types, fit_types, alphas, Ks, cats, *,
+                                     N_real=None, M_real=None, NEED_GRAD: bool = True,
+                                     BLOCK=None, num_warps=None, num_stages=None):
+    """CPU drop-in for the Triton directionless-color value+quaternion-grad kernel.
+    A = ref anchors (P,N,3), B = fit anchors (P,M,3), q=(P,4), t=(P,3); ref/fit_types
+    (P,N)/(P,M). Returns (O, dQ, dT) with dQ = dO/dq (quaternion), like the shape kernel."""
+    P, N_pad, _ = A.shape
+    _, M_pad, _ = B.shape
+    dev, dt = A.device, A.dtype
+    An = np.ascontiguousarray(A.detach().cpu().numpy())
+    Bn = np.ascontiguousarray(B.detach().cpu().numpy())
+    qn = np.ascontiguousarray(q.detach().cpu().numpy())
+    tn = np.ascontiguousarray(t.detach().cpu().numpy())
+    At = ref_types.detach().cpu().numpy().astype(np.int64)
+    Bt = fit_types.detach().cpu().numpy().astype(np.int64)
+    al = alphas.detach().cpu().numpy().astype(np.float64)
+    Ksn = Ks.detach().cpu().numpy().astype(np.float64)
+    cn = cats.detach().cpu().numpy().astype(np.int64)
+    Nr = (np.full(P, N_pad, np.int64) if N_real is None
+          else N_real.detach().cpu().numpy().astype(np.int64))
+    Mr = (np.full(P, M_pad, np.int64) if M_real is None
+          else M_real.detach().cpu().numpy().astype(np.int64))
+    O, dQ, dT = _pharm_color_grad_kernel(An, Bn, qn, tn, At, Bt, al, Ksn, cn, Nr, Mr, bool(NEED_GRAD))
+    return (torch.as_tensor(O, device=dev, dtype=dt),
+            torch.as_tensor(dQ, device=dev, dtype=dt),
+            torch.as_tensor(dT, device=dev, dtype=dt))
+
+
+# ===========================================================================
+#  DIRECTIONAL pharmacophore overlap value + QUATERNION gradient (pharm mode).
+#  Same typed/directional Gaussian + weight (cat 1/2) as _pharm_grad_kernel, but
+#  takes the quaternion q (assumes |q|=1, as the adam renormalizes it) and emits
+#  dV/dq DIRECTLY in-register, so the pharm driver drops the
+#  rotation->quaternion projection + normalization-Jacobian tail. dV/dq is the
+#  projection of grad_R = grad_R_positional + grad_R_weight onto q, computed by
+#  reusing the validated shape-kernel dR/dq tail TWICE: once with the positional
+#  "force" (sum_j aKwE*(rotfit-ref)) and the body-frame fit ANCHOR, and once with
+#  the weight "force" (sum_j coeff*ref_vn) and the body-frame fit VECTOR.
+# ===========================================================================
+@njit(parallel=True, fastmath=False, cache=True)
+def _pharm_grad_dq_kernel(A, B, q, t, At, Bt, RvA, FvB, alphas, Ks, cats, Nr, Mr, need_grad):
+    P = A.shape[0]
+    O = np.zeros(P, dtype=np.float64)
+    dQ = np.zeros((P, 4), dtype=np.float64)
+    dT = np.zeros((P, 3), dtype=np.float64)
+    for p in prange(P):
+        qr = q[p, 0]; qi = q[p, 1]; qj = q[p, 2]; qk_ = q[p, 3]
+        tx = t[p, 0]; ty = t[p, 1]; tz = t[p, 2]
+        r00 = 1.0 - 2.0 * (qj * qj + qk_ * qk_); r01 = 2.0 * (qi * qj - qk_ * qr); r02 = 2.0 * (qi * qk_ + qj * qr)
+        r10 = 2.0 * (qi * qj + qk_ * qr); r11 = 1.0 - 2.0 * (qi * qi + qk_ * qk_); r12 = 2.0 * (qj * qk_ - qi * qr)
+        r20 = 2.0 * (qi * qk_ - qj * qr); r21 = 2.0 * (qj * qk_ + qi * qr); r22 = 1.0 - 2.0 * (qi * qi + qj * qj)
+        n_real = Nr[p]; m_real = Mr[p]
+        Oacc = 0.0
+        dTx = 0.0; dTy = 0.0; dTz = 0.0
+        dQw = 0.0; dQx = 0.0; dQy = 0.0; dQz = 0.0
+        for i in range(m_real):  # FIT
+            fax0 = B[p, i, 0]; fay0 = B[p, i, 1]; faz0 = B[p, i, 2]
+            ityp = Bt[p, i]
+            icat = cats[ityp]
+            if icat == 3:
+                continue
+            ialpha = alphas[ityp]; iK = Ks[ityp]
+            fvx = FvB[p, i, 0]; fvy = FvB[p, i, 1]; fvz = FvB[p, i, 2]
+            fnorm = math.sqrt(fvx * fvx + fvy * fvy + fvz * fvz)
+            finv = 1.0 / (fnorm if fnorm > 1e-12 else 1e-12)
+            fvxn = fvx * finv; fvyn = fvy * finv; fvzn = fvz * finv
+            fatx = r00 * fax0 + r01 * fay0 + r02 * faz0 + tx
+            faty = r10 * fax0 + r11 * fay0 + r12 * faz0 + ty
+            fatz = r20 * fax0 + r21 * fay0 + r22 * faz0 + tz
+            fvtx = r00 * fvxn + r01 * fvyn + r02 * fvzn
+            fvty = r10 * fvxn + r11 * fvyn + r12 * fvzn
+            fvtz = r20 * fvxn + r21 * fvyn + r22 * fvzn
+            fxj = 0.0; fyj = 0.0; fzj = 0.0   # positional force (sum_j aKwE*(rotfit-ref))
+            wfx = 0.0; wfy = 0.0; wfz = 0.0   # weight force (sum_j coeff*ref_vn)
+            for j in range(n_real):  # REF (same-type only)
+                if At[p, j] != ityp:
+                    continue
+                rax = A[p, j, 0]; ray = A[p, j, 1]; raz = A[p, j, 2]
+                rvx = RvA[p, j, 0]; rvy = RvA[p, j, 1]; rvz = RvA[p, j, 2]
+                rnorm = math.sqrt(rvx * rvx + rvy * rvy + rvz * rvz)
+                rinv = 1.0 / (rnorm if rnorm > 1e-12 else 1e-12)
+                rvxn = rvx * rinv; rvyn = rvy * rinv; rvzn = rvz * rinv
+                dx = fatx - rax; dy = faty - ray; dz = fatz - raz   # rotfit - ref
+                r2 = dx * dx + dy * dy + dz * dz
+                E = math.exp(-ialpha * 0.5 * r2)
+                D = fvtx * rvxn + fvty * rvyn + fvtz * rvzn
+                if icat == 1:
+                    Dcl = 0.0 if D < 0.0 else (1.0 if D > 1.0 else D)
+                    w = (Dcl + 2.0) / 3.0
+                elif icat == 2:
+                    w = (abs(D) + 2.0) / 3.0
+                else:
+                    w = 1.0
+                KwE = iK * w * E
+                Oacc += KwE
+                if need_grad:
+                    aKwE = -ialpha * KwE
+                    fxj += aKwE * dx; fyj += aKwE * dy; fzj += aKwE * dz
+                    if icat == 1:
+                        c = 1.0 if (D > 0.0 and D < 1.0) else 0.0
+                    elif icat == 2:
+                        c = 1.0 if D > 0.0 else (-1.0 if D < 0.0 else 0.0)
+                    else:
+                        c = 0.0
+                    coeff = (1.0 / 3.0) * iK * E * c
+                    wfx += coeff * rvxn; wfy += coeff * rvyn; wfz += coeff * rvzn
+            if need_grad:
+                dTx += fxj; dTy += fyj; dTz += fzj
+                # positional dV/dq: shape tail with force (fxj,..) and body fit ANCHOR (fa*0)
+                dQw += fxj * (-2.0 * qk_ * fay0 + 2.0 * qj * faz0) + fyj * (2.0 * qk_ * fax0 - 2.0 * qi * faz0) + fzj * (-2.0 * qj * fax0 + 2.0 * qi * fay0)
+                dQx += fxj * (2.0 * qj * fay0 + 2.0 * qk_ * faz0) + fyj * (2.0 * qj * fax0 - 4.0 * qi * fay0 - 2.0 * qr * faz0) + fzj * (2.0 * qk_ * fax0 + 2.0 * qr * fay0 - 4.0 * qi * faz0)
+                dQy += fxj * (-4.0 * qj * fax0 + 2.0 * qi * fay0 + 2.0 * qr * faz0) + fyj * (2.0 * qi * fax0 + 2.0 * qk_ * faz0) + fzj * (-2.0 * qr * fax0 + 2.0 * qk_ * fay0 - 4.0 * qj * faz0)
+                dQz += fxj * (-4.0 * qk_ * fax0 - 2.0 * qr * fay0 + 2.0 * qi * faz0) + fyj * (2.0 * qr * fax0 - 4.0 * qk_ * fay0 + 2.0 * qj * faz0) + fzj * (2.0 * qi * fax0 + 2.0 * qj * fay0)
+                # weight dV/dq: shape tail with force (wf*) and body fit VECTOR (fv*n)
+                dQw += wfx * (-2.0 * qk_ * fvyn + 2.0 * qj * fvzn) + wfy * (2.0 * qk_ * fvxn - 2.0 * qi * fvzn) + wfz * (-2.0 * qj * fvxn + 2.0 * qi * fvyn)
+                dQx += wfx * (2.0 * qj * fvyn + 2.0 * qk_ * fvzn) + wfy * (2.0 * qj * fvxn - 4.0 * qi * fvyn - 2.0 * qr * fvzn) + wfz * (2.0 * qk_ * fvxn + 2.0 * qr * fvyn - 4.0 * qi * fvzn)
+                dQy += wfx * (-4.0 * qj * fvxn + 2.0 * qi * fvyn + 2.0 * qr * fvzn) + wfy * (2.0 * qi * fvxn + 2.0 * qk_ * fvzn) + wfz * (-2.0 * qr * fvxn + 2.0 * qk_ * fvyn - 4.0 * qj * fvzn)
+                dQz += wfx * (-4.0 * qk_ * fvxn - 2.0 * qr * fvyn + 2.0 * qi * fvzn) + wfy * (2.0 * qr * fvxn - 4.0 * qk_ * fvyn + 2.0 * qj * fvzn) + wfz * (2.0 * qi * fvxn + 2.0 * qj * fvyn)
+        O[p] = Oacc
+        dT[p, 0] = dTx; dT[p, 1] = dTy; dT[p, 2] = dTz
+        dQ[p, 0] = dQw; dQ[p, 1] = dQx; dQ[p, 2] = dQy; dQ[p, 3] = dQz
+    return O, dQ, dT
+
+
+def pharm_grad_dq_se3_batch(q, t, ref_types, fit_types, ref_anchors, fit_anchors,
+                            ref_vectors, fit_vectors, alphas, Ks, cats, *,
+                            N_real=None, M_real=None, NEED_GRAD: bool = True,
+                            BLOCK=None, num_warps=None, num_stages=None):
+    """CPU drop-in for the Triton directional pharm value+QUATERNION-grad kernel. Takes q
+    (not R) and returns (O, dQ, dT) with dQ = dO/dq -- no R->q projection needed downstream."""
+    P, N_pad, _ = ref_anchors.shape
+    _, M_pad, _ = fit_anchors.shape
+    dev, dt = ref_anchors.device, ref_anchors.dtype
+
+    def _np(x):
+        return np.ascontiguousarray(x.detach().cpu().numpy())
+    RaA = _np(ref_anchors); FaB = _np(fit_anchors)
+    RvA = _np(ref_vectors); FvB = _np(fit_vectors)
+    RtA = ref_types.detach().cpu().numpy().astype(np.int64)
+    FtB = fit_types.detach().cpu().numpy().astype(np.int64)
+    qn = _np(q); tn = _np(t)
+    al = alphas.detach().cpu().numpy().astype(np.float64)
+    Ksn = Ks.detach().cpu().numpy().astype(np.float64)
+    cn = cats.detach().cpu().numpy().astype(np.int64)
+    Nr = (np.full(P, N_pad, np.int64) if N_real is None
+          else N_real.detach().cpu().numpy().astype(np.int64))
+    Mr = (np.full(P, M_pad, np.int64) if M_real is None
+          else M_real.detach().cpu().numpy().astype(np.int64))
+    O, dQ, dT = _pharm_grad_dq_kernel(RaA, FaB, qn, tn, RtA, FtB, RvA, FvB, al, Ksn, cn, Nr, Mr, bool(NEED_GRAD))
+    return (torch.as_tensor(O, device=dev, dtype=dt),
+            torch.as_tensor(dQ, device=dev, dtype=dt),
+            torch.as_tensor(dT, device=dev, dtype=dt))
+
+
 @torch.no_grad()
 def _batch_self_overlap_esp(P_pad, charges, N_real, alpha: float = 0.81, lam: float = 0.3):
     """ESP self-overlap via the identity pose; CPU replica of _batch_self_overlap_esp."""
