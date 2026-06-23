@@ -1,10 +1,17 @@
 # shepherd_score/accel/drivers/_common.py
 # Common utilities shared across fast GPU-accelerated alignment methods.
 
+import math
 import os
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
+
+# Structured seeds (default ON). Adds +/-90deg principal-axis rotations (the axis-SWAP
+# starts, analog of ROSHAMBO2's discrete start modes) to the identity + 4 PCA core, so
+# far fewer seeds match the old 50-seed quality. Set FSS_STRUCT_SEEDS=0 to revert to the
+# legacy identity + 4 PCA + Fibonacci seed set (used by the parity gate).
+_STRUCT_SEEDS = os.environ.get("FSS_STRUCT_SEEDS", "1") != "0"
 
 # Shared early-stop patience override for the esp/pharm fine loops (None -> use the
 # call's default). Lever 2: patience=5 over-runs ~25 steps after convergence on the
@@ -330,18 +337,37 @@ def batched_seeds_torch(A_batch: torch.Tensor,
 
     pca_quats = quat_mul(quat_order[1], quat_order[0]).reshape(K, 4, 4).to(dtype)
 
-    # ---- identity + Fibonacci seeds (Fibonacci set is fixed across pairs) ----
+    # ---- assemble seeds: identity + 4 PCA (+ structured axis swaps) + Fibonacci fill ----
     identity = torch.zeros(K, 1, 4, device=device, dtype=dtype)
     identity[:, :, 0] = 1.0
-    if num_seeds == 50:
-        fibo = _get_45_fibo().to(device=device, dtype=dtype)
-    elif num_seeds > 5:
-        fibo = _quats_from_fibo(num_seeds - 5).to(device=device, dtype=dtype)
-    else:  # num_seeds == 5 -> identity + 4 PCA only, no Fibonacci
-        fibo = identity.new_zeros(0, 4)
-    fibo_b = fibo.unsqueeze(0).expand(K, -1, -1)                    # (K, num_seeds-5, 4)
 
-    quats = torch.cat([identity, pca_quats, fibo_b], dim=1)        # (K, num_seeds, 4)
+    # Structured seeds: +/-90deg rotations about each ref principal axis, composed onto
+    # the base PCA alignment. The 4 PCA quats already cover axis SIGN-flips (180deg); these
+    # add the axis SWAPS that PCA-alignment alone misses (ROSHAMBO2 gets them from its
+    # discrete start modes). Vectorized and reuses the already-computed principal axes, so
+    # the cost is negligible next to the float64 PCA eigensolve it rides on.
+    n_struct = min(max(num_seeds - 5, 0), 6) if _STRUCT_SEEDS else 0
+    if n_struct > 0:
+        base_pca = pca_quats[:, 0]                                  # (K,4) no-sign-flip PCA align
+        axes = ref_axes.to(dtype)                                   # (K,3,3) rows = principal axes
+        cos_h = math.cos(math.pi / 4)                              # +/-90deg half-angle
+        sgn = torch.tensor([math.sin(math.pi / 4), -math.sin(math.pi / 4)], device=device, dtype=dtype)
+        w = torch.full((K, 3, 2, 1), cos_h, device=device, dtype=dtype)
+        xyz = sgn.view(1, 1, 2, 1) * axes.view(K, 3, 1, 3)         # (K,3,2,3) per axis, +/-90
+        q_ax = torch.cat([w, xyz], dim=-1).reshape(K, 6, 4)[:, :n_struct]
+        base_rep = base_pca.unsqueeze(1).expand(K, n_struct, 4).reshape(-1, 4)
+        struct_quats = quat_mul(q_ax.reshape(-1, 4), base_rep).reshape(K, n_struct, 4)
+    else:
+        struct_quats = identity.new_zeros(K, 0, 4)
+
+    n_fibo = max(num_seeds - 5 - n_struct, 0)
+    if n_fibo > 0:
+        fibo_b = _quats_from_fibo(n_fibo).to(device=device, dtype=dtype).unsqueeze(0).expand(K, -1, -1)
+    else:
+        fibo_b = identity.new_zeros(K, 0, 4)
+
+    # slice handles num_seeds < 5 too (identity + leading PCA quats)
+    quats = torch.cat([identity, pca_quats, struct_quats, fibo_b], dim=1)[:, :num_seeds]
     quats = F.normalize(quats, p=2, dim=-1)
 
     # ---- translations: t = ref_com - R(q) @ fit_com  (COM alignment) ----

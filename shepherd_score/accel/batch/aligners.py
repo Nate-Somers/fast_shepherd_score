@@ -36,6 +36,23 @@ _INT_BUFFER_CACHE: dict[int, dict[str, torch.Tensor]] = {}
 # accuracy -- gated in benchmarks/experiments/speedlab.py. None -> 50.
 _NUM_SEEDS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_SEEDS"))
 
+# Per-mode default seed count (the FINE_NUM_SEEDS env var overrides all of them). With the
+# structured (+/-90deg PCA-axis) seeds, each mode preserves the legacy 50-seed MEAN overlap
+# (and self-copy recovery ~1.0) at the count below -- verified across two drug sets by
+# benchmarks/seed_parity_gate.py. The pure-shape modes converge fastest (their structured
+# shape-axis seeds cover the basins; surf even edges 50-seed). The modes carrying a non-shape
+# channel (esp/pharm/vol_color) are inherently multi-basin (charge / pharmacophore / color),
+# so they're kept higher for per-pair stability even though their MEAN is flat below ~20.
+# Raise a value for libraries far larger / more symmetric than drug-like.
+# vol_esp shares esp's ESP channel; esp_combo (absent) falls back to 50 via _seeds_for.
+_MODE_SEEDS = {"vol": 18, "surf": 20, "esp": 40, "vol_esp": 40, "pharm": 40, "vol_color": 40}
+
+
+def _seeds_for(mode: str) -> int:
+    """Seed count for ``mode``: the FINE_NUM_SEEDS env override if set, else the per-mode
+    optimal (legacy fallback 50 for any mode not in the table)."""
+    return _NUM_SEEDS if _NUM_SEEDS else _MODE_SEEDS.get(mode, 50)
+
 
 def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 100):
     """
@@ -126,7 +143,7 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
 
         # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
         # memory-pressured chunking never re-pays the launch-bound seed-gen.
-        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=(_NUM_SEEDS or 50))
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds_for("vol"))
 
         # ---- coarse + fine alignment, in GPU-memory-safe sub-batches -------
         def _proc(_s, _k):
@@ -281,7 +298,7 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
 
         # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
         # memory-pressured chunking never re-pays the launch-bound seed-gen.
-        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=(_NUM_SEEDS or 50))
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds_for("surf"))
 
         # ---- coarse + fine alignment (same engine as volumetric), processed in
         # GPU-memory-safe sub-batches sized per bucket (pairs are independent)
@@ -510,12 +527,12 @@ def _esp_bucketed_align(
                 N_real=N_real[sl], M_real=M_real[sl],
                 trans_centers_batch=tcb, trans_centers_real=tcr,
                 num_repeats_per_trans=num_repeats_per_trans,
-                num_seeds=(_NUM_SEEDS or 50),
+                num_seeds=_seeds_for(subbatch_tag),
                 topk=topk, steps_fine=steps_fine, lr=lr,
             )
             return sc, q, t
         scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=(subbatch_tag, N_pad, M_pad, (_NUM_SEEDS or 50)), device=device)
+            _proc, K, key=(subbatch_tag, N_pad, M_pad, _seeds_for(subbatch_tag)), device=device)
 
         all_pairs.extend(bucket)
         all_scores.append(scores)
@@ -985,14 +1002,14 @@ def _align_batch_pharm(
                 ref_types[sl], fit_types[sl], ref_ancs[sl], fit_ancs[sl],
                 ref_vecs[sl], fit_vecs[sl],
                 similarity=similarity, extended_points=extended_points,
-                only_extended=only_extended, num_repeats=num_repeats,
+                only_extended=only_extended, num_repeats=_seeds_for("pharm"),
                 trans_centers_batch=tcb, trans_centers_real=tcr,
                 num_repeats_per_trans=10, N_real=N_real[sl], M_real=M_real[sl],
                 topk=topk, steps_fine=steps_fine, lr=lr,
             )
             return sc, q, t
         scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=("pharm", N_pad, M_pad, num_repeats), device=device)
+            _proc, K, key=("pharm", N_pad, M_pad, _seeds_for("pharm")), device=device)
 
         all_pairs.extend(bucket)
         all_scores.append(scores)
