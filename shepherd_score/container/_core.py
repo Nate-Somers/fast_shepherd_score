@@ -69,7 +69,8 @@ class Molecule:
                  pharm_ancs: Optional[np.ndarray] = None,
                  pharm_vecs: Optional[np.ndarray] = None,
                  feature_set: str = 'shepherd',
-                 directionless: bool = False
+                 directionless: bool = False,
+                 surface_method: str = 'mesh'
                  ):
         """
         Molecule constructor to extract interaction profiles.
@@ -116,6 +117,13 @@ class Molecule:
             When ``True``, generate isotropic (zero-vector) "color" pharmacophores for all
             families (ROCS/ROSHAMBO style). Default ``False`` computes orientation vectors.
             Only used when pharmacophores are generated.
+        surface_method : str
+            How to generate the surface point cloud when it is generated internally.
+            ``'mesh'`` (default, UNCHANGED) uses the original Open3D ball-pivoting + Poisson-disk
+            surface. ``'smooth_sdf'`` uses the opt-in, Open3D-free, mesh-free smooth + stochastic
+            surfacer (``generate_point_cloud.get_molecular_surface_smooth_sdf``) intended for the
+            generative pipeline; it requires ``num_surf_points`` (not ``density``). Opt-in only;
+            using it is a distribution shift vs a model trained on the mesh surface (validate first).
         """
         self.mol = mol
         self.atom_pos = Chem.RemoveHs(mol).GetConformer().GetPositions()
@@ -124,6 +132,7 @@ class Molecule:
         else:
             self.num_surf_points = len(surface_points)
         self.density = density
+        self.surface_method = surface_method
 
         if isinstance(partial_charges, list):
             partial_charges = np.array(partial_charges)
@@ -186,18 +195,27 @@ class Molecule:
         Gets the point cloud positions.
         """
         self.mol, centers = get_atom_coords(self.mol, MMFF_optimize=False)
+        surface_method = getattr(self, 'surface_method', 'mesh')
         if use_density:
+            if surface_method != 'mesh':
+                raise ValueError(
+                    f"surface_method={surface_method!r} does not support density-based surfaces; "
+                    "the mesh-free path needs num_surf_points. Use surface_method='mesh' with density, "
+                    "or pass num_surf_points instead of density."
+                )
             positions = get_molecular_surface_const_density(centers,
                                                             self.radii,
                                                             self.density,
                                                             probe_radius=self.probe_radius,
                                                             num_samples_per_atom=25)
         else:
+            # num_samples_per_atom left to each method's default: 25 for 'mesh' (unchanged),
+            # the sparser SMOOTH_SDF_NSPA for 'smooth_sdf'.
             positions = get_molecular_surface(centers,
                                               self.radii,
                                               num_points=self.num_surf_points,
                                               probe_radius=self.probe_radius,
-                                              num_samples_per_atom = 25)
+                                              method=surface_method)
         return positions.astype(np.float32)
 
 
