@@ -401,3 +401,34 @@ device plus a combined [`speed_all_hardware.png`](benchmarks/results/speed_all_h
 across all six (regenerate it with `python benchmarks/plot_all_hardware.py`). Re-running a benchmark builds a
 deterministic molecule cache once (`FSS_MOL_CACHE_DIR`, default `benchmarks/molcache/`) so
 repeat runs start fast.
+---
+
+## Seed strategy — structured starts + per-mode optimal counts
+
+Each batched alignment optimizes every pair from several SE(3) **seeds** (initial
+orientations) and keeps the best. Two additive changes cut the seed count — and the per-pair
+work — without losing overlap quality. Both are on by default; neither changes the public API.
+
+- **Structured PCA-axis seeds.** On top of the `identity + 4 principal-component-alignment
+  quaternions` core, `accel/drivers/_common.py:batched_seeds_torch` now adds **±90° rotations
+  about each reference principal axis** — the axis-*swap* starts (the same idea as ROSHAMBO2's
+  discrete start modes) that the four sign-flip PCA quats don't cover. They are built fully
+  vectorized and reuse the principal axes already computed for the PCA seeds, so seed
+  generation is **no slower than** the legacy `identity + 4 PCA + Fibonacci` set (faster at
+  large batch — both are dominated by the float64 PCA eigensolve). Set `FSS_STRUCT_SEEDS=0`
+  to revert to the legacy seed set.
+- **Per-mode seed counts.** Each mode now defaults to its own seed count
+  (`accel/batch/aligners.py:_MODE_SEEDS`; the `FINE_NUM_SEEDS` env var still overrides)
+  instead of a blanket 50: **`vol` 18, `surf` 20, `esp` / `vol_esp` / `pharm` / `vol_color`
+  40**. The pure-shape modes converge fastest (their structured shape-axis seeds cover the
+  basins — `surf` even edges the 50-seed result); the modes carrying a non-shape channel
+  (`esp`/`pharm`/`vol_color`) are inherently **multi-basin** (charge / pharmacophore / color
+  landscapes have many near-equal optima), so they are kept higher for per-pair stability. Net:
+  the same recovered overlap at fewer seeds — up to **~1.4× faster on `esp`**, with the shape
+  modes using ~2.5× fewer seeds.
+- **Parity gate.** [`benchmarks/seed_parity_gate.py`](benchmarks/seed_parity_gate.py) runs the
+  legacy 50-seed path against each mode's new default in isolated subprocesses and asserts no
+  regression in **mean overlap** or self-copy recovery. Mean overlap is the stable quality
+  metric here: the multi-basin modes differ *per pair* between **any** two seed sets — even
+  legacy-50 vs structured-50 — while the mean is flat, so per-pair reproduction is not a
+  meaningful target.
