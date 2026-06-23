@@ -323,7 +323,8 @@ def make_real_cohort(mode: str, *, n_pairs: int, bucket_kind: str,
 # FORK engine  (in-process: this fork via MoleculePairBatch, backend="triton")
 # ===========================================================================
 _SCORE_ATTR = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf",
-               "esp": "sim_aligned_esp", "pharm": "sim_aligned_pharm"}
+               "esp": "sim_aligned_esp", "pharm": "sim_aligned_pharm",
+               "vol_color": "sim_aligned_vol_color"}
 
 
 def _fork_pool_smiles(mode, bucket):
@@ -360,6 +361,10 @@ def _fork_align(mode, pairs, cfg):
     elif mode == "pharm":
         b.align_with_pharm(num_repeats=cfg["num_repeats"], lr=cfg["lr"],
                            backend="triton", max_num_steps=cfg["steps"])
+    elif mode == "vol_color":
+        b.align_with_vol_color(color_weight=cfg.get("color_weight", 0.5),
+                               num_repeats=cfg["num_repeats"], lr=cfg["lr"],
+                               backend="triton", max_num_steps=cfg["steps"])
     else:
         raise ValueError(mode)
 
@@ -745,7 +750,8 @@ def _hw_footer(hw: dict) -> str:
 # ===========================================================================
 # Rendering
 # ===========================================================================
-COLOR = {"vol": "#7b3294", "surf": "#1f6fb2", "esp": "#1a9850", "pharm": "#d9700a"}
+COLOR = {"vol": "#7b3294", "surf": "#1f6fb2", "esp": "#1a9850", "pharm": "#d9700a",
+         "vol_color": "#c0392b"}
 LS = {"same": "-", "cross": (0, (5, 2))}
 MK = {"same": "o", "cross": "D"}
 
@@ -997,7 +1003,8 @@ def main():
     ap = argparse.ArgumentParser(description="fast_shepherd_score fork-vs-original alignment benchmark")
     ap.add_argument("--orig-cell", help=argparse.SUPPRESS)         # internal: run as original subprocess
     ap.add_argument("--fork-cell", help=argparse.SUPPRESS)         # internal: run as isolated fork subprocess
-    ap.add_argument("--modes", nargs="+", default=MODES, choices=MODES)
+    ap.add_argument("--modes", nargs="+", default=MODES, choices=MODES + ["vol_color"],
+                    help="vol_color (ROCS-style shape+color) is fork-only; run it with --no-original")
     ap.add_argument("--buckets", nargs="+", default=BUCKETS, choices=BUCKETS)
     ap.add_argument("--sizes", type=int, nargs="+", default=SIZES)
     ap.add_argument("--cap", type=float, default=DEFAULT_CAP,

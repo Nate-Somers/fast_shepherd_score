@@ -429,6 +429,7 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                       extended_points: bool = False,
                       only_extended: bool = False,
                       precomputed_self_overlaps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                      directional: bool = True,
                       ) -> torch.Tensor:
     """
     Compute pharmacophore score.
@@ -472,6 +473,11 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
         ``extended_points`` is False), the per-type self-overlap computation is
         skipped and only the cross-overlap VAB is computed each call. Used to
         avoid redundant self-overlap recomputation in optimization loops.
+    directional : bool, optional
+        When ``True`` (default), HBA/HBD/aromatic/halogen are scored with the
+        orientation-vector cosine weighting (fss behavior). When ``False``, *all* types
+        are scored as isotropic point Gaussians (ROCS/ROSHAMBO "color"); this forces
+        ``extended_points`` off and is incompatible with ``precomputed_self_overlaps``.
 
     Returns
     -------
@@ -502,6 +508,23 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
         similarity_func = partial(tversky_func, sigma=0.05)
     else:
         raise ValueError('Argument `similarity` must be one of (tanimoto, tversky, tversky_ref, tversky_fit).')
+
+    # Directionless (ROCS/ROSHAMBO-style "color") scoring routes EVERY type through the
+    # point-only Gaussian overlap. Note: zeroing the vectors is NOT equivalent -- a zero
+    # vector gives cosine weight (0+2)/3 = 2/3 on cross terms but 1 on self terms, which
+    # does not cancel in the Tanimoto, so the cosine path must be skipped entirely.
+    if not directional:
+        # `extended_points` encodes directional geometry (anchor + vector-extended point),
+        # so it is mutually exclusive with directionless scoring.
+        extended_points = False
+        only_extended = False
+        # Self-overlaps must be recomputed directionless; a directional precompute (e.g.
+        # from compute_self_overlaps_pharm) would corrupt the Tanimoto denominator.
+        if precomputed_self_overlaps is not None:
+            raise ValueError(
+                "Directionless pharmacophore scoring (`directional=False`) is incompatible "
+                "with `precomputed_self_overlaps`; recompute self-overlaps directionless."
+            )
 
     # Determine if single instance or batched
     if len(ptype_1.shape) == 1 and len(ptype_2.shape) == 1:
@@ -657,6 +680,22 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
                                                allow_antiparallel=True)
+        elif not directional:
+            if batched:
+                VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='aromatic',
+                                                               ptype_1=ptype_1,
+                                                               ptype_2=ptype_2,
+                                                               cdist_21=cdist_21,
+                                                               cdist_22=cdist_22,
+                                                               cdist_11=cdist_11)
+            else:
+                VAB, VAA, VBB = get_volume_overlap_score(ptype_str='aromatic',
+                                                         ptype_1=ptype_1,
+                                                         ptype_2=ptype_2,
+                                                         anchors_1=anchors_1,
+                                                         anchors_2=anchors_2)
+            ref_overlap += VAA
+            fit_overlap += VBB
         elif batched:
             VAB, VAA, VBB = get_vector_volume_overlap_score_batch(ptype_str='aromatic',
                                                                   ptype_1=ptype_1,
@@ -691,6 +730,22 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
                                                allow_antiparallel=False)
+        elif not directional:
+            if batched:
+                VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='acceptor',
+                                                               ptype_1=ptype_1,
+                                                               ptype_2=ptype_2,
+                                                               cdist_21=cdist_21,
+                                                               cdist_22=cdist_22,
+                                                               cdist_11=cdist_11)
+            else:
+                VAB, VAA, VBB = get_volume_overlap_score(ptype_str='acceptor',
+                                                         ptype_1=ptype_1,
+                                                         ptype_2=ptype_2,
+                                                         anchors_1=anchors_1,
+                                                         anchors_2=anchors_2)
+            ref_overlap += VAA
+            fit_overlap += VBB
         elif extended_points:
             VAB, VAA, VBB = get_volume_overlap_score_extended_points(ptype_str='acceptor',
                                                                      ptype_1=ptype_1,
@@ -735,6 +790,22 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
                                                allow_antiparallel=False)
+        elif not directional:
+            if batched:
+                VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='donor',
+                                                               ptype_1=ptype_1,
+                                                               ptype_2=ptype_2,
+                                                               cdist_21=cdist_21,
+                                                               cdist_22=cdist_22,
+                                                               cdist_11=cdist_11)
+            else:
+                VAB, VAA, VBB = get_volume_overlap_score(ptype_str='donor',
+                                                         ptype_1=ptype_1,
+                                                         ptype_2=ptype_2,
+                                                         anchors_1=anchors_1,
+                                                         anchors_2=anchors_2)
+            ref_overlap += VAA
+            fit_overlap += VBB
         elif extended_points:
             VAB, VAA, VBB = get_volume_overlap_score_extended_points(ptype_str='donor',
                                                                      ptype_1=ptype_1,
@@ -779,6 +850,22 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
                                                allow_antiparallel=False)
+        elif not directional:
+            if batched:
+                VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='halogen',
+                                                               ptype_1=ptype_1,
+                                                               ptype_2=ptype_2,
+                                                               cdist_21=cdist_21,
+                                                               cdist_22=cdist_22,
+                                                               cdist_11=cdist_11)
+            else:
+                VAB, VAA, VBB = get_volume_overlap_score(ptype_str='halogen',
+                                                         ptype_1=ptype_1,
+                                                         ptype_2=ptype_2,
+                                                         anchors_1=anchors_1,
+                                                         anchors_2=anchors_2)
+            ref_overlap += VAA
+            fit_overlap += VBB
         elif extended_points:
             VAB, VAA, VBB = get_volume_overlap_score_extended_points(ptype_str='halogen',
                                                                      ptype_1=ptype_1,
@@ -833,9 +920,15 @@ def get_pharm_combo_score(centers_1: torch.Tensor,
                           alpha: float = 0.81,
                           similarity: str = 'tanimoto',
                           extended_points: bool = False,
-                          only_extended: bool = False
+                          only_extended: bool = False,
+                          color_weight: float = 0.5,
+                          directional: bool = True
                           ) -> torch.Tensor:
-    """ Compute a combined shape and pharmacophore score. """
+    """ Compute a combined shape and pharmacophore score.
+
+    The combined score is ``(1 - color_weight) * shape + color_weight * pharm``. The
+    default ``color_weight=0.5`` reproduces the previous unweighted average. Set
+    ``directional=False`` for ROCS/ROSHAMBO-style isotropic "color" scoring. """
     # Similarity scoring
     if similarity.lower() == 'tanimoto':
         similarity_func = tanimoto_func
@@ -857,7 +950,8 @@ def get_pharm_combo_score(centers_1: torch.Tensor,
                                     vectors_2=vectors_2,
                                     similarity=similarity,
                                     extended_points=extended_points,
-                                    only_extended=only_extended)
+                                    only_extended=only_extended,
+                                    directional=directional)
 
     # Shape scoring
     VAB = VAB_2nd_order(centers_1=centers_1,
@@ -873,5 +967,5 @@ def get_pharm_combo_score(centers_1: torch.Tensor,
                                   VAA=VAA,
                                   VBB=VBB)
 
-    score = (pharm_score + shape_score)/2
+    score = (1 - color_weight) * shape_score + color_weight * pharm_score
     return score

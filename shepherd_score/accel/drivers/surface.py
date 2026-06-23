@@ -21,6 +21,7 @@ from ._common import (
     apply_se3_transform,
     quaternion_to_rotation_matrix,
     _update_best,
+    ES_PATIENCE_OVERRIDE,
 )
 
 
@@ -214,7 +215,7 @@ def coarse_fine_surface_align_many(
             current_max = best_score.max().item()
             if current_max - prev_max_score < early_stop_tol:
                 no_improve_count += 1
-                if no_improve_count >= early_stop_patience:
+                if no_improve_count >= (ES_PATIENCE_OVERRIDE or early_stop_patience):
                     break
             else:
                 no_improve_count = 0

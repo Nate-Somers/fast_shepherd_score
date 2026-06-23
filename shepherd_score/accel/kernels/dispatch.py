@@ -118,3 +118,7 @@ _batch_self_overlap_esp = _make("_batch_self_overlap_esp", "esp")
 
 # --- pharmacophore kernel (pharmacophore_grad_triton <-> cpu_overlap) ---------
 pharm_score_grad_se3_batch = _make("pharm_score_grad_se3_batch", "pharm")
+# Directional pharm value+QUATERNION-grad kernel (pharm mode, in-register dQ).
+pharm_grad_dq_se3_batch = _make("pharm_grad_dq_se3_batch", "pharm")
+# Directionless "color" value+quaternion-grad kernel (vol_color).
+pharm_color_score_grad_se3_batch = _make("pharm_color_score_grad_se3_batch", "pharm")

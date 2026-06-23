@@ -23,6 +23,7 @@ from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
 from shepherd_score.score.pharmacophore_scoring import _SIM_TYPE, get_overlap_pharm
 from shepherd_score.alignment import optimize_ROCS_overlay, optimize_ROCS_overlay_analytical, optimize_ROCS_esp_overlay, optimize_ROCS_esp_overlay_analytical, optimize_esp_combo_score_overlay
 from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_overlay_analytical
+from shepherd_score.alignment import optimize_vol_color_overlay
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.accel import batch as _ba
 
@@ -66,7 +67,9 @@ class Molecule:
                  pharm_multi_vector: Optional[bool] = None,
                  pharm_types: Optional[np.ndarray] = None,
                  pharm_ancs: Optional[np.ndarray] = None,
-                 pharm_vecs: Optional[np.ndarray] = None
+                 pharm_vecs: Optional[np.ndarray] = None,
+                 feature_set: str = 'shepherd',
+                 directionless: bool = False
                  ):
         """
         Molecule constructor to extract interaction profiles.
@@ -103,6 +106,16 @@ class Molecule:
             Anchor positions of pharmacophores. Shape: (P,3).
         pharm_vecs : Optional[np.ndarray]
             Unit vectors relative to anchor positions of pharmacophores. Shape: (P,3).
+        feature_set : str
+            Which pharmacophore feature definition to use when generating pharmacophores.
+            ``'shepherd'`` (default) uses the local ``smarts_features.fdef`` (8 fss types);
+            ``'rdkit_base'`` uses RDKit's stock ``BaseFeatures.fdef`` reduced to the 6
+            ROCS/ROSHAMBO color types. Only used when pharmacophores are generated (i.e.
+            ``pharm_multi_vector`` is not ``None`` and explicit arrays are not provided).
+        directionless : bool
+            When ``True``, generate isotropic (zero-vector) "color" pharmacophores for all
+            families (ROCS/ROSHAMBO style). Default ``False`` computes orientation vectors.
+            Only used when pharmacophores are generated.
         """
         self.mol = mol
         self.atom_pos = Chem.RemoveHs(mol).GetConformer().GetPositions()
@@ -144,6 +157,7 @@ class Molecule:
         self._nonH_atoms_idx = np.array([a.GetIdx() for a in self.mol.GetAtoms() if a.GetAtomicNum() != 1])
 
         self.pharm_multi_vector = pharm_multi_vector
+        self.pharm_feature_set = feature_set
         if isinstance(pharm_types, np.ndarray) and isinstance(pharm_ancs, np.ndarray) and isinstance(pharm_vecs, np.ndarray):
             self.pharm_types, self.pharm_ancs, self.pharm_vecs = pharm_types, pharm_ancs, pharm_vecs
         else:
@@ -153,7 +167,9 @@ class Molecule:
                     multi_vector=self.pharm_multi_vector,
                     exclude=[],
                     check_access=False,
-                    scale=1.
+                    scale=1.,
+                    feature_set=feature_set,
+                    directionless=directionless
                 )
 
     def get_partial_charges(self) -> np.ndarray:
@@ -216,14 +232,18 @@ class Molecule:
                           multi_vector: bool = True,
                           exclude: List[int] = [],
                           check_access: bool = False,
-                          scale: float = 1):
+                          scale: float = 1,
+                          feature_set: str = 'shepherd',
+                          directionless: bool = False):
         """ Get the pharmacophores of the molecule. """
         self.pharm_types, self.pharm_ancs, self.pharm_vecs = get_pharmacophores(
             self.mol,
             multi_vector=multi_vector,
             exclude=exclude,
             check_access=check_access,
-            scale=scale
+            scale=scale,
+            feature_set=feature_set,
+            directionless=directionless
         )
 
 
@@ -329,6 +349,9 @@ class MoleculePair:
         self.transform_pharm = np.eye(4)
         self.sim_aligned_pharm = None
 
+        self.transform_vol_color = np.eye(4)
+        self.sim_aligned_vol_color = None
+
     # --- batched GPU/Triton aligners -------------------------------------
     # Implemented as free functions in ``_batch_align`` (kept out of this file
     # for size); bound here as static methods so the public seam is unchanged --
@@ -339,6 +362,7 @@ class MoleculePair:
     _align_batch_vol_esp   = staticmethod(_ba._align_batch_vol_esp)
     _align_batch_esp_combo = staticmethod(_ba._align_batch_esp_combo)
     _align_batch_pharm     = staticmethod(_ba._align_batch_pharm)
+    _align_batch_vol_color = staticmethod(_ba._align_batch_vol_color)
 
     def align_with_vol(self,
                        no_H: bool = True,
@@ -980,6 +1004,123 @@ class MoleculePair:
             self.transform_esp_combo = se3_transform.numpy()
             self.sim_aligned_esp_combo = score.numpy()
             return aligned_fit_points.detach().numpy()
+
+
+    def align_with_vol_color(self,
+                             color_weight: float = 0.5,
+                             alpha: float = 0.81,
+                             similarity: _SIM_TYPE = 'tanimoto',
+                             directional: bool = False,
+                             extended_points: bool = False,
+                             only_extended: bool = False,
+                             num_repeats: int = 50,
+                             trans_init: bool = False,
+                             lr: float = 0.1,
+                             max_num_steps: int = 200,
+                             verbose: bool = False,
+                             use_fast: bool = False) -> np.ndarray:
+        """
+        Align using a ROCS/ROSHAMBO-style combined atom-centred Gaussian *shape* (volume) +
+        directionless *color* (pharmacophore) overlay (a TanimotoCombo analogue).
+
+        The optimized objective is
+        ``(1 - color_weight) * shape_Tanimoto + color_weight * color_Tanimoto``. By default
+        the color channel is *directionless* (isotropic point Gaussians, ROCS/ROSHAMBO
+        "color"); pass ``directional=True`` to keep fss's orientation-vector weighting. For
+        ROCS/ROSHAMBO feature parity, build the ``Molecule`` objects with
+        ``feature_set='rdkit_base'``.
+
+        Optimally aligned score is stored in ``self.sim_aligned_vol_color`` and the optimal
+        SE(3) transformation in ``self.transform_vol_color``.
+
+        Parameters
+        ----------
+        color_weight : float, optional
+            Weight of the color channel in [0, 1]; shape gets ``1 - color_weight``.
+            Default is 0.5 (the ROCS/ROSHAMBO 50/50 combo).
+        alpha : float, optional
+            Gaussian width for the shape overlap. Default is 0.81 (volumetric, heavy atoms).
+        similarity : str, optional
+            Similarity for the color channel. Default is 'tanimoto'.
+        directional : bool, optional
+            ``False`` (default) scores color as isotropic point Gaussians; ``True`` uses the
+            orientation-vector cosine weighting.
+        extended_points, only_extended : bool, optional
+            Forwarded to the color scorer (ignored when ``directional=False``).
+        num_repeats : int, optional
+            Number of SE(3) initializations. Default is 50.
+        trans_init : bool, optional
+            Translation-seeded initialization from the reference atoms. Default is ``False``.
+        lr : float, optional
+            Learning rate. Default is 0.1.
+        max_num_steps : int, optional
+            Maximum optimization steps. Default is 200.
+        verbose : bool, optional
+            Print progress. Default is ``False``.
+
+        Returns
+        -------
+        aligned_fit_centers : np.ndarray (M, 3)
+            Transformed fit atom (heavy-atom) coordinates.
+        """
+        if self.ref_molec.pharm_types is None or self.fit_molec.pharm_types is None:
+            raise ValueError(
+                'Both Molecule objects must have pharmacophores to use align_with_vol_color. '
+                "Build them with `pharm_multi_vector` set (and optionally "
+                "`feature_set='rdkit_base'` for ROCS/ROSHAMBO color)."
+            )
+
+        dev = self.device
+
+        # Opt-in per-pair fast path: the batched fused-kernel driver (shape Triton/numba
+        # kernel + fused directionless color kernel). Only covers the directionless tanimoto
+        # case it implements; otherwise falls through to the torch optimizer.
+        if (use_fast and torch.cuda.is_available() and not directional
+                and similarity == 'tanimoto' and not extended_points):
+            try:
+                from shepherd_score.accel.drivers.vol_color import fast_optimize_vol_color_overlay
+            except ImportError:
+                fast_optimize_vol_color_overlay = None
+            if fast_optimize_vol_color_overlay is not None:
+                aligned_fit_centers, se3_transform, score = fast_optimize_vol_color_overlay(
+                    ref_centers=self._ref_xyz_t,
+                    fit_centers=self._fit_xyz_t,
+                    ref_types=torch.as_tensor(self.ref_molec.pharm_types, dtype=torch.int64, device=dev),
+                    fit_types=torch.as_tensor(self.fit_molec.pharm_types, dtype=torch.int64, device=dev),
+                    ref_ancs=torch.as_tensor(self.ref_molec.pharm_ancs, dtype=torch.float32, device=dev),
+                    fit_ancs=torch.as_tensor(self.fit_molec.pharm_ancs, dtype=torch.float32, device=dev),
+                    alpha=alpha, color_weight=color_weight, num_repeats=num_repeats,
+                    trans_centers=self._ref_xyz_t if trans_init else None,
+                    steps_fine=max_num_steps, lr=lr,
+                )
+                self.transform_vol_color = se3_transform.numpy()
+                self.sim_aligned_vol_color = score.numpy()
+                return aligned_fit_centers.numpy()
+
+        aligned_fit_centers, se3_transform, score = optimize_vol_color_overlay(
+            ref_centers=self._ref_xyz_t,
+            fit_centers=self._fit_xyz_t,
+            ref_pharms=torch.from_numpy(self.ref_molec.pharm_types).to(dev),
+            fit_pharms=torch.from_numpy(self.fit_molec.pharm_types).to(dev),
+            ref_anchors=torch.from_numpy(self.ref_molec.pharm_ancs).to(torch.float32).to(dev),
+            fit_anchors=torch.from_numpy(self.fit_molec.pharm_ancs).to(torch.float32).to(dev),
+            ref_vectors=torch.from_numpy(self.ref_molec.pharm_vecs).to(torch.float32).to(dev),
+            fit_vectors=torch.from_numpy(self.fit_molec.pharm_vecs).to(torch.float32).to(dev),
+            alpha=alpha,
+            color_weight=color_weight,
+            similarity=similarity,
+            directional=directional,
+            extended_points=extended_points,
+            only_extended=only_extended,
+            num_repeats=num_repeats,
+            trans_centers=self._ref_xyz_t if trans_init else None,
+            lr=lr,
+            max_num_steps=max_num_steps,
+            verbose=verbose,
+        )
+        self.transform_vol_color = se3_transform.numpy()
+        self.sim_aligned_vol_color = score.numpy()
+        return aligned_fit_centers.numpy()
 
 
     def align_with_pharm(self,

@@ -1031,6 +1031,71 @@ class MoleculePairBatch:
             verbose=verbose,
         )
 
+    def align_with_vol_color(self,
+                             color_weight: float = 0.5,
+                             alpha: float = 0.81,
+                             num_repeats: int = 50,
+                             trans_init: bool = False,
+                             lr: float = 0.1,
+                             max_num_steps: int = 200,
+                             verbose: bool = False,
+                             backend: str = "jax",
+                             return_aligned: bool = False,
+                             ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        """Align all pairs using the ROCS/ROSHAMBO-style ``vol_color`` combo
+        (atom-Gaussian shape + directionless pharmacophore color).
+
+        Results are stored in-place on each MoleculePair:
+        - ``pair.transform_vol_color`` and ``pair.sim_aligned_vol_color``
+
+        Parameters
+        ----------
+        color_weight : float
+            Weight of the color channel in [0, 1] (default 0.5).
+        alpha : float
+            Gaussian width for the shape overlap (default 0.81, volumetric).
+        num_repeats, trans_init, lr, max_num_steps, verbose
+            Standard optimization controls.
+        backend : str
+            ``"jax"`` (default) runs the per-pair torch path sequentially via
+            ``MoleculePair.align_with_vol_color``. ``"triton"`` (aliases ``"cuda"``/
+            ``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_vol_color`` driver — the shape channel runs on
+            the Triton (CUDA) / numba (CPU) kernel and the directionless color channel
+            on pure PyTorch, so the batched path runs on either device. The batched
+            path is shape-gradient-optimized + color-scored (FastROCS-style), like
+            ``esp_combo``; the per-pair (``"jax"``) path optimizes the joint gradient.
+        return_aligned : bool
+            For the batched backend, build the aligned-fit-atom list when ``True``.
+
+        Returns
+        -------
+        scores : np.ndarray
+            Shape: (N,).
+        aligned_list : list of np.ndarray
+            Aligned fit atom coordinates per pair (``None`` entries unless
+            ``return_aligned=True`` on the batched backend).
+        """
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_color,
+            dict(alpha=alpha, color_weight=color_weight, trans_init=trans_init,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_color", "transform_vol_color", "_fit_xyz_t",
+            return_aligned, numba_ok=True)
+        if handled:
+            return _result
+
+        return self._delegate_alignment(
+            'align_with_vol_color', 'sim_aligned_vol_color',
+            color_weight=color_weight,
+            alpha=alpha,
+            num_repeats=num_repeats,
+            trans_init=trans_init,
+            lr=lr,
+            max_num_steps=max_num_steps,
+            verbose=verbose,
+        )
+
     def _pad_and_mask_pharm(self):
         """Extract, pad, and create masks for pharmacophore alignment.
 

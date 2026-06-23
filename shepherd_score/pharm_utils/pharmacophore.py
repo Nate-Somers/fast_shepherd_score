@@ -404,12 +404,28 @@ def _average_vectors(vectors: List):
 _cached_factory: rdkit.Chem.rdMolChemicalFeatures.MolChemicalFeatureFactory | None = (
     None
 )
+# Separate lazily-cached factory for RDKit's stock BaseFeatures.fdef (used for the
+# ROCS/ROSHAMBO-style ``feature_set='rdkit_base'`` color definitions).
+_cached_factory_base: rdkit.Chem.rdMolChemicalFeatures.MolChemicalFeatureFactory | None = (
+    None
+)
+
+# Stock BaseFeatures.fdef families used for the 6-type ROCS/ROSHAMBO color set and how
+# they map onto fss ``P_TYPES`` names. ``LumpedHydrophobe`` (clustered) is used for the
+# hydrophobe rather than the per-atom ``Hydrophobe`` to avoid an explosion of points.
+_RDKIT_BASE_FAMILIES = ('Aromatic', 'Donor', 'Acceptor', 'PosIonizable', 'NegIonizable',
+                        'LumpedHydrophobe')
+_RDKIT_BASE_RENAME = {'PosIonizable': 'Cation', 'NegIonizable': 'Anion',
+                      'LumpedHydrophobe': 'Hydrophobe'}
+
 
 def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
                             multi_vector: bool = True,
                             exclude: List[int] = [],
                             check_access: bool = False,
-                            scale: float = 1.0
+                            scale: float = 1.0,
+                            feature_set: str = 'shepherd',
+                            directionless: bool = False
                             ) -> Dict:
     """
     Get the positions of pharmacophore anchors and their associated unit vectors.
@@ -428,6 +444,16 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
         Check if HBD/HBA are accessible to the molecular surface. Default is ``False``.
     scale : float, optional
         Length of the vector in Angstroms. Default is 1.0.
+    feature_set : str, optional
+        Which feature definition to use. ``'shepherd'`` (default) uses the local
+        ``smarts_features.fdef`` (8 fss types incl. Halogen/ZnBinder). ``'rdkit_base'``
+        uses RDKit's stock ``BaseFeatures.fdef`` reduced to the 6 ROCS/ROSHAMBO color
+        types (Donor, Acceptor, Aromatic, Hydrophobe, Cation, Anion), mapping
+        ``PosIonizable->Cation``, ``NegIonizable->Anion``, ``LumpedHydrophobe->Hydrophobe``.
+    directionless : bool, optional
+        When ``True``, emit zero vectors for *all* families (including donor/acceptor/
+        aromatic/halogen) so the features are isotropic ROCS/ROSHAMBO-style "color" atoms.
+        Default is ``False`` (compute orientation vectors as usual).
 
     Returns
     -------
@@ -435,15 +461,25 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
         Dictionary with format ``{'FeatureName': {'P': [(anchor coord), ...],
         'V': [(rel. vec), ...]}}``.
     """
-    global _cached_factory
+    global _cached_factory, _cached_factory_base
     pharmacophores = {}
 
-    if _cached_factory is None:
-        dirname = os.path.dirname(__file__)
-        fdef_file = os.path.join(dirname, "smarts_features.fdef")
-        _cached_factory = AllChem.BuildFeatureFactory(fdef_file)
+    if feature_set == 'rdkit_base':
+        if _cached_factory_base is None:
+            from rdkit import RDConfig
+            _cached_factory_base = AllChem.BuildFeatureFactory(
+                os.path.join(RDConfig.RDDataDir, 'BaseFeatures.fdef'))
+        factory = _cached_factory_base
+    elif feature_set == 'shepherd':
+        if _cached_factory is None:
+            dirname = os.path.dirname(__file__)
+            fdef_file = os.path.join(dirname, "smarts_features.fdef")
+            _cached_factory = AllChem.BuildFeatureFactory(fdef_file)
+        factory = _cached_factory
+    else:
+        raise ValueError(f"`feature_set` must be 'shepherd' or 'rdkit_base', got {feature_set!r}.")
 
-    mol_feats = _cached_factory.GetFeaturesForMol(mol)
+    mol_feats = factory.GetFeaturesForMol(mol)
 
     # Filter only these for rdkit processing, we will compute hydrophobes later
     keep = ('Aromatic', 'ZnBinder', 'Donor', 'Acceptor', 'Cation', 'Anion', 'Halogen')
@@ -451,7 +487,13 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
     # Non-hydrophobe pharmacophore processing
     for feat in mol_feats:
         family = feat.GetFamily() # type of pharmacophore
-        if family not in keep:
+        if feature_set == 'rdkit_base':
+            # Keep only the 6 ROCS/ROSHAMBO color families (checked on the stock name so
+            # the per-atom 'Hydrophobe' family is excluded), then rename into P_TYPES.
+            if family not in _RDKIT_BASE_FAMILIES:
+                continue
+            family = _RDKIT_BASE_RENAME.get(family, family)
+        elif family not in keep:
           continue
         if family not in pharmacophores:
             pharmacophores[family] = {}
@@ -460,7 +502,7 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
 
         pos = feat.GetPos() # positions of pharmacophore anchor
 
-        if family.lower() == 'aromatic':
+        if not directionless and family.lower() == 'aromatic':
             anchor, vec = GetAromaticFeatVects(conf = mol.GetConformer(),
                                                featAtoms = feat.GetAtomIds(),
                                                featLoc = pos,
@@ -470,7 +512,7 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
                 anchor = anchor[0]
                 vec = vec[0]
 
-        elif family.lower() == 'donor':
+        elif not directionless and family.lower() == 'donor':
             aids = feat.GetAtomIds()
             if len(aids) == 1:
                 featAtom = mol.GetAtomWithIdx(aids[0])
@@ -502,7 +544,7 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
                     anchor = anchor[0]
                     vec = deepcopy(avg_vec)
 
-        elif family.lower() == 'acceptor':
+        elif not directionless and family.lower() == 'acceptor':
             aids = feat.GetAtomIds()
             if len(aids) == 1:
                 featAtom = mol.GetAtomWithIdx(aids[0])
@@ -535,7 +577,7 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
                     anchor = anchor[0]
                     vec = deepcopy(avg_vec)
 
-        elif family.lower() == 'halogen':
+        elif not directionless and family.lower() == 'halogen':
             aids = feat.GetAtomIds()
             if len(aids) == 1:
                 featAtom = mol.GetAtomWithIdx(aids[0])
@@ -550,7 +592,6 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
             vec = Chem.rdGeometry.Point3D(0,0,0)
 
         if anchor is not None and vec is not None:
-            pass
             if isinstance(anchor, list):
                 pharmacophores[family]['P'].extend(_rdkit_point3d_to_tuple(x) for x in anchor)
                 pharmacophores[family]['V'].extend(_rdkit_point3d_to_tuple(x) for x in vec)
@@ -558,11 +599,14 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
                 pharmacophores[family]['P'].append(_rdkit_point3d_to_tuple(anchor))
                 pharmacophores[family]['V'].append(_rdkit_point3d_to_tuple(vec))
 
-    # Hydrophobe processing
-    hydrophobes = find_hydrophobes(mol=mol, cluster_hydrophobic=True)
-    pharmacophores['Hydrophobe'] = {}
-    pharmacophores['Hydrophobe']['P'] = hydrophobes
-    pharmacophores['Hydrophobe']['V'] = [(0,0,0) for _ in range(len(hydrophobes))]
+    # Hydrophobe processing. The 'shepherd' feature set computes hydrophobes via SMARTS
+    # clustering here; 'rdkit_base' already sourced Hydrophobe (from LumpedHydrophobe) in
+    # the loop above, so skip to avoid double-counting.
+    if feature_set != 'rdkit_base':
+        hydrophobes = find_hydrophobes(mol=mol, cluster_hydrophobic=True)
+        pharmacophores['Hydrophobe'] = {}
+        pharmacophores['Hydrophobe']['P'] = hydrophobes
+        pharmacophores['Hydrophobe']['V'] = [(0,0,0) for _ in range(len(hydrophobes))]
     return pharmacophores
 
 
@@ -570,7 +614,9 @@ def get_pharmacophores(mol: rdkit.Chem.rdchem.Mol,
                        multi_vector: bool = True,
                        exclude: List[int] = [],
                        check_access: bool = False,
-                       scale: float = 1.0
+                       scale: float = 1.0,
+                       feature_set: str = 'shepherd',
+                       directionless: bool = False
                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Get the identity, anchor positions, and relative unit vectors for each pharmacophore.
@@ -614,7 +660,9 @@ def get_pharmacophores(mol: rdkit.Chem.rdchem.Mol,
                                                   multi_vector=multi_vector,
                                                   check_access=check_access,
                                                   scale=scale,
-                                                  exclude=exclude)
+                                                  exclude=exclude,
+                                                  feature_set=feature_set,
+                                                  directionless=directionless)
     N = sum(len(pharmacophores_dict[family]['P']) for family in pharmacophores_dict)
     X = np.empty((N,), dtype=np.int64)
     P = np.empty((N, 3), dtype=np.float64)

@@ -173,8 +173,9 @@ def project_grad_R_to_quaternion(G: torch.Tensor, q: torch.Tensor) -> torch.Tens
         return torch.stack([grad_qw, grad_qx, grad_qy, grad_qz], dim=-1)
 
 
-@lru_cache(maxsize=4)
-def build_lookup_tables_cached(device_str: str, dtype_str: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+@lru_cache(maxsize=8)
+def build_lookup_tables_cached(device_str: str, dtype_str: str,
+                              directionless: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     alphas = []
     Ks = []
     categories = []
@@ -185,7 +186,14 @@ def build_lookup_tables_cached(device_str: str, dtype_str: str) -> Tuple[torch.T
         alphas.append(a)
         Ks.append((math.pi / (2.0 * a)) ** 1.5)
 
-        if p_lower in _NONDIRECTIONAL:
+        if p_lower == 'dummy':
+            categories.append(3)
+        elif directionless:
+            # ROCS/ROSHAMBO "color": every real type is an isotropic point Gaussian
+            # (category 0 -> kernel uses w=1.0, no vector weighting). Per-type alpha is
+            # unchanged, so this matches the directionless pure-torch get_overlap_pharm.
+            categories.append(0)
+        elif p_lower in _NONDIRECTIONAL:
             categories.append(0)
         elif p_lower in _DIRECTIONAL:
             categories.append(1)
@@ -202,12 +210,15 @@ def build_lookup_tables_cached(device_str: str, dtype_str: str) -> Tuple[torch.T
         torch.tensor(categories, device=device, dtype=torch.long)
     )
 
-def build_lookup_tables(device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def build_lookup_tables(device: torch.device, dtype: torch.dtype,
+                        directionless: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build constant lookup tables for all P_TYPES.
-    categories: 0=_NONDIRECTIONAL, 1=_DIRECTIONAL, 2=_AROMATIC, 3=Dummy
+    categories: 0=_NONDIRECTIONAL, 1=_DIRECTIONAL, 2=_AROMATIC, 3=Dummy.
+    When ``directionless=True``, all real types map to category 0 (isotropic point
+    Gaussians) for ROCS/ROSHAMBO-style "color" scoring.
     """
-    return build_lookup_tables_cached(str(device), str(dtype))
+    return build_lookup_tables_cached(str(device), str(dtype), directionless)
 
 def compute_overlap_and_grad_pharm(
     R: torch.Tensor,

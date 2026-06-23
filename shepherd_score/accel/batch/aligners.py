@@ -1025,3 +1025,136 @@ def _align_batch_pharm(
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_pharm = S
         p.sim_aligned_pharm = s
+
+
+def _align_batch_vol_color(
+    pairs: list["MoleculePair"],
+    *,
+    alpha: float = 0.81,
+    color_weight: float = 0.5,
+    trans_init: bool = False,
+    num_repeats: int = 50,
+    num_repeats_per_trans: int = 10,
+    topk: int = 30,
+    steps_fine: int = 100,
+    lr: float = 0.075,
+) -> None:
+    """
+    Batched ROCS/ROSHAMBO-style vol_color alignment (atom Gaussian shape + directionless
+    pharmacophore color). Shape uses the fused volumetric kernel (Triton on CUDA, numba on
+    CPU); color uses the pure-torch directionless scorer. SE(3) gradient is shape-driven
+    (FastROCS-style: shape-optimized, color-scored), matching the esp_combo pattern.
+
+    Writes per-pair: ``p.transform_vol_color`` (4x4), ``p.sim_aligned_vol_color`` (float).
+    """
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_color, pairs,
+                                alpha=alpha, color_weight=color_weight, trans_init=trans_init,
+                                num_repeats=num_repeats, num_repeats_per_trans=num_repeats_per_trans,
+                                topk=topk, steps_fine=steps_fine, lr=lr)
+
+    for p in pairs:
+        if p.ref_molec.pharm_types is None or p.fit_molec.pharm_types is None:
+            raise ValueError("Pharmacophores are None; cannot run _align_batch_vol_color.")
+
+    from shepherd_score.accel.drivers.vol_color import (
+        fast_optimize_vol_color_overlay_batch, _PHARM_PAD_TYPE)
+
+    device = pairs[0].device
+
+    def _ensure(p, attr, src, dtype):
+        t = getattr(p, attr, None)
+        if t is None:
+            setattr(p, attr, torch.as_tensor(src, dtype=dtype, device=device))
+        elif t.device != device:
+            setattr(p, attr, t.to(device, non_blocking=True))
+
+    for p in pairs:
+        _ensure(p, "_ref_xyz_t", p.ref_molec.atom_pos, torch.float32)
+        _ensure(p, "_fit_xyz_t", p.fit_molec.atom_pos, torch.float32)
+        _ensure(p, "_ref_pharm_types_t", p.ref_molec.pharm_types, torch.int64)
+        _ensure(p, "_fit_pharm_types_t", p.fit_molec.pharm_types, torch.int64)
+        _ensure(p, "_ref_pharm_ancs_t", p.ref_molec.pharm_ancs, torch.float32)
+        _ensure(p, "_fit_pharm_ancs_t", p.fit_molec.pharm_ancs, torch.float32)
+
+    all_pairs: list[MoleculePair] = []
+    all_scores: list[torch.Tensor] = []
+    all_q: list[torch.Tensor] = []
+    all_t: list[torch.Tensor] = []
+
+    buckets: dict[tuple[int, int, int, int, int], list[MoleculePair]] = {}
+    for p in pairs:
+        n_cent = _band_key(p._ref_xyz_t.shape[0])
+        m_cent = _band_key(p._fit_xyz_t.shape[0])
+        n_ph = _band_key(p._ref_pharm_ancs_t.shape[0])
+        m_ph = _band_key(p._fit_pharm_ancs_t.shape[0])
+        tc = int(p._ref_xyz_t.shape[0]) if trans_init else 0
+        buckets.setdefault((n_cent, m_cent, n_ph, m_ph, tc), []).append(p)
+
+    for (n_cent_pad, m_cent_pad, n_ph_pad, m_ph_pad, tc), bucket in buckets.items():
+        K = len(bucket)
+
+        centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
+        # Pad pharm type slots with Dummy (index 8) so padded anchors are never scored.
+        ref_types = torch.full((K, n_ph_pad), _PHARM_PAD_TYPE, device=device, dtype=torch.int64)
+        fit_types = torch.full((K, m_ph_pad), _PHARM_PAD_TYPE, device=device, dtype=torch.int64)
+        ref_ancs = torch.zeros(K, n_ph_pad, 3, device=device, dtype=torch.float32)
+        fit_ancs = torch.zeros(K, m_ph_pad, 3, device=device, dtype=torch.float32)
+
+        N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+
+        ref_cent_ts = [p._ref_xyz_t for p in bucket]
+        fit_cent_ts = [p._fit_xyz_t for p in bucket]
+        n_cent_list = [t.shape[0] for t in ref_cent_ts]
+        m_cent_list = [t.shape[0] for t in fit_cent_ts]
+        ref_anc_ts = [p._ref_pharm_ancs_t for p in bucket]
+        fit_anc_ts = [p._fit_pharm_ancs_t for p in bucket]
+        n_ph_list = [t.shape[0] for t in ref_anc_ts]
+        m_ph_list = [t.shape[0] for t in fit_anc_ts]
+
+        N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
+        M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))
+        N_real_pharm = torch.tensor(n_ph_list, device=device, dtype=torch.int32)
+        M_real_pharm = torch.tensor(m_ph_list, device=device, dtype=torch.int32)
+
+        _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
+        _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
+        _scatter_fill(ref_types, [p._ref_pharm_types_t for p in bucket], n_ph_list)
+        _scatter_fill(fit_types, [p._fit_pharm_types_t for p in bucket], m_ph_list)
+        _scatter_fill(ref_ancs, ref_anc_ts, n_ph_list)
+        _scatter_fill(fit_ancs, fit_anc_ts, m_ph_list)
+
+        trans_centers_batch = None
+        trans_centers_real = None
+        if trans_init:
+            trans_centers_batch = torch.stack([p._ref_xyz_t for p in bucket])
+            trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
+
+        _, q_batch, t_batch, scores = fast_optimize_vol_color_overlay_batch(
+            centers_1, centers_2, ref_types, fit_types, ref_ancs, fit_ancs,
+            alpha=alpha, color_weight=color_weight,
+            N_real_centers=N_real_centers, M_real_centers=M_real_centers,
+            N_real_pharm=N_real_pharm, M_real_pharm=M_real_pharm,
+            trans_centers_batch=trans_centers_batch, trans_centers_real=trans_centers_real,
+            num_repeats_per_trans=num_repeats_per_trans,
+            topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("vol_color"),
+        )
+
+        all_pairs.extend(bucket)
+        all_scores.append(scores)
+        all_q.append(q_batch)
+        all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    scores_list = scores_cpu.tolist()
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_color = S
+        p.sim_aligned_vol_color = s

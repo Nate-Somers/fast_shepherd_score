@@ -240,7 +240,8 @@ def get_overlap_pharm_np(ptype_1: np.ndarray,
                          vectors_2: np.ndarray,
                          similarity: _SIM_TYPE = 'tanimoto',
                          extended_points: bool = False,
-                         only_extended: bool = False
+                         only_extended: bool = False,
+                         directional: bool = True
                          ) -> np.ndarray:
     """
     NumPy implementation to compute pharmacophore score.
@@ -288,6 +289,12 @@ def get_overlap_pharm_np(ptype_1: np.ndarray,
         similarity_func = partial(tversky_func_np, sigma=0.05)
     else:
         raise ValueError('Argument `similarity` must be one of (tanimoto, tversky, tversky_ref, tversky_fit).')
+
+    # Directionless (ROCS/ROSHAMBO "color") scoring: route all types through the point-only
+    # overlap. extended_points encodes directional geometry, so it is forced off.
+    if not directional:
+        extended_points = False
+        only_extended = False
 
     # Determine if single instance or batched
     if len(ptype_1.shape) == 1 and len(ptype_2.shape) == 1:
@@ -354,21 +361,34 @@ def get_overlap_pharm_np(ptype_1: np.ndarray,
 
     # Aromatic
     if 'aromatic' in ptype_key2ind:
-        VAB, VAA, VBB = get_vector_volume_overlap_score_np(ptype_str='aromatic',
-                                                           ptype_1=ptype_1,
-                                                           ptype_2=ptype_2,
-                                                           anchors_1=anchors_1,
-                                                           anchors_2=anchors_2,
-                                                           vectors_1=vectors_1,
-                                                           vectors_2=vectors_2,
-                                                           allow_antiparallel=True)
+        if directional:
+            VAB, VAA, VBB = get_vector_volume_overlap_score_np(ptype_str='aromatic',
+                                                               ptype_1=ptype_1,
+                                                               ptype_2=ptype_2,
+                                                               anchors_1=anchors_1,
+                                                               anchors_2=anchors_2,
+                                                               vectors_1=vectors_1,
+                                                               vectors_2=vectors_2,
+                                                               allow_antiparallel=True)
+        else:
+            VAB, VAA, VBB = get_volume_overlap_score_np(ptype_str='aromatic',
+                                                        ptype_1=ptype_1,
+                                                        ptype_2=ptype_2,
+                                                        anchors_1=anchors_1,
+                                                        anchors_2=anchors_2)
         overlap += VAB
         ref_overlap += VAA
         fit_overlap += VBB
 
     # Acceptor
     if 'acceptor' in ptype_key2ind:
-        if extended_points:
+        if not directional:
+            VAB, VAA, VBB = get_volume_overlap_score_np(ptype_str='acceptor',
+                                                        ptype_1=ptype_1,
+                                                        ptype_2=ptype_2,
+                                                        anchors_1=anchors_1,
+                                                        anchors_2=anchors_2)
+        elif extended_points:
             VAB, VAA, VBB = get_volume_overlap_score_extended_points_np(ptype_str='acceptor',
                                                                         ptype_1=ptype_1,
                                                                         ptype_2=ptype_2,
@@ -392,7 +412,13 @@ def get_overlap_pharm_np(ptype_1: np.ndarray,
 
     # Donors
     if 'donor' in ptype_key2ind:
-        if extended_points:
+        if not directional:
+            VAB, VAA, VBB = get_volume_overlap_score_np(ptype_str='donor',
+                                                        ptype_1=ptype_1,
+                                                        ptype_2=ptype_2,
+                                                        anchors_1=anchors_1,
+                                                        anchors_2=anchors_2)
+        elif extended_points:
             VAB, VAA, VBB = get_volume_overlap_score_extended_points_np(ptype_str='donor',
                                                                         ptype_1=ptype_1,
                                                                         ptype_2=ptype_2,
@@ -416,7 +442,13 @@ def get_overlap_pharm_np(ptype_1: np.ndarray,
 
     # Halogen
     if 'halogen' in ptype_key2ind:
-        if extended_points:
+        if not directional:
+            VAB, VAA, VBB = get_volume_overlap_score_np(ptype_str='halogen',
+                                                        ptype_1=ptype_1,
+                                                        ptype_2=ptype_2,
+                                                        anchors_1=anchors_1,
+                                                        anchors_2=anchors_2)
+        elif extended_points:
             VAB, VAA, VBB = get_volume_overlap_score_extended_points_np(ptype_str='halogen',
                                                                         ptype_1=ptype_1,
                                                                         ptype_2=ptype_2,
@@ -453,9 +485,15 @@ def get_pharm_combo_score(centers_1: np.ndarray,
                           alpha: float = 0.81,
                           similarity: str = 'tanimoto',
                           extended_points: bool = False,
-                          only_extended: bool = False
+                          only_extended: bool = False,
+                          color_weight: float = 0.5,
+                          directional: bool = True
                           ) -> np.ndarray:
-    """ Compute a combined shape and pharmacophore score. """
+    """ Compute a combined shape and pharmacophore score.
+
+    The combined score is ``(1 - color_weight) * shape + color_weight * pharm``
+    (``color_weight=0.5`` reproduces the previous unweighted average). Set
+    ``directional=False`` for ROCS/ROSHAMBO-style isotropic "color" scoring. """
     # Similarity scoring
     if similarity.lower() == 'tanimoto':
         similarity_func = tanimoto_func_np
@@ -477,7 +515,8 @@ def get_pharm_combo_score(centers_1: np.ndarray,
                                        vectors_2=vectors_2,
                                        similarity=similarity,
                                        extended_points=extended_points,
-                                       only_extended=only_extended)
+                                       only_extended=only_extended,
+                                       directional=directional)
     # Shape scoring
     VAB = VAB_2nd_order_np(centers_1=centers_1,
                            centers_2=centers_2,
@@ -492,5 +531,5 @@ def get_pharm_combo_score(centers_1: np.ndarray,
                                   VAA=VAA,
                                   VBB=VBB)
 
-    score = (pharm_score + shape_score)/2
+    score = (1 - color_weight) * shape_score + color_weight * pharm_score
     return score
