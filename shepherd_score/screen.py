@@ -775,80 +775,76 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
 
 def _build_fit_fast_pairs(arrs: dict, mode: str, device):
     """Load one shard's FIT arrays as device tensors once; return (ids, [_FastPair])
-    whose fit tensors are views into them."""
+    whose fit tensors are views into them. The per-molecule views are produced with a
+    single torch.split/unbind (and np.split for the numpy holders) rather than a
+    K-iteration Python slicing loop -- the views are byte-for-byte identical, but the
+    slicing collapses into one C call (otherwise ~250k aten::slice/select calls per
+    100k-molecule shard, the dominant per-shard host cost for the fast modes)."""
     import torch
     ids = arrs["ids"]
     K = len(ids)
     pairs = [_FastPair(device) for _ in range(K)]
     f = lambda a: torch.as_tensor(a, dtype=torch.float32, device=device)
+    splitT = lambda big, off: torch.split(big, np.diff(off).tolist())   # K variable device views
+    splitN = lambda arr, off: np.split(arr, off[1:-1])                   # K variable numpy views
+
     if mode == "vol":
-        big = f(arrs["atom_pos"]); off = arrs["atom_off"]
-        for i, p in enumerate(pairs):
-            p._fit_xyz_t = big[int(off[i]):int(off[i + 1])]
+        for p, c in zip(pairs, splitT(f(arrs["atom_pos"]), arrs["atom_off"])):
+            p._fit_xyz_t = c
     elif mode == "surf":
-        big = f(arrs["surf_pos"])                       # (K, S, 3)
-        for i, p in enumerate(pairs):
-            p._fit_surf_t = big[i]
+        for p, s in zip(pairs, torch.unbind(f(arrs["surf_pos"]))):       # (K, S, 3) -> K views
+            p._fit_surf_t = s
     elif mode == "esp":
-        bs = f(arrs["surf_pos"]); be = f(arrs["surf_esp"])
-        for i, p in enumerate(pairs):
-            p._fit_surf_t = bs[i]; p._fit_surf_esp_t = be[i]
+        for p, s, e in zip(pairs, torch.unbind(f(arrs["surf_pos"])), torch.unbind(f(arrs["surf_esp"]))):
+            p._fit_surf_t = s; p._fit_surf_esp_t = e
     elif mode == "pharm":
+        off = arrs["pharm_off"]
         bt = torch.as_tensor(arrs["pharm_types"], dtype=torch.int64, device=device)
-        ba = f(arrs["pharm_ancs"]); bv = f(arrs["pharm_vecs"]); off = arrs["pharm_off"]
-        for i, p in enumerate(pairs):
-            a, b = int(off[i]), int(off[i + 1])
-            p._fit_pharm_types_t = bt[a:b]; p._fit_pharm_ancs_t = ba[a:b]; p._fit_pharm_vecs_t = bv[a:b]
+        for p, t, a, v in zip(pairs, torch.split(bt, np.diff(off).tolist()),
+                              splitT(f(arrs["pharm_ancs"]), off), splitT(f(arrs["pharm_vecs"]), off)):
+            p._fit_pharm_types_t = t; p._fit_pharm_ancs_t = a; p._fit_pharm_vecs_t = v
     elif mode == "vol_color":
-        big = f(arrs["atom_pos"]); aoff = arrs["atom_off"]
+        aoff, poff = arrs["atom_off"], arrs["pharm_off"]
         bt = torch.as_tensor(arrs["pharm_types"], dtype=torch.int64, device=device)
-        ba = f(arrs["pharm_ancs"]); poff = arrs["pharm_off"]
         np_atom, np_pt, np_pa = arrs["atom_pos"], arrs["pharm_types"], arrs["pharm_ancs"]
-        for i, p in enumerate(pairs):
-            a0, a1 = int(aoff[i]), int(aoff[i + 1])
-            p0, p1 = int(poff[i]), int(poff[i + 1])
-            p._fit_xyz_t = big[a0:a1]
-            p._fit_pharm_types_t = bt[p0:p1]; p._fit_pharm_ancs_t = ba[p0:p1]
-            # numpy holder for the aligner's eager p.fit_molec.<attr> reads
-            p.fit_molec = _ArrView(np_atom[a0:a1], np_pt[p0:p1], np_pa[p0:p1])
+        for p, at, pt, pa, an, ptn, pan in zip(
+                pairs, splitT(f(arrs["atom_pos"]), aoff),
+                torch.split(bt, np.diff(poff).tolist()), splitT(f(arrs["pharm_ancs"]), poff),
+                splitN(np_atom, aoff), splitN(np_pt, poff), splitN(np_pa, poff)):
+            p._fit_xyz_t = at; p._fit_pharm_types_t = pt; p._fit_pharm_ancs_t = pa
+            p.fit_molec = _ArrView(an, ptn, pan)        # numpy holder for the aligner's eager reads
     elif mode == "vol_esp":
-        big = f(arrs["atom_pos"]); aoff = arrs["atom_off"]
+        aoff = arrs["atom_off"]
         # heavy_off + xyz_noH exist only when some molecule's RemoveHs retained an H; else
-        # atom_off/atom_pos already are the heavy set (so this is a no-op slice for the common
-        # case and back-compat for legacy stores that predate these keys).
+        # atom_off/atom_pos already are the heavy set (no-op for the common case / legacy stores).
         hoff = arrs["heavy_off"] if "heavy_off" in arrs else aoff
-        xnoH = f(arrs["xyz_noH"]) if "xyz_noH" in arrs else big
-        if "all_off" in arrs:                       # with-H store: heavy charges = charges[all_off][nonH]
-            whc = arrs["charges"]; alloff = arrs["all_off"]; nonH = arrs["nonH"]
-            for i, p in enumerate(pairs):
-                a0, a1 = int(aoff[i]), int(aoff[i + 1])
-                h0, h1 = int(hoff[i]), int(hoff[i + 1])
-                heavy = whc[int(alloff[i]):int(alloff[i + 1])][nonH[h0:h1]]
-                p._fit_xyz_esp_t = f(heavy); p.fit_molec = _ArrView(partial_charges=heavy)
-                p._fit_xyz_noH_t = xnoH[h0:h1]          # heavy centers, 1:1 with heavy charges
-                p._fit_xyz_t = big[a0:a1]               # RemoveHs atom_pos (trans-init centers only)
+        atom_t = splitT(f(arrs["atom_pos"]), aoff)
+        xnoH_t = splitT(f(arrs["xyz_noH"]) if "xyz_noH" in arrs else f(arrs["atom_pos"]), hoff)
+        if "all_off" in arrs:                       # with-H store: heavy = charges[all_off][nonH]
+            # vectorize the per-molecule gather whc[all_off[i]:all_off[i+1]][nonH[h0:h1]]:
+            # global heavy index = nonH + each heavy atom's molecule all_off start.
+            alloff, nonH = arrs["all_off"], arrs["nonH"]
+            heavy_all = arrs["charges"][nonH + np.repeat(alloff[:-1], np.diff(hoff))]
         else:                                        # heavy charges stored directly
-            chg = arrs["charges"]
-            for i, p in enumerate(pairs):
-                a0, a1 = int(aoff[i]), int(aoff[i + 1])
-                h0, h1 = int(hoff[i]), int(hoff[i + 1])
-                p._fit_xyz_esp_t = f(chg[h0:h1]); p.fit_molec = _ArrView(partial_charges=chg[h0:h1])
-                p._fit_xyz_noH_t = xnoH[h0:h1]          # heavy centers, 1:1 with heavy charges
-                p._fit_xyz_t = big[a0:a1]               # RemoveHs atom_pos (trans-init centers only)
+            heavy_all = arrs["charges"]
+        for p, at, xn, ht, hn in zip(pairs, atom_t, xnoH_t,
+                                     splitT(f(heavy_all), hoff), splitN(heavy_all, hoff)):
+            p._fit_xyz_esp_t = ht; p.fit_molec = _ArrView(partial_charges=hn)
+            p._fit_xyz_noH_t = xn               # heavy centers, 1:1 with heavy charges
+            p._fit_xyz_t = at                   # RemoveHs atom_pos (trans-init centers only)
     elif mode == "esp_combo":
-        bs = f(arrs["surf_pos"]); be = f(arrs["surf_esp"])     # (K, S, 3) / (K, S)
-        cwh = f(arrs["cwh"]); part = f(arrs["charges"]); rad = f(arrs["radii"]); alloff = arrs["all_off"]
-        big = f(arrs["atom_pos"]); aoff = arrs["atom_off"]
-        np_surf, np_se, np_part = arrs["surf_pos"], arrs["surf_esp"], arrs["charges"]
-        np_cwh, np_rad = arrs["cwh"], arrs["radii"]
-        for i, p in enumerate(pairs):
-            c0, c1 = int(alloff[i]), int(alloff[i + 1])
-            a0, a1 = int(aoff[i]), int(aoff[i + 1])
-            p._fit_surf_t = bs[i]; p._fit_surf_esp_t = be[i]
-            p._fit_centers_w_H_t = cwh[c0:c1]; p._fit_partial_t = part[c0:c1]; p._fit_radii_t = rad[c0:c1]
-            p._fit_xyz_t = big[a0:a1]            # heavy atoms (alpha=0.81 shape channel)
-            p.fit_molec = _ArrView(surf_pos=np_surf[i], surf_esp=np_se[i], partial_charges=np_part[c0:c1],
-                                   radii=np_rad[c0:c1], mol=_MolShim(np_cwh[c0:c1]))
+        aoff, alloff = arrs["atom_off"], arrs["all_off"]
+        np_surf, np_se = arrs["surf_pos"], arrs["surf_esp"]
+        for i, (p, s, e, c, pa, r, at, partn, radn, cwhn) in enumerate(zip(
+                pairs, torch.unbind(f(arrs["surf_pos"])), torch.unbind(f(arrs["surf_esp"])),
+                splitT(f(arrs["cwh"]), alloff), splitT(f(arrs["charges"]), alloff),
+                splitT(f(arrs["radii"]), alloff), splitT(f(arrs["atom_pos"]), aoff),
+                splitN(arrs["charges"], alloff), splitN(arrs["radii"], alloff), splitN(arrs["cwh"], alloff))):
+            p._fit_surf_t = s; p._fit_surf_esp_t = e
+            p._fit_centers_w_H_t = c; p._fit_partial_t = pa; p._fit_radii_t = r
+            p._fit_xyz_t = at                   # heavy atoms (alpha=0.81 shape channel)
+            p.fit_molec = _ArrView(surf_pos=np_surf[i], surf_esp=np_se[i], partial_charges=partn,
+                                   radii=radn, mol=_MolShim(cwhn))
     else:
         raise ValueError(mode)
     return ids, pairs
