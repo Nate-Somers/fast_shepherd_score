@@ -348,3 +348,44 @@ def test_panel_scores_out(tmp_path, molecules):
             assert outs[j][i] == pytest.approx(by_id[i], abs=1e-6)
     # query j=0 is molecules[1] -> its own id (1) scores ~1.0
     assert outs[0][1] == pytest.approx(1.0, abs=1e-2)
+
+
+def test_vol_esp_stream_retained_h(tmp_path):
+    """vol_esp must stream a molecule whose Chem.RemoveHs RETAINS an H (atom_pos longer
+    than the strict-heavy charge set -- some DUD-E decoys). The heavy-only store can't
+    split heavy charges by atom_off there, so it persists a heavy offset + strict-heavy
+    centers; the streamed scores must still match the in-memory MoleculePairBatch path."""
+    import copy
+
+    # [2H]OC(=O)c1ccccc1 keeps its deuterium after RemoveHs -> atom_pos (10) != heavy (9).
+    smis = ["CC(=O)Oc1ccccc1C(=O)O", "c1ccccc1O", "[2H]OC(=O)c1ccccc1",
+            "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"]
+    mols = [_build_molecule(s, seed=i) for i, s in enumerate(smis)]
+    retained = [m for m in mols if len(m.atom_pos) != len(m._nonH_atoms_idx)]
+    assert retained, "test premise broken: no molecule retains an H after RemoveHs"
+
+    store_path = os.path.join(tmp_path, "lib.fss")
+    with ProfileStore.create(store_path, num_surf_points=64, modes=("vol", "vol_esp"),
+                             dtype="float32", pre_centered=True) as store:
+        for i, m in enumerate(mols):
+            store.add(m, id=i)
+
+    # The store gained the heavy offset + strict-heavy centers (a clean store would not).
+    import glob
+    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
+        assert "heavy_off" in d.files and "xyz_noH" in d.files
+
+    query = mols[0]                                  # clean query
+    hits = screen(query, ProfileStore.open(store_path), mode="vol_esp", backend="numba",
+                  num_repeats=5, max_num_steps=50, top_k=len(mols), lam=0.1)
+    assert len(hits) == len(mols)
+    fast_by_id = {h.id: h.score for h in hits}
+
+    cq = copy.deepcopy(query); cq.center_to(cq.atom_pos.mean(0))
+    def _c(m):
+        c = copy.deepcopy(m); c.center_to(c.atom_pos.mean(0)); return c
+    pairs = [MoleculePair(cq, _c(m), do_center=False) for m in mols]
+    ref, _ = MoleculePairBatch(pairs).align_with_vol_esp(
+        backend="numba", lam=0.1, num_repeats=5, max_num_steps=50)
+    for i, rs in enumerate(ref):                     # incl. the retained-H molecule
+        assert fast_by_id[i] == pytest.approx(float(rs), abs=1e-4)

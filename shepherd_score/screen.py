@@ -115,6 +115,21 @@ def _f32(a):
     return None if a is None else np.array(a, dtype=np.float32, order="C")
 
 
+def _heavy_positions(m):
+    """Strict-heavy (Z != 1) atom coordinates, ordered to match
+    ``partial_charges[_nonH_atoms_idx]`` -- exactly the Gaussian centers the vol_esp
+    aligner uses. Read from the with-H conformer when present (a ``Molecule``, or an
+    esp_combo ``MoleculeProfile`` via its ``_MolShim``); falls back to ``atom_pos`` for a
+    heavy-only profile (self-consistent only when ``Chem.RemoveHs`` kept no H). This is
+    what lets vol_esp stream correctly when RemoveHs retains an H -- ``atom_pos`` is then
+    the RemoveHs set, longer than and misaligned with the heavy charges."""
+    mol = getattr(m, "mol", None)
+    idx = getattr(m, "_nonH_atoms_idx", None)
+    if mol is not None and idx is not None:
+        return np.asarray(mol.GetConformer().GetPositions())[np.asarray(idx)]
+    return np.asarray(m.atom_pos)
+
+
 # --------------------------------------------------------------------------- #
 # MoleculeProfile
 # --------------------------------------------------------------------------- #
@@ -135,15 +150,18 @@ class MoleculeProfile:
     ``Molecule`` replacement.
     """
 
-    __slots__ = ("atom_pos", "surf_pos", "surf_esp", "partial_charges", "radii",
+    __slots__ = ("atom_pos", "atom_pos_noH", "surf_pos", "surf_esp", "partial_charges", "radii",
                  "_nonH_atoms_idx", "pharm_types", "pharm_ancs", "pharm_vecs",
                  "num_surf_points", "mol", "id")
 
     def __init__(self, *, atom_pos, surf_pos=None, surf_esp=None,
                  partial_charges=None, radii=None, nonH_atoms_idx=None,
                  pharm_types=None, pharm_ancs=None, pharm_vecs=None,
-                 centers_w_H=None, id=None):
+                 centers_w_H=None, atom_pos_noH=None, id=None):
         self.atom_pos = _f32(atom_pos)
+        # Strict-heavy vol_esp centers (1:1 with the heavy charges); None when identical to
+        # atom_pos (RemoveHs kept no H) -- callers then use atom_pos.
+        self.atom_pos_noH = _f32(atom_pos_noH)
         self.surf_pos = _f32(surf_pos)
         self.surf_esp = _f32(surf_esp)
         self.partial_charges = _f32(partial_charges)
@@ -168,6 +186,8 @@ class MoleculeProfile:
         arrays only (no conformer transform)."""
         mu = np.asarray(xyz_means, dtype=np.float32)
         self.atom_pos = self.atom_pos - mu
+        if self.atom_pos_noH is not None:
+            self.atom_pos_noH = self.atom_pos_noH - mu
         if self.surf_pos is not None:
             self.surf_pos = self.surf_pos - mu
         if self.pharm_ancs is not None:
@@ -226,6 +246,7 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
     optionally centering to the heavy-atom COM. Returns a ``MoleculeProfile``."""
     atom_pos = _f32(m.atom_pos)
     surf = surf_esp = charges = nonH = radii = cwh = None
+    atom_pos_noH = None
     ph_t = ph_a = ph_v = None
 
     if sch["surf"]:
@@ -248,6 +269,12 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
             # heavy index for a Molecule (full charges) and the identity for a
             # heavy MoleculeProfile, so both -- and a with-H profile -- reduce correctly.
             charges = _f32(np.asarray(m.partial_charges)[m._nonH_atoms_idx])
+        # Heavy Gaussian centers for vol_esp, 1:1 with the heavy charges. Kept only when it
+        # actually differs from atom_pos (i.e. RemoveHs retained an H); else atom_pos serves
+        # and nothing extra is stored.
+        hp = np.asarray(_heavy_positions(m), dtype=np.float32)
+        if hp.shape != atom_pos.shape or not np.array_equal(hp, atom_pos):
+            atom_pos_noH = hp
     if sch["radii"]:
         if m.radii is None:
             raise ValueError("store needs vdW radii but molecule has none")
@@ -271,11 +298,14 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
             ph_a = ph_a - mu
         if cwh is not None:
             cwh = cwh - mu
+        if atom_pos_noH is not None:
+            atom_pos_noH = atom_pos_noH - mu   # shift by the atom_pos COM (matches the
+                                               # in-memory conformer transform, not its own COM)
 
     return MoleculeProfile(
         atom_pos=atom_pos, surf_pos=surf, surf_esp=surf_esp, partial_charges=charges,
         radii=radii, nonH_atoms_idx=nonH, pharm_types=ph_t, pharm_ancs=ph_a,
-        pharm_vecs=ph_v, centers_w_H=cwh, id=id,
+        pharm_vecs=ph_v, centers_w_H=cwh, atom_pos_noH=atom_pos_noH, id=id,
     )
 
 
@@ -449,8 +479,21 @@ class ProfileStore:
                 if sch["centers_w_H"]:
                     out["cwh"] = np.concatenate(
                         [r.mol.GetConformer().GetPositions() for r in recs]).astype(dt)
+                heavy_lens = [len(r._nonH_atoms_idx) for r in recs]
             else:
                 out["charges"] = np.concatenate([r.partial_charges for r in recs]).astype(dt)
+                heavy_lens = [len(r.partial_charges) for r in recs]
+            # vol_esp needs heavy centers 1:1 with the heavy charges. When a molecule's
+            # RemoveHs kept an H, atom_pos/atom_off no longer match the heavy set, so the heavy
+            # charges (and with-H nonH index) can't be split by atom_off -- persist explicit
+            # heavy offsets + the strict-heavy centers. Emitted only when some atom_pos_noH
+            # exists, so non-retained-H stores are byte-for-byte unchanged (and legacy stores,
+            # which lack these keys, fall back to atom_off in the reader).
+            if any(r.atom_pos_noH is not None for r in recs):
+                out["heavy_off"] = offsets(heavy_lens)
+                out["xyz_noH"] = np.concatenate(
+                    [(r.atom_pos_noH if r.atom_pos_noH is not None else r.atom_pos)
+                     for r in recs]).astype(dt)
         if sch["pharm"]:
             ph_lens = [len(r.pharm_types) for r in recs]
             out["pharm_off"] = offsets(ph_lens)
@@ -682,7 +725,9 @@ def _query_ref_arrays(q, mode: str) -> dict:
         return {"xyz": np.asarray(q.atom_pos, np.float32),
                 "ptypes": np.asarray(q.pharm_types), "pancs": np.asarray(q.pharm_ancs, np.float32)}
     if mode == "vol_esp":
-        return {"xyz": np.asarray(q.atom_pos, np.float32),  # heavy atoms + heavy charges
+        # Strict-heavy centers (from the with-H conformer) 1:1 with the heavy charges -- NOT
+        # atom_pos, which is the RemoveHs set and longer when an H was retained.
+        return {"xyz": np.asarray(_heavy_positions(q), np.float32),
                 "charges": np.asarray(np.asarray(q.partial_charges)[q._nonH_atoms_idx], np.float32)}
     if mode == "esp_combo":
         return {"surf": np.asarray(q.surf_pos, np.float32),
@@ -712,9 +757,9 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
                 "_ref_pharm_ancs_t": f(ra["pancs"]),
                 "ref_molec": _ArrView(ra["xyz"], ra["ptypes"], ra["pancs"])}
     if mode == "vol_esp":
-        # The store's heavy atom_pos is 1:1 with the heavy charges (see
-        # _query_ref_arrays), so it also serves as the no-H Gaussian centers.
-        # Pre-set _ref_xyz_noH_t so the aligner never dereferences .mol (absent here).
+        # ra["xyz"] is the strict-heavy centers (1:1 with the heavy charges; see
+        # _query_ref_arrays). Pre-set _ref_xyz_noH_t so the aligner reads it instead of
+        # dereferencing .mol (absent on this array-only path).
         xyz = f(ra["xyz"])
         return {"_ref_xyz_t": xyz, "_ref_xyz_noH_t": xyz, "_ref_xyz_esp_t": f(ra["charges"]),
                 "ref_molec": _ArrView(atom_pos=ra["xyz"], partial_charges=ra["charges"])}
@@ -768,19 +813,28 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
             p.fit_molec = _ArrView(np_atom[a0:a1], np_pt[p0:p1], np_pa[p0:p1])
     elif mode == "vol_esp":
         big = f(arrs["atom_pos"]); aoff = arrs["atom_off"]
-        if "all_off" in arrs:                       # with-H store: heavy = charges[all_off][nonH]
+        # heavy_off + xyz_noH exist only when some molecule's RemoveHs retained an H; else
+        # atom_off/atom_pos already are the heavy set (so this is a no-op slice for the common
+        # case and back-compat for legacy stores that predate these keys).
+        hoff = arrs["heavy_off"] if "heavy_off" in arrs else aoff
+        xnoH = f(arrs["xyz_noH"]) if "xyz_noH" in arrs else big
+        if "all_off" in arrs:                       # with-H store: heavy charges = charges[all_off][nonH]
             whc = arrs["charges"]; alloff = arrs["all_off"]; nonH = arrs["nonH"]
             for i, p in enumerate(pairs):
                 a0, a1 = int(aoff[i]), int(aoff[i + 1])
-                p._fit_xyz_t = p._fit_xyz_noH_t = big[a0:a1]   # atom_pos = heavy centers (1:1 w/ charges)
-                heavy = whc[int(alloff[i]):int(alloff[i + 1])][nonH[a0:a1]]
+                h0, h1 = int(hoff[i]), int(hoff[i + 1])
+                heavy = whc[int(alloff[i]):int(alloff[i + 1])][nonH[h0:h1]]
                 p._fit_xyz_esp_t = f(heavy); p.fit_molec = _ArrView(partial_charges=heavy)
+                p._fit_xyz_noH_t = xnoH[h0:h1]          # heavy centers, 1:1 with heavy charges
+                p._fit_xyz_t = big[a0:a1]               # RemoveHs atom_pos (trans-init centers only)
         else:                                        # heavy charges stored directly
             chg = arrs["charges"]
             for i, p in enumerate(pairs):
                 a0, a1 = int(aoff[i]), int(aoff[i + 1])
-                p._fit_xyz_t = p._fit_xyz_noH_t = big[a0:a1]   # atom_pos = heavy centers (1:1 w/ charges)
-                p._fit_xyz_esp_t = f(chg[a0:a1]); p.fit_molec = _ArrView(partial_charges=chg[a0:a1])
+                h0, h1 = int(hoff[i]), int(hoff[i + 1])
+                p._fit_xyz_esp_t = f(chg[h0:h1]); p.fit_molec = _ArrView(partial_charges=chg[h0:h1])
+                p._fit_xyz_noH_t = xnoH[h0:h1]          # heavy centers, 1:1 with heavy charges
+                p._fit_xyz_t = big[a0:a1]               # RemoveHs atom_pos (trans-init centers only)
     elif mode == "esp_combo":
         bs = f(arrs["surf_pos"]); be = f(arrs["surf_esp"])     # (K, S, 3) / (K, S)
         cwh = f(arrs["cwh"]); part = f(arrs["charges"]); rad = f(arrs["radii"]); alloff = arrs["all_off"]
