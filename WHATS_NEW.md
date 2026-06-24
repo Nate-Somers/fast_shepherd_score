@@ -16,7 +16,9 @@ behavior untouched.
   (`accel/kernels/cpu.py`) for CPU tensors — selected **per call by tensor device**
   (`accel/kernels/dispatch.py`), so it runs whether or not Triton is installed (CUDA tensors →
   Triton, CPU tensors → numba, in one process). Numerically exact and **~25× faster than
-  the original per-pair CPU path** on `vol` (all batched modes except `esp_combo`).
+  the original per-pair CPU path** on `vol`. **Every batched mode now has a numba CPU path** —
+  `esp_combo` was the last holdout and joined them via a fused ESP-comparison kernel (see
+  [§ esp_combo fast backend](#esp_combo--fused-esp-channel--cpunumba-backend)).
 - **Out-of-core screening:** a new top-level `shepherd_score.screen` module streams a
   precomputed, on-disk library of interaction profiles past a query through the
   *unchanged* batch API, so you can screen sets far larger than RAM (a billion
@@ -30,6 +32,14 @@ behavior untouched.
   (`"mesh"`, the Open3D ball-pivoting surface).** A new `shepherd_score.surface_diagnostics` module
   quantifies crimp/leak for any surfacer. See
   [§2 Smooth surface](#mesh-free-smooth-surface-generative-pipeline).
+- **Extending the engine (contributors):** [`docs/ADDING_A_FAST_MODE.md`](docs/ADDING_A_FAST_MODE.md)
+  is a step-by-step guide for adding a new alignment/scoring mode to the fast backend — including
+  the exact path **from a PyTorch autograd objective to a fused Triton+numba kernel** (factor into
+  value/force/similarity, copy the verbatim `dR/dq` tail, validate `dO/dq` against
+  `torch.autograd.grad`). A paste-ready agent brief with a literal kernel + numba-twin + driver
+  code recipe lives in [`shepherd_score/accel/agent_prompt.md`](shepherd_score/accel/agent_prompt.md).
+  Both encode the optimizations this fork relies on (in-register `dO/dq`, fused value+grad behind
+  `NEED_GRAD`, `exp2`, per-call device dispatch, same-kernel self-overlaps, banded padding).
 
 ---
 
@@ -46,15 +56,15 @@ shepherd_score/                         #  accel/ = 21 new modules, ~7,100 LOC t
 │   ├── kernels/                        #    Layer 1 — raw compute cores                  (~1,590 LOC)
 │   │   ├── dispatch.py                     #  120 L  per-call device routing (Triton on CUDA, numba on CPU)
 │   │   ├── shape_triton.py                 #  632 L  fused value+gradient shape (ROCS) overlap (Triton)
-│   │   ├── esp_triton.py                   #  305 L  + electrostatic-potential (ESP) weighting (Triton)
+│   │   ├── esp_triton.py                   #  451 L  + ESP weighting + ShaEP ESP-comparison kernel (Triton)
 │   │   ├── pharm_triton.py                 #  177 L  typed/directional pharmacophore value+SE(3) grad (Triton)
-│   │   └── cpu.py                          #  354 L  numba CPU mirrors of all three kernels
+│   │   └── cpu.py                          #  632 L  numba CPU mirrors of every kernel (shape/ESP/pharm/color/ESP-compare)
 │   ├── drivers/                        #    Layer 2 — batched coarse-to-fine SE(3) optimizers  (~3,550 LOC)
 │   │   ├── _common.py                      #  460 L  batched SE(3) seed gen, quaternion ops, _update_best
 │   │   ├── shape.py                        #  431 L  volumetric (atom-cloud) driver (also drives surf)
 │   │   ├── surface.py                      #  391 L  surface-point driver
 │   │   ├── esp.py                          #  490 L  ESP-weighted driver
-│   │   ├── esp_combo.py                    #  677 L  ShaEP-style combo driver
+│   │   ├── esp_combo.py                    #  671 L  ShaEP-style combo driver (fused ESP-comparison channel)
 │   │   ├── pharm.py                        #  629 L  pharmacophore driver
 │   │   └── pharm_overlap.py                #  476 L  pharmacophore overlap scoring (pure PyTorch)
 │   ├── batch/                          #    Layer 3 — batch orchestration (package)       (~1,300 LOC)
@@ -86,10 +96,10 @@ per-pair `MoleculePair` is a public class whose batch-orchestration helpers
 (`_align_batch_*`) are private internals re-exported from the new `accel/batch/`. The
 kernels and optimizers are pure internals, gated behind a `try/except ImportError` so the
 package imports fine without Triton, and each batched driver additionally falls back to a
-**numba CPU** implementation (`accel/kernels/cpu.py`) when Triton is unavailable. All five mode
-drivers import on a CPU-only box; the validated CPU aligners are `vol`/`vol_esp`/`surf`/`esp`/`pharm`,
-while `esp_combo` reuses the same numba shape kernel but stays GPU-targeted (its CPU path is
-not tuned or validated).
+**numba CPU** implementation (`accel/kernels/cpu.py`) when Triton is unavailable. All six mode
+drivers import and run on a CPU-only box; the validated CPU aligners are
+`vol`/`vol_esp`/`surf`/`esp`/`pharm`/`esp_combo` — `esp_combo`'s ESP channel is the fused
+value-only `esp_comparison_batch` kernel (Triton + numba), so it is no longer GPU-only.
 
 ### Changes to existing upstream files
 
@@ -136,7 +146,7 @@ scores, aligned = batch.align_with_surf(alpha=0.81, backend="numba")    # fast C
 | Maximum throughput on a CUDA GPU | `backend="triton"` | Batched coarse-to-fine drivers on the Triton GPU kernels. |
 | A fast CPU run (no GPU, or to keep the GPU free) | `backend="numba"` | The **same** batched drivers, run on the numba CPU kernels. ~25× over the original CPU path on `vol`. |
 
-`backend="numba"` forces every pair onto CPU and **works on any machine** — even a GPU box with Triton installed — because the kernel is chosen *per call by tensor device* (CPU→numba, CUDA→Triton). So you don't have to uninstall Triton to get a deterministic CPU pass. (`esp_combo` is the one mode with no numba path — it raises `NotImplementedError`; use `"triton"` or `"jax"` for it.)
+`backend="numba"` forces every pair onto CPU and **works on any machine** — even a GPU box with Triton installed — because the kernel is chosen *per call by tensor device* (CPU→numba, CUDA→Triton). So you don't have to uninstall Triton to get a deterministic CPU pass. (As of this update **every mode, including `esp_combo`, has a numba CPU path** — `esp_combo`'s ESP channel runs on the fused `esp_comparison_batch` kernel.)
 
 - `scores` → `np.ndarray` of shape `(N,)`.
 - Results are also written **in place** on each pair (e.g. `pair.sim_aligned_surf`,
@@ -329,7 +339,7 @@ Every alignment mode is reachable from the batch API across all three backends:
 | `align_with_surf`      (surface shape)            | ✓ | ✓ | ✓ |
 | `align_with_esp`       (surface + ESP)            | ✓ | ✓ | ✓ |
 | `align_with_pharm`     (pharmacophore)            | ✓ | ✓ | ✓ |
-| `align_with_esp_combo` (ShaEP-style combo)        | ✓ | ✓ | ✗ |
+| `align_with_esp_combo` (ShaEP-style combo)        | ✓ | ✓ | ✓ |
 
 Notes:
 - **`backend="numba"`** (alias `"cpu"`) runs the *same* batched coarse-to-fine drivers
@@ -345,8 +355,9 @@ Notes:
   coarse-to-fine optimization — a translation-invariant fix that recovers self-copy to
   ~1.0 even for molecules with very few pharmacophores, on both backends, at no throughput
   cost; this also removes a `numba`-vs-`triton` basin divergence in that regime.)
-  `esp_combo` is **excluded** (its CPU path is not tuned/validated) and raises
-  `NotImplementedError`.
+  `esp_combo` now also runs on numba — its shape channel is the shared numba overlap
+  kernel and its ESP channel is the fused `esp_comparison_batch` numba kernel (see
+  [§ esp_combo fast backend](#esp_combo--fused-esp-channel--cpunumba-backend)).
 - The Triton/numba `vol`/`vol_esp` backends align **heavy atoms only** (`no_H=True`); passing
   `no_H=False` raises `NotImplementedError`.
 - `max_num_steps` maps to the Triton optimizer's fine-step count.
@@ -564,6 +575,54 @@ had all three):
   one still using `tl.exp`; switched to `tl.exp2(x·log₂e)` (hardware `ex2.approx`), matching the
   shape/esp/color kernels (bit-close; self-copy safe via the exact-cancellation identity).
 
+### `esp_combo` — fused ESP channel + CPU/numba backend
+
+`esp_combo` (the ShaEP-style shape + surface-ESP blend) was the **last mode without a CPU/numba
+path** and the only one whose per-step ESP term still ran in eager PyTorch. Its inner loop scored
+the ESP channel with two `_batch_esp_comparison` calls that each built a `(K, N_surf, M_atoms)`
+`torch.cdist` distance tensor (`K = pairs × seeds`) — the dominant per-step cost on GPU and the
+reason the CPU path was left disabled. This update closes both gaps:
+
+- **Fused, value-only `esp_comparison_batch` kernel** (`accel/kernels/esp_triton.py` +
+  `accel/kernels/cpu.py`, registered in `dispatch.py`). One CTA per pair streams field
+  point × atom in registers — per surface point it accumulates the Coulomb ESP from the other
+  molecule's atoms, the vdW+probe volume mask, and the Gaussian of the ESP difference — and never
+  materializes the `(N_surf, M_atoms)` tensor. It is **value-only by design**: `esp_combo` steers
+  the pose with the *shape* gradient and uses the ESP term only to score/select (FastROCS-style),
+  so no `dO/dq` tail is needed and existing behavior is preserved exactly.
+- **No redundant shape recompute.** The fine loop already computes the shape overlap `VAB` (with
+  gradient) every step; it is now threaded into the combo score (`_batch_esp_combo_score(...,
+  VAB_shape=VAB)`) instead of being recomputed by a second value-only shape-kernel launch. The
+  now-unused `centers_2` fit-cloud transform was dropped.
+- **numba backend enabled.** `MoleculePairBatch.align_with_esp_combo(backend="numba"/"cpu")` no
+  longer raises — it routes through the same batched driver, and per-call device dispatch selects
+  the numba twins (the shape numba kernel + the new ESP numba kernel) for CPU tensors.
+
+**Validation.** The fused kernel reproduces the old `torch.cdist` math to **~2e-14** (numba, fp64)
+and **~4e-7** (Triton, fp32); **Triton == numba to ~2e-7** (fp32). End-to-end, the speedup is
+**behavior-preserving** — scores drift **~3e-8** vs the old path. The full batch/scoring/screen
+suite (50 tests) passes on both backends, plus a new
+`test_esp_combo_numba_cpu_and_matches_triton` regression test.
+
+**Measured (RTX 4050 laptop).** The ESP channel itself (fused vs the old cdist math):
+**~4.6× on numba** and **~23–27× on Triton** at fine-loop scale (`K = 5k–25k`, the kernel's
+no-materialization win grows with batch). End-to-end, same driver with only the ESP channel
+swapped (behavior-preserving before/after; numbers below from WSL, `SimModelEnv`, triton 3.6 /
+numba 0.63):
+
+| backend | batch | before (pairs/s) | after (pairs/s) | speedup |
+|---|--:|--:|--:|--:|
+| numba (CPU) | 100 | 43 | 102 | **2.4×** |
+| Triton (GPU) | 100 | 143 | 538 | **3.8×** |
+| Triton (GPU) | 1000 | 201 | 1216 | **6.1×** |
+
+(Absolute pairs/s vary run-to-run: the small-batch GPU rows are launch-overhead-bound and subject
+to laptop thermal throttle, and the numba row depends on core count/contention — Windows-native
+`GNNenv` measures the CPU before/after at ~41 → ~130 pairs/s, **~3.2×**. The speedup *ratio* and the
+~3e-8 score drift are stable across runs.) `esp_combo` is now a first-class fast-backend mode on
+both Triton and numba, like the other ESP modes (and the `FINE_ES_PATIENCE` override wired in above
+applies here too).
+
 ---
 
 ## 3. Strategies Used
@@ -587,8 +646,9 @@ last decimal.
    (`accel/multi_gpu.py` `MultiGPUAligner`) builds each GPU's shard once and reaches
    **3.50–3.79× on 4×L40S** (verified on node3615, bit-exact vs single-GPU). See **D**.
 4. **CPU engine (numba) — the same batched driver, on CPU.** The batched drivers (all
-   modes except `esp_combo`) have a numba (`@njit(parallel=True)`) value+SE(3)-gradient
-   kernel (`accel/kernels/cpu.py`) that replicates the Triton kernel operation-for-operation.
+   six modes, `esp_combo` included as of this update) have a numba (`@njit(parallel=True)`)
+   value(+SE(3)-gradient) kernel (`accel/kernels/cpu.py`) that replicates the Triton kernel
+   operation-for-operation.
    Kernel choice is **per call, by tensor device** (`accel/kernels/dispatch.py`): CUDA tensors run
    the Triton kernels, CPU tensors the numba ones — so the numba path runs whenever the data
    is on CPU, whether or not Triton is installed (e.g. `backend="numba"` on a GPU box). It is **numerically exact** (computes the true

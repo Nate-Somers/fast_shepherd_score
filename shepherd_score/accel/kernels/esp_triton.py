@@ -10,6 +10,7 @@ import triton.language as tl
 import torch
 
 from .shape_triton import _OVERLAP_CONFIGS
+from ...score.constants import COULOMB_SCALING, LAM_SCALING
 
 
 # Self-tunes per (N_pad, M_pad) on the actual device -- no GPU-specific hardcoding.
@@ -268,6 +269,151 @@ def overlap_score_grad_esp_se3_batch(
         NEED_GRAD=NEED_GRAD,
     )
     return out_S, out_dQ, out_dT
+
+
+# ============================================================================
+#  ShaEP ESP surface-comparison kernel (esp_combo mode), VALUE-ONLY.
+#
+#  For each real field point i of the "observer" molecule, compute the Coulomb
+#  ESP induced there by the OTHER molecule's atoms, mask the point out if it
+#  falls inside that molecule's vdW+probe volume, and accumulate a Gaussian of
+#  the ESP difference:
+#      esp = sum_i  keep_i * exp( -(point_esp_i - sum_m q_m/d_im)^2 / lam )
+#  This is the fused replacement for the (B, N_surf, M_atoms) torch.cdist that
+#  the eager `_batch_esp_comparison` materialized twice per fine step. It is
+#  value-only: esp_combo steers the pose with the SHAPE gradient (the ESP term
+#  is scored / used for seed selection), so no dO/dq tail is needed.
+#
+#  The caller passes points + atoms already in the world frame (the driver
+#  applies the SE(3) transform to whichever cloud is moving), so the kernel
+#  needs no quaternion -- it is a pure pairwise reduction.
+# ============================================================================
+@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
+@triton.jit
+def _esp_comparison_tiled(
+    P_ptr, A_ptr,             # field points (B*N_pad*3), source atoms (B*M_pad*3)
+    Q_ptr, R_ptr,             # atom charges (B*M_pad), atom vdW radii (B*M_pad)
+    PE_ptr,                   # precomputed ESP at field points (B*N_pad)
+    Nreal_ptr, Mreal_ptr,     # (B,) real field-point / atom counts
+    BATCH, M_pad, N_pad,      # ints
+    inv_lam, coulomb, probe,  # scalars
+    S_ptr,                    # output ESP comparison (B,)
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    realN = tl.load(Nreal_ptr + pid)
+    realM = tl.load(Mreal_ptr + pid)
+
+    P_ptr  = P_ptr  + pid * N_pad * 3
+    A_ptr  = A_ptr  + pid * M_pad * 3
+    Q_ptr  = Q_ptr  + pid * M_pad
+    R_ptr  = R_ptr  + pid * M_pad
+    PE_ptr = PE_ptr + pid * N_pad
+    S_ptr  = S_ptr  + pid
+
+    inv_ln2 = 1.4426950408889634
+    total = 0.0
+
+    # outer loop over field-point tiles; inner loop over atom tiles
+    for n0 in range(0, N_pad, BLOCK):
+        offs_n = n0 + tl.arange(0, BLOCK)
+        mask_n = offs_n < realN
+        n_idx = tl.where(mask_n, offs_n, 0)
+        px = tl.load(P_ptr + n_idx * 3 + 0, mask=mask_n, other=0.0)
+        py = tl.load(P_ptr + n_idx * 3 + 1, mask=mask_n, other=0.0)
+        pz = tl.load(P_ptr + n_idx * 3 + 2, mask=mask_n, other=0.0)
+        pe = tl.load(PE_ptr + n_idx, mask=mask_n, other=0.0)
+
+        esp_acc = tl.zeros([BLOCK], dtype=tl.float32)   # ESP at each field point
+        block_cnt = tl.zeros([BLOCK], dtype=tl.float32)  # # of blocking atoms
+
+        for m0 in range(0, M_pad, BLOCK):
+            offs_m = m0 + tl.arange(0, BLOCK)
+            mask_m = offs_m < realM
+            m_idx = tl.where(mask_m, offs_m, 0)
+            ax = tl.load(A_ptr + m_idx * 3 + 0, mask=mask_m, other=0.0)
+            ay = tl.load(A_ptr + m_idx * 3 + 1, mask=mask_m, other=0.0)
+            az = tl.load(A_ptr + m_idx * 3 + 2, mask=mask_m, other=0.0)
+            qc = tl.load(Q_ptr + m_idx, mask=mask_m, other=0.0)
+            rad = tl.load(R_ptr + m_idx, mask=mask_m, other=0.0)
+
+            dx = px[:, None] - ax[None, :]
+            dy = py[:, None] - ay[None, :]
+            dz = pz[:, None] - az[None, :]
+            d = tl.sqrt(dx * dx + dy * dy + dz * dz)
+            d = tl.where(d < 1e-6, 1e-6, d)
+
+            pair_m = mask_m[None, :]
+            # ESP contribution sum_m q_m / d  (padded atoms masked out -> 0)
+            esp_acc += tl.sum(tl.where(pair_m, qc[None, :] / d, 0.0), axis=1)
+            # a real atom within (radius + probe) blocks this point
+            blocked = (d < (rad[None, :] + probe)) & pair_m
+            block_cnt += tl.sum(tl.where(blocked, 1.0, 0.0), axis=1)
+
+        esp_acc = esp_acc * coulomb
+        diff = pe - esp_acc
+        keep = mask_n & (block_cnt == 0.0)
+        val = tl.where(keep, tl.exp2((-(diff * diff) * inv_lam) * inv_ln2), 0.0)
+        total += tl.sum(val)
+
+    tl.store(S_ptr, total)
+
+
+def esp_comparison_batch(
+    points, atoms, charges, point_esp, radii, *,
+    N_real: torch.Tensor | None = None,
+    M_real: torch.Tensor | None = None,
+    probe_radius: float = 1.0,
+    lam: float = 0.001,
+    BLOCK: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
+):
+    """Fused ShaEP ESP surface comparison (value-only). One CTA per pair.
+
+    Shapes (all world-frame, padded):
+      points    : (K, N_pad, 3) observer field points (where ESP is compared)
+      atoms     : (K, M_pad, 3) source-molecule atom coordinates (with H)
+      charges   : (K, M_pad)    source-molecule partial charges
+      point_esp : (K, N_pad)    precomputed ESP at ``points``
+      radii     : (K, M_pad)    source-molecule vdW radii (for the volume mask)
+      N_real/M_real : (K,) int   true field-point / atom counts (padding masks)
+
+    Returns ``esp`` (K,): the masked Gaussian-of-ESP-difference sum, matching the
+    eager ``_batch_esp_comparison`` / ``_esp_comparison`` torch reference. ``lam``
+    is the raw weighting parameter; ``LAM_SCALING`` is applied internally.
+    """
+    K, N_pad, _ = points.shape
+    _, M_pad, _ = atoms.shape
+    device = points.device
+    dtype = points.dtype
+
+    if N_real is None:
+        N_real = torch.full((K,), N_pad, device=device, dtype=torch.int32)
+    else:
+        N_real = N_real.to(device=device, dtype=torch.int32, copy=False)
+    if M_real is None:
+        M_real = torch.full((K,), M_pad, device=device, dtype=torch.int32)
+    else:
+        M_real = M_real.to(device=device, dtype=torch.int32, copy=False)
+
+    inv_lam = 1.0 / (LAM_SCALING * lam)
+    out_S = torch.zeros(K, device=device, dtype=dtype)
+
+    grid = (K,)
+    _esp_comparison_tiled[grid](
+        points.contiguous().view(-1),
+        atoms.contiguous().view(-1),
+        charges.contiguous().view(-1),
+        radii.contiguous().view(-1),
+        point_esp.contiguous().view(-1),
+        N_real.contiguous(),
+        M_real.contiguous(),
+        K, M_pad, N_pad,
+        inv_lam, float(COULOMB_SCALING), float(probe_radius),
+        out_S,
+    )
+    return out_S
 
 
 @torch.no_grad()

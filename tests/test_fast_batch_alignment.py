@@ -225,6 +225,68 @@ def test_fast_esp_combo_padding_masks_stable():
     assert abs(float(scores_slice1[0]) - s_full[1]) < 1e-4
 
 
+def _esp_combo_synth_batch(device):
+    """Two synthetic esp_combo pairs of different sizes (padding required), built
+    on ``device``. Reseeds per call so CPU and CUDA runs get identical inputs."""
+    torch.manual_seed(0)
+    device = torch.device(device)
+    K = 2
+    n_wH, m_wH = [9, 2], [8, 3]
+    n_surf, m_surf = [40, 40], [41, 41]
+    nwp, mwp, nsp, msp = max(n_wH), max(m_wH), max(n_surf), max(m_surf)
+    z = lambda *s: torch.zeros(*s, device=device, dtype=torch.float32)
+    cwH1, cwH2 = z(K, nwp, 3), z(K, mwp, 3)
+    p1, p2 = z(K, nwp), z(K, mwp)
+    r1 = torch.ones(K, nwp, device=device) * 1.5
+    r2 = torch.ones(K, mwp, device=device) * 1.5
+    c1, c2 = z(K, nwp, 3), z(K, mwp, 3)
+    pts1, pts2 = z(K, nsp, 3), z(K, msp, 3)
+    pc1, pc2 = z(K, nsp), z(K, msp)
+    for i in range(K):
+        cwH1[i, : n_wH[i]] = torch.randn(n_wH[i], 3) * 0.2
+        cwH2[i, : m_wH[i]] = torch.randn(m_wH[i], 3) * 0.2
+        c1[i, : n_wH[i]] = cwH1[i, : n_wH[i]]
+        c2[i, : m_wH[i]] = cwH2[i, : m_wH[i]]
+        pts1[i, : n_surf[i]] = torch.randn(n_surf[i], 3) * 0.3
+        pts2[i, : m_surf[i]] = torch.randn(m_surf[i], 3) * 0.3
+        pc1[i, : n_surf[i]] = torch.randn(n_surf[i]) * 0.05
+        pc2[i, : m_surf[i]] = torch.randn(m_surf[i]) * 0.05
+    ints = lambda lst: torch.tensor(lst, device=device, dtype=torch.int32)
+    args = (cwH1, cwH2, c1, c2, pts1, pts2, p1, p2, pc1, pc2, r1, r2, 0.81)
+    kw = dict(lam=0.001, probe_radius=1.0, esp_weight=0.5,
+              N_real_atoms_w_H_1=ints(n_wH), M_real_atoms_w_H_2=ints(m_wH),
+              N_real_centers=ints(n_wH), M_real_centers=ints(m_wH),
+              N_real_surf_1=ints(n_surf), M_real_surf_2=ints(m_surf),
+              topk=3, steps_fine=20, lr=0.075)
+    return args, kw
+
+
+def test_esp_combo_numba_cpu_and_matches_triton():
+    """esp_combo on the CPU/numba backend (via the fused esp_comparison_batch kernel):
+    runs, gives finite in-range scores, and matches the Triton path when CUDA is present."""
+    pytest.importorskip("numba")
+    from shepherd_score.accel.drivers.esp_combo import (
+        fast_optimize_esp_combo_score_overlay_batch,
+    )
+
+    args, kw = _esp_combo_synth_batch("cpu")
+    scores_cpu = fast_optimize_esp_combo_score_overlay_batch(*args, **kw)[3]
+    s_cpu = scores_cpu.detach().cpu().tolist()
+    assert all(math.isfinite(x) for x in s_cpu)
+    assert all(-1e-4 <= x <= 1.0 + 1e-4 for x in s_cpu)
+
+    if torch.cuda.is_available():
+        try:
+            import triton  # noqa: F401
+        except Exception:
+            return
+        args_g, kw_g = _esp_combo_synth_batch("cuda")
+        scores_gpu = fast_optimize_esp_combo_score_overlay_batch(*args_g, **kw_g)[3]
+        s_gpu = scores_gpu.detach().cpu().tolist()
+        for a, b in zip(s_cpu, s_gpu):
+            assert abs(a - b) < 5e-3, f"numba {a} vs triton {b}"
+
+
 def test_pharm_similarity_matches_legacy():
     from shepherd_score.accel.drivers.pharm_overlap import batch_pharm_similarity
     from shepherd_score.score.pharmacophore_scoring import get_overlap_pharm

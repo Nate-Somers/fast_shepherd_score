@@ -30,6 +30,8 @@ import numpy as np
 import torch
 from numba import njit, prange
 
+from ...score.constants import COULOMB_SCALING, LAM_SCALING
+
 _K_PI = math.pi ** 1.5
 
 
@@ -228,6 +230,67 @@ def overlap_score_grad_esp_se3_batch(A, B, charges_A, charges_B, q, t, *,
     return (torch.as_tensor(V, device=dev, dtype=dt),
             torch.as_tensor(dQ, device=dev, dtype=dt),
             torch.as_tensor(dT, device=dev, dtype=dt))
+
+
+# ===========================================================================
+#  ShaEP ESP surface comparison (esp_combo), VALUE-ONLY. CPU twin of the Triton
+#  esp_triton._esp_comparison_tiled, op-for-op: for each real field point i,
+#  Coulomb ESP from the other molecule's atoms, vdW+probe volume mask, Gaussian
+#  of the ESP difference, summed over points. Replaces the (K,N_surf,M_atoms)
+#  torch.cdist the eager `_batch_esp_comparison` materialized. fp64 accumulation;
+#  math.exp vs the Triton exp2 is the only intended divergence. No gradient
+#  (esp_combo steers the pose with the shape gradient).
+# ===========================================================================
+@njit(parallel=True, fastmath=False, cache=True)
+def _esp_comparison_kernel(P, A, Q, R, PE, Nr, Mr, inv_lam, coulomb, probe):
+    K = P.shape[0]
+    S = np.zeros(K, dtype=np.float64)
+    for k in prange(K):
+        n_real = Nr[k]; m_real = Mr[k]
+        total = 0.0
+        for i in range(n_real):
+            px = P[k, i, 0]; py = P[k, i, 1]; pz = P[k, i, 2]
+            pe = PE[k, i]
+            esp = 0.0
+            blocked = False
+            for m in range(m_real):
+                dx = px - A[k, m, 0]; dy = py - A[k, m, 1]; dz = pz - A[k, m, 2]
+                d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if d < 1e-6:
+                    d = 1e-6
+                esp += Q[k, m] / d
+                if d < R[k, m] + probe:
+                    blocked = True
+            esp *= coulomb
+            if not blocked:
+                diff = pe - esp
+                total += math.exp(-(diff * diff) * inv_lam)
+        S[k] = total
+    return S
+
+
+def esp_comparison_batch(points, atoms, charges, point_esp, radii, *,
+                         N_real=None, M_real=None, probe_radius: float = 1.0,
+                         lam: float = 0.001, BLOCK=None, num_warps=None, num_stages=None):
+    """CPU drop-in for the Triton ``esp_comparison_batch`` (value-only ShaEP ESP
+    term). Returns ``esp`` (K,) as a torch tensor on ``points.device``. ``lam`` is
+    the raw weighting parameter; ``LAM_SCALING`` is applied internally."""
+    K, N_pad, _ = points.shape
+    _, M_pad, _ = atoms.shape
+    dev, dt = points.device, points.dtype
+    Pn = np.ascontiguousarray(points.detach().cpu().numpy())
+    An = np.ascontiguousarray(atoms.detach().cpu().numpy())
+    Qn = np.ascontiguousarray(charges.detach().cpu().numpy())
+    Rn = np.ascontiguousarray(radii.detach().cpu().numpy())
+    PEn = np.ascontiguousarray(point_esp.detach().cpu().numpy())
+    Nr = (np.full(K, N_pad, np.int64) if N_real is None
+          else N_real.detach().cpu().numpy().astype(np.int64))
+    Mr = (np.full(K, M_pad, np.int64) if M_real is None
+          else M_real.detach().cpu().numpy().astype(np.int64))
+    inv_lam = 1.0 / (LAM_SCALING * float(lam))
+    S = _esp_comparison_kernel(Pn, An, Qn, Rn, PEn, Nr, Mr,
+                               inv_lam, float(COULOMB_SCALING), float(probe_radius))
+    return torch.as_tensor(S, device=dev, dtype=dt)
 
 
 # ===========================================================================

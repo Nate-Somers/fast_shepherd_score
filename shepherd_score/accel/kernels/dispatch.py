@@ -115,6 +115,8 @@ fused_surf_step_batch = _make("fused_surf_step_batch", "shape")
 # --- ESP kernels (gaussian_overlap_esp_triton <-> cpu_overlap) ----------------
 overlap_score_grad_esp_se3_batch = _make("overlap_score_grad_esp_se3_batch", "esp")
 _batch_self_overlap_esp = _make("_batch_self_overlap_esp", "esp")
+# ShaEP ESP surface-comparison (esp_combo), value-only fused reduction.
+esp_comparison_batch = _make("esp_comparison_batch", "esp")
 
 # --- pharmacophore kernel (pharmacophore_grad_triton <-> cpu_overlap) ---------
 pharm_score_grad_se3_batch = _make("pharm_score_grad_se3_batch", "pharm")

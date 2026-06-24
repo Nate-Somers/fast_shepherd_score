@@ -108,7 +108,7 @@ class MoleculePairBatch:
         ``precheck`` (if given) runs AFTER ``_prepare_numba`` for the numba backend,
         preserving the original ordering of mode-specific guards (e.g. the ``no_H``
         check). ``numba_ok=False`` rejects the numba backend up front with
-        ``numba_msg`` (esp_combo has no validated CPU path).
+        ``numba_msg`` (used by any mode whose CPU path is not implemented).
         """
         if backend in self._NUMBA_BACKENDS and not numba_ok:
             raise NotImplementedError(numba_msg)
@@ -994,6 +994,8 @@ class MoleculePairBatch:
             ``MoleculePair.align_with_esp_combo``. ``"triton"`` (aliases
             ``"cuda"``/``"gpu"``) routes to the batched
             ``MoleculePair._align_batch_esp_combo`` GPU kernel (multi-GPU-aware).
+            ``"numba"`` (alias ``"cpu"``) runs the same batched path on CPU via the
+            numba kernels (the ESP channel is the fused ``esp_comparison_batch``).
         return_aligned : bool
             For the Triton backend, build the aligned-fit-surface list when ``True``.
 
@@ -1011,10 +1013,7 @@ class MoleculePairBatch:
                  esp_weight=esp_weight, trans_init=trans_init,
                  num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
             "sim_aligned_esp_combo", "transform_esp_combo", "_fit_surf_t",
-            return_aligned, numba_ok=False,
-            numba_msg=("backend='numba' does not support esp_combo: its CPU/numba path is "
-                       "not tuned or validated (esp_combo stays GPU-targeted). Use "
-                       "backend='triton' on a GPU, or backend='jax' on CPU."))
+            return_aligned)
         if handled:
             return _result
 

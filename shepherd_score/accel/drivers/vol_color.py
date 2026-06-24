@@ -4,22 +4,27 @@
 #
 # BOTH channels run on fused value(+gradient) kernels (Triton on CUDA, numba on CPU, via
 # kernel dispatch) — exactly like the other modes — so vol_color runs at comparable speed:
-#   * SHAPE  -> overlap_score_grad_se3_batch (same kernel as vol/esp_combo); drives the SE(3)
-#              gradient (scaled by 1-color_weight), Tanimoto chain rule.
-#   * COLOR  -> pharm_score_grad_se3_batch with DIRECTIONLESS lookup tables
+#   * SHAPE  -> overlap_score_grad_se3_batch (same kernel as vol/esp_combo); returns the
+#              overlap gradient w.r.t. the quaternion (dO_s/dq) directly.
+#   * COLOR  -> pharm_color_score_grad_se3_batch with DIRECTIONLESS lookup tables
 #              (build_lookup_tables(directionless=True) -> every real type is category 0, an
-#              isotropic point Gaussian). Evaluated value+gradient each step (NEED_GRAD=True --
-#              the SAME launch, no extra kernel dispatch).
+#              isotropic point Gaussian). This is an IN-REGISTER dO/dq kernel: it takes the
+#              unit quaternion q, builds R(q) in registers, and returns dO_c/dq directly --
+#              the SAME quaternion-space convention as the shape kernel, with NO R->q
+#              projection tail. Value+gradient each step (NEED_GRAD=True -- the SAME launch).
 #
 # JOINT gradient (ROSHAMBO2 `combination` mode): the SE(3) step descends on
 #   d/dpose [ (1-w)*shape_Tanimoto + w*color_Tanimoto ]
-# i.e. BOTH channels steer the pose, not just shape. The shape kernel returns the overlap
-# gradient w.r.t. the quaternion directly; the color kernel returns it w.r.t. the rotation
-# matrix, which is converted to the quaternion via apply_tanimoto_chain_rule ->
-# project_grad_R_to_quaternion -> normalization Jacobian (the same path the `pharm` driver
-# uses). Both land in the same quaternion space (validated to ~1e-16 vs autograd), so the
-# weighted sum is the exact combined-objective gradient. This matches the per-pair torch path
-# (alignment._torch.optimize_vol_color_overlay) and recovers self-copy 1.0.
+# i.e. BOTH channels steer the pose, not just shape. Because both kernels already emit the
+# overlap gradient in the SAME quaternion space, each channel's Tanimoto chain-rule scale is
+# applied straight to its dO/dq and the per-channel descent gradients are summed (see the
+# fine loop below):
+#   g_q = (1-w)*(-scale_s*dQ_s) + w*(-scale_c*dQ_c)
+# There is NO apply_tanimoto_chain_rule / project_grad_R_to_quaternion host projection tail --
+# the color kernel was moved in-register (like the `pharm` driver), so only the unit->raw
+# quaternion normalization handled by fused_adam_qt_with_tangent_proj remains. Validated to
+# ~1e-16 vs autograd, so the weighted sum is the exact combined-objective gradient. Matches
+# the per-pair torch path (alignment._torch.optimize_vol_color_overlay), recovers self-copy 1.0.
 
 from __future__ import annotations
 

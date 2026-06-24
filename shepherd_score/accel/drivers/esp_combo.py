@@ -8,15 +8,16 @@ import torch
 from typing import Tuple, Optional
 
 # Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
-# esp_combo reuses the SAME Gaussian shape kernel (vol overlap) as fast_se3/surface.
-# Note: the batch backend="numba" path excludes esp_combo (its CPU execution is not
-# tuned/validated); this import keeps the module importable and GPU behaviour intact.
+# esp_combo reuses the SAME Gaussian shape kernel (vol overlap) as fast_se3/surface
+# for the shape channel, and the fused value-only `esp_comparison_batch` kernel for
+# the ShaEP ESP channel (replacing the per-step (B,N_surf,M_atoms) torch.cdist). Both
+# kernels have Triton (CUDA) and numba (CPU) twins, so esp_combo runs on either backend.
 from ..kernels.dispatch import (
     overlap_score_grad_se3_batch,
     fused_adam_qt_with_tangent_proj,
     _batch_self_overlap,
+    esp_comparison_batch,
 )
-from ...score.constants import COULOMB_SCALING, LAM_SCALING
 from ._common import (
     check_gpu_available,
     build_coarse_grid,
@@ -115,41 +116,20 @@ def _batch_esp_comparison(points_1: torch.Tensor,
     -------
     esp : torch.Tensor (B,)
         ESP comparison scores
+
+    Notes
+    -----
+    Thin wrapper over the fused ``esp_comparison_batch`` kernel (Triton on CUDA,
+    numba on CPU). The kernel computes the same masked Gaussian-of-ESP-difference
+    sum as the original ``torch.cdist`` implementation, but without materializing
+    the ``(B, N_surf, M_atoms)`` distance tensor -- which is what made the eager
+    path the per-step bottleneck (and the CPU path untenable). ``points_1`` and
+    ``centers_w_H_2`` are expected already in the world frame.
     """
-    lam_scaled = LAM_SCALING * lam
-
-    # distances: (B, N_surf, M_atoms)
-    distances = torch.cdist(points_1, centers_w_H_2)
-
-    # mask: surface points outside molecule 2's volume
-    # mask = (all distances >= radii + probe) -> 1.0, else 0.0
-    BATCH, N_surf_pad, M_atoms_pad = distances.shape
-    atom_mask = (
-        torch.arange(M_atoms_pad, device=distances.device).view(1, 1, M_atoms_pad)
-        < M_real_atoms.view(BATCH, 1, 1)
-    )
-    cond = distances >= (radii_2.unsqueeze(1) + probe_radius)
-    cond = cond | (~atom_mask)  # padded atoms are non-blocking
-    mask = cond.all(dim=2).float()
-
-    surf_mask = (
-        torch.arange(N_surf_pad, device=distances.device).view(1, N_surf_pad)
-        < N_real_surf.view(BATCH, 1)
-    ).float()
-    mask = mask * surf_mask
-
-    # ESP at surface points due to molecule 2's partial charges
-    # Use reciprocal distances, clamp to avoid division by zero
-    inv_distances = 1.0 / distances.clamp(min=1e-6)  # (B, N_surf, M_atoms)
-    inv_distances = inv_distances * atom_mask.to(inv_distances.dtype)
-    partial_charges_2 = partial_charges_2 * atom_mask[:, 0, :].to(partial_charges_2.dtype)
-    esp_at_surf_1 = torch.einsum('bm,bnm->bn', partial_charges_2, inv_distances) * COULOMB_SCALING
-
-    # ESP similarity
-    diff_sq = (points_charges_1 - esp_at_surf_1) ** 2
-    esp = (mask * torch.exp(-diff_sq / lam_scaled)).sum(dim=1)
-
-    return esp
+    return esp_comparison_batch(
+        points_1, centers_w_H_2, partial_charges_2, points_charges_1, radii_2,
+        N_real=N_real_surf, M_real=M_real_atoms,
+        probe_radius=probe_radius, lam=lam)
 
 
 @torch.no_grad()
@@ -177,9 +157,15 @@ def _batch_esp_combo_score(
         N_real_atoms_w_H_1: torch.Tensor,
         M_real_atoms_w_H_2: torch.Tensor,
         N_real_surf_1: torch.Tensor,
-        M_real_surf_2: torch.Tensor) -> torch.Tensor:
+        M_real_surf_2: torch.Tensor,
+        VAB_shape: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Compute batched ESP combo score (shape + ESP similarity).
+
+    ``VAB_shape`` (optional): the shape overlap VAB already computed for this pose
+    by the caller. The fine loop computes VAB (with gradient) every step anyway, so
+    passing it here skips a redundant value-only shape-kernel launch per step. When
+    ``None`` (coarse-grid path) the shape overlap is recomputed from ``centers_*``.
 
     Returns
     -------
@@ -190,15 +176,18 @@ def _batch_esp_combo_score(
     N_surf = N_real_surf_1.to(dtype=centers_1.dtype)
     M_surf = M_real_surf_2.to(dtype=centers_1.dtype)
 
-    # Shape similarity using volumetric kernel
-    VAB, _, _ = _overlap_in_chunks_volumetric(
-        centers_1, centers_2,
-        torch.tensor([[1., 0., 0., 0.]], device=centers_1.device).expand(BATCH, 4),
-        torch.zeros(BATCH, 3, device=centers_1.device),
-        alpha=alpha,
-        N_real=N_real_centers,
-        M_real=M_real_centers,
-        NEED_GRAD=False)
+    # Shape similarity using volumetric kernel (reuse the caller's VAB if given)
+    if VAB_shape is None:
+        VAB, _, _ = _overlap_in_chunks_volumetric(
+            centers_1, centers_2,
+            torch.tensor([[1., 0., 0., 0.]], device=centers_1.device).expand(BATCH, 4),
+            torch.zeros(BATCH, 3, device=centers_1.device),
+            alpha=alpha,
+            N_real=N_real_centers,
+            M_real=M_real_centers,
+            NEED_GRAD=False)
+    else:
+        VAB = VAB_shape
 
     volumetric_sim = VAB / (VAA + VBB - VAB)
 
@@ -407,28 +396,31 @@ def coarse_fine_esp_combo_align_many(
     no_improve_count = 0
 
     for step in range(steps_fine):
-        # Use shape gradients for optimization (ESP doesn't affect SE3 derivatives much)
-        # Transform fit data
+        # Use shape gradients for optimization (ESP doesn't affect SE3 derivatives much).
+        # Transform the fit clouds the ESP comparison needs (atoms-with-H + surface
+        # points of molecule 2). The shape-"centers" of molecule 2 are NOT transformed
+        # here -- the shape kernel rotates them internally from (q_k, t_k), and its VAB
+        # is reused for the score (so no separate centers_2_t / shape recompute).
         centers_w_H_2_t = apply_se3_transform(centers_w_H_2_k, q_k, t_k)
-        centers_2_t = apply_se3_transform(centers_2_k, q_k, t_k)
         points_2_t = apply_se3_transform(points_2_k, q_k, t_k)
 
-        # Get shape gradients from kernel
+        # Get shape value + gradients from kernel
         VAB, dQ, dT = _overlap_in_chunks_volumetric(
             centers_1_k, centers_2_k, q_k, t_k,
             alpha=alpha, N_real=N_k, M_real=M_k)
 
-        # Compute full combo score for tracking
+        # Compute full combo score for tracking (reuse VAB from the gradient kernel)
         score = _batch_esp_combo_score(
             centers_w_H_1_k, centers_w_H_2_t,
-            centers_1_k, centers_2_t,
+            centers_1_k, centers_2_k,
             points_1_k, points_2_t,
             partial_charges_1_k, partial_charges_2_k,
             point_charges_1_k, point_charges_2_k,
             radii_1_k, radii_2_k,
             alpha, lam, probe_radius, esp_weight,
             VAA_k, VBB_k, N_k, M_k,
-            N_atoms_k, M_atoms_k, N_surf_k, M_surf_k)
+            N_atoms_k, M_atoms_k, N_surf_k, M_surf_k,
+            VAB_shape=VAB)
 
         # Scale gradients for shape component
         denom = VAA_plus_VBB - VAB
