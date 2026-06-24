@@ -886,17 +886,16 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
 
 
 def _align_fast(pairs, ref_tensors: dict, mode: str, batch_kw: dict):
-    """Set the shared query ref tensors on the resident fit-pairs and run the
-    batched aligner; return (scores np, transforms list)."""
+    """Set the shared query ref tensors on the resident fit-pairs and run the batched
+    aligner; return the per-pair scores (np). Transforms are NOT built here -- they are
+    materialized lazily for top-K survivors only (``_TopK.offer_pair``), since building
+    all K per shard is the dominant overhead and a screen keeps only ~top_k."""
     from shepherd_score.accel.batch import aligners
     for p in pairs:
         for k, v in ref_tensors.items():
             setattr(p, k, v)
     getattr(aligners, "_align_batch_" + mode)(pairs, **batch_kw)
-    sc_attr, tf_attr = _SCORE_ATTR[mode], _TRANSFORM_ATTR[mode]
-    scores = np.array([float(getattr(p, sc_attr)) for p in pairs], dtype=float)
-    transforms = [_transform_of(p, tf_attr) for p in pairs]
-    return scores, transforms
+    return np.array([float(getattr(p, _SCORE_ATTR[mode])) for p in pairs], dtype=float)
 
 
 class _TopK:
@@ -907,7 +906,7 @@ class _TopK:
     def __init__(self, k):
         self.k = k; self.heap = []; self._c = 0
 
-    def offer(self, score, id_, transform):
+    def _push(self, score, id_, transform):
         self._c += 1
         item = (score, self._c, id_, transform)
         if len(self.heap) < self.k:
@@ -915,9 +914,17 @@ class _TopK:
         elif score > self.heap[0][0]:
             heapq.heapreplace(self.heap, item)
 
+    def offer_pair(self, score, id_, pair, tf_attr):
+        """Offer a candidate, materializing its transform from ``pair`` ONLY if the
+        score makes the top-K. A screen keeps ~k of K, so this builds ~k transforms
+        instead of K (the dominant per-shard overhead). Must be called while ``pair``
+        still holds this query's pose (before the next query/shard re-aligns it)."""
+        if len(self.heap) < self.k or score > self.heap[0][0]:
+            self._push(score, id_, _transform_of(pair, tf_attr))
+
     def merge_raw(self, raw):
         for (s, i, t) in raw:
-            self.offer(s, i, t)
+            self._push(s, i, t)
 
     def raw(self):
         return [(s, i, t) for (s, _, i, t) in self.heap]
@@ -971,8 +978,8 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
             start = sh["start"]
             for qi, ra in enumerate(qs_ref):
                 ref = _ref_tensors_from_arrays(ra, mode, device)
-                scores, transforms = _align_fast(pairs, ref, mode, batch_kw)
-                _accumulate(heaps[qi], ids, scores, transforms, scores_out, qi, start)
+                scores = _align_fast(pairs, ref, mode, batch_kw)
+                _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
         else:
             sh = store.manifest["shards"][idx]
             profiles = store.read_profiles(idx)
@@ -986,8 +993,7 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                 result = getattr(MoleculePairBatch(pairs), "align_with_" + mode)(
                     backend=backend, **align_kwargs)
                 scores = np.asarray(result[0], dtype=float)
-                transforms = [_transform_of(p, tf_attr) for p in pairs]
-                _accumulate(heaps[qi], ids, scores, transforms, scores_out, qi, start)
+                _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
         done += sh["n"]
         if progress:
             print(f"[screen] {done}/{n_total} library molecules aligned "
@@ -995,9 +1001,9 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
     return heaps
 
 
-def _accumulate(heap, ids, scores, transforms, scores_out, qi, start):
+def _accumulate(heap, ids, scores, pairs, tf_attr, scores_out, qi, start):
     for i in range(len(ids)):
-        heap.offer(float(scores[i]), ids[i], transforms[i])
+        heap.offer_pair(float(scores[i]), ids[i], pairs[i], tf_attr)
     if scores_out is not None and scores_out[qi] is not None:
         scores_out[qi][start:start + len(ids)] = scores
 
@@ -1173,6 +1179,7 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
         store = ProfileStore.open(store_path)
         ref_tensors = [_ref_tensors_from_arrays(ra, mode, dev) for ra in ref_arrays_list]
         heaps = [_TopK(top_k) for _ in ref_arrays_list]
+        tf_attr = _TRANSFORM_ATTR[mode]
         while True:
             idx = shard_q.get()
             if idx is None:
@@ -1181,9 +1188,9 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
             ids, pairs = _build_fit_fast_pairs(arrs, mode, dev)
             ids = [_id_to_py(x) for x in ids]
             for qi, ref in enumerate(ref_tensors):
-                scores, transforms = _align_fast(pairs, ref, mode, batch_kw)
+                scores = _align_fast(pairs, ref, mode, batch_kw)
                 for i in range(len(ids)):
-                    heaps[qi].offer(float(scores[i]), ids[i], transforms[i])
+                    heaps[qi].offer_pair(float(scores[i]), ids[i], pairs[i], tf_attr)
             torch.cuda.synchronize()
         out_q.put((rank, [h.raw() for h in heaps]))
     except Exception:                            # noqa: BLE001 - relayed to parent
