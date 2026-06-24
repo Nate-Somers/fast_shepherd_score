@@ -233,7 +233,7 @@ hits[0].score, hits[0].id, hits[0].transform          # best match; hits sorted 
 panel = screen_many([q1, q2, q3], store, mode="esp", lam=0.3, top_k=1000)   # panel[j] = query j's hits
 
 # multi-GPU: persistent one-process-per-GPU pool, spawned ONCE, that streams shards
-# (NOT respawned per shard). Fast modes vol/surf/esp/pharm/vol_color.
+# (NOT respawned per shard). Fast modes: all seven (vol/vol_esp/surf/esp/pharm/vol_color/esp_combo).
 hits = screen(query, store, mode="vol", ndev=4, top_k=1000)
 
 # ROCS/ROSHAMBO-style shape + directionless-color (vol_color): needs only a pharm
@@ -246,17 +246,24 @@ allscores = np.memmap("scores.f32", mode="w+", dtype="float32", shape=(len(store
 screen(query, store, mode="esp", scores_out=allscores, top_k=1000)
 ```
 
-**The engine (what removes the streaming-layer bottlenecks).** For the fast modes
-(`vol/surf/esp/pharm/vol_color`) on a pre-centered store, `screen()`/`screen_many()` take a
-**direct array → kernel** path: each shard's fit arrays are loaded **once** as device tensors and
-the batched aligner (`_align_batch_*`) is fed lightweight `_FastPair`s whose fit tensors are
-*views* into them and whose ref tensors are the *shared* query — **no per-molecule
-`MoleculeProfile`/`MoleculePair`, no numpy→torch per pair**. (`vol_esp`/`esp_combo` use the
-per-pair compatibility path.) Concretely:
+**The engine (what removes the streaming-layer bottlenecks).** For **all seven fast modes**
+(`vol/vol_esp/surf/esp/pharm/vol_color/esp_combo`) on a pre-centered store, `screen()`/
+`screen_many()` take a **direct array → kernel** path: each shard's fit arrays are loaded **once**
+as device tensors and the batched aligner (`_align_batch_*`) is fed lightweight `_FastPair`s whose
+fit tensors are *views* into them and whose ref tensors are the *shared* query — **no per-molecule
+`MoleculeProfile`/`MoleculePair`, no numpy→torch per pair**. (`vol_esp` and `esp_combo` joined this
+direct path in this update — see
+[§ Screen fast-path for `vol_esp` and `esp_combo`](#screen-fast-path-for-vol_esp-and-esp_combo);
+they previously fell back to per-pair construction, and `vol_esp` screening crashed outright.)
+Concretely:
 - **`screen_many` (query panels)** builds each shard's fit tensors once and swaps only the query
   across the panel, so the library is read once per *campaign*, not once per query.
 - **`ndev>1`** uses a persistent shard-parallel pool (one process per GPU, spawned once, shards
   pulled off a queue) instead of re-spawning workers per shard.
+- **Shared-query self-overlap once per bucket.** Every pair in a size-bucket shares the same query,
+  so the query self-overlap (the Tanimoto denominator term) is identical across rows; the
+  `vol`/`surf` batched aligners now detect the shared ref by identity and compute it **once**, then
+  broadcast — bit-identical, K−1 fewer self-overlaps per shard.
 
 Notes:
 - **`modes=` decides what's stored.** Only the arrays the listed modes need are written
@@ -274,6 +281,45 @@ Notes:
   and a panel screen equals per-query screens (`tests/test_screen.py`). Design + rationale:
   [`docs/STREAMING_DESIGN.md`](docs/STREAMING_DESIGN.md); the one-time build cost it feeds:
   [`docs/MOLECULE_CONSTRUCTION_PROBLEM.md`](docs/MOLECULE_CONSTRUCTION_PROBLEM.md).
+
+### Screen fast-path for `vol_esp` and `esp_combo`
+
+This update extends the streaming-screen **direct array → kernel** path (above) to the two modes
+that were still on the slow per-pair fallback, so **all seven modes now screen on the fast path**.
+`esp_combo` screening was correct but paid per-molecule `MoleculeProfile`/`MoleculePair`
+construction every shard; `vol_esp` screening **crashed** — it reconstructed heavy-atom charges
+from a with-H store with a mismatched CSR offset. Both are fixed and verified bit-identical to the
+slow path.
+
+- **What it does (no signature change).** `screen(query, store, mode="vol_esp", lam=…)` and
+  `screen(query, store, mode="esp_combo", alpha=…)` now build `_FastPair`s straight from the shard
+  arrays — no per-molecule object construction — exactly like the other five fast modes (so
+  `screen_many` panels, `ndev>1`, `scores_out=` all apply unchanged). `esp_combo` covers **both**
+  shape channels: volumetric (`alpha=0.81`, heavy-atom centers) and surface-shape (`alpha=ALPHA`).
+- **Files adjusted (this workstream):**
+  - [`shepherd_score/screen.py`](shepherd_score/screen.py) — registered both modes in
+    `_FAST_MODES`/`_NEEDS_ARRVIEW` and extended the per-mode fast-path helpers
+    (`_query_ref_arrays`, `_ref_tensors_from_arrays`, `_build_fit_fast_pairs`, `_fast_batch_kwargs`)
+    plus the `_FastPair`/`_ArrView` storage. The two non-obvious bits: the `vol_esp` heavy-charge
+    reconstruction from a with-H store (`charges[all_off][nonH[atom_off]]`, matching the slow path's
+    `partial_charges[_nonH_atoms_idx]`), and giving the `esp_combo` `_ArrView` a `_MolShim` + `radii`
+    because the batched aligner reads `mol.GetConformer().GetPositions()` / `.radii` **eagerly** (as
+    `_ensure(...)` source arguments) even when the cached tensor makes them unused.
+  - [`shepherd_score/accel/batch/aligners.py`](shepherd_score/accel/batch/aligners.py) — the
+    **shared-query self-overlap hoist** for the `vol`/`surf` batched aligners (one self-overlap per
+    bucket instead of one per pair; see the bullet above).
+- **Parity (bit-identical to the slow per-pair screen path).** On a 60-molecule float32 store, the
+  slow vs fast `screen()` checksums match exactly, self-hit `1.000`:
+
+  | mode | shape channel | slow `CHECKSUM` | fast `CHECKSUM` |
+  |---|---|--:|--:|
+  | `vol_esp`   | —                      | 26.47480655 | 26.47480655 |
+  | `esp_combo` | surface (`alpha=ALPHA`) | 24.23063995 | 24.23063995 |
+  | `esp_combo` | volumetric (`alpha=0.81`) | 26.57599893 | 26.57599893 |
+
+  The slow `vol_esp` path is also a pre-existing bug surfaced here (heavy-charge offset mismatch
+  against a with-H store); the fast path reads the stored arrays directly and screens correctly. One
+  library molecule with `len(atom_pos) ≠ len(_nonH_atoms_idx)` (a data inconsistency) is filtered.
 
 ### Mesh-free smooth surface (generative pipeline)
 
