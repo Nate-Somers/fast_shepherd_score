@@ -138,7 +138,14 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
         _scatter_fill(fit_pad, fit_ts, m_list)
 
         # ---- self-overlaps (reused kernel) ---------------------------------
-        VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
+        # Screen query-reuse: when every pair in the bucket shares the SAME ref
+        # tensor (the fast screen path sets one query ref on all pairs), the ref
+        # self-overlap is identical for every row -- compute it once and broadcast
+        # (bit-identical to the per-row kernel, but K-1 fewer self-overlaps).
+        if K > 1 and all(p._ref_xyz_t is bucket[0]._ref_xyz_t for p in bucket):
+            VAA = _self_overlap_in_chunks(ref_pad[:1], N_real[:1], alpha).expand(K).contiguous()
+        else:
+            VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
         VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
 
         # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
@@ -293,7 +300,12 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
         _scatter_fill(fit_pad, fit_ts, m_list)
 
         # ---- self-overlaps on surface point clouds ----------------------------
-        VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
+        # Screen query-reuse: a shared ref surface -> identical self-overlap per row;
+        # compute once and broadcast (bit-identical). See _align_batch_vol.
+        if K > 1 and all(p._ref_surf_t is bucket[0]._ref_surf_t for p in bucket):
+            VAA = _self_overlap_in_chunks(ref_pad[:1], N_real[:1], alpha).expand(K).contiguous()
+        else:
+            VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
         VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
 
         # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
