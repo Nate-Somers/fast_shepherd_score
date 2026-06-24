@@ -649,6 +649,7 @@ class _FastPair:
                  "_ref_pharm_ancs_t", "_fit_pharm_ancs_t",
                  "_ref_pharm_vecs_t", "_fit_pharm_vecs_t",
                  "_ref_xyz_esp_t", "_fit_xyz_esp_t",                 # vol_esp heavy charges
+                 "_ref_xyz_noH_t", "_fit_xyz_noH_t",                 # vol_esp heavy-atom centers (array-sourced; no .mol here)
                  "_ref_centers_w_H_t", "_fit_centers_w_H_t",         # esp_combo with-H centers
                  "_ref_partial_t", "_fit_partial_t",                 # esp_combo with-H charges
                  "_ref_radii_t", "_fit_radii_t",                     # esp_combo with-H radii
@@ -711,7 +712,11 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
                 "_ref_pharm_ancs_t": f(ra["pancs"]),
                 "ref_molec": _ArrView(ra["xyz"], ra["ptypes"], ra["pancs"])}
     if mode == "vol_esp":
-        return {"_ref_xyz_t": f(ra["xyz"]), "_ref_xyz_esp_t": f(ra["charges"]),
+        # The store's heavy atom_pos is 1:1 with the heavy charges (see
+        # _query_ref_arrays), so it also serves as the no-H Gaussian centers.
+        # Pre-set _ref_xyz_noH_t so the aligner never dereferences .mol (absent here).
+        xyz = f(ra["xyz"])
+        return {"_ref_xyz_t": xyz, "_ref_xyz_noH_t": xyz, "_ref_xyz_esp_t": f(ra["charges"]),
                 "ref_molec": _ArrView(atom_pos=ra["xyz"], partial_charges=ra["charges"])}
     if mode == "esp_combo":
         return {"_ref_surf_t": f(ra["surf"]), "_ref_surf_esp_t": f(ra["surf_esp"]),
@@ -767,14 +772,14 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
             whc = arrs["charges"]; alloff = arrs["all_off"]; nonH = arrs["nonH"]
             for i, p in enumerate(pairs):
                 a0, a1 = int(aoff[i]), int(aoff[i + 1])
-                p._fit_xyz_t = big[a0:a1]
+                p._fit_xyz_t = p._fit_xyz_noH_t = big[a0:a1]   # atom_pos = heavy centers (1:1 w/ charges)
                 heavy = whc[int(alloff[i]):int(alloff[i + 1])][nonH[a0:a1]]
                 p._fit_xyz_esp_t = f(heavy); p.fit_molec = _ArrView(partial_charges=heavy)
         else:                                        # heavy charges stored directly
             chg = arrs["charges"]
             for i, p in enumerate(pairs):
                 a0, a1 = int(aoff[i]), int(aoff[i + 1])
-                p._fit_xyz_t = big[a0:a1]
+                p._fit_xyz_t = p._fit_xyz_noH_t = big[a0:a1]   # atom_pos = heavy centers (1:1 w/ charges)
                 p._fit_xyz_esp_t = f(chg[a0:a1]); p.fit_molec = _ArrView(partial_charges=chg[a0:a1])
     elif mode == "esp_combo":
         bs = f(arrs["surf_pos"]); be = f(arrs["surf_esp"])     # (K, S, 3) / (K, S)

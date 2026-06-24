@@ -602,6 +602,8 @@ def _align_batch_vol_esp(
         if p.ref_molec.partial_charges is None or p.fit_molec.partial_charges is None:
             raise ValueError("Partial charges are None; cannot run _align_batch_vol_esp.")
 
+        # _ref_xyz_t / _fit_xyz_t (atom_pos) are kept only for trans_init seed
+        # centers (matches per-pair vol_esp, which seeds from atom_pos).
         rx = getattr(p, "_ref_xyz_t", None)
         fx = getattr(p, "_fit_xyz_t", None)
         if rx is None:
@@ -612,6 +614,29 @@ def _align_batch_vol_esp(
             p._fit_xyz_t = torch.as_tensor(p.fit_molec.atom_pos, dtype=torch.float32, device=device)
         elif fx.device != device:
             p._fit_xyz_t = fx.to(device, non_blocking=True)
+
+        # Gaussian centers MUST be the same strict heavy atoms as the charges
+        # below (partial_charges[_nonH_atoms_idx]). atom_pos comes from
+        # Chem.RemoveHs, which RETAINS some H (stereo/isotope/valence), so its
+        # count can exceed len(_nonH_atoms_idx) -- a data-dependent off-by-a-few
+        # (DUD-E decoys hit it) that desyncs the bucketed scatter-fill (coords
+        # n_list != charge length). Index the conformer by _nonH_atoms_idx so
+        # centers stay 1:1 with the charges (bit-identical to atom_pos when
+        # RemoveHs keeps no H, since center_to transforms both together).
+        rxn = getattr(p, "_ref_xyz_noH_t", None)
+        if rxn is None:
+            p._ref_xyz_noH_t = torch.as_tensor(
+                p.ref_molec.mol.GetConformer().GetPositions()[p.ref_molec._nonH_atoms_idx],
+                dtype=torch.float32, device=device)
+        elif rxn.device != device:
+            p._ref_xyz_noH_t = rxn.to(device, non_blocking=True)
+        fxn = getattr(p, "_fit_xyz_noH_t", None)
+        if fxn is None:
+            p._fit_xyz_noH_t = torch.as_tensor(
+                p.fit_molec.mol.GetConformer().GetPositions()[p.fit_molec._nonH_atoms_idx],
+                dtype=torch.float32, device=device)
+        elif fxn.device != device:
+            p._fit_xyz_noH_t = fxn.to(device, non_blocking=True)
 
         rxe = getattr(p, "_ref_xyz_esp_t", None)
         if rxe is None:
@@ -630,7 +655,7 @@ def _align_batch_vol_esp(
 
     _esp_bucketed_align(
         pairs, alpha=alpha, lam_scaled=lam,            # RAW lam (matches per-pair vol_esp)
-        ref_pts_attr="_ref_xyz_t", fit_pts_attr="_fit_xyz_t",
+        ref_pts_attr="_ref_xyz_noH_t", fit_pts_attr="_fit_xyz_noH_t",
         ref_chg_attr="_ref_xyz_esp_t", fit_chg_attr="_fit_xyz_esp_t",
         out_tf_attr="transform_vol_esp_noH", out_sc_attr="sim_aligned_vol_esp_noH",
         subbatch_tag="vol_esp", trans_init=trans_init,
