@@ -37,15 +37,18 @@ _INT_BUFFER_CACHE: dict[int, dict[str, torch.Tensor]] = {}
 _NUM_SEEDS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_SEEDS"))
 
 # Per-mode default seed count (the FINE_NUM_SEEDS env var overrides all of them). With the
-# structured (+/-90deg PCA-axis) seeds, each mode preserves the legacy 50-seed MEAN overlap
-# (and self-copy recovery ~1.0) at the count below -- verified across two drug sets by
-# benchmarks/seed_parity_gate.py. The pure-shape modes converge fastest (their structured
-# shape-axis seeds cover the basins; surf even edges 50-seed). The modes carrying a non-shape
-# channel (esp/pharm/vol_color) are inherently multi-basin (charge / pharmacophore / color),
-# so they're kept higher for per-pair stability even though their MEAN is flat below ~20.
-# Raise a value for libraries far larger / more symmetric than drug-like.
-# vol_esp shares esp's ESP channel; esp_combo (absent) falls back to 50 via _seeds_for.
-_MODE_SEEDS = {"vol": 18, "surf": 20, "esp": 40, "vol_esp": 40, "pharm": 40, "vol_color": 40}
+# structured (+/-90deg PCA-axis) seeds, each mode captures >=99.9% of the fully-converged
+# cross-pair MEAN overlap (and self-copy recovery ~1.0) at the count below -- verified on a
+# 200-cross-pair drug sweep by benchmarks/optimize_defaults.py (knee finder:
+# benchmarks/analyze_defaults.py). The pure-shape/volumetric channels (vol/vol_esp/vol_color)
+# converge fastest and shed seeds to ~28. The modes whose extra channel makes the landscape
+# inherently multi-basin (surf surface / esp charge / pharm pharmacophore / esp_combo combo)
+# keep more seeds: their MEAN keeps creeping with seed count, so the per-pair tail (not the
+# mean) is the limiter -- esp_combo is the most seed-hungry of all (40 seeds -> only 99.9%,
+# 6% tail), which is why it stays at 50. Raise a value for libraries far larger / more
+# symmetric than drug-like. vol_esp shares esp's ESP channel.
+_MODE_SEEDS = {"vol": 18, "surf": 20, "esp": 28, "vol_esp": 28, "esp_combo": 50,
+               "pharm": 40, "vol_color": 28}
 
 
 def _seeds_for(mode: str) -> int:
@@ -859,6 +862,7 @@ def _align_batch_esp_combo(
             topk=topk,
             steps_fine=steps_fine,
             lr=lr,
+            num_seeds=_seeds_for("esp_combo"),
         )
 
         all_pairs.extend(bucket)

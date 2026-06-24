@@ -598,6 +598,7 @@ def fast_optimize_esp_combo_score_overlay_batch(
         num_repeats_per_trans: int = 10,
         topk: int = 30,
         steps_fine: int = 100,
+        num_seeds: int = 50,
         lr: float = 0.075) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fast GPU-accelerated batch ESP-combo alignment with padding-safe masks.
@@ -657,6 +658,7 @@ def fast_optimize_esp_combo_score_overlay_batch(
         num_repeats_per_trans=num_repeats_per_trans,
         topk=topk,
         steps_fine=steps_fine,
+        num_seeds=num_seeds,
         lr=lr,
         N_real_centers=N_real_centers,
         M_real_centers=M_real_centers,

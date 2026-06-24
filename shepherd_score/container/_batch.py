@@ -247,7 +247,7 @@ class MoleculePairBatch:
                        num_repeats: int = 50,
                        trans_init: bool = False,
                        lr: float = 0.1,
-                       max_num_steps: int = 200,
+                       max_num_steps: int = 50,
                        num_workers: int = 1,
                        use_shmap: bool = True,
                        num_buckets: int = 1,
@@ -280,7 +280,8 @@ class MoleculePairBatch:
         lr : float
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
-            Maximum optimization steps. Default is 200.
+            Maximum optimization steps. Default is 50 (45-50 steps fully converge the
+            fine optimizer on drug-like pairs; see benchmarks/optimize_defaults.py).
         num_workers : int
             Number of parallel workers.  ``1`` (default) runs sequentially
             in-process. When ``use_shmap=True`` (the default), this value is informational;
@@ -462,7 +463,7 @@ class MoleculePairBatch:
                            num_repeats: int = 50,
                            trans_init: bool = False,
                            lr: float = 0.1,
-                           max_num_steps: int = 200,
+                           max_num_steps: int = 50,
                            num_workers: int = 1,
                            use_shmap: bool = True,
                            num_buckets: int = 1,
@@ -497,7 +498,8 @@ class MoleculePairBatch:
         lr : float
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
-            Maximum optimization steps. Default is 200.
+            Maximum optimization steps. Default is 50 (45-50 steps fully converge the
+            fine optimizer on drug-like pairs; see benchmarks/optimize_defaults.py).
         num_workers : int
             Number of parallel worker processes. ``1`` (default) runs
             sequentially in-process. Values greater than ``len(self.pairs)``
@@ -702,7 +704,7 @@ class MoleculePairBatch:
                         num_repeats: int = 50,
                         trans_init: bool = False,
                         lr: float = 0.1,
-                        max_num_steps: int = 200,
+                        max_num_steps: int = 50,
                         use_jax: bool = True,
                         use_analytical: bool = True,
                         num_workers: int = 1,
@@ -731,7 +733,8 @@ class MoleculePairBatch:
         lr : float
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
-            Maximum optimization steps. Default is 200.
+            Maximum optimization steps. Default is 50 (45-50 steps fully converge the
+            fine optimizer on drug-like pairs; see benchmarks/optimize_defaults.py).
         use_jax : bool
             Whether to use JAX backend. Default is True.
         use_analytical : bool
@@ -831,7 +834,7 @@ class MoleculePairBatch:
                        num_repeats: int = 50,
                        trans_init: bool = False,
                        lr: float = 0.1,
-                       max_num_steps: int = 200,
+                       max_num_steps: int = 50,
                        use_jax: bool = True,
                        use_analytical: bool = True,
                        num_workers: int = 1,
@@ -862,7 +865,8 @@ class MoleculePairBatch:
         lr : float
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
-            Maximum optimization steps. Default is 200.
+            Maximum optimization steps. Default is 50 (45-50 steps fully converge the
+            fine optimizer on drug-like pairs; see benchmarks/optimize_defaults.py).
         use_jax : bool
             Whether to use JAX backend. Default is True.
         use_analytical : bool
@@ -973,7 +977,7 @@ class MoleculePairBatch:
                              num_repeats: int = 50,
                              trans_init: bool = False,
                              lr: float = 0.1,
-                             max_num_steps: int = 200,
+                             max_num_steps: int = 50,
                              verbose: bool = False,
                              backend: str = "jax",
                              return_aligned: bool = False,
@@ -1036,7 +1040,7 @@ class MoleculePairBatch:
                              num_repeats: int = 50,
                              trans_init: bool = False,
                              lr: float = 0.1,
-                             max_num_steps: int = 200,
+                             max_num_steps: int = 50,
                              verbose: bool = False,
                              backend: str = "jax",
                              return_aligned: bool = False,
@@ -1165,7 +1169,7 @@ class MoleculePairBatch:
                          num_repeats: int = 50,
                          trans_init: bool = False,
                          lr: float = 0.1,
-                         max_num_steps: int = 200,
+                         max_num_steps: int = 70,
                          num_workers: int = 1,
                          use_shmap: bool = True,
                          num_buckets: int = 1,

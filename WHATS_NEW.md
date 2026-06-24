@@ -747,9 +747,29 @@ last decimal.
 9. **Kernel occupancy & schedule tuning.** Small tiles (one warp per CTA) suit the tiny
    per-pose problems; the BLOCK size and kernel schedule (`num_warps`, `num_stages`) are now
    selected per problem shape via `@triton.autotune` and validated to be bit-identical.
+10. **Per-mode default seed/step counts, accuracy-tuned** (2026-06). Swept `(num_seeds ×
+    fine-steps)` for all seven modes against the fully-converged reference on 200 distinct
+    drug cross-pairs (`benchmarks/optimize_defaults.py` → `analyze_defaults.py`), keeping the
+    cheapest setting that still captures **≥99.9% of the converged mean overlap** (with a
+    bounded per-pair tail and intact self-copy recovery; alignment scores are
+    backend-independent, so the knees found on the numba CPU sweep transfer to the Triton GPU
+    path). Two outcomes. **(a) Steps were the big waste:** every mode converges by ~40–50 fine
+    steps, so the public `max_num_steps` default drops **200 → 50** (`pharm` → 70) — a 3–4×
+    step cut for free (the batched fine loop early-stops on the batch *max*, so the single
+    hardest pair had been dragging 200 steps across the whole batch). **(b) Seeds split by
+    landscape:** the volumetric modes shed seeds — `esp`/`vol_esp`/`vol_color` go **40 → 28**
+    in `_MODE_SEEDS` — while the most seed-sensitive multi-basin modes (`surf` 20, `pharm` 40,
+    `esp_combo` 50) keep their counts, because their mean keeps creeping with seed count.
+    Validated to lose **≤0.08%** vs the prior defaults (`benchmarks/validate_new_defaults.py`).
+    **Bug fixed in passing:** `esp_combo` silently *ignored* the seed config — its driver chain
+    (`_align_batch_esp_combo` → `fast_optimize_esp_combo_score_overlay_batch` →
+    `coarse_fine_esp_combo_align_many`) never threaded `num_seeds` through, hardwiring 50 — so
+    it is now wired to `_seeds_for`/`_MODE_SEEDS` like every other mode (the value stays 50; the
+    probe in `benchmarks/esp_combo_seed_probe.py` confirms `esp_combo` is the most seed-hungry
+    mode, so 50 is justified — it just wasn't *tunable* before).
 
 ### D. Multi-GPU & very large batches (cluster / L40S work)
-10. **Multi-GPU = one process per GPU (verified).** The transparent thread-sharding path was
+11. **Multi-GPU = one process per GPU (verified).** The transparent thread-sharding path was
     host/GIL-bound (~1.0–2.3× on 4×L40S) and has been **removed**. Multi-GPU now runs through
     the persistent `MultiGPUAligner` pool (`accel/multi_gpu.py`): one OS process per GPU, each
     owning its shard (build + align, data resident on its GPU), CPU threads capped to
@@ -758,13 +778,13 @@ last decimal.
     3.50×, esp 3.79×, pharm 3.63× (`benchmarks/experiments/mgpu_parity.py` asserts the process
     path is bit-exact: max|Δscore|<1e-6). A transparent `align_with_*` runs single-GPU by default
     (no silent `spawn`); `FSS_MGPU_BACKEND=process` opts into transparent process sharding.
-11. **100k-pairs-per-call batches.** cuSOLVER's batched `eigh` fails past ~8k problems, so the
+12. **100k-pairs-per-call batches.** cuSOLVER's batched `eigh` fails past ~8k problems, so the
     SE(3) seed solve is **chunked to ≤4,096** — numerically identical, but it's what lets a
     single call align **100,000 pairs** without crashing. This is what backs the flat
     large-batch throughput on the L40S below.
 
 ### E. Note
-12. The headline benchmark runs **each `(mode, size)` cell in its own fresh subprocess**.
+13. The headline benchmark runs **each `(mode, size)` cell in its own fresh subprocess**.
     A laptop GPU throttles under sustained load (a ~2–3× artifact across a long run) and
     Triton autotune keys on the per-pose shape (so a process that warms up on a tiny batch
     would lock in the wrong config). Per-cell isolation gives each measurement a recovered
