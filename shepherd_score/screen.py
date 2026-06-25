@@ -968,40 +968,55 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                        n_total):
     """Process ``shard_idxs`` against the query panel, one shard load per shard,
     aligning every query against it. Returns a ``_TopK`` per query."""
-    heaps = [_TopK(top_k) for _ in qs_ref]
-    tf_attr = _TRANSFORM_ATTR[mode]
-    done = 0
-    if not fast:
-        from shepherd_score.container import MoleculePair, MoleculePairBatch
-    for idx in shard_idxs:
-        if fast:
-            sh, arrs = store.read_shard(idx)
-            ids, pairs = _build_fit_fast_pairs(arrs, mode, device)
-            ids = [_id_to_py(x) for x in ids]
-            start = sh["start"]
-            for qi, ra in enumerate(qs_ref):
-                ref = _ref_tensors_from_arrays(ra, mode, device)
-                scores = _align_fast(pairs, ref, mode, batch_kw)
-                _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
-        else:
-            sh = store.manifest["shards"][idx]
-            profiles = store.read_profiles(idx)
-            if center_profiles:
-                for p in profiles:
-                    p.center_to(p.atom_pos.mean(0))
-            ids = [_id_to_py(p.id) for p in profiles]
-            start = sh["start"]
-            for qi, q in enumerate(qs_ref):
-                pairs = [MoleculePair(q, p, do_center=False) for p in profiles]
-                result = getattr(MoleculePairBatch(pairs), "align_with_" + mode)(
-                    backend=backend, **align_kwargs)
-                scores = np.asarray(result[0], dtype=float)
-                _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
-        done += sh["n"]
-        if progress:
-            print(f"[screen] {done}/{n_total} library molecules aligned "
-                  f"x {len(qs_ref)} queries", flush=True)
-    return heaps
+    # This driver already shards the library manually (one shard per call), so suppress
+    # the aligner's transparent multi-GPU re-distribution. Otherwise, on a multi-GPU host
+    # with a large shard, _should_distribute can fire; under FSS_MGPU_BACKEND=process the
+    # process backend reads Molecule arrays off each pair (p.ref_molec.atom_pos), which the
+    # lightweight _FastPair stand-ins don't carry -> AttributeError. Mirrors the multi-GPU
+    # screen worker; restored afterward since this runs in the caller's process/thread.
+    try:
+        from shepherd_score.accel.batch import _DISPATCH_LOCAL
+    except Exception:
+        from shepherd_score.container._core import _DISPATCH_LOCAL
+    _prev_active = getattr(_DISPATCH_LOCAL, "active", False)
+    _DISPATCH_LOCAL.active = True
+    try:
+        heaps = [_TopK(top_k) for _ in qs_ref]
+        tf_attr = _TRANSFORM_ATTR[mode]
+        done = 0
+        if not fast:
+            from shepherd_score.container import MoleculePair, MoleculePairBatch
+        for idx in shard_idxs:
+            if fast:
+                sh, arrs = store.read_shard(idx)
+                ids, pairs = _build_fit_fast_pairs(arrs, mode, device)
+                ids = [_id_to_py(x) for x in ids]
+                start = sh["start"]
+                for qi, ra in enumerate(qs_ref):
+                    ref = _ref_tensors_from_arrays(ra, mode, device)
+                    scores = _align_fast(pairs, ref, mode, batch_kw)
+                    _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
+            else:
+                sh = store.manifest["shards"][idx]
+                profiles = store.read_profiles(idx)
+                if center_profiles:
+                    for p in profiles:
+                        p.center_to(p.atom_pos.mean(0))
+                ids = [_id_to_py(p.id) for p in profiles]
+                start = sh["start"]
+                for qi, q in enumerate(qs_ref):
+                    pairs = [MoleculePair(q, p, do_center=False) for p in profiles]
+                    result = getattr(MoleculePairBatch(pairs), "align_with_" + mode)(
+                        backend=backend, **align_kwargs)
+                    scores = np.asarray(result[0], dtype=float)
+                    _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
+            done += sh["n"]
+            if progress:
+                print(f"[screen] {done}/{n_total} library molecules aligned "
+                      f"x {len(qs_ref)} queries", flush=True)
+        return heaps
+    finally:
+        _DISPATCH_LOCAL.active = _prev_active
 
 
 def _accumulate(heap, ids, scores, pairs, tf_attr, scores_out, qi, start):
@@ -1085,6 +1100,18 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
             and not align_kwargs.get("trans_init") and backend != "jax")
     device = (torch.device("cpu") if backend in ("numba", "cpu")
               else torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
+
+    # The fast CPU path runs the batched kernels through numba. Without it the aligner falls
+    # into a per-pair fallback that calls p.align_with_<mode>() -- which the lightweight
+    # _FastPair stand-ins on the fast screen path don't have, so it dies with a confusing
+    # AttributeError deep inside the aligner. Fail clearly up front instead.
+    if fast and device.type == "cpu":
+        try:
+            import numba  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "fast CPU screen requires numba (the batched CPU kernels run on it) -- "
+                "install it (pip install numba) or screen on a GPU backend") from None
 
     if ndev and ndev > 1:
         if not fast:
