@@ -43,12 +43,12 @@ _NUM_SEEDS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_SEEDS"))
 # benchmarks/analyze_defaults.py). The pure-shape/volumetric channels (vol/vol_esp/vol_color)
 # converge fastest and shed seeds to ~28. The modes whose extra channel makes the landscape
 # inherently multi-basin (surf surface / surf_esp charge / pharm pharmacophore /
-# vol_and_shape_esp combo) keep more seeds: their MEAN keeps creeping with seed count, so the
-# per-pair tail (not the mean) is the limiter -- vol_and_shape_esp is the most seed-hungry of
+# vol_and_surf_esp combo) keep more seeds: their MEAN keeps creeping with seed count, so the
+# per-pair tail (not the mean) is the limiter -- vol_and_surf_esp is the most seed-hungry of
 # all (40 seeds -> only 99.9%, 6% tail), which is why it stays at 50. Raise a value for
 # libraries far larger / more symmetric than drug-like. vol_esp shares surf_esp's ESP channel.
-# (surf_esp and vol_and_shape_esp are the canonical names for the legacy esp / esp_combo modes.)
-_MODE_SEEDS = {"vol": 18, "surf": 20, "surf_esp": 28, "vol_esp": 28, "vol_and_shape_esp": 50,
+# (surf_esp and vol_and_surf_esp are the canonical names for the legacy esp / esp_combo modes.)
+_MODE_SEEDS = {"vol": 18, "surf": 20, "surf_esp": 28, "vol_esp": 28, "vol_and_surf_esp": 50,
                "pharm": 40, "vol_color": 28}
 
 
@@ -668,7 +668,7 @@ def _align_batch_vol_esp(
         steps_fine=steps_fine, lr=lr,
     )
 
-def _align_batch_vol_and_shape_esp(
+def _align_batch_vol_and_surf_esp(
     pairs: list["MoleculePair"],
     *,
     alpha: float,
@@ -684,19 +684,19 @@ def _align_batch_vol_and_shape_esp(
 ) -> None:
     """
     Batched ESP-combo alignment (ShaEP-style) with padding-safe masks.
-    ``vol_and_shape_esp`` is the canonical name for the mode formerly called
+    ``vol_and_surf_esp`` is the canonical name for the mode formerly called
     ``esp_combo`` (legacy alias kept below).
 
     Side effects
     ------------
     Writes:
-    - p.transform_vol_and_shape_esp
-    - p.sim_aligned_vol_and_shape_esp
+    - p.transform_vol_and_surf_esp
+    - p.sim_aligned_vol_and_surf_esp
     """
     if not pairs:
         return
     if _should_distribute(pairs):
-        return _run_distributed(_align_batch_vol_and_shape_esp, pairs,
+        return _run_distributed(_align_batch_vol_and_surf_esp, pairs,
                                 alpha=alpha, lam=lam, probe_radius=probe_radius,
                                 esp_weight=esp_weight, trans_init=trans_init,
                                 num_repeats=num_repeats,
@@ -710,9 +710,9 @@ def _align_batch_vol_and_shape_esp(
     # Ensure required tensors exist on device
     for p in pairs:
         if p.ref_molec.surf_pos is None or p.fit_molec.surf_pos is None:
-            raise ValueError("Surface points are None; cannot run _align_batch_vol_and_shape_esp.")
+            raise ValueError("Surface points are None; cannot run _align_batch_vol_and_surf_esp.")
         if p.ref_molec.surf_esp is None or p.fit_molec.surf_esp is None:
-            raise ValueError("Surface ESP is None; cannot run _align_batch_vol_and_shape_esp.")
+            raise ValueError("Surface ESP is None; cannot run _align_batch_vol_and_surf_esp.")
 
         def _ensure(p, attr, src, dtype):
             t = getattr(p, attr, None)
@@ -866,7 +866,7 @@ def _align_batch_vol_and_shape_esp(
             topk=topk,
             steps_fine=steps_fine,
             lr=lr,
-            num_seeds=_seeds_for("vol_and_shape_esp"),
+            num_seeds=_seeds_for("vol_and_surf_esp"),
         )
 
         all_pairs.extend(bucket)
@@ -881,8 +881,8 @@ def _align_batch_vol_and_shape_esp(
     SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair quaternion_to_SE3)
     scores_list = scores_cpu.tolist()                       # one C call (was K float())
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
-        p.transform_vol_and_shape_esp = S
-        p.sim_aligned_vol_and_shape_esp = s
+        p.transform_vol_and_surf_esp = S
+        p.sim_aligned_vol_and_surf_esp = s
 
 def _align_batch_pharm(
     pairs: list["MoleculePair"],
@@ -1088,7 +1088,7 @@ def _align_batch_vol_color(
     Batched ROCS/ROSHAMBO-style vol_color alignment (atom Gaussian shape + directionless
     pharmacophore color). Shape uses the fused volumetric kernel (Triton on CUDA, numba on
     CPU); color uses the pure-torch directionless scorer. SE(3) gradient is shape-driven
-    (FastROCS-style: shape-optimized, color-scored), matching the vol_and_shape_esp pattern.
+    (FastROCS-style: shape-optimized, color-scored), matching the vol_and_surf_esp pattern.
 
     Writes per-pair: ``p.transform_vol_color`` (4x4), ``p.sim_aligned_vol_color`` (float).
     """
@@ -1205,9 +1205,9 @@ def _align_batch_vol_color(
         p.sim_aligned_vol_color = s
 
 
-# --- legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_shape_esp) ----------
+# --- legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp) ----------
 # Same function objects, so ``__name__`` stays canonical -- the multi-GPU dispatch
 # (``align_fn.__name__.replace("_align_batch_", "")``) and _MODE_SPEC lookup are
 # unaffected. Kept so external code / pickles referencing the old names still resolve.
 _align_batch_esp = _align_batch_surf_esp
-_align_batch_esp_combo = _align_batch_vol_and_shape_esp
+_align_batch_esp_combo = _align_batch_vol_and_surf_esp

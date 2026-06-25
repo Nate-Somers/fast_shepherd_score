@@ -78,7 +78,7 @@ def _should_distribute(pairs) -> bool:
 # Each mode declares how to (a) pull its per-pair inputs off the Molecule objects as
 # picklable numpy arrays, (b) rebuild the cached device tensors inside a worker, and
 # (c) read the results back. ``extract`` and ``tensors`` are positional-aligned.
-# Modes absent here have no process path (e.g. ``vol_and_shape_esp``) and run single-GPU.
+# Modes absent here have no process path (e.g. ``vol_and_surf_esp``) and run single-GPU.
 _MODE_SPEC = {
     "vol": {
         "extract": [("ref_molec", "atom_pos"), ("fit_molec", "atom_pos")],

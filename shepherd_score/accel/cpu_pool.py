@@ -40,10 +40,10 @@ import os
 import numpy as np
 
 # Modes with a `_MODE_SPEC` entry (declared in _batch_align for the GPU process path).
-# vol_esp / vol_and_shape_esp have no entry -> the caller falls back to the single-process path.
+# vol_esp / vol_and_surf_esp have no entry -> the caller falls back to the single-process path.
 POOL_MODES = ("vol", "surf", "surf_esp", "pharm")
-# Legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_shape_esp); normalized in align_pairs.
-_LEGACY_MODE_ALIASES = {"esp": "surf_esp", "esp_combo": "vol_and_shape_esp"}
+# Legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp); normalized in align_pairs.
+_LEGACY_MODE_ALIASES = {"esp": "surf_esp", "esp_combo": "vol_and_surf_esp"}
 
 
 # ---------------------------------------------------------------------------

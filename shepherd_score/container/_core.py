@@ -361,8 +361,8 @@ class MoleculePair:
         self.transform_vol_esp_noH = np.eye(4)
         self.sim_aligned_vol_esp_noH = None
 
-        self.transform_vol_and_shape_esp = np.eye(4)
-        self.sim_aligned_vol_and_shape_esp = None
+        self.transform_vol_and_surf_esp = np.eye(4)
+        self.sim_aligned_vol_and_surf_esp = None
 
         self.transform_pharm = np.eye(4)
         self.sim_aligned_pharm = None
@@ -371,7 +371,7 @@ class MoleculePair:
         self.sim_aligned_vol_color = None
 
     # --- legacy result-attribute aliases (renamed modes; old names kept working) ---
-    # esp -> surf_esp, esp_combo -> vol_and_shape_esp. The canonical attributes set in
+    # esp -> surf_esp, esp_combo -> vol_and_surf_esp. The canonical attributes set in
     # __init__ are the real storage; these properties redirect old reads/writes to them.
     @property
     def sim_aligned_esp(self): return self.sim_aligned_surf_esp
@@ -382,13 +382,13 @@ class MoleculePair:
     @transform_esp.setter
     def transform_esp(self, v): self.transform_surf_esp = v
     @property
-    def sim_aligned_esp_combo(self): return self.sim_aligned_vol_and_shape_esp
+    def sim_aligned_esp_combo(self): return self.sim_aligned_vol_and_surf_esp
     @sim_aligned_esp_combo.setter
-    def sim_aligned_esp_combo(self, v): self.sim_aligned_vol_and_shape_esp = v
+    def sim_aligned_esp_combo(self, v): self.sim_aligned_vol_and_surf_esp = v
     @property
-    def transform_esp_combo(self): return self.transform_vol_and_shape_esp
+    def transform_esp_combo(self): return self.transform_vol_and_surf_esp
     @transform_esp_combo.setter
-    def transform_esp_combo(self, v): self.transform_vol_and_shape_esp = v
+    def transform_esp_combo(self, v): self.transform_vol_and_surf_esp = v
 
     # --- batched GPU/Triton aligners -------------------------------------
     # Implemented as free functions in ``_batch_align`` (kept out of this file
@@ -398,12 +398,12 @@ class MoleculePair:
     _align_batch_surf      = staticmethod(_ba._align_batch_surf)
     _align_batch_surf_esp  = staticmethod(_ba._align_batch_surf_esp)
     _align_batch_vol_esp   = staticmethod(_ba._align_batch_vol_esp)
-    _align_batch_vol_and_shape_esp = staticmethod(_ba._align_batch_vol_and_shape_esp)
+    _align_batch_vol_and_surf_esp = staticmethod(_ba._align_batch_vol_and_surf_esp)
     _align_batch_pharm     = staticmethod(_ba._align_batch_pharm)
     _align_batch_vol_color = staticmethod(_ba._align_batch_vol_color)
-    # legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_shape_esp)
+    # legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp)
     _align_batch_esp       = _align_batch_surf_esp
-    _align_batch_esp_combo = _align_batch_vol_and_shape_esp
+    _align_batch_esp_combo = _align_batch_vol_and_surf_esp
 
     def align_with_vol(self,
                        no_H: bool = True,
@@ -848,7 +848,7 @@ class MoleculePair:
             return aligned_fit_points.numpy()
 
 
-    def align_with_vol_and_shape_esp(self,
+    def align_with_vol_and_surf_esp(self,
                              alpha: float,
                              lam: float = 0.001,
                              probe_radius: float = 1.0,
@@ -861,13 +861,13 @@ class MoleculePair:
                              use_fast: bool = False,
                              verbose: bool = False):
         """
-        Align using ShaEP similarity score. ``vol_and_shape_esp`` is the canonical name
+        Align using ShaEP similarity score. ``vol_and_surf_esp`` is the canonical name
         for the mode formerly called ``esp_combo`` (legacy alias kept below).
         If alpha is 0.81, then it automatically uses volumetric shape similarity.
         Otherwise, it uses surface shape similarity.
 
-        Optimally aligned score found in ``self.sim_aligned_vol_and_shape_esp`` and the optimal
-        SE(3) transformation is at ``self.transform_vol_and_shape_esp``.
+        Optimally aligned score found in ``self.sim_aligned_vol_and_surf_esp`` and the optimal
+        SE(3) transformation is at ``self.transform_vol_and_surf_esp``.
 
         Parameters
         ----------
@@ -937,8 +937,8 @@ class MoleculePair:
                 max_num_steps=max_num_steps,
                 verbose=verbose
             )
-            self.transform_vol_and_shape_esp = np.array(se3_transform)
-            self.sim_aligned_vol_and_shape_esp = np.array(score)
+            self.transform_vol_and_surf_esp = np.array(se3_transform)
+            self.sim_aligned_vol_and_surf_esp = np.array(score)
             return np.array(aligned_fit_points)
         else:
             if alpha == 0.81:
@@ -1017,8 +1017,8 @@ class MoleculePair:
                         lr=lr,
                     )
 
-                    self.transform_vol_and_shape_esp = se3_transform_t.numpy()
-                    self.sim_aligned_vol_and_shape_esp = score_t.numpy()
+                    self.transform_vol_and_surf_esp = se3_transform_t.numpy()
+                    self.sim_aligned_vol_and_surf_esp = score_t.numpy()
                     return aligned_fit_points_t.numpy()
 
             aligned_fit_points, se3_transform, score = optimize_esp_combo_score_overlay(
@@ -1044,13 +1044,13 @@ class MoleculePair:
                 max_num_steps=max_num_steps,
                 verbose=verbose
             )
-            self.transform_vol_and_shape_esp = se3_transform.numpy()
-            self.sim_aligned_vol_and_shape_esp = score.numpy()
+            self.transform_vol_and_surf_esp = se3_transform.numpy()
+            self.sim_aligned_vol_and_surf_esp = score.numpy()
             return aligned_fit_points.detach().numpy()
 
-    # legacy method aliases (esp -> surf_esp, esp_combo -> vol_and_shape_esp)
+    # legacy method aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp)
     align_with_esp = align_with_surf_esp
-    align_with_esp_combo = align_with_vol_and_shape_esp
+    align_with_esp_combo = align_with_vol_and_surf_esp
 
 
     def align_with_vol_color(self,

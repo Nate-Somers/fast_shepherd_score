@@ -37,9 +37,9 @@ _SCORE_ATTR = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf",
                "surf_esp": "sim_aligned_surf_esp", "pharm": "sim_aligned_pharm"}
 _TRANSFORM_ATTR = {"vol": "transform_vol_noH", "surf": "transform_surf",
                    "surf_esp": "transform_surf_esp", "pharm": "transform_pharm"}
-# Legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_shape_esp); normalized at the
+# Legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp); normalized at the
 # public align entry points so old callers keep working.
-_LEGACY_MODE_ALIASES = {"esp": "surf_esp", "esp_combo": "vol_and_shape_esp"}
+_LEGACY_MODE_ALIASES = {"esp": "surf_esp", "esp_combo": "vol_and_surf_esp"}
 
 
 def _cap_threads(threads):
