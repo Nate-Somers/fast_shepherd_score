@@ -118,7 +118,7 @@ Available batch alignment methods
      - PyTorch/JAX
      - Delegates to each ``MoleculePair`` (surface arrays are same-sized, no padding needed)
      - Not recommended to use ``use_shmap=True`` with this method.
-   * - ``align_with_esp``
+   * - ``align_with_surf_esp``
      - PyTorch/JAX
      - Delegates to each ``MoleculePair`` (surface arrays are same-sized, no padding needed)
      - Not recommended to use ``use_shmap=True`` with this method.

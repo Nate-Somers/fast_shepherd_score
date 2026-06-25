@@ -40,8 +40,10 @@ import os
 import numpy as np
 
 # Modes with a `_MODE_SPEC` entry (declared in _batch_align for the GPU process path).
-# vol_esp / esp_combo have no entry -> the caller falls back to the single-process path.
-POOL_MODES = ("vol", "surf", "esp", "pharm")
+# vol_esp / vol_and_shape_esp have no entry -> the caller falls back to the single-process path.
+POOL_MODES = ("vol", "surf", "surf_esp", "pharm")
+# Legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_shape_esp); normalized in align_pairs.
+_LEGACY_MODE_ALIASES = {"esp": "surf_esp", "esp_combo": "vol_and_shape_esp"}
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +201,7 @@ def align_pairs(mode, pairs, num_workers, align_kwargs):
     """
     import torch
     from shepherd_score.accel import batch as bm
+    mode = _LEGACY_MODE_ALIASES.get(mode, mode)    # accept legacy esp / esp_combo
     spec = bm._MODE_SPEC[mode]
     extract, tnames = spec["extract"], spec["tensors"]
     tf_attr, sc_attr = spec["out"]

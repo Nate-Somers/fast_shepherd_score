@@ -352,8 +352,8 @@ class MoleculePair:
         self.transform_surf = np.eye(4)
         self.sim_aligned_surf = None
 
-        self.transform_esp = np.eye(4)
-        self.sim_aligned_esp = None
+        self.transform_surf_esp = np.eye(4)
+        self.sim_aligned_surf_esp = None
 
         self.transform_vol_esp = np.eye(4)
         self.sim_aligned_vol_esp = None
@@ -361,8 +361,8 @@ class MoleculePair:
         self.transform_vol_esp_noH = np.eye(4)
         self.sim_aligned_vol_esp_noH = None
 
-        self.transform_esp_combo = np.eye(4)
-        self.sim_aligned_esp_combo = None
+        self.transform_vol_and_shape_esp = np.eye(4)
+        self.sim_aligned_vol_and_shape_esp = None
 
         self.transform_pharm = np.eye(4)
         self.sim_aligned_pharm = None
@@ -370,17 +370,40 @@ class MoleculePair:
         self.transform_vol_color = np.eye(4)
         self.sim_aligned_vol_color = None
 
+    # --- legacy result-attribute aliases (renamed modes; old names kept working) ---
+    # esp -> surf_esp, esp_combo -> vol_and_shape_esp. The canonical attributes set in
+    # __init__ are the real storage; these properties redirect old reads/writes to them.
+    @property
+    def sim_aligned_esp(self): return self.sim_aligned_surf_esp
+    @sim_aligned_esp.setter
+    def sim_aligned_esp(self, v): self.sim_aligned_surf_esp = v
+    @property
+    def transform_esp(self): return self.transform_surf_esp
+    @transform_esp.setter
+    def transform_esp(self, v): self.transform_surf_esp = v
+    @property
+    def sim_aligned_esp_combo(self): return self.sim_aligned_vol_and_shape_esp
+    @sim_aligned_esp_combo.setter
+    def sim_aligned_esp_combo(self, v): self.sim_aligned_vol_and_shape_esp = v
+    @property
+    def transform_esp_combo(self): return self.transform_vol_and_shape_esp
+    @transform_esp_combo.setter
+    def transform_esp_combo(self, v): self.transform_vol_and_shape_esp = v
+
     # --- batched GPU/Triton aligners -------------------------------------
     # Implemented as free functions in ``_batch_align`` (kept out of this file
     # for size); bound here as static methods so the public seam is unchanged --
     # ``MoleculePair._align_batch_vol(pairs, ...)`` etc. still resolve here.
     _align_batch_vol       = staticmethod(_ba._align_batch_vol)
     _align_batch_surf      = staticmethod(_ba._align_batch_surf)
-    _align_batch_esp       = staticmethod(_ba._align_batch_esp)
+    _align_batch_surf_esp  = staticmethod(_ba._align_batch_surf_esp)
     _align_batch_vol_esp   = staticmethod(_ba._align_batch_vol_esp)
-    _align_batch_esp_combo = staticmethod(_ba._align_batch_esp_combo)
+    _align_batch_vol_and_shape_esp = staticmethod(_ba._align_batch_vol_and_shape_esp)
     _align_batch_pharm     = staticmethod(_ba._align_batch_pharm)
     _align_batch_vol_color = staticmethod(_ba._align_batch_vol_color)
+    # legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_shape_esp)
+    _align_batch_esp       = _align_batch_surf_esp
+    _align_batch_esp_combo = _align_batch_vol_and_shape_esp
 
     def align_with_vol(self,
                        no_H: bool = True,
@@ -684,7 +707,7 @@ class MoleculePair:
             return aligned_fit_points.numpy()
 
 
-    def align_with_esp(self,
+    def align_with_surf_esp(self,
                        alpha: float,
                        lam: float = 0.3,
                        num_repeats: int = 50,
@@ -696,13 +719,14 @@ class MoleculePair:
                        use_fast: bool = False,
                        verbose: bool = False) -> np.ndarray:
         """
-        Align fit_molec to ref_molec using ESP+surface similarity.
+        Align fit_molec to ref_molec using surface-ESP similarity. ``surf_esp`` is the
+        canonical name for the mode formerly called ``esp`` (legacy alias kept below).
         ``lam`` is scaled by ``(1e4/(4*55.263*np.pi))**2`` for correct units.
 
         Typically, ``lam=0.3`` is used and is scaled internally.
 
-        Optimally aligned score found in ``self.sim_aligned_esp`` and the optimal SE(3)
-        transformation is at ``self.transform_esp``.
+        Optimally aligned score found in ``self.sim_aligned_surf_esp`` and the optimal SE(3)
+        transformation is at ``self.transform_surf_esp``.
 
         Parameters
         ----------
@@ -758,8 +782,8 @@ class MoleculePair:
                 max_num_steps=max_num_steps,
                 verbose=verbose
             )
-            self.transform_esp = np.array(se3_transform)
-            self.sim_aligned_esp = np.array(score)
+            self.transform_surf_esp = np.array(se3_transform)
+            self.sim_aligned_surf_esp = np.array(score)
             return np.array(aligned_fit_points)
         else: # Use Torch implementation (opt-in CUDA fast path via use_fast)
             if use_fast and torch.cuda.is_available():
@@ -800,8 +824,8 @@ class MoleculePair:
                         lr=lr,
                     )
 
-                    self.transform_esp = se3_transform_t.numpy()
-                    self.sim_aligned_esp = score_t.numpy()
+                    self.transform_surf_esp = se3_transform_t.numpy()
+                    self.sim_aligned_surf_esp = score_t.numpy()
                     return aligned_fit_points_t.numpy()
 
             _esp_fn = optimize_ROCS_esp_overlay_analytical if use_analytical else optimize_ROCS_esp_overlay
@@ -819,12 +843,12 @@ class MoleculePair:
                 verbose=verbose
             )
 
-            self.transform_esp = se3_transform.numpy()
-            self.sim_aligned_esp = score.numpy()
+            self.transform_surf_esp = se3_transform.numpy()
+            self.sim_aligned_surf_esp = score.numpy()
             return aligned_fit_points.numpy()
 
 
-    def align_with_esp_combo(self,
+    def align_with_vol_and_shape_esp(self,
                              alpha: float,
                              lam: float = 0.001,
                              probe_radius: float = 1.0,
@@ -837,12 +861,13 @@ class MoleculePair:
                              use_fast: bool = False,
                              verbose: bool = False):
         """
-        Align using ShaEP similarity score.
+        Align using ShaEP similarity score. ``vol_and_shape_esp`` is the canonical name
+        for the mode formerly called ``esp_combo`` (legacy alias kept below).
         If alpha is 0.81, then it automatically uses volumetric shape similarity.
         Otherwise, it uses surface shape similarity.
 
-        Optimally aligned score found in ``self.sim_aligned_esp_combo`` and the optimal SE(3)
-        transformation is at ``self.transform_esp_combo``.
+        Optimally aligned score found in ``self.sim_aligned_vol_and_shape_esp`` and the optimal
+        SE(3) transformation is at ``self.transform_vol_and_shape_esp``.
 
         Parameters
         ----------
@@ -912,8 +937,8 @@ class MoleculePair:
                 max_num_steps=max_num_steps,
                 verbose=verbose
             )
-            self.transform_esp_combo = np.array(se3_transform)
-            self.sim_aligned_esp_combo = np.array(score)
+            self.transform_vol_and_shape_esp = np.array(se3_transform)
+            self.sim_aligned_vol_and_shape_esp = np.array(score)
             return np.array(aligned_fit_points)
         else:
             if alpha == 0.81:
@@ -992,8 +1017,8 @@ class MoleculePair:
                         lr=lr,
                     )
 
-                    self.transform_esp_combo = se3_transform_t.numpy()
-                    self.sim_aligned_esp_combo = score_t.numpy()
+                    self.transform_vol_and_shape_esp = se3_transform_t.numpy()
+                    self.sim_aligned_vol_and_shape_esp = score_t.numpy()
                     return aligned_fit_points_t.numpy()
 
             aligned_fit_points, se3_transform, score = optimize_esp_combo_score_overlay(
@@ -1019,9 +1044,13 @@ class MoleculePair:
                 max_num_steps=max_num_steps,
                 verbose=verbose
             )
-            self.transform_esp_combo = se3_transform.numpy()
-            self.sim_aligned_esp_combo = score.numpy()
+            self.transform_vol_and_shape_esp = se3_transform.numpy()
+            self.sim_aligned_vol_and_shape_esp = score.numpy()
             return aligned_fit_points.detach().numpy()
+
+    # legacy method aliases (esp -> surf_esp, esp_combo -> vol_and_shape_esp)
+    align_with_esp = align_with_surf_esp
+    align_with_esp_combo = align_with_vol_and_shape_esp
 
 
     def align_with_vol_color(self,

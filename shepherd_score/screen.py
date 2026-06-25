@@ -36,12 +36,12 @@ Example
 >>> from shepherd_score.screen import ProfileStore, screen
 >>> # BUILD ONCE (parallel across the cluster; each worker writes its own shards)
 >>> with ProfileStore.create("lib.fss", num_surf_points=200,
-...                           modes=("surf", "esp", "pharm")) as store:
+...                           modes=("surf", "surf_esp", "pharm")) as store:
 ...     for mol in library_rdkit_mols:
 ...         store.add(Molecule(mol, num_surf_points=200, pharm_multi_vector=False))
 >>> # SCREEN (streamed; never holds the library in RAM)
 >>> query = Molecule(query_mol, num_surf_points=200, pharm_multi_vector=False)
->>> hits = screen(query, ProfileStore.open("lib.fss"), mode="esp",
+>>> hits = screen(query, ProfileStore.open("lib.fss"), mode="surf_esp",
 ...               lam=0.3, num_repeats=50, top_k=1000)   # backend auto: triton on GPU, numba on CPU
 >>> hits[0].score, hits[0].id            # best match
 """
@@ -63,19 +63,24 @@ __all__ = ["MoleculeProfile", "ProfileStore", "screen", "screen_many", "Hit"]
 # Per-mode result attributes written in-place by ``MoleculePairBatch.align_with_*``.
 _SCORE_ATTR = {
     "vol": "sim_aligned_vol_noH", "vol_esp": "sim_aligned_vol_esp_noH",
-    "surf": "sim_aligned_surf", "esp": "sim_aligned_esp",
-    "esp_combo": "sim_aligned_esp_combo", "pharm": "sim_aligned_pharm",
+    "surf": "sim_aligned_surf", "surf_esp": "sim_aligned_surf_esp",
+    "vol_and_shape_esp": "sim_aligned_vol_and_shape_esp", "pharm": "sim_aligned_pharm",
     "vol_color": "sim_aligned_vol_color",
 }
 _TRANSFORM_ATTR = {
     "vol": "transform_vol_noH", "vol_esp": "transform_vol_esp_noH",
-    "surf": "transform_surf", "esp": "transform_esp",
-    "esp_combo": "transform_esp_combo", "pharm": "transform_pharm",
+    "surf": "transform_surf", "surf_esp": "transform_surf_esp",
+    "vol_and_shape_esp": "transform_vol_and_shape_esp", "pharm": "transform_pharm",
     "vol_color": "transform_vol_color",
 }
 _VALID_MODES = tuple(_SCORE_ATTR)
+# Legacy mode aliases: old user-facing mode names -> canonical. Normalized at every
+# public entry point so old code (``mode="esp"``/``"esp_combo"``) keeps working.
+_LEGACY_MODE_ALIASES = {"esp": "surf_esp", "esp_combo": "vol_and_shape_esp"}
+def _canon_mode(mode):
+    return _LEGACY_MODE_ALIASES.get(mode, mode)
 # Modes whose surface ``alpha`` should auto-default to ALPHA(num_surf_points).
-_SURF_ALPHA_MODES = {"surf", "esp"}
+_SURF_ALPHA_MODES = {"surf", "surf_esp"}
 
 
 Hit = namedtuple("Hit", ["score", "id", "transform"])
@@ -207,35 +212,36 @@ class MoleculeProfile:
 # storage schema helpers
 # --------------------------------------------------------------------------- #
 def _schema_from_modes(modes) -> dict:
-    modes = set(modes)
+    modes = {_canon_mode(m) for m in modes}            # accept legacy esp / esp_combo
     unknown = modes - set(_VALID_MODES)
     if unknown:
         raise ValueError(f"unknown modes {sorted(unknown)}; valid: {list(_VALID_MODES)}")
     return dict(
-        surf=bool({"surf", "esp", "esp_combo"} & modes),
-        surf_esp=bool({"esp", "esp_combo"} & modes),
-        charges=bool({"vol_esp", "esp_combo"} & modes),
-        with_H=("esp_combo" in modes),
-        radii=("esp_combo" in modes),
-        centers_w_H=("esp_combo" in modes),
+        surf=bool({"surf", "surf_esp", "vol_and_shape_esp"} & modes),
+        surf_esp=bool({"surf_esp", "vol_and_shape_esp"} & modes),
+        charges=bool({"vol_esp", "vol_and_shape_esp"} & modes),
+        with_H=("vol_and_shape_esp" in modes),
+        radii=("vol_and_shape_esp" in modes),
+        centers_w_H=("vol_and_shape_esp" in modes),
         pharm=bool({"pharm", "vol_color"} & modes),   # vol_color = atoms + directionless pharm
     )
 
 
 def _store_supports(schema: dict, mode: str) -> bool:
+    mode = _canon_mode(mode)                           # accept legacy esp / esp_combo
     if mode == "vol":
         return True                                   # atom_pos is always stored
     if mode == "vol_esp":
         return schema["charges"]
     if mode == "surf":
         return schema["surf"]
-    if mode == "esp":
+    if mode == "surf_esp":
         return schema["surf"] and schema["surf_esp"]
     if mode == "pharm":
         return schema["pharm"]
     if mode == "vol_color":
         return schema["pharm"]                          # atoms (always) + pharm types/anchors
-    if mode == "esp_combo":
+    if mode == "vol_and_shape_esp":
         return (schema["surf"] and schema["surf_esp"] and schema["centers_w_H"]
                 and schema["radii"] and schema["charges"] and schema["with_H"])
     return False
@@ -361,7 +367,8 @@ class ProfileStore:
         modes : sequence of str
             Which alignment modes this store must support. Only the arrays those
             modes need are stored (``"vol"`` works from any store -- ``atom_pos``
-            is always kept). Valid: ``vol vol_esp surf esp pharm esp_combo``.
+            is always kept). Valid: ``vol vol_esp surf surf_esp pharm vol_and_shape_esp``
+            (legacy ``esp``/``esp_combo`` also accepted).
         dtype : {"float16", "float32"}
             On-disk dtype for coordinate/charge arrays. ``float16`` halves disk +
             IO at ~0.01 A error (the surface resampling noise floor); reconstructed
@@ -654,11 +661,11 @@ def _centered_copy(query):
 # is swapped across a panel while the fit views stay resident -> one shard build
 # serves every query.
 # --------------------------------------------------------------------------- #
-_FAST_MODES = ("vol", "surf", "esp", "pharm", "vol_color", "vol_esp", "esp_combo")
+_FAST_MODES = ("vol", "surf", "surf_esp", "pharm", "vol_color", "vol_esp", "vol_and_shape_esp")
 # Modes whose batched aligner reads ``p.ref_molec.<attr>`` *eagerly* (vol_color probes
-# pharm; vol_esp/esp_combo do a None-guard on partial_charges / surf_pos+surf_esp), so the
-# fast path attaches a tiny ``_ArrView`` to satisfy those reads (tensors are still pre-cached).
-_NEEDS_ARRVIEW = ("vol_color", "vol_esp", "esp_combo")
+# pharm; vol_esp/vol_and_shape_esp do a None-guard on partial_charges / surf_pos+surf_esp), so
+# the fast path attaches a tiny ``_ArrView`` to satisfy those reads (tensors still pre-cached).
+_NEEDS_ARRVIEW = ("vol_color", "vol_esp", "vol_and_shape_esp")
 
 
 class _ArrView:
@@ -698,11 +705,11 @@ class _FastPair:
                  "_ref_radii_t", "_fit_radii_t",                     # esp_combo with-H radii
                  "transform_vol_noH", "sim_aligned_vol_noH",
                  "transform_surf", "sim_aligned_surf",
-                 "transform_esp", "sim_aligned_esp",
+                 "transform_surf_esp", "sim_aligned_surf_esp",
                  "transform_pharm", "sim_aligned_pharm",
                  "transform_vol_color", "sim_aligned_vol_color",
                  "transform_vol_esp_noH", "sim_aligned_vol_esp_noH",
-                 "transform_esp_combo", "sim_aligned_esp_combo")
+                 "transform_vol_and_shape_esp", "sim_aligned_vol_and_shape_esp")
 
     def __init__(self, device):
         self.device = device
@@ -715,7 +722,7 @@ def _query_ref_arrays(q, mode: str) -> dict:
         return {"xyz": np.asarray(q.atom_pos, np.float32)}
     if mode == "surf":
         return {"surf": np.asarray(q.surf_pos, np.float32)}
-    if mode == "esp":
+    if mode == "surf_esp":
         return {"surf": np.asarray(q.surf_pos, np.float32),
                 "surf_esp": np.asarray(q.surf_esp, np.float32)}
     if mode == "pharm":
@@ -729,7 +736,7 @@ def _query_ref_arrays(q, mode: str) -> dict:
         # atom_pos, which is the RemoveHs set and longer when an H was retained.
         return {"xyz": np.asarray(_heavy_positions(q), np.float32),
                 "charges": np.asarray(np.asarray(q.partial_charges)[q._nonH_atoms_idx], np.float32)}
-    if mode == "esp_combo":
+    if mode == "vol_and_shape_esp":
         return {"surf": np.asarray(q.surf_pos, np.float32),
                 "surf_esp": np.asarray(q.surf_esp, np.float32),
                 "cwh": np.asarray(q.mol.GetConformer().GetPositions(), np.float32),  # with-H centers
@@ -746,7 +753,7 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
         return {"_ref_xyz_t": f(ra["xyz"])}
     if mode == "surf":
         return {"_ref_surf_t": f(ra["surf"])}
-    if mode == "esp":
+    if mode == "surf_esp":
         return {"_ref_surf_t": f(ra["surf"]), "_ref_surf_esp_t": f(ra["surf_esp"])}
     if mode == "pharm":
         return {"_ref_pharm_types_t": torch.as_tensor(ra["ptypes"], dtype=torch.int64, device=device),
@@ -763,7 +770,7 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
         xyz = f(ra["xyz"])
         return {"_ref_xyz_t": xyz, "_ref_xyz_noH_t": xyz, "_ref_xyz_esp_t": f(ra["charges"]),
                 "ref_molec": _ArrView(atom_pos=ra["xyz"], partial_charges=ra["charges"])}
-    if mode == "esp_combo":
+    if mode == "vol_and_shape_esp":
         return {"_ref_surf_t": f(ra["surf"]), "_ref_surf_esp_t": f(ra["surf_esp"]),
                 "_ref_centers_w_H_t": f(ra["cwh"]), "_ref_partial_t": f(ra["partial"]),
                 "_ref_radii_t": f(ra["radii"]), "_ref_xyz_t": f(ra["xyz"]),
@@ -794,7 +801,7 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
     elif mode == "surf":
         for p, s in zip(pairs, torch.unbind(f(arrs["surf_pos"]))):       # (K, S, 3) -> K views
             p._fit_surf_t = s
-    elif mode == "esp":
+    elif mode == "surf_esp":
         for p, s, e in zip(pairs, torch.unbind(f(arrs["surf_pos"])), torch.unbind(f(arrs["surf_esp"]))):
             p._fit_surf_t = s; p._fit_surf_esp_t = e
     elif mode == "pharm":
@@ -832,7 +839,7 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
             p._fit_xyz_esp_t = ht; p.fit_molec = _ArrView(partial_charges=hn)
             p._fit_xyz_noH_t = xn               # heavy centers, 1:1 with heavy charges
             p._fit_xyz_t = at                   # RemoveHs atom_pos (trans-init centers only)
-    elif mode == "esp_combo":
+    elif mode == "vol_and_shape_esp":
         aoff, alloff = arrs["atom_off"], arrs["all_off"]
         np_surf, np_se = arrs["surf_pos"], arrs["surf_esp"]
         for i, (p, s, e, c, pa, r, at, partn, radn, cwhn) in enumerate(zip(
@@ -856,7 +863,7 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
     steps = ak.get("max_num_steps", 200)
     if mode in ("vol", "surf"):
         return dict(alpha=ak.get("alpha", 0.81), steps_fine=steps)
-    if mode == "esp":
+    if mode == "surf_esp":
         return dict(alpha=ak.get("alpha", 0.81), lam=ak.get("lam", 0.3),
                     num_repeats=ak.get("num_repeats", 50), trans_init=False,
                     lr=ak.get("lr", 0.1), steps_fine=steps)
@@ -873,7 +880,7 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
         return dict(alpha=ak.get("alpha", 0.81), lam=ak["lam"],
                     num_repeats=ak.get("num_repeats", 50), trans_init=False,
                     lr=ak.get("lr", 0.1), steps_fine=steps)
-    if mode == "esp_combo":  # mirrors align_with_esp_combo(backend="triton") dispatch
+    if mode == "vol_and_shape_esp":  # mirrors align_with_vol_and_shape_esp(backend="triton") dispatch
         return dict(alpha=ak["alpha"], lam=ak.get("lam", 0.001),
                     probe_radius=ak.get("probe_radius", 1.0), esp_weight=ak.get("esp_weight", 0.5),
                     num_repeats=ak.get("num_repeats", 50), trans_init=False,
@@ -942,8 +949,8 @@ def _resolve_screen(store, mode, alpha, align_kwargs):
     if alpha is None and mode in _SURF_ALPHA_MODES:
         from shepherd_score.score.constants import ALPHA
         alpha = float(ALPHA(store.num_surf_points))
-    if alpha is None and mode == "esp_combo":
-        raise ValueError("esp_combo requires an explicit alpha (it selects volumetric "
+    if alpha is None and mode == "vol_and_shape_esp":
+        raise ValueError("vol_and_shape_esp requires an explicit alpha (it selects volumetric "
                          "shape at alpha=0.81, otherwise surface shape); pass alpha=...")
     if mode == "vol_esp" and "lam" not in align_kwargs:
         # align_with_vol_esp makes lam a required positional (no default), so don't invent
@@ -1015,7 +1022,7 @@ def _normalize_scores_out(scores_out, n_queries):
                      "of one array per query")
 
 
-def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "esp", *,
+def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp", *,
                 backend: Optional[str] = None, do_center: Optional[bool] = None,
                 top_k: int = 1000, ndev: Optional[int] = None,
                 scores_out=None, alpha: Optional[float] = None,
@@ -1024,7 +1031,7 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "esp", *,
 
     Each shard is read from disk **once** and aligned against *every* query (so the
     library is streamed once for the whole panel, not once per query). For the fast
-    modes (all of ``vol/vol_esp/surf/esp/pharm/vol_color/esp_combo``) on a pre-centered
+    modes (all of ``vol/vol_esp/surf/surf_esp/pharm/vol_color/vol_and_shape_esp``) on a pre-centered
     store, the shard's fit tensors are built once on-device and reused across the panel
     via the direct array->kernel path (no per-molecule ``MoleculeProfile``/``MoleculePair``).
 
@@ -1037,10 +1044,11 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "esp", *,
     """
     import torch
     queries = list(queries)
+    mode = _canon_mode(mode)                      # accept legacy esp / esp_combo everywhere below
     align_kwargs = _resolve_screen(store, mode, alpha, align_kwargs)
     backend = backend or _default_backend()
 
-    if mode in ("surf", "esp", "esp_combo"):
+    if mode in ("surf", "surf_esp", "vol_and_shape_esp"):
         for q in queries:
             qn = getattr(q, "num_surf_points", None)
             if qn is not None and qn != store.num_surf_points:
@@ -1051,13 +1059,13 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "esp", *,
     # opaquely inside _query_ref_arrays (mirrors _profile_from_schema's clear-error convention).
     # A bare RDKit Molecule always has these; a MoleculeProfile reconstructed without the mode's
     # arrays does not.
-    if mode == "esp_combo":
+    if mode == "vol_and_shape_esp":
         for q in queries:
             miss = [a for a in ("surf_pos", "surf_esp", "mol", "partial_charges", "radii")
                     if getattr(q, a, None) is None]
             if miss:
-                raise ValueError(f"esp_combo query is missing {miss}; build the query "
-                                 f"Molecule/MoleculeProfile with esp_combo arrays (surface, "
+                raise ValueError(f"vol_and_shape_esp query is missing {miss}; build the query "
+                                 f"Molecule/MoleculeProfile with vol_and_shape_esp arrays (surface, "
                                  f"with-H centers, partial charges, radii)")
     elif mode == "vol_esp":
         for q in queries:
@@ -1099,7 +1107,7 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "esp", *,
     return [h.sorted() for h in heaps]
 
 
-def screen(query, store: "ProfileStore", mode: str = "esp", *,
+def screen(query, store: "ProfileStore", mode: str = "surf_esp", *,
            backend: Optional[str] = None, do_center: Optional[bool] = None,
            top_k: int = 1000, ndev: Optional[int] = None,
            scores_out: Optional[np.ndarray] = None, alpha: Optional[float] = None,
@@ -1117,7 +1125,8 @@ def screen(query, store: "ProfileStore", mode: str = "esp", *,
     store : ProfileStore
         Opened for reading.
     mode : str
-        One of ``vol vol_esp surf esp pharm esp_combo vol_color`` (must be supported by
+        One of ``vol vol_esp surf surf_esp pharm vol_and_shape_esp vol_color`` (legacy
+        ``esp``/``esp_combo`` accepted; must be supported by
         the store). **All seven** take the fast direct array->kernel path on a pre-centered
         store (``trans_init=False``, non-jax backend). ``vol_color`` (ROCS/ROSHAMBO-style
         shape + directionless pharmacophore color) needs only a pharm store (atoms +
@@ -1136,7 +1145,7 @@ def screen(query, store: "ProfileStore", mode: str = "esp", *,
         score in library order. Single-process only.
     alpha : float, optional
         Shape Gaussian width; auto-fills ``ALPHA(num_surf_points)`` for ``surf``/``esp``,
-        required for ``esp_combo`` (``alpha=0.81`` selects volumetric shape, else surface),
+        required for ``vol_and_shape_esp`` (``alpha=0.81`` selects volumetric shape, else surface),
         defaults to ``0.81`` for ``vol``/``vol_esp``, ignored only for ``pharm``.
     **align_kwargs
         Passed to the aligner (``lam``, ``num_repeats``, ``max_num_steps``, ``lr``,

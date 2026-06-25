@@ -828,7 +828,7 @@ class MoleculePairBatch:
             verbose=verbose,
         )
 
-    def align_with_esp(self,
+    def align_with_surf_esp(self,
                        alpha: float,
                        lam: float = 0.3,
                        num_repeats: int = 50,
@@ -849,8 +849,9 @@ class MoleculePairBatch:
         size-sorting is needed.  It is not recommended to use multiprocessing
         due to this reason.
 
+        ``surf_esp`` is the canonical name for the legacy ``esp`` mode (alias kept).
         Results are stored in-place on each MoleculePair:
-        - ``pair.transform_esp`` and ``pair.sim_aligned_esp``
+        - ``pair.transform_surf_esp`` and ``pair.sim_aligned_surf_esp``
 
         Parameters
         ----------
@@ -889,15 +890,15 @@ class MoleculePairBatch:
             Aligned fit surface coordinates for each pair.
         backend : str
             ``"jax"`` (default) or ``"triton"`` (aliases ``"cuda"``/``"gpu"``) which
-            routes to ``MoleculePair._align_batch_esp`` (multi-GPU-aware; it applies the
+            routes to ``MoleculePair._align_batch_surf_esp`` (multi-GPU-aware; it applies the
             same internal LAM_SCALING as this path, so ``lam`` is consistent across
             backends). ``return_aligned`` controls the aligned-surface list.
         """
         handled, _result = self._run_fast_or_fallthrough(
-            backend, MoleculePair._align_batch_esp,
+            backend, MoleculePair._align_batch_surf_esp,
             dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
                  trans_init=trans_init, lr=lr, steps_fine=max_num_steps),
-            "sim_aligned_esp", "transform_esp", "_fit_surf_t", return_aligned,
+            "sim_aligned_surf_esp", "transform_surf_esp", "_fit_surf_t", return_aligned,
             num_workers=num_workers)
         if handled:
             return _result
@@ -933,8 +934,8 @@ class MoleculePairBatch:
                 scores[i] = score
                 aligned_list[i] = aligned_pts
                 pair = self.pairs[i]
-                pair.transform_esp = se3_transform
-                pair.sim_aligned_esp = score
+                pair.transform_surf_esp = se3_transform
+                pair.sim_aligned_surf_esp = score
             return scores, aligned_list
 
         elif num_workers > 1: # parallel
@@ -951,13 +952,13 @@ class MoleculePairBatch:
                     scores[global_i] = score
                     aligned_list[global_i] = aligned_pts
                     pair = self.pairs[global_i]
-                    pair.transform_esp = se3_transform
-                    pair.sim_aligned_esp = score
+                    pair.transform_surf_esp = se3_transform
+                    pair.sim_aligned_surf_esp = score
             return scores, aligned_list
 
         # sequential
         return self._delegate_alignment(
-            'align_with_esp', 'sim_aligned_esp',
+            'align_with_surf_esp', 'sim_aligned_surf_esp',
             alpha=alpha,
             lam=lam,
             num_repeats=num_repeats,
@@ -969,7 +970,7 @@ class MoleculePairBatch:
             verbose=verbose,
         )
 
-    def align_with_esp_combo(self,
+    def align_with_vol_and_shape_esp(self,
                              alpha: float,
                              lam: float = 0.001,
                              probe_radius: float = 1.0,
@@ -982,22 +983,23 @@ class MoleculePairBatch:
                              backend: str = "jax",
                              return_aligned: bool = False,
                              ) -> Tuple[np.ndarray, List[np.ndarray]]:
-        """Align all pairs using ShaEP-style ESP-combo similarity.
+        """Align all pairs using ShaEP-style ESP-combo similarity. ``vol_and_shape_esp``
+        is the canonical name for the legacy ``esp_combo`` mode (alias kept).
 
         Results are stored in-place on each MoleculePair:
-        - ``pair.transform_esp_combo`` and ``pair.sim_aligned_esp_combo``
+        - ``pair.transform_vol_and_shape_esp`` and ``pair.sim_aligned_vol_and_shape_esp``
 
         Parameters
         ----------
         alpha, lam, probe_radius, esp_weight : float
-            ShaEP combo parameters (see ``MoleculePair.align_with_esp_combo``).
+            ShaEP combo parameters (see ``MoleculePair.align_with_vol_and_shape_esp``).
         num_repeats, trans_init, lr, max_num_steps, verbose
             Standard optimization controls.
         backend : str
             ``"jax"`` (default) runs the per-pair CPU/torch path sequentially via
-            ``MoleculePair.align_with_esp_combo``. ``"triton"`` (aliases
+            ``MoleculePair.align_with_vol_and_shape_esp``. ``"triton"`` (aliases
             ``"cuda"``/``"gpu"``) routes to the batched
-            ``MoleculePair._align_batch_esp_combo`` GPU kernel (multi-GPU-aware).
+            ``MoleculePair._align_batch_vol_and_shape_esp`` GPU kernel (multi-GPU-aware).
             ``"numba"`` (alias ``"cpu"``) runs the same batched path on CPU via the
             numba kernels (the ESP channel is the fused ``esp_comparison_batch``).
         return_aligned : bool
@@ -1012,17 +1014,17 @@ class MoleculePairBatch:
             ``return_aligned=True`` on the Triton backend).
         """
         handled, _result = self._run_fast_or_fallthrough(
-            backend, MoleculePair._align_batch_esp_combo,
+            backend, MoleculePair._align_batch_vol_and_shape_esp,
             dict(alpha=alpha, lam=lam, probe_radius=probe_radius,
                  esp_weight=esp_weight, trans_init=trans_init,
                  num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
-            "sim_aligned_esp_combo", "transform_esp_combo", "_fit_surf_t",
+            "sim_aligned_vol_and_shape_esp", "transform_vol_and_shape_esp", "_fit_surf_t",
             return_aligned)
         if handled:
             return _result
 
         return self._delegate_alignment(
-            'align_with_esp_combo', 'sim_aligned_esp_combo',
+            'align_with_vol_and_shape_esp', 'sim_aligned_vol_and_shape_esp',
             alpha=alpha,
             lam=lam,
             probe_radius=probe_radius,
@@ -1033,6 +1035,10 @@ class MoleculePairBatch:
             max_num_steps=max_num_steps,
             verbose=verbose,
         )
+
+    # legacy method aliases (esp -> surf_esp, esp_combo -> vol_and_shape_esp)
+    align_with_esp = align_with_surf_esp
+    align_with_esp_combo = align_with_vol_and_shape_esp
 
     def align_with_vol_color(self,
                              color_weight: float = 0.5,

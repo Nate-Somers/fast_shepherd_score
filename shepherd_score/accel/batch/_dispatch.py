@@ -78,7 +78,7 @@ def _should_distribute(pairs) -> bool:
 # Each mode declares how to (a) pull its per-pair inputs off the Molecule objects as
 # picklable numpy arrays, (b) rebuild the cached device tensors inside a worker, and
 # (c) read the results back. ``extract`` and ``tensors`` are positional-aligned.
-# Modes absent here have no process path (e.g. ``esp_combo``) and run single-GPU.
+# Modes absent here have no process path (e.g. ``vol_and_shape_esp``) and run single-GPU.
 _MODE_SPEC = {
     "vol": {
         "extract": [("ref_molec", "atom_pos"), ("fit_molec", "atom_pos")],
@@ -90,12 +90,12 @@ _MODE_SPEC = {
         "tensors": [("_ref_surf_t", torch.float32), ("_fit_surf_t", torch.float32)],
         "out": ("transform_surf", "sim_aligned_surf"),
     },
-    "esp": {
+    "surf_esp": {                                  # canonical name for the legacy "esp" mode
         "extract": [("ref_molec", "surf_pos"), ("fit_molec", "surf_pos"),
                     ("ref_molec", "surf_esp"), ("fit_molec", "surf_esp")],
         "tensors": [("_ref_surf_t", torch.float32), ("_fit_surf_t", torch.float32),
                     ("_ref_surf_esp_t", torch.float32), ("_fit_surf_esp_t", torch.float32)],
-        "out": ("transform_esp", "sim_aligned_esp"),
+        "out": ("transform_surf_esp", "sim_aligned_surf_esp"),
     },
     "pharm": {
         "extract": [("ref_molec", "pharm_types"), ("fit_molec", "pharm_types"),

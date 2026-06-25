@@ -34,9 +34,12 @@ import numpy as np
 
 # Public per-mode result attributes written in-place by align_with_*.
 _SCORE_ATTR = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf",
-               "esp": "sim_aligned_esp", "pharm": "sim_aligned_pharm"}
+               "surf_esp": "sim_aligned_surf_esp", "pharm": "sim_aligned_pharm"}
 _TRANSFORM_ATTR = {"vol": "transform_vol_noH", "surf": "transform_surf",
-                   "esp": "transform_esp", "pharm": "transform_pharm"}
+                   "surf_esp": "transform_surf_esp", "pharm": "transform_pharm"}
+# Legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_shape_esp); normalized at the
+# public align entry points so old callers keep working.
+_LEGACY_MODE_ALIASES = {"esp": "surf_esp", "esp_combo": "vol_and_shape_esp"}
 
 
 def _cap_threads(threads):
@@ -114,7 +117,7 @@ def align_multi_gpu(pairs: Sequence,
         Pairs to align. Only their ``ref_molec`` / ``fit_molec`` (lightweight,
         picklable ``Molecule`` objects) cross the process boundary; each worker
         rebuilds the ``MoleculePair`` on its own GPU.
-    mode : {"vol", "surf", "esp", "pharm"}
+    mode : {"vol", "surf", "surf_esp", "pharm"}  (legacy "esp" accepted)
     ndev : int, optional
         Number of GPUs/processes (default: all visible CUDA devices).
     threads : int, optional
@@ -139,6 +142,7 @@ def align_multi_gpu(pairs: Sequence,
     import torch
     import torch.multiprocessing as mp
 
+    mode = _LEGACY_MODE_ALIASES.get(mode, mode)    # accept legacy esp / esp_combo
     if mode not in _SCORE_ATTR:
         raise ValueError(f"mode must be one of {list(_SCORE_ATTR)}, got {mode!r}")
     pairs = list(pairs)
@@ -290,7 +294,7 @@ class MultiGPUAligner:
         pairs = [MoleculePair(a, b, device="cpu") for a, b in mols]   # CPU build
         with MultiGPUAligner(pairs) as pool:                          # fork: fast
             scores, transforms = pool.align("vol", no_H=True, alpha=0.81)
-            esp_scores, _      = pool.align("esp", alpha=0.81, lam=0.3, num_repeats=16)
+            esp_scores, _      = pool.align("surf_esp", alpha=0.81, lam=0.3, num_repeats=16)
     """
 
     def __init__(self, pairs, *, ndev=None, threads=None, do_center=False,
@@ -382,6 +386,7 @@ class MultiGPUAligner:
         the original input order. Cheap per call -- only params in, results out."""
         if self._closed:
             raise RuntimeError("MultiGPUAligner is closed")
+        mode = _LEGACY_MODE_ALIASES.get(mode, mode)    # accept legacy esp / esp_combo
         if mode not in _SCORE_ATTR:
             raise ValueError(f"mode must be one of {list(_SCORE_ATTR)}, got {mode!r}")
         for r in range(self.ndev):

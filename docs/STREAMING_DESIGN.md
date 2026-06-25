@@ -4,7 +4,7 @@
 > (tests: [`tests/test_screen.py`](../tests/test_screen.py); streaming scores are
 > bit-equivalent to the in-memory `MoleculePairBatch` path). This document is the
 > design + rationale; the shipped API matches it, with the on-disk format refined to
-> one `.npz` per shard (§3.2) and `esp_combo` supported via a conformer shim (§3.1).
+> one `.npz` per shard (§3.2) and `vol_and_shape_esp` supported via a conformer shim (§3.1).
 > An opt-in, out-of-core screening path that aligns a query (or a handful of queries)
 > against a library far larger than host RAM, without changing any existing class,
 > kernel, or default. Companion to
@@ -26,7 +26,7 @@ So the entire library cannot be materialized as `Molecule`/`MoleculePair`
 objects on a normal node. Two facts make this *easy* to fix rather than hard:
 
 1. **Alignment compute is cheap and already chunked.** On one H100, 1e9 *cross*
-   (distinct) pairs is ~2.7 h (vol) to ~11 h (esp); a few GPUs bring it under an
+   (distinct) pairs is ~2.7 h (vol) to ~11 h (surf_esp); a few GPUs bring it under an
    hour. Inside the GPU path, `_subbatched_align()` already streams each
    size-band bucket through the device under a 70%-free-memory budget with
    OOM-retry — **no global `K×N×M` tensor is ever built**
@@ -36,7 +36,7 @@ objects on a normal node. Two facts make this *easy* to fix rather than hard:
 2. **Alignment never needs the RDKit `Mol`.** The batched aligners read only
    numpy arrays off `ref_molec`/`fit_molec` (`atom_pos`, `surf_pos`, `surf_esp`,
    `partial_charges`, `_nonH_atoms_idx`, `pharm_types/ancs/vecs`, `radii`). Only
-   `esp_combo` touches `.mol` (for with-H centers), and even there the fast path
+   `vol_and_shape_esp` touches `.mol` (for with-H centers), and even there the fast path
    prefers a pre-cached tensor.
 
 Therefore the **only** missing piece is a *host-side* loop that (a) persists
@@ -97,7 +97,7 @@ class MoleculeProfile:
         self.pharm_ancs = pharm_ancs
         self.pharm_vecs = pharm_vecs
         self.num_surf_points = None if surf_pos is None else len(surf_pos)
-        self.centers_w_H = centers_w_H   # only for esp_combo
+        self.centers_w_H = centers_w_H   # only for vol_and_shape_esp
         self.mol = None
 
     def center_to(self, xyz_means):      # RDKit-free; only the arrays move
@@ -109,13 +109,13 @@ class MoleculeProfile:
     @classmethod
     def from_molecule(cls, m, *, modes=_VALID_MODES, id=None):   # _VALID_MODES = all 6
         """Extract exactly the arrays the requested modes need; drop the Mol."""
-        need_surf = bool({"surf", "esp", "esp_combo"} & set(modes))
-        need_chg  = bool({"esp", "vol_esp", "esp_combo"} & set(modes))
+        need_surf = bool({"surf", "surf_esp", "vol_and_shape_esp"} & set(modes))
+        need_chg  = bool({"surf_esp", "vol_esp", "vol_and_shape_esp"} & set(modes))
         need_ph   = "pharm" in modes
         return cls(
             atom_pos=m.atom_pos.astype("float32"),
             surf_pos=(m.surf_pos.astype("float32") if need_surf else None),
-            surf_esp=(m.surf_esp.astype("float32") if need_surf and "esp" in modes else None),
+            surf_esp=(m.surf_esp.astype("float32") if need_surf and "surf_esp" in modes else None),
             partial_charges=(m.partial_charges[m._nonH_atoms_idx].astype("float32")
                              if need_chg else None),
             pharm_types=(m.pharm_types if need_ph else None),
@@ -131,12 +131,12 @@ class MoleculeProfile:
   if `do_center=True`, the array-only `center_to` above covers it.
 - `vol_esp` reads `partial_charges[_nonH_atoms_idx]`; storing heavy-atom charges
   with an identity index returns them unchanged. ✅
-- `esp_combo` is the **only** mode that reads `.mol.GetConformer().GetPositions()`
+- `vol_and_shape_esp` is the **only** mode that reads `.mol.GetConformer().GetPositions()`
   (for with-H centers). `MoleculeProfile` supplies a tiny conformer **shim** so that
   call returns the stored `centers_w_H` — no real RDKit `Mol` needed. (Pre-seeding the
   aligner's `_ref_centers_w_H_t` tensor does **not** suffice: the aligner evaluates
   `p.ref_molec.mol.GetConformer().GetPositions()` *eagerly* as a call argument, so
-  `.mol` must respond to it.) All six modes — `vol/vol_esp/surf/esp/pharm/esp_combo` —
+  `.mol` must respond to it.) All six modes — `vol/vol_esp/surf/surf_esp/pharm/vol_and_shape_esp` —
   are supported RDKit-free.
 
 ### 3.2 `ProfileStore` — sharded, memory-mappable, on-disk profile store
@@ -154,7 +154,7 @@ library.fss/
 ├── shard_00000.npz        # one shard's molecules, concatenated:
 │                          #   atom_pos (Σnᵢ,3) + atom_off (n+1,)     ragged (CSR)
 │                          #   surf_pos (n,S,3), surf_esp (n,S)       fixed S
-│                          #   charges (+ all_off/nonH when with-H), radii, cwh  (esp_combo)
+│                          #   charges (+ all_off/nonH when with-H), radii, cwh  (vol_and_shape_esp)
 │                          #   pharm_types/ancs/vecs + pharm_off      ragged (CSR)
 │                          #   ids (n,)
 └── shard_00001.npz ...
@@ -197,8 +197,8 @@ Notes:
   screening runs `do_center=False` and stays fully RDKit-free. (The store builder
   centers once at write time.)
 - **Free padding win:** because `S` is constant, a surface shard slice
-  `surf_pos[a:b]` is *already* the `(K, S, 3)` shape the surf/esp kernels want —
-  surface/esp screening can feed the kernel with zero re-padding. Vol/pharm stay
+  `surf_pos[a:b]` is *already* the `(K, S, 3)` shape the surf/surf_esp kernels want —
+  surface/surf_esp screening can feed the kernel with zero re-padding. Vol/pharm stay
   ragged and pad per shard as today.
 
 ### 3.3 `screen()` — the high-level streaming driver
@@ -209,13 +209,13 @@ a memmapped file (1B float32 = 4 GB, fine on disk; transforms only kept for the
 top-K, since 1B×4×4 fp32 = 64 GB is too much to retain).
 
 ```python
-def screen(query, store, mode="esp", *, backend=None, do_center=None,
+def screen(query, store, mode="surf_esp", *, backend=None, do_center=None,
            top_k=1000, ndev=None, scores_out=None, alpha=None,
            progress=False, **align_kwargs):
     """Stream `store` past `query`, aligning each shard with `mode`, returning the
     top_k Hit(score, id, transform). backend=None -> auto ("triton" on CUDA, else
     "numba"). For a pre-centered store the query is centered once and profiles run
-    do_center=False; alpha auto-fills ALPHA(num_surf_points) for surf/esp. The rest
+    do_center=False; alpha auto-fills ALPHA(num_surf_points) for surf/surf_esp. The rest
     of align_kwargs (lam, num_repeats, similarity, ...) pass straight to
     align_with_<mode>."""
     heap = TopK(top_k)                                  # (score, id, transform)
@@ -248,7 +248,7 @@ from shepherd_score.score.constants import ALPHA
 # 1) BUILD THE STORE ONCE (parallel across the cluster; the expensive step —
 #    see MOLECULE_CONSTRUCTION_PROBLEM.md). Each worker writes its own shards.
 with ProfileStore.create("library.fss", num_surf_points=200,
-                         modes=("surf", "esp", "pharm"), dtype="float16") as store:
+                         modes=("surf", "surf_esp", "pharm"), dtype="float16") as store:
     for mol in library_rdkit_mols:                 # this worker's shard of the library
         m = Molecule(mol, num_surf_points=200, pharm_multi_vector=False)
         store.add(m)                               # arrays kept, RDKit Mol dropped
@@ -256,7 +256,7 @@ with ProfileStore.create("library.fss", num_surf_points=200,
 # 2) SCREEN (streamed; never holds the library in RAM)
 query = Molecule(query_mol, num_surf_points=200, pharm_multi_vector=False)
 store = ProfileStore.open("library.fss")            # one shard read at a time
-hits  = screen(query, store, mode="esp", alpha=ALPHA(200), lam=0.3,
+hits  = screen(query, store, mode="surf_esp", alpha=ALPHA(200), lam=0.3,
                num_repeats=50, backend="triton", ndev=4, top_k=1000)
 # hits: [Hit(score, id, transform), ...] sorted desc  (ndev>1 -> persistent shard pool)
 ```
@@ -289,7 +289,7 @@ scaling, band-bucketing, sub-batch memory safety, and every backend (`triton` /
 
 > **Update (shipped):** the three performance bottlenecks below are now implemented in
 > `screen.py`, beyond the original v1 loop. (1) A **fast direct path** for
-> `vol/surf/esp/pharm` on a pre-centered store loads each shard's fit arrays once as
+> `vol/surf/surf_esp/pharm` on a pre-centered store loads each shard's fit arrays once as
 > device tensors and feeds the batched aligner lightweight `_FastPair`s (fit = views,
 > ref = shared query) — no per-molecule `MoleculeProfile`/`MoleculePair`. (2)
 > **`screen_many(queries, ...)`** reads each shard once and aligns the whole query panel
@@ -310,12 +310,12 @@ scaling, band-bucketing, sub-batch memory safety, and every backend (`triton` /
 ## 6. Phased implementation plan
 
 *All steps below are implemented in [`shepherd_score/screen.py`](../shepherd_score/screen.py);
-this records the build/validation order. `esp_combo` (step 6) shipped via the conformer
+this records the build/validation order. `vol_and_shape_esp` (step 6) shipped via the conformer
 shim of §3.1.*
 
 1. **`MoleculeProfile` + duck-type test.** Build one from a real `Molecule`, wrap
    in `MoleculePair(query, profile, do_center=False)`, and assert
-   `MoleculePairBatch([...]).align_with_{vol,surf,esp,pharm}(backend="triton")`
+   `MoleculePairBatch([...]).align_with_{vol,surf,surf_esp,pharm}(backend="triton")`
    gives **bit-identical** scores to the all-`Molecule` path. This is the
    correctness gate; everything else is plumbing.
 2. **`ProfileStore` writer/reader** (sharded `.npy`, CSR offsets, fp16 flag,
@@ -323,7 +323,7 @@ shim of §3.1.*
 3. **`screen()` driver** with top-K sink + optional memmapped scores, single-GPU.
 4. **Wire `ndev>1`** through `align_multi_gpu` per shard; confirm scaling.
 5. **fp16 accuracy gate** (rank ρ / top-K overlap vs an fp32 store on a few-k set).
-6. **esp_combo extension**: store `centers_w_H` + pre-seed `_*_centers_w_H_t`.
+6. **vol_and_shape_esp extension**: store `centers_w_H` + pre-seed `_*_centers_w_H_t`.
 7. Docs + a `scripts/stream_screen.py` example mirroring `scripts/docking_screen.py`.
 
 ## 7. Constraints (hard requirements)

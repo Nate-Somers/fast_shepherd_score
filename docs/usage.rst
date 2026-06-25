@@ -166,18 +166,18 @@ Alignment using the :class:`shepherd_score.container.MoleculePair` class:
    # By default we use automatic differentiation via pytorch
    surf_points_aligned = mp.align_with_surf(ALPHA(mp.num_surf_points),
                                             num_repeats=50)
-   surf_points_esp_aligned = mp.align_with_esp(ALPHA(mp.num_surf_points),
+   surf_points_esp_aligned = mp.align_with_surf_esp(ALPHA(mp.num_surf_points),
                                                lam=0.3,
                                                num_repeats=50)
    pharm_pos_aligned, pharm_vec_aligned = mp.align_with_pharm(num_repeats=50)
 
    # Optimal scores and SE(3) transformation matrices are stored as attributes
-   # mp.sim_aligned_surf, mp.sim_aligned_esp, mp.sim_aligned_pharm
-   # mp.transform_surf, mp.transform_esp, mp.transform_pharm
+   # mp.sim_aligned_surf, mp.sim_aligned_surf_esp, mp.sim_aligned_pharm
+   # mp.transform_surf, mp.transform_surf_esp, mp.transform_pharm
 
    # Get a copy of the optimally aligned fit Molecule object
    transformed_fit_molec = mp.get_transformed_molecule(
-       se3_transform=mp.transform_surf  # or mp.transform_esp, mp.transform_pharm
+       se3_transform=mp.transform_surf  # or mp.transform_surf_esp, mp.transform_pharm
    )
 
 Acclerated alignment of multiple pairs using the :class:`shepherd_score.container.MoleculePairBatch` class:

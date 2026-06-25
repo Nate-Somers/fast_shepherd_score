@@ -25,6 +25,11 @@ behavior untouched.
   `Molecule` objects ≈ ~10 TB). It is **purely additive — zero edits to any existing
   file**. See [§2 Streaming](#streaming--out-of-core-screening-libraries-larger-than-ram)
   and [`docs/STREAMING_DESIGN.md`](docs/STREAMING_DESIGN.md).
+- **Mode rename (legacy preserved):** the two ESP alignment modes were renamed to clearer,
+  self-describing names — **`esp` → `surf_esp`** (surface-ESP-weighted surface alignment) and
+  **`esp_combo` → `vol_and_shape_esp`** (the ShaEP-style combined volume + shape + ESP scorer).
+  The old names keep working **everywhere** as aliases, so existing code and on-disk stores are
+  untouched. See [§ Mode rename](#mode-rename-esp--surf_esp-esp_combo--vol_and_shape_esp).
 - **Mesh-free smooth surfacer (opt-in):** a new `surface_method="smooth_sdf"` on `Molecule`
   builds the surface point cloud **without Open3D** — it projects sampled points onto a smooth-min
   implicit iso-surface that rounds the concave atom-border "crimps", keeping the surface smooth +
@@ -909,3 +914,38 @@ work — without losing overlap quality. Both are on by default; neither changes
   metric here: the multi-basin modes differ *per pair* between **any** two seed sets — even
   legacy-50 vs structured-50 — while the mean is flat, so per-pair reproduction is not a
   meaningful target.
+---
+
+## Mode rename: `esp` → `surf_esp`, `esp_combo` → `vol_and_shape_esp`
+
+Two alignment modes were given clearer, self-describing canonical names. The old names
+remain fully supported as **aliases** — this is a pure rename with **no behavior change**.
+
+| legacy name | canonical name | what it is |
+|---|---|---|
+| `esp` | `surf_esp` | surface-ESP-weighted surface alignment (ROCS-style shape on the surface point cloud, weighted by surface electrostatic potential) |
+| `esp_combo` | `vol_and_shape_esp` | ShaEP-style combined scorer: volume + shape + ESP |
+
+The rename is **canonical** (the new names are the real definitions) but **backward
+compatible at every layer**:
+
+- **Methods.** `MoleculePair` / `MoleculePairBatch` now define `align_with_surf_esp` and
+  `align_with_vol_and_shape_esp`; `align_with_esp` / `align_with_esp_combo` are kept as
+  aliases to them.
+- **Result attributes.** Results are written to `sim_aligned_surf_esp` / `transform_surf_esp`
+  and `sim_aligned_vol_and_shape_esp` / `transform_vol_and_shape_esp`. The legacy
+  `sim_aligned_esp` / `transform_esp` (and `…_esp_combo`) are **read/write properties** that
+  redirect to the canonical attributes, so old code reading them is unchanged.
+- **`screen()` / `ProfileStore`.** `mode="surf_esp"` / `mode="vol_and_shape_esp"` are
+  canonical; `mode="esp"` / `mode="esp_combo"` are normalized to them at every entry point.
+  Stores built with `modes=("…","esp","esp_combo")` still build and screen correctly, and
+  existing on-disk stores keep working.
+- **Batched aligners.** The free functions are `_align_batch_surf_esp` /
+  `_align_batch_vol_and_shape_esp` (with `_align_batch_esp` / `_align_batch_esp_combo`
+  aliases), and the multi-GPU / CPU-pool mode tables and `MultiGPUAligner.align(mode=…)`
+  accept both spellings.
+
+Not renamed (these are the underlying electrostatics, **not** the mode): the `surf_esp`
+surface-ESP array on `Molecule`, the ESP kernels/drivers (`accel/drivers/esp.py`,
+`accel/drivers/esp_combo.py`, `esp_triton.py`), the `esp_weight` parameter, and the separate
+`vol_esp` (volumetric-ESP) mode.
