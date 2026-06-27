@@ -10,6 +10,7 @@ from ..kernels.dispatch import (
     _batch_self_overlap, fused_surf_step_batch, _HAS_TRITON,
 )
 from ._common import batched_seeds_torch, _update_best
+from ._graphed import _GraphedFineBase, run_graphed, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 from typing import Optional
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -89,11 +90,8 @@ def _self_overlap_in_chunks(P_pad, N_real, alpha=0.81):
 # ~2.7x faster at batch 16, fading to ~1x by batch 256 (compute-bound). So it is
 # used ONLY for small P (where it helps and the per-shape buffers are cheap);
 # large P and any capture failure fall back to the eager loop. Disable with
-# FINE_CUDA_GRAPHS=0.
-_FINE_GRAPHS = os.environ.get("FINE_CUDA_GRAPHS", "1") != "0"
-_GRAPH_MAX_P = int(os.environ.get("FINE_GRAPH_MAX_P", 16000))   # ~batch<=320 (x50 seeds)
-_GRAPH_STEPS = int(os.environ.get("FINE_GRAPH_STEPS", 50))      # fixed steps; eager early-stops ~50
-_FINE_GRAPH_CACHE: dict = {}
+# FINE_CUDA_GRAPHS=0. The capture/replay machinery + env knobs (_FINE_GRAPHS,
+# _GRAPH_MAX_P, _GRAPH_STEPS) now live in ._graphed and are shared by all 7 modes.
 
 # Single-kernel fused fine step (overlap value+grad + score + best + Adam + renorm
 # in one launch/step, vs ~10 in the eager loop). Prototype behind a flag.
@@ -123,18 +121,19 @@ _ES_PATIENCE = (lambda v: int(v) if v else None)(os.environ.get("FINE_ES_PATIENC
 _ES_TOL = (lambda v: float(v) if v else None)(os.environ.get("FINE_ES_TOL"))
 
 
-class _GraphedFineSurf:
-    """Capture one in-place surf fine step into a CUDA graph; replay = N steps.
+class _GraphedFineSurf(_GraphedFineBase):
+    """Capture one in-place surf/vol fine step into a CUDA graph; replay = N steps.
 
     All loop-carried state (q/t, Adam moments, best_*) lives in persistent buffers
     updated in place; per-step temporaries use out= so there are no host syncs and
     no reallocation -- the requirements for graph capture. Inputs (A/B/seeds/...)
     are copied into the buffers before each replay, so one captured graph serves
-    every bucket of the same (N_pad, M_pad, P) shape.
+    every bucket of the same (N_pad, M_pad, P) shape. capture()/run() are inherited
+    from _GraphedFineBase.
     """
 
     def __init__(self, N_pad, M_pad, P, steps, alpha, lr, device):
-        self.steps = steps; self.alpha = float(alpha); self.lr = float(lr)
+        self.alpha = float(alpha); self.lr = float(lr)
         f = lambda *s: torch.empty(*s, device=device, dtype=torch.float32)
         self.A = f(P, N_pad, 3); self.B = f(P, M_pad, 3)
         self.Nr = torch.empty(P, device=device, dtype=torch.int32)
@@ -147,11 +146,17 @@ class _GraphedFineSurf:
         self.denom = f(P); self.d2 = f(P); self.score = f(P); self.scale = f(P)
         self.better = torch.empty(P, device=device, dtype=torch.bool)
         self.gq = f(P, 4); self.gt = f(P, 3)
-        self.graph = None
+        super().__init__(steps)
 
     def _step(self):
         VAB, dQ, dT = overlap_score_grad_se3_batch(
             self.A, self.B, self.q, self.t, alpha=self.alpha, N_real=self.Nr, M_real=self.Mr)
+        self._tanimoto_adam_tail(VAB, dQ, dT)
+
+    def _tanimoto_adam_tail(self, VAB, dQ, dT):
+        """Single-channel Tanimoto score + best-pose tracking + tangent-projected Adam, all
+        in-place into persistent buffers. Shared by surf/vol and the ESP subclass (whose
+        only difference is the fused shape+ESP overlap kernel that produces VAB/dQ/dT)."""
         torch.sub(self.norm, VAB, out=self.denom)
         torch.div(VAB, self.denom, out=self.score)
         torch.mul(self.denom, self.denom, out=self.d2)
@@ -176,33 +181,15 @@ class _GraphedFineSurf:
         self.mq.zero_(); self.vq.zero_(); self.mt.zero_(); self.vt.zero_()
         self.best.fill_(-float('inf')); self.bq.copy_(self.qs); self.bt.copy_(self.ts)
 
-    def capture(self, A, B, Nr, Mr, norm, qs, ts):
-        self._load(A, B, Nr, Mr, norm, qs, ts); self._reset()
-        s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):                       # warmup -> compile/autotune
-            for _ in range(3):
-                self._step()
-        torch.cuda.current_stream().wait_stream(s)
-        self._reset()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, capture_error_mode="thread_local"):
-            self._step()
-
-    def run(self, A, B, Nr, Mr, norm, qs, ts):
-        self._load(A, B, Nr, Mr, norm, qs, ts); self._reset()
-        for _ in range(self.steps):
-            self.graph.replay()
+    def _result(self):
         return self.best, self.bq, self.bt
 
 
 def _run_graphed_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps, N_pad, M_pad, P):
-    key = (A_k.device.index, N_pad, M_pad, P, steps, round(float(alpha), 4), round(float(lr), 5))
-    gf = _FINE_GRAPH_CACHE.get(key)
-    if gf is None:
-        gf = _GraphedFineSurf(N_pad, M_pad, P, steps, alpha, lr, A_k.device)
-        gf.capture(A_k, B_k, N_k, M_k, norm, q_seed, t_seed)
-        _FINE_GRAPH_CACHE[key] = gf
-    return gf.run(A_k, B_k, N_k, M_k, norm, q_seed, t_seed)
+    key = (A_k.device.index, "surf", N_pad, M_pad, P, steps, round(float(alpha), 4), round(float(lr), 5))
+    return run_graphed(
+        lambda: _GraphedFineSurf(N_pad, M_pad, P, steps, alpha, lr, A_k.device),
+        key, (A_k, B_k, N_k, M_k, norm, q_seed, t_seed))
 
 
 def _run_fused_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps_fine,

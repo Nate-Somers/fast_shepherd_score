@@ -20,6 +20,8 @@ from ._common import (
     apply_se3_transform,
     quaternion_to_rotation_matrix
 )
+from ._graphed import run_graphed, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
+from .shape import _GraphedFineSurf
 
 
 @torch.no_grad()
@@ -99,6 +101,39 @@ def _self_overlap_esp_chunks(P_pad, C_pad, N_real, alpha, lam):
             P_pad[s:e], C_pad[s:e], N_real[s:e], alpha, lam)
 
     return V_all
+
+
+class _GraphedFineEsp(_GraphedFineSurf):
+    """CUDA-graph fine loop for vol_esp/surf_esp. The ESP score is the SAME single-channel
+    Tanimoto as surf/vol -- the only difference is the overlap value VAB, produced by the
+    FUSED shape+ESP kernel (charges weight each Gaussian pair-term). So this reuses
+    _GraphedFineSurf's score/best/Adam tail verbatim and only swaps the overlap kernel,
+    adding persistent charge buffers (CA/CB) and the lam scalar."""
+
+    def __init__(self, N_pad, M_pad, P, steps, alpha, lam, lr, device):
+        self.lam = float(lam)
+        self.CA = torch.empty(P, N_pad, device=device, dtype=torch.float32)
+        self.CB = torch.empty(P, M_pad, device=device, dtype=torch.float32)
+        super().__init__(N_pad, M_pad, P, steps, alpha, lr, device)
+
+    def _step(self):
+        VAB, dQ, dT = overlap_score_grad_esp_se3_batch(
+            self.A, self.B, self.CA, self.CB, self.q, self.t,
+            alpha=self.alpha, lam=self.lam, N_real=self.Nr, M_real=self.Mr)
+        self._tanimoto_adam_tail(VAB, dQ, dT)
+
+    def _load(self, A, B, CA, CB, Nr, Mr, norm, qs, ts):
+        super()._load(A, B, Nr, Mr, norm, qs, ts)
+        self.CA.copy_(CA); self.CB.copy_(CB)
+
+
+def _run_graphed_esp(A_k, B_k, CA_k, CB_k, q_seed, t_seed, N_k, M_k, norm,
+                     alpha, lam, lr, steps, N_pad, M_pad, P):
+    key = (A_k.device.index, "esp", N_pad, M_pad, P, steps,
+           round(float(alpha), 4), round(float(lam), 6), round(float(lr), 5))
+    return run_graphed(
+        lambda: _GraphedFineEsp(N_pad, M_pad, P, steps, alpha, lam, lr, A_k.device),
+        key, (A_k, B_k, CA_k, CB_k, N_k, M_k, norm, q_seed, t_seed))
 
 
 def coarse_fine_esp_align_many(
@@ -236,50 +271,68 @@ def coarse_fine_esp_align_many(
     VBB_rep = VBB.repeat_interleave(P)
     VAA_plus_VBB = VAA_rep + VBB_rep
 
-    # Adam state
-    m_q = torch.zeros_like(q_k)
-    v_q = torch.zeros_like(q_k)
-    m_t = torch.zeros_like(t_k)
-    v_t = torch.zeros_like(t_k)
+    PK = q_k.shape[0]
+    best_score = best_q = best_t = None
 
-    best_score = torch.full((len(q_k),), -float('inf'), device=device)
-    best_q = q_k.clone()
-    best_t = t_k.clone()
+    # --- CUDA-graph fast path: capture one fine step, replay it min(steps_fine,_GRAPH_STEPS)
+    # times with ~zero per-step host launch overhead. vol_esp/surf_esp had NO graph path
+    # before -- greenfield. Gated to the launch-bound small/medium-P CUDA fp32 regime; large
+    # P / capture failure fall back to the eager loop below. See drivers/_graphed.
+    if (_FINE_GRAPHS and A_batch.is_cuda and PK <= _GRAPH_MAX_P
+            and A_batch.dtype == torch.float32):
+        try:
+            best_score, best_q, best_t = _run_graphed_esp(
+                A_k.contiguous(), B_k.contiguous(), CA_k.contiguous(), CB_k.contiguous(),
+                q_k, t_k, N_k, M_k, VAA_plus_VBB, alpha, lam, lr,
+                min(steps_fine, _GRAPH_STEPS), N_pad, M_pad, PK)
+        except Exception:
+            best_score = None                              # capture failed -> eager
 
-    # Early stopping state
-    prev_max_score = -float('inf')
-    no_improve_count = 0
+    if best_score is None:
+        # Adam state
+        m_q = torch.zeros_like(q_k)
+        v_q = torch.zeros_like(q_k)
+        m_t = torch.zeros_like(t_k)
+        v_t = torch.zeros_like(t_k)
 
-    for step in range(steps_fine):
-        VAB, dQ, dT = _overlap_in_chunks_esp(
-            A_k, B_k, CA_k, CB_k, q_k, t_k,
-            alpha=alpha, lam=lam, N_real=N_k, M_real=M_k)
+        best_score = torch.full((len(q_k),), -float('inf'), device=device)
+        best_q = q_k.clone()
+        best_t = t_k.clone()
 
-        denom = VAA_plus_VBB - VAB
-        score = VAB / denom
-        scale = VAA_plus_VBB / (denom * denom)
+        # Early stopping state
+        prev_max_score = -float('inf')
+        no_improve_count = 0
 
-        # Track best via torch.where (fixed-shape, sync-free; boolean
-        # index-assignment was measured slower due to a per-step device sync).
-        best_score, best_q, best_t = _fc._update_best(score, q_k, t_k, best_score, best_q, best_t)
+        for step in range(steps_fine):
+            VAB, dQ, dT = _overlap_in_chunks_esp(
+                A_k, B_k, CA_k, CB_k, q_k, t_k,
+                alpha=alpha, lam=lam, N_real=N_k, M_real=M_k)
 
-        # Early stopping check every 5 iterations to reduce GPU→CPU sync overhead
-        if step % 5 == 0:
-            current_max = best_score.max().item()
-            if current_max - prev_max_score < early_stop_tol:
-                no_improve_count += 1
-                if no_improve_count >= (_fc.ES_PATIENCE_OVERRIDE or early_stop_patience):
-                    break
-            else:
-                no_improve_count = 0
-                prev_max_score = current_max
+            denom = VAA_plus_VBB - VAB
+            score = VAB / denom
+            scale = VAA_plus_VBB / (denom * denom)
 
-        # Fused Adam with tangent-space projection (avoids intermediate dQ_tan tensor)
-        fused_adam_qt_with_tangent_proj(
-            q_k, t_k,
-            -dQ * scale.unsqueeze(1),
-            -dT * scale.unsqueeze(1),
-            m_q, v_q, m_t, v_t, lr)
+            # Track best via torch.where (fixed-shape, sync-free; boolean
+            # index-assignment was measured slower due to a per-step device sync).
+            best_score, best_q, best_t = _fc._update_best(score, q_k, t_k, best_score, best_q, best_t)
+
+            # Early stopping check every 5 iterations to reduce GPU→CPU sync overhead
+            if step % 5 == 0:
+                current_max = best_score.max().item()
+                if current_max - prev_max_score < early_stop_tol:
+                    no_improve_count += 1
+                    if no_improve_count >= (_fc.ES_PATIENCE_OVERRIDE or early_stop_patience):
+                        break
+                else:
+                    no_improve_count = 0
+                    prev_max_score = current_max
+
+            # Fused Adam with tangent-space projection (avoids intermediate dQ_tan tensor)
+            fused_adam_qt_with_tangent_proj(
+                q_k, t_k,
+                -dQ * scale.unsqueeze(1),
+                -dT * scale.unsqueeze(1),
+                m_q, v_q, m_t, v_t, lr)
 
     # ------------------------------------------------------------------
     # 5) Gather final results

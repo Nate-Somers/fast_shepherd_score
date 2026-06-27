@@ -31,7 +31,10 @@ from __future__ import annotations
 import torch
 from typing import Optional, Tuple
 
-from ..kernels.dispatch import fused_adam_qt_with_tangent_proj, pharm_color_score_grad_se3_batch
+from ..kernels.dispatch import (
+    fused_adam_qt_with_tangent_proj, pharm_color_score_grad_se3_batch,
+    overlap_score_grad_se3_batch,
+)
 from ._common import (
     check_gpu_available,
     batched_seeds_torch,
@@ -41,6 +44,7 @@ from ._common import (
     _update_best,
     ES_PATIENCE_OVERRIDE,
 )
+from ._graphed import _GraphedFineBase, run_graphed, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 from .esp_combo import _overlap_in_chunks_volumetric, _self_overlap_chunks
 from ...score.analytical_gradients._torch import build_lookup_tables
 
@@ -66,6 +70,105 @@ def _color_overlap(q: torch.Tensor,
         anchors_1, anchors_2, q, t, types_1, types_2,
         al, Ks, cats, N_real=N_real_ph, M_real=M_real_ph, NEED_GRAD=False)
     return O
+
+
+class _GraphedFineVolColor(_GraphedFineBase):
+    """CUDA-graph fine loop for vol_color -- the worst host-overhead mode (TWO value+grad
+    kernels per step: shape overlap_score_grad_se3_batch + directionless color
+    pharm_color_score_grad_se3_batch). Both run inside the captured step, so the per-step
+    host gap (and the second launch's host cost) disappears on replay. The combined-objective
+    gradient g = (1-w)*(-scale_s*dO_s/dq) + w*(-scale_c*dO_c/dq) is built in-place, mirroring
+    the eager loop exactly. Color lookup tables are a capture-time constant (directionless,
+    identical across buckets) so they are held by reference, not reloaded."""
+
+    def __init__(self, N_pad, M_pad, P_pad, Q_pad, P, steps, alpha, color_weight, lr,
+                 tables, device):
+        self.alpha = float(alpha); self.w = float(color_weight); self.lr = float(lr)
+        self.al, self.Ks, self.cats = tables               # constant directionless color tables
+        f = lambda *s: torch.empty(*s, device=device, dtype=torch.float32)
+        i = lambda *s: torch.empty(*s, device=device, dtype=torch.int32)
+        # shape + color input clouds (persistent; loaded per bucket)
+        self.A = f(P, N_pad, 3); self.B = f(P, M_pad, 3)
+        self.anc1 = f(P, P_pad, 3); self.anc2 = f(P, Q_pad, 3)
+        self.pt1 = i(P, P_pad); self.pt2 = i(P, Q_pad)     # pharm type indices (pre-cast int32)
+        self.Nr = i(P); self.Mr = i(P)                     # shape-atom counts
+        self.Npr = i(P); self.Mpr = i(P)                   # pharm-feature counts
+        self.norm_s = f(P); self.norm_c = f(P)             # shape / color self-overlap sums
+        # loop-carried state
+        self.qs = f(P, 4); self.ts = f(P, 3)
+        self.q = f(P, 4); self.t = f(P, 3)
+        self.mq = f(P, 4); self.vq = f(P, 4); self.mt = f(P, 3); self.vt = f(P, 3)
+        self.best = f(P); self.bq = f(P, 4); self.bt = f(P, 3)
+        # per-step temporaries (out= targets)
+        self.denom_s = f(P); self.d2s = f(P); self.shape_sim = f(P); self.scale_s = f(P)
+        self.denom_c = f(P); self.d2c = f(P); self.color_sim = f(P); self.scale_c = f(P)
+        self.score = f(P); self.better = torch.empty(P, device=device, dtype=torch.bool)
+        self.gq = f(P, 4); self.gt = f(P, 3); self.tmpq = f(P, 4); self.tmpt = f(P, 3)
+        super().__init__(steps)
+
+    def _step(self):
+        VAB, dQs, dTs = overlap_score_grad_se3_batch(
+            self.A, self.B, self.q, self.t, alpha=self.alpha, N_real=self.Nr, M_real=self.Mr)
+        O_c, dQc, dTc = pharm_color_score_grad_se3_batch(
+            self.anc1, self.anc2, self.q, self.t, self.pt1, self.pt2,
+            self.al, self.Ks, self.cats, N_real=self.Npr, M_real=self.Mpr, NEED_GRAD=True)
+        # shape Tanimoto + d/dO_s scale
+        torch.sub(self.norm_s, VAB, out=self.denom_s)
+        torch.div(VAB, self.denom_s, out=self.shape_sim)
+        torch.mul(self.denom_s, self.denom_s, out=self.d2s)
+        torch.div(self.norm_s, self.d2s, out=self.scale_s)
+        # color Tanimoto + d/dO_c scale
+        torch.sub(self.norm_c, O_c, out=self.denom_c)
+        torch.div(O_c, self.denom_c, out=self.color_sim)
+        torch.mul(self.denom_c, self.denom_c, out=self.d2c)
+        torch.div(self.norm_c, self.d2c, out=self.scale_c)
+        # score = (1-w)*shape_sim + w*color_sim
+        torch.mul(self.shape_sim, 1.0 - self.w, out=self.score)
+        self.score.add_(self.color_sim, alpha=self.w)
+        # best-pose tracking (in-place)
+        torch.gt(self.score, self.best, out=self.better)
+        torch.where(self.better, self.score, self.best, out=self.best)
+        bm = self.better.unsqueeze(1)
+        torch.where(bm, self.q, self.bq, out=self.bq)
+        torch.where(bm, self.t, self.bt, out=self.bt)
+        # combined descent grad g = (1-w)*(-scale_s*dQs) + w*(-scale_c*dQc)
+        torch.mul(dQs, self.scale_s.unsqueeze(1), out=self.gq); self.gq.mul_(-(1.0 - self.w))
+        torch.mul(dQc, self.scale_c.unsqueeze(1), out=self.tmpq); self.tmpq.mul_(-self.w)
+        self.gq.add_(self.tmpq)
+        torch.mul(dTs, self.scale_s.unsqueeze(1), out=self.gt); self.gt.mul_(-(1.0 - self.w))
+        torch.mul(dTc, self.scale_c.unsqueeze(1), out=self.tmpt); self.tmpt.mul_(-self.w)
+        self.gt.add_(self.tmpt)
+        fused_adam_qt_with_tangent_proj(self.q, self.t, self.gq, self.gt,
+                                        self.mq, self.vq, self.mt, self.vt, self.lr)
+
+    def _load(self, A, B, anc1, anc2, pt1, pt2, Nr, Mr, Npr, Mpr, norm_s, norm_c, qs, ts):
+        self.A.copy_(A); self.B.copy_(B)
+        self.anc1.copy_(anc1); self.anc2.copy_(anc2)
+        self.pt1.copy_(pt1.to(torch.int32)); self.pt2.copy_(pt2.to(torch.int32))
+        self.Nr.copy_(Nr.to(torch.int32)); self.Mr.copy_(Mr.to(torch.int32))
+        self.Npr.copy_(Npr.to(torch.int32)); self.Mpr.copy_(Mpr.to(torch.int32))
+        self.norm_s.copy_(norm_s); self.norm_c.copy_(norm_c)
+        self.qs.copy_(qs); self.ts.copy_(ts)
+
+    def _reset(self):
+        self.q.copy_(self.qs); self.t.copy_(self.ts)
+        self.mq.zero_(); self.vq.zero_(); self.mt.zero_(); self.vt.zero_()
+        self.best.fill_(-float('inf')); self.bq.copy_(self.qs); self.bt.copy_(self.ts)
+
+    def _result(self):
+        return self.best, self.bq, self.bt
+
+
+def _run_graphed_vol_color(A_k, B_k, anc1_k, anc2_k, pt1_k, pt2_k, N_k, M_k, Np_k, Mp_k,
+                           norm_s, norm_c, q_seed, t_seed, tables, alpha, color_weight, lr,
+                           steps, N_pad, M_pad, P_pad, Q_pad, P):
+    key = (A_k.device.index, "vol_color", N_pad, M_pad, P_pad, Q_pad, P, steps,
+           round(float(alpha), 4), round(float(color_weight), 4), round(float(lr), 5))
+    return run_graphed(
+        lambda: _GraphedFineVolColor(N_pad, M_pad, P_pad, Q_pad, P, steps, alpha,
+                                     color_weight, lr, tables, A_k.device),
+        key, (A_k, B_k, anc1_k, anc2_k, pt1_k, pt2_k, N_k, M_k, Np_k, Mp_k,
+              norm_s, norm_c, q_seed, t_seed))
 
 
 def coarse_fine_vol_color_align_many(
