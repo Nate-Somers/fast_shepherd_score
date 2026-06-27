@@ -27,6 +27,7 @@ from ._common import (
     _update_best,
     ES_PATIENCE_OVERRIDE,
 )
+from ._graphed import _GraphedFineBase, run_graphed, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 
 
 @torch.no_grad()
@@ -209,6 +210,103 @@ def _batch_esp_combo_score(
     score = esp_weight * electrostatic_sim + (1 - esp_weight) * volumetric_sim
 
     return score
+
+
+class _GraphedFineEspCombo(_GraphedFineBase):
+    """CUDA-graph fine loop for vol_and_surf_esp -- the heaviest mode (per step: 1 shape
+    value+grad kernel + 2 value-only ESP-comparison kernels + 2 SE(3) cloud transforms).
+    The pose is steered purely by the shape gradient (scaled by 1-esp_weight); the ESP
+    enters only the TRACKED combo score. The captured step mirrors the eager body verbatim
+    with the best-update made in-place. Per-step temporaries (transformed clouds, ESP sums,
+    score) are fresh, served from the graph's private pool on replay; only the loop-carried
+    state (q/t, Adam moments, best*) is persistent. esp_combo is compute-bound, so graphing
+    mainly UNIFIES the path; the eager loop remains the fallback for large P / capture
+    failure."""
+
+    def __init__(self, Nc, Mc, NwH, MwH, Ns, Ms, P, steps,
+                 alpha, lam, probe_radius, esp_weight, lr, device):
+        self.alpha = float(alpha); self.lam = float(lam)
+        self.probe_radius = float(probe_radius); self.esp_weight = float(esp_weight)
+        self.lr = float(lr)
+        f = lambda *s: torch.empty(*s, device=device, dtype=torch.float32)
+        i = lambda *s: torch.empty(*s, device=device, dtype=torch.int32)
+        self.cent1 = f(P, Nc, 3); self.cent2 = f(P, Mc, 3)           # shape centers
+        self.cwH1 = f(P, NwH, 3); self.cwH2 = f(P, MwH, 3)           # ESP atoms (w/ H)
+        self.pts1 = f(P, Ns, 3); self.pts2 = f(P, Ms, 3)            # surface points
+        self.pc1 = f(P, NwH); self.pc2 = f(P, MwH)                   # atom partial charges
+        self.ptc1 = f(P, Ns); self.ptc2 = f(P, Ms)                   # surface ESP per point
+        self.rad1 = f(P, NwH); self.rad2 = f(P, MwH)                 # vdW radii
+        self.Nr = i(P); self.Mr = i(P)                               # centers counts
+        self.Natoms = i(P); self.Matoms = i(P)                      # atom-w-H counts
+        self.Nsurf = i(P); self.Msurf = i(P)                        # surf-point counts
+        self.VAA = f(P); self.VBB = f(P); self.normsum = f(P)        # shape self-overlaps
+        self.qs = f(P, 4); self.ts = f(P, 3)
+        self.q = f(P, 4); self.t = f(P, 3)
+        self.mq = f(P, 4); self.vq = f(P, 4); self.mt = f(P, 3); self.vt = f(P, 3)
+        self.best = f(P); self.bq = f(P, 4); self.bt = f(P, 3)
+        super().__init__(steps)
+
+    def _step(self):
+        cwH2_t = apply_se3_transform(self.cwH2, self.q, self.t)
+        pts2_t = apply_se3_transform(self.pts2, self.q, self.t)
+        VAB, dQ, dT = overlap_score_grad_se3_batch(
+            self.cent1, self.cent2, self.q, self.t,
+            alpha=self.alpha, N_real=self.Nr, M_real=self.Mr)
+        score = _batch_esp_combo_score(
+            self.cwH1, cwH2_t, self.cent1, self.cent2, self.pts1, pts2_t,
+            self.pc1, self.pc2, self.ptc1, self.ptc2, self.rad1, self.rad2,
+            self.alpha, self.lam, self.probe_radius, self.esp_weight,
+            self.VAA, self.VBB, self.Nr, self.Mr, self.Natoms, self.Matoms,
+            self.Nsurf, self.Msurf, VAB_shape=VAB)
+        denom = self.normsum - VAB
+        scale = self.normsum / (denom * denom)
+        # best-pose tracking, in-place
+        better = score > self.best
+        torch.where(better, score, self.best, out=self.best)
+        bm = better.unsqueeze(1)
+        torch.where(bm, self.q, self.bq, out=self.bq)
+        torch.where(bm, self.t, self.bt, out=self.bt)
+        # pose steered by SHAPE gradient only, scaled by (1 - esp_weight)
+        g = (scale * (1.0 - self.esp_weight)).unsqueeze(1)
+        fused_adam_qt_with_tangent_proj(self.q, self.t, -dQ * g, -dT * g,
+                                        self.mq, self.vq, self.mt, self.vt, self.lr)
+
+    def _load(self, cent1, cent2, cwH1, cwH2, pts1, pts2, pc1, pc2, ptc1, ptc2, rad1, rad2,
+              Nr, Mr, Natoms, Matoms, Nsurf, Msurf, VAA, VBB, normsum, qs, ts):
+        self.cent1.copy_(cent1); self.cent2.copy_(cent2)
+        self.cwH1.copy_(cwH1); self.cwH2.copy_(cwH2)
+        self.pts1.copy_(pts1); self.pts2.copy_(pts2)
+        self.pc1.copy_(pc1); self.pc2.copy_(pc2)
+        self.ptc1.copy_(ptc1); self.ptc2.copy_(ptc2)
+        self.rad1.copy_(rad1); self.rad2.copy_(rad2)
+        self.Nr.copy_(Nr.to(torch.int32)); self.Mr.copy_(Mr.to(torch.int32))
+        self.Natoms.copy_(Natoms.to(torch.int32)); self.Matoms.copy_(Matoms.to(torch.int32))
+        self.Nsurf.copy_(Nsurf.to(torch.int32)); self.Msurf.copy_(Msurf.to(torch.int32))
+        self.VAA.copy_(VAA); self.VBB.copy_(VBB); self.normsum.copy_(normsum)
+        self.qs.copy_(qs); self.ts.copy_(ts)
+
+    def _reset(self):
+        self.q.copy_(self.qs); self.t.copy_(self.ts)
+        self.mq.zero_(); self.vq.zero_(); self.mt.zero_(); self.vt.zero_()
+        self.best.fill_(-float('inf')); self.bq.copy_(self.qs); self.bt.copy_(self.ts)
+
+    def _result(self):
+        return self.best, self.bq, self.bt
+
+
+def _run_graphed_esp_combo(cent1, cent2, cwH1, cwH2, pts1, pts2, pc1, pc2, ptc1, ptc2,
+                           rad1, rad2, Nr, Mr, Natoms, Matoms, Nsurf, Msurf, VAA, VBB,
+                           normsum, q_seed, t_seed, alpha, lam, probe_radius, esp_weight, lr,
+                           steps, Nc, Mc, NwH, MwH, Ns, Ms, P, es_patience=0, es_tol=1e-5):
+    key = (cent1.device.index, "esp_combo", Nc, Mc, NwH, MwH, Ns, Ms, P, steps,
+           round(float(alpha), 4), round(float(lam), 6), round(float(probe_radius), 4),
+           round(float(esp_weight), 4), round(float(lr), 5))
+    return run_graphed(
+        lambda: _GraphedFineEspCombo(Nc, Mc, NwH, MwH, Ns, Ms, P, steps,
+                                     alpha, lam, probe_radius, esp_weight, lr, cent1.device),
+        key, (cent1, cent2, cwH1, cwH2, pts1, pts2, pc1, pc2, ptc1, ptc2, rad1, rad2,
+              Nr, Mr, Natoms, Matoms, Nsurf, Msurf, VAA, VBB, normsum, q_seed, t_seed),
+        es_patience=es_patience, es_tol=es_tol)
 
 
 def coarse_fine_esp_combo_align_many(
@@ -395,7 +493,36 @@ def coarse_fine_esp_combo_align_many(
     prev_max_score = -float('inf')
     no_improve_count = 0
 
+    # --- CUDA-graph fast path: capture the (shape-grad + 2 value-only ESP + 2 SE3) step and
+    # replay it. esp_combo is compute-bound (heavy surface ESP), so this mainly UNIFIES the
+    # path; the eager loop below remains the fallback for large P / capture failure. ---
+    _graphed = None
+    if (_FINE_GRAPHS and centers_1_k.is_cuda and centers_1_k.dtype == torch.float32
+            and len(q_k) <= _GRAPH_MAX_P):
+        try:
+            _graphed = _run_graphed_esp_combo(
+                centers_1_k.contiguous(), centers_2_k.contiguous(),
+                centers_w_H_1_k.contiguous(), centers_w_H_2_k.contiguous(),
+                points_1_k.contiguous(), points_2_k.contiguous(),
+                partial_charges_1_k, partial_charges_2_k,
+                point_charges_1_k, point_charges_2_k, radii_1_k, radii_2_k,
+                N_k, M_k, N_atoms_k, M_atoms_k, N_surf_k, M_surf_k,
+                VAA_k, VBB_k, VAA_plus_VBB, q_k, t_k,
+                alpha, lam, probe_radius, esp_weight, lr,
+                # Run up to steps_fine; the blocked early-stop (patience=5, matching eager)
+                # caps it at ~the eager step count -- esp_combo converges slower than the
+                # other modes (heavier ESP landscape), so a fixed 50-step cap under-optimized.
+                steps_fine,
+                N_pad_centers, M_pad_centers, N_pad_w_H, M_pad_w_H, N_surf, M_surf, len(q_k),
+                es_patience=(ES_PATIENCE_OVERRIDE or early_stop_patience), es_tol=early_stop_tol)
+        except Exception:
+            _graphed = None
+    if _graphed is not None:
+        best_score, best_q, best_t = _graphed
+
     for step in range(steps_fine):
+        if _graphed is not None:
+            break
         # Use shape gradients for optimization (ESP doesn't affect SE3 derivatives much).
         # Transform the fit clouds the ESP comparison needs (atoms-with-H + surface
         # points of molecule 2). The shape-"centers" of molecule 2 are NOT transformed

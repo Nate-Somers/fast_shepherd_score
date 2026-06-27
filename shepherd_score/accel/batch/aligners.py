@@ -1119,17 +1119,36 @@ def _align_batch_vol_color(
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    buckets: dict[tuple[int, int, int, int, int], list[MoleculePair]] = {}
+    # COLLAPSED bucket key: shape bands only (n_cent, m_cent[, tc]) -- matching vol exactly.
+    # The pharmacophore-anchor counts are deliberately NOT in the key: their pad width is
+    # cheap and padded anchor slots are Dummy-typed (never scored) + masked out by
+    # N_real_pharm, so two pairs that share a shape bucket but differ in feature count stay
+    # together and their anchors are padded to the bucket's max feature band. This is
+    # RESULT-IDENTICAL (the masked color kernel ignores the extra slots) but collapses the
+    # bucket count back to the vol baseline -- vol_color was the worst-fragmented mode (its
+    # old 5-tuple key split each shape bucket by two orthogonal feature-count dims, starving
+    # each batched kernel of occupancy).
+    buckets: dict[tuple[int, int, int], list[MoleculePair]] = {}
     for p in pairs:
         n_cent = _band_key(p._ref_xyz_t.shape[0])
         m_cent = _band_key(p._fit_xyz_t.shape[0])
-        n_ph = _band_key(p._ref_pharm_ancs_t.shape[0])
-        m_ph = _band_key(p._fit_pharm_ancs_t.shape[0])
         tc = int(p._ref_xyz_t.shape[0]) if trans_init else 0
-        buckets.setdefault((n_cent, m_cent, n_ph, m_ph, tc), []).append(p)
+        buckets.setdefault((n_cent, m_cent, tc), []).append(p)
 
-    for (n_cent_pad, m_cent_pad, n_ph_pad, m_ph_pad, tc), bucket in buckets.items():
+    for (n_cent_pad, m_cent_pad, tc), bucket in buckets.items():
         K = len(bucket)
+
+        ref_cent_ts = [p._ref_xyz_t for p in bucket]
+        fit_cent_ts = [p._fit_xyz_t for p in bucket]
+        n_cent_list = [t.shape[0] for t in ref_cent_ts]
+        m_cent_list = [t.shape[0] for t in fit_cent_ts]
+        ref_anc_ts = [p._ref_pharm_ancs_t for p in bucket]
+        fit_anc_ts = [p._fit_pharm_ancs_t for p in bucket]
+        n_ph_list = [t.shape[0] for t in ref_anc_ts]
+        m_ph_list = [t.shape[0] for t in fit_anc_ts]
+        # Anchors are not keyed -> pad to this bucket's max feature band (>= every row's count).
+        n_ph_pad = _band_key(max(n_ph_list))
+        m_ph_pad = _band_key(max(m_ph_list))
 
         centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
         centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
@@ -1141,15 +1160,6 @@ def _align_batch_vol_color(
 
         N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
         M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
-
-        ref_cent_ts = [p._ref_xyz_t for p in bucket]
-        fit_cent_ts = [p._fit_xyz_t for p in bucket]
-        n_cent_list = [t.shape[0] for t in ref_cent_ts]
-        m_cent_list = [t.shape[0] for t in fit_cent_ts]
-        ref_anc_ts = [p._ref_pharm_ancs_t for p in bucket]
-        fit_anc_ts = [p._fit_pharm_ancs_t for p in bucket]
-        n_ph_list = [t.shape[0] for t in ref_anc_ts]
-        m_ph_list = [t.shape[0] for t in fit_anc_ts]
 
         N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
         M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))

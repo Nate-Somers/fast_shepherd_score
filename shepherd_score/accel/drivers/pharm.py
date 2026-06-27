@@ -13,6 +13,7 @@ from .pharm_overlap import (
 # (pharmacophore_overlap_triton, imported above, is pure PyTorch and needs no dispatch.)
 from ..kernels.dispatch import fused_adam_qt, pharm_score_grad_se3_batch, pharm_grad_dq_se3_batch
 from ...score.analytical_gradients._torch import build_lookup_tables
+from ._graphed import _GraphedFineBase, run_graphed, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 from . import _common as _fc
 from ._common import (
     check_gpu_available,
@@ -37,6 +38,86 @@ from ...score.analytical_gradients import (
 )
 
 _PHARM_SIGMA_MAP = {'tversky': 0.95, 'tversky_ref': 1.0, 'tversky_fit': 0.05}
+
+
+class _GraphedFinePharm(_GraphedFineBase):
+    """CUDA-graph fine loop for pharm (directional pharmacophore, default kernel + tanimoto
+    path). The captured step mirrors the eager use_kernel branch verbatim -- unit-quaternion
+    renormalize -> directional pharm_grad_dq_se3_batch (in-register dO/dq) -> tanimoto
+    score+scale -> normalization Jacobian (unit->raw quat) -> in-place best tracking ->
+    explicit tangent projection -> fused_adam_qt (no internal projection). Per-step
+    temporaries are fresh (served from the graph's private pool on replay); only the
+    loop-carried state (q/t, Adam moments, best*) is persistent. The lookup tables (al/Ks/cats)
+    and the pose-invariant self-overlap sum (VAA_an+VBB_an) are capture-time constants.
+
+    Only extended_points=False + similarity='tanimoto' is graphed; tversky and the
+    extended/padded-autograd paths keep the eager loop."""
+
+    def __init__(self, N_pad, M_pad, P, steps, lr, tables, device):
+        self.lr = float(lr)
+        self.al, self.Ks, self.cats = tables
+        f = lambda *s: torch.empty(*s, device=device, dtype=torch.float32)
+        i = lambda *s: torch.empty(*s, device=device, dtype=torch.int32)
+        self.anc1 = f(P, N_pad, 3); self.anc2 = f(P, M_pad, 3)
+        self.vec1 = f(P, N_pad, 3); self.vec2 = f(P, M_pad, 3)
+        self.types1 = i(P, N_pad); self.types2 = i(P, M_pad)
+        self.Nr = i(P); self.Mr = i(P)
+        self.norm = f(P)                                   # VAA_an + VBB_an (self-overlap sum)
+        self.qs = f(P, 4); self.ts = f(P, 3)
+        self.q = f(P, 4); self.t = f(P, 3)
+        self.mq = f(P, 4); self.vq = f(P, 4); self.mt = f(P, 3); self.vt = f(P, 3)
+        self.best = f(P); self.bq = f(P, 4); self.bt = f(P, 3)
+        super().__init__(steps)
+
+    def _step(self):
+        q_unit = torch.nn.functional.normalize(self.q, dim=1)
+        O_AB, dQ_raw, dT_raw = pharm_grad_dq_se3_batch(
+            q_unit, self.t, self.types1, self.types2, self.anc1, self.anc2,
+            self.vec1, self.vec2, self.al, self.Ks, self.cats,
+            N_real=self.Nr, M_real=self.Mr)
+        denom = self.norm - O_AB                           # (VAA_an+VBB_an) - O_AB
+        score = O_AB / denom                               # tanimoto
+        scale = -self.norm / (denom * denom)               # d(-tanimoto)/dO_AB
+        sgrad_q_unit = scale.unsqueeze(1) * dQ_raw
+        sgrad_t = scale.unsqueeze(1) * dT_raw
+        qn = self.q.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        dQ = (sgrad_q_unit - q_unit * (q_unit * sgrad_q_unit).sum(1, keepdim=True)) / qn
+        # best-pose tracking, IN-PLACE (the one structural change from the eager loop, whose
+        # functional torch.where would rebind the persistent buffers and break replay).
+        better = score > self.best
+        torch.where(better, score, self.best, out=self.best)
+        bm = better.unsqueeze(1)
+        torch.where(bm, self.q, self.bq, out=self.bq)
+        torch.where(bm, self.t, self.bt, out=self.bt)
+        # explicit tangent-space projection of dQ, then fused Adam (no internal projection)
+        radial = (dQ * self.q).sum(dim=1, keepdim=True)
+        dQ_tan = dQ - self.q * radial
+        fused_adam_qt(self.q, self.t, dQ_tan, sgrad_t, self.mq, self.vq, self.mt, self.vt, self.lr)
+
+    def _load(self, anc1, anc2, vec1, vec2, types1, types2, Nr, Mr, norm, qs, ts):
+        self.anc1.copy_(anc1); self.anc2.copy_(anc2)
+        self.vec1.copy_(vec1); self.vec2.copy_(vec2)
+        self.types1.copy_(types1.to(torch.int32)); self.types2.copy_(types2.to(torch.int32))
+        self.Nr.copy_(Nr.to(torch.int32)); self.Mr.copy_(Mr.to(torch.int32))
+        self.norm.copy_(norm); self.qs.copy_(qs); self.ts.copy_(ts)
+
+    def _reset(self):
+        self.q.copy_(self.qs); self.t.copy_(self.ts)
+        self.mq.zero_(); self.vq.zero_(); self.mt.zero_(); self.vt.zero_()
+        self.best.fill_(-float('inf')); self.bq.copy_(self.qs); self.bt.copy_(self.ts)
+
+    def _result(self):
+        return self.best, self.bq, self.bt
+
+
+def _run_graphed_pharm(anc1_k, anc2_k, vec1_k, vec2_k, types1_k, types2_k, N_k, M_k, norm,
+                       q_seed, t_seed, tables, lr, steps, N_pad, M_pad, P,
+                       es_patience=0, es_tol=1e-5):
+    key = (anc1_k.device.index, "pharm", N_pad, M_pad, P, steps, round(float(lr), 5))
+    return run_graphed(
+        lambda: _GraphedFinePharm(N_pad, M_pad, P, steps, lr, tables, anc1_k.device),
+        key, (anc1_k, anc2_k, vec1_k, vec2_k, types1_k, types2_k, N_k, M_k, norm, q_seed, t_seed),
+        es_patience=es_patience, es_tol=es_tol)
 
 
 def coarse_fine_pharm_align_many(
@@ -271,7 +352,28 @@ def coarse_fine_pharm_align_many(
                 extended_points=extended_points, only_extended=only_extended,
             )
 
+    # --- CUDA-graph fast path: capture one fine step, replay it. Only the default kernel +
+    # tanimoto branch is graphed (extended_points/tversky/padded-autograd keep the eager
+    # loop). Greenfield (no prior graph path). See drivers/_graphed. ---
+    _graphed = None
+    if (_FINE_GRAPHS and use_kernel and similarity == 'tanimoto'
+            and anchors_1_k.is_cuda and anchors_1_k.dtype == torch.float32
+            and anchors_1_k.shape[0] <= _GRAPH_MAX_P):
+        try:
+            _graphed = _run_graphed_pharm(
+                anchors_1_k.contiguous(), anchors_2_k.contiguous(),
+                vectors_1_k.contiguous(), vectors_2_k.contiguous(),
+                types_1_k, types_2_k, N_k, M_k, VAA_an + VBB_an, q_param, t_param,
+                _pk_tables, lr, steps_fine, N_pad, M_pad, anchors_1_k.shape[0],
+                es_patience=(_fc.ES_PATIENCE_OVERRIDE or early_stop_patience), es_tol=early_stop_tol)
+        except Exception:
+            _graphed = None
+    if _graphed is not None:
+        best_score, best_q, best_t = _graphed
+
     for step in range(steps_fine):
+        if _graphed is not None:
+            break
         if use_analytical:
             # One fused value+grad pass, no autograd graph, no per-step host sync.
             q_unit = torch.nn.functional.normalize(q_param, dim=1)

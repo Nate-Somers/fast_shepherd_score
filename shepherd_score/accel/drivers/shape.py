@@ -185,11 +185,13 @@ class _GraphedFineSurf(_GraphedFineBase):
         return self.best, self.bq, self.bt
 
 
-def _run_graphed_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps, N_pad, M_pad, P):
+def _run_graphed_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps, N_pad, M_pad, P,
+                      es_patience=0, es_tol=1e-5):
     key = (A_k.device.index, "surf", N_pad, M_pad, P, steps, round(float(alpha), 4), round(float(lr), 5))
     return run_graphed(
         lambda: _GraphedFineSurf(N_pad, M_pad, P, steps, alpha, lr, A_k.device),
-        key, (A_k, B_k, N_k, M_k, norm, q_seed, t_seed))
+        key, (A_k, B_k, N_k, M_k, norm, q_seed, t_seed),
+        es_patience=es_patience, es_tol=es_tol)
 
 
 def _run_fused_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps_fine,
@@ -327,7 +329,9 @@ def coarse_fine_align_many(
         try:
             best_score, best_q, best_t = _run_graphed_fine(
                 A_k.contiguous(), B_k.contiguous(), q_seed, t_seed, N_k, M_k,
-                VAA_plus_VBB, alpha, lr, min(steps_fine, _GRAPH_STEPS), N_pad, M_pad, P)
+                VAA_plus_VBB, alpha, lr, steps_fine, N_pad, M_pad, P,
+                es_patience=(_ES_PATIENCE if _ES_PATIENCE is not None else early_stop_patience),
+                es_tol=(_ES_TOL if _ES_TOL is not None else early_stop_tol))
         except Exception:
             best_score = None                              # capture failed -> eager
 

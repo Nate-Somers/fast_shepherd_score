@@ -161,14 +161,15 @@ class _GraphedFineVolColor(_GraphedFineBase):
 
 def _run_graphed_vol_color(A_k, B_k, anc1_k, anc2_k, pt1_k, pt2_k, N_k, M_k, Np_k, Mp_k,
                            norm_s, norm_c, q_seed, t_seed, tables, alpha, color_weight, lr,
-                           steps, N_pad, M_pad, P_pad, Q_pad, P):
+                           steps, N_pad, M_pad, P_pad, Q_pad, P, es_patience=0, es_tol=1e-5):
     key = (A_k.device.index, "vol_color", N_pad, M_pad, P_pad, Q_pad, P, steps,
            round(float(alpha), 4), round(float(color_weight), 4), round(float(lr), 5))
     return run_graphed(
         lambda: _GraphedFineVolColor(N_pad, M_pad, P_pad, Q_pad, P, steps, alpha,
                                      color_weight, lr, tables, A_k.device),
         key, (A_k, B_k, anc1_k, anc2_k, pt1_k, pt2_k, N_k, M_k, Np_k, Mp_k,
-              norm_s, norm_c, q_seed, t_seed))
+              norm_s, norm_c, q_seed, t_seed),
+        es_patience=es_patience, es_tol=es_tol)
 
 
 def coarse_fine_vol_color_align_many(
@@ -304,55 +305,76 @@ def coarse_fine_vol_color_align_many(
                            tables, Mp_k, Mp_k)
     VAA_c_plus_VBB_c = VAA_c + VBB_c
 
-    m_q = torch.zeros_like(q_k); v_q = torch.zeros_like(q_k)
-    m_t = torch.zeros_like(t_k); v_t = torch.zeros_like(t_k)
+    best_score = best_q = best_t = None
 
-    best_score = torch.full((PK,), -float('inf'), device=device)
-    best_q = q_k.clone()
-    best_t = t_k.clone()
+    # --- CUDA-graph fast path: capture the 2-kernel (shape+color) step, replay it. This is
+    # the worst host-overhead mode (2 launches/step); graphing removes the per-step host gap.
+    # Gated to the launch-bound small/medium-P CUDA fp32 regime (large P / capture failure
+    # fall back to the eager loop below). See drivers/_graphed.
+    if (_FINE_GRAPHS and centers_1_k.is_cuda and PK <= _GRAPH_MAX_P
+            and centers_1_k.dtype == torch.float32):
+        try:
+            best_score, best_q, best_t = _run_graphed_vol_color(
+                centers_1_k.contiguous(), centers_2_k.contiguous(),
+                anchors_1_k.contiguous(), anchors_2_k.contiguous(),
+                ptype_1_k, ptype_2_k, N_k, M_k, Np_k, Mp_k,
+                VAA_plus_VBB, VAA_c_plus_VBB_c, q_k, t_k,
+                (al, Ks, cats), alpha, color_weight, lr,
+                steps_fine, N_pad_cent, M_pad_cent, P_pad, Q_pad, PK,
+                es_patience=early_stop_patience, es_tol=early_stop_tol)
+        except Exception:
+            best_score = None                              # capture failed -> eager
 
-    prev_max_score = -float('inf')
-    no_improve_count = 0
+    if best_score is None:
+        m_q = torch.zeros_like(q_k); v_q = torch.zeros_like(q_k)
+        m_t = torch.zeros_like(t_k); v_t = torch.zeros_like(t_k)
 
-    for step in range(steps_fine):
-        # --- Shape: value + quaternion gradient (fused kernel) ---
-        VAB, dQ_s, dT_s = _overlap_in_chunks_volumetric(
-            centers_1_k, centers_2_k, q_k, t_k, alpha=alpha, N_real=N_k, M_real=M_k)
-        denom_s = VAA_plus_VBB - VAB
-        shape_sim = VAB / denom_s
-        scale_s = (VAA_plus_VBB / (denom_s * denom_s)).unsqueeze(1)   # d shape_T / d O_s
+        best_score = torch.full((PK,), -float('inf'), device=device)
+        best_q = q_k.clone()
+        best_t = t_k.clone()
 
-        # --- Color: value + QUATERNION gradient directly from the fused color kernel ---
-        # (dQ_c = dO_c/dq, same convention as the shape kernel; no R->q projection tail)
-        O_c, dQ_c, dT_c = pharm_color_score_grad_se3_batch(
-            anchors_1_k, anchors_2_k, q_k, t_k, ptype_1_k, ptype_2_k,
-            al, Ks, cats, N_real=Np_k, M_real=Mp_k, NEED_GRAD=True)
-        denom_c = VAA_c_plus_VBB_c - O_c
-        color_sim = O_c / denom_c
-        scale_c = (VAA_c_plus_VBB_c / (denom_c * denom_c)).unsqueeze(1)   # d color_T / d O_c
+        prev_max_score = -float('inf')
+        no_improve_count = 0
 
-        score = (1.0 - color_weight) * shape_sim + color_weight * color_sim
+        for step in range(steps_fine):
+            # --- Shape: value + quaternion gradient (fused kernel) ---
+            VAB, dQ_s, dT_s = _overlap_in_chunks_volumetric(
+                centers_1_k, centers_2_k, q_k, t_k, alpha=alpha, N_real=N_k, M_real=M_k)
+            denom_s = VAA_plus_VBB - VAB
+            shape_sim = VAB / denom_s
+            scale_s = (VAA_plus_VBB / (denom_s * denom_s)).unsqueeze(1)   # d shape_T / d O_s
 
-        # --- Combined descent gradient: (1-w)*(-scale_s*dQ_s) + w*(-scale_c*dQ_c) ---
-        # Both kernels emit dO/dq in the same quaternion space (validated vs autograd to ~1e-16);
-        # -scale*dO/dq = -d(Tanimoto)/dq is the per-channel descent gradient.
-        g_q = (1.0 - color_weight) * (-scale_s * dQ_s) + color_weight * (-scale_c * dQ_c)
-        g_t = (1.0 - color_weight) * (-scale_s * dT_s) + color_weight * (-scale_c * dT_c)
+            # --- Color: value + QUATERNION gradient directly from the fused color kernel ---
+            # (dQ_c = dO_c/dq, same convention as the shape kernel; no R->q projection tail)
+            O_c, dQ_c, dT_c = pharm_color_score_grad_se3_batch(
+                anchors_1_k, anchors_2_k, q_k, t_k, ptype_1_k, ptype_2_k,
+                al, Ks, cats, N_real=Np_k, M_real=Mp_k, NEED_GRAD=True)
+            denom_c = VAA_c_plus_VBB_c - O_c
+            color_sim = O_c / denom_c
+            scale_c = (VAA_c_plus_VBB_c / (denom_c * denom_c)).unsqueeze(1)   # d color_T / d O_c
 
-        best_score, best_q, best_t = _update_best(score, q_k, t_k, best_score, best_q, best_t)
+            score = (1.0 - color_weight) * shape_sim + color_weight * color_sim
 
-        if step % 5 == 0:
-            current_max = best_score.max().item()
-            if current_max - prev_max_score < early_stop_tol:
-                no_improve_count += 1
-                if no_improve_count >= early_stop_patience:
-                    break
-            else:
-                no_improve_count = 0
-                prev_max_score = current_max
+            # --- Combined descent gradient: (1-w)*(-scale_s*dQ_s) + w*(-scale_c*dQ_c) ---
+            # Both kernels emit dO/dq in the same quaternion space (validated vs autograd to ~1e-16);
+            # -scale*dO/dq = -d(Tanimoto)/dq is the per-channel descent gradient.
+            g_q = (1.0 - color_weight) * (-scale_s * dQ_s) + color_weight * (-scale_c * dQ_c)
+            g_t = (1.0 - color_weight) * (-scale_s * dT_s) + color_weight * (-scale_c * dT_c)
 
-        fused_adam_qt_with_tangent_proj(
-            q_k, t_k, g_q, g_t, m_q, v_q, m_t, v_t, lr)
+            best_score, best_q, best_t = _update_best(score, q_k, t_k, best_score, best_q, best_t)
+
+            if step % 5 == 0:
+                current_max = best_score.max().item()
+                if current_max - prev_max_score < early_stop_tol:
+                    no_improve_count += 1
+                    if no_improve_count >= early_stop_patience:
+                        break
+                else:
+                    no_improve_count = 0
+                    prev_max_score = current_max
+
+            fused_adam_qt_with_tangent_proj(
+                q_k, t_k, g_q, g_t, m_q, v_q, m_t, v_t, lr)
 
     final_score = best_score.view(BATCH, P)
     best = final_score.argmax(dim=1)

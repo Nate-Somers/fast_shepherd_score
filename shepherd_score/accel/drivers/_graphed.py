@@ -38,9 +38,17 @@ _FINE_GRAPHS = os.environ.get("FINE_CUDA_GRAPHS", "1") != "0"
 # compute-bound there, so the graph stops helping) UNLESS the mode opts into chunked replay
 # via run_graphed_chunked (the launch-bound modes, where it keeps helping at large batch).
 _GRAPH_MAX_P = int(os.environ.get("FINE_GRAPH_MAX_P", 16000))
-# Fixed replay count. The eager loop early-stops ~50 steps on the fast-converging benchmark;
-# a fixed-50 capture is parity-safe for surf/vol. Slower modes may raise this (validated).
+# Fixed replay cap when early-stop is disabled. Otherwise the graph replays UP TO steps_fine
+# and stops early (see below), so this is mostly legacy.
 _GRAPH_STEPS = int(os.environ.get("FINE_GRAPH_STEPS", 50))
+# Blocked early-stop for the replay loop: check best.max() every _GRAPH_ES_BLOCK replays
+# (one host sync per block, NOT per step) and stop on the same patience/tol schedule as the
+# eager loop. This is essential -- without it the graph runs a FIXED step count and OVER-RUNS
+# vs the eager early-stop, which regresses the COMPUTE-bound modes (surf, esp_combo, pharm at
+# large batch) where the extra steps cost real kernel time. With it, the graph runs ~the same
+# number of steps as eager, so the launch-bound modes keep their big win and the compute-bound
+# modes stop regressing. Set _GRAPH_ES_BLOCK=0 to disable (fixed-step replay).
+_GRAPH_ES_BLOCK = int(os.environ.get("FINE_GRAPH_ES_BLOCK", 5))
 
 # Process-wide cache of captured graphs, keyed by (device, mode, shapes, P, steps, params).
 _FINE_GRAPH_CACHE: dict = {}
@@ -66,6 +74,11 @@ class _GraphedFineBase:
     def __init__(self, steps: int):
         self.steps = int(steps)
         self.graph = None
+        # Blocked early-stop schedule (set by run_graphed from the driver's eager params).
+        # es_patience == 0 -> disabled (fixed-step replay).
+        self.es_patience = 0
+        self.es_tol = 1e-5
+        self.es_block = _GRAPH_ES_BLOCK
 
     # --- subclass hooks (no-ops here so a mis-specified subclass fails loudly) ---
     def _step(self):        raise NotImplementedError
@@ -87,23 +100,52 @@ class _GraphedFineBase:
             self._step()
 
     def run(self, *inputs):
-        """Load this bucket, reset loop state, replay the captured step ``steps`` times."""
+        """Load this bucket, reset loop state, replay the captured step (with blocked
+        early-stop when enabled), and return the best pose."""
         self._load(*inputs); self._reset()
-        for _ in range(self.steps):
+        if self.es_patience and self.es_block:
+            # Mirror the eager early-stop schedule EXACTLY. Eager checks best.max() at steps
+            # 0, 5, 10, ... and seeds its baseline `prev` with the STEP-0 value (the best of
+            # the seed poses). best is max-over-past-poses, so after one replay it equals
+            # eager's step-0 best. So: replay one step, seed `prev`, then check every es_block
+            # replays. Matching the *schedule* (not just patience/tol) is essential -- seeding
+            # `prev` a block late made the graph stop ~one block early, which regressed
+            # slow-converging surf_esp by ~1%. With this, the graph stops at the same step as
+            # eager, so best is bit-equivalent.
             self.graph.replay()
+            done = 1
+            prev = self.best.max().item(); no_improve = 0
+            while done < self.steps:
+                k = min(self.es_block, self.steps - done)
+                for _ in range(k):
+                    self.graph.replay()
+                done += k
+                cur = self.best.max().item()           # one host sync per block, not per step
+                if cur - prev < self.es_tol:
+                    no_improve += 1
+                    if no_improve >= self.es_patience:
+                        break
+                else:
+                    no_improve = 0; prev = cur
+        else:
+            for _ in range(self.steps):
+                self.graph.replay()
         return self._result()
 
 
-def run_graphed(make, key, inputs):
+def run_graphed(make, key, inputs, *, es_patience=0, es_tol=1e-5):
     """Fetch (or build+capture) the graph for ``key`` and run this bucket through it.
 
     ``make`` is a zero-arg factory for the subclass instance (called only on cache miss);
     ``inputs`` is the tuple forwarded to ``capture``/``run`` (and thence ``_load``). One
     captured graph serves every bucket of the same key (same shapes/P/steps/params).
+    ``es_patience``/``es_tol`` set the replay-loop blocked early-stop to match the driver's
+    eager early-stop (0 -> run a fixed ``steps`` replays).
     """
     gf = _FINE_GRAPH_CACHE.get(key)
     if gf is None:
         gf = make()
+        gf.es_patience = int(es_patience); gf.es_tol = float(es_tol)
         gf.capture(*inputs)
         _FINE_GRAPH_CACHE[key] = gf
     return gf.run(*inputs)

@@ -128,12 +128,13 @@ class _GraphedFineEsp(_GraphedFineSurf):
 
 
 def _run_graphed_esp(A_k, B_k, CA_k, CB_k, q_seed, t_seed, N_k, M_k, norm,
-                     alpha, lam, lr, steps, N_pad, M_pad, P):
+                     alpha, lam, lr, steps, N_pad, M_pad, P, es_patience=0, es_tol=1e-5):
     key = (A_k.device.index, "esp", N_pad, M_pad, P, steps,
            round(float(alpha), 4), round(float(lam), 6), round(float(lr), 5))
     return run_graphed(
         lambda: _GraphedFineEsp(N_pad, M_pad, P, steps, alpha, lam, lr, A_k.device),
-        key, (A_k, B_k, CA_k, CB_k, N_k, M_k, norm, q_seed, t_seed))
+        key, (A_k, B_k, CA_k, CB_k, N_k, M_k, norm, q_seed, t_seed),
+        es_patience=es_patience, es_tol=es_tol)
 
 
 def coarse_fine_esp_align_many(
@@ -284,7 +285,8 @@ def coarse_fine_esp_align_many(
             best_score, best_q, best_t = _run_graphed_esp(
                 A_k.contiguous(), B_k.contiguous(), CA_k.contiguous(), CB_k.contiguous(),
                 q_k, t_k, N_k, M_k, VAA_plus_VBB, alpha, lam, lr,
-                min(steps_fine, _GRAPH_STEPS), N_pad, M_pad, PK)
+                steps_fine, N_pad, M_pad, PK,
+                es_patience=(_fc.ES_PATIENCE_OVERRIDE or early_stop_patience), es_tol=early_stop_tol)
         except Exception:
             best_score = None                              # capture failed -> eager
 

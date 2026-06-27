@@ -23,7 +23,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 _ATTR = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf", "esp": "sim_aligned_esp",
-         "pharm": "sim_aligned_pharm", "vol_color": "sim_aligned_vol_color"}
+         "pharm": "sim_aligned_pharm", "vol_color": "sim_aligned_vol_color",
+         "vol_and_surf_esp": "sim_aligned_vol_and_surf_esp"}
 _SMI = ["CC(=O)Oc1ccccc1C(=O)O", "CC(C)Cc1ccc(cc1)C(C)C(=O)O", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
         "COc1ccc2cc(ccc2c1)C(C)C(=O)O", "Oc1ccccc1", "CC(=O)Nc1ccc(O)cc1", "OC(=O)c1ccccc1O",
         "CC(=O)CC(c1ccccc1)c1c(O)c2ccccc2oc1=O", "O(CCN(C)C)C(c1ccccc1)c1ccccc1",
@@ -64,6 +65,7 @@ def _align(batch, mode):
     elif mode == "esp": b.align_with_esp(alpha=0.81, lam=0.3, backend="triton", max_num_steps=100)
     elif mode == "pharm": b.align_with_pharm(backend="triton", max_num_steps=100)
     elif mode == "vol_color": b.align_with_vol_color(color_weight=0.5, backend="triton", max_num_steps=100)
+    elif mode == "vol_and_surf_esp": b.align_with_vol_and_surf_esp(alpha=0.81, backend="triton", max_num_steps=100)
     return np.array([float(getattr(p, _ATTR[mode])) for p in batch])
 
 
