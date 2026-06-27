@@ -58,6 +58,52 @@ def _seeds_for(mode: str) -> int:
     return _NUM_SEEDS if _NUM_SEEDS else _MODE_SEEDS.get(mode, 50)
 
 
+def _batch_upload(pairs, attr, src_fn, dtype, device):
+    """Set ``p.<attr>`` for every ``p`` with ONE host concat + ONE ``.to(device)``
+    view-split, instead of one ``torch.as_tensor(..., device=device)`` per pair.
+
+    Bit-identical to the per-pair build it replaces: ``np.concatenate`` over a list of
+    ``(n_i, F)`` host arrays then ``.split([n_i])`` along dim 0 yields tensors whose
+    contents/dtype match per-array ``torch.as_tensor(src, dtype=...)``, and the
+    downstream ``_scatter_fill`` re-``cat``s them anyway.
+
+    The dtype cast is done VIA TORCH (``from_numpy(flat).to(device=..., dtype=...)``),
+    NOT via numpy ``.astype`` -- this exactly reproduces ``torch.as_tensor(arr,
+    dtype=dtype, device=device)``, which for a CPU-numpy source + target device
+    decomposes to ``torch.from_numpy(arr).to(device, dtype)`` (verified bytewise). numpy's
+    float64->float32 rounding can differ from torch's by a ULP, so a numpy-side
+    ``.astype(float32)`` made vol_esp / vol_and_surf_esp diverge from baseline -- they are
+    the only modes with float64 RDKit sources (``partial_charges`` and
+    ``mol.GetConformer().GetPositions()``); the other 5 modes' arrays are already float32
+    so the cast was a no-op and they matched. Casting through torch is provably
+    bit-identical for every dtype (int64/float32 no-op, float64->float32 via torch).
+    ``np.concatenate`` keeps the source dtype and is fine since each ``_batch_upload``
+    call's ``src_fn`` yields one uniform-dtype attribute.
+
+    Each per-pair view is ``.clone()``d so the cached ``_*_t`` tensor is its OWN
+    contiguous allocation -- exactly like the per-pair ``torch.as_tensor`` it replaces
+    (separate storage, no shared-buffer aliasing across pairs).
+
+    Only pairs whose ``<attr>`` is None (cold cache) get the batched upload; pairs
+    already holding a same-device tensor are left untouched (so the SCREEN path, which
+    pre-warms these via build_fit, stays a no-op), and a wrong-device cached tensor is
+    moved per-pair (rare warm/multi-GPU path). ``src_fn`` does any host-side numpy
+    indexing (e.g. ``_nonH_atoms_idx``) -- that stays numpy, not an ``aten::to``.
+    """
+    cold = [p for p in pairs if getattr(p, attr, None) is None]
+    if cold:
+        arrs = [src_fn(p) for p in cold]                       # numpy, host, cheap
+        sizes = [len(a) for a in arrs]
+        flat = np.concatenate(arrs)                            # keep SOURCE dtype (no numpy cast)
+        dev = torch.from_numpy(flat).to(device=device, dtype=dtype)  # torch does the cast (matches as_tensor)
+        for p, t in zip(cold, dev.split(sizes)):
+            setattr(p, attr, t.clone())                        # own allocation (no shared-buffer alias)
+    for p in pairs:                                            # warm wrong-device path
+        t = getattr(p, attr)
+        if t.device != device:
+            setattr(p, attr, t.to(device, non_blocking=True))
+
+
 def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_fine: int = 100):
     """
     Batched alignment with workspace reuse & reduced per-pair transfers.
@@ -76,13 +122,12 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
 
     device = pairs[0].device
     # --- move coords once (skip if already there & right dtype) -------------
-    for p in pairs:
-        rx = p._ref_xyz_t
-        fx = p._fit_xyz_t
-        if rx.device != device:
-            p._ref_xyz_t = rx.to(device, non_blocking=True)
-        if fx.device != device:
-            p._fit_xyz_t = fx.to(device, non_blocking=True)
+    # _ref_xyz_t/_fit_xyz_t are set in MoleculePair.__init__, so these are never
+    # cold here -- _batch_upload's cold branch is a no-op and only the per-pair
+    # device-move (the original two lines) runs. atom_pos is the same source the
+    # constructor used, so a hypothetical cold pair stays bit-identical too.
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
 
     # --- result accumulators (GPU first; host copy only once) ---------------
     all_pairs: list[MoleculePair] = []
@@ -222,30 +267,24 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
     device = pairs[0].device
 
     # --- ensure/prepare surface tensors on the right device --------------------
+    # Validate the cold (build-from-numpy) pairs with the exact same guards/messages
+    # as the per-pair build, preserving the "either missing -> rebuild both" coupling;
+    # the two _batch_upload calls then do one batched H2D each (warm same-device pairs
+    # untouched, warm wrong-device moved per-pair) -- bit-identical to the old loop.
     for p in pairs:
-        # Prefer already-prepared torch tensors
-        r = getattr(p, "_ref_surf_t", None)
-        f = getattr(p, "_fit_surf_t", None)
-
-        if r is None or f is None:
-            # Fallback: build from numpy surface arrays if present
+        if getattr(p, "_ref_surf_t", None) is None or getattr(p, "_fit_surf_t", None) is None:
             if not hasattr(p, "ref_molec") or not hasattr(p.ref_molec, "surf_pos"):
                 raise ValueError(
                     "Surface points missing: MoleculePair must have _ref/_fit_surf_t "
                     "or ref_molec/fit_molec with .surf_pos."
                 )
-            r_np = p.ref_molec.surf_pos
-            f_np = p.fit_molec.surf_pos
-            if r_np is None or f_np is None:
+            if p.ref_molec.surf_pos is None or p.fit_molec.surf_pos is None:
                 raise ValueError("Surface points are None; cannot run _align_batch_surf.")
-            p._ref_surf_t = torch.as_tensor(r_np, dtype=torch.float32, device=device)
-            p._fit_surf_t = torch.as_tensor(f_np, dtype=torch.float32, device=device)
-        else:
-            # move to target device if needed
-            if r.device != device:
-                p._ref_surf_t = r.to(device, non_blocking=True)
-            if f.device != device:
-                p._fit_surf_t = f.to(device, non_blocking=True)
+            # Rebuild BOTH when either is cold (matches the coupled original branch).
+            p._ref_surf_t = None
+            p._fit_surf_t = None
+    _batch_upload(pairs, "_ref_surf_t", lambda p: p.ref_molec.surf_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_surf_t", lambda p: p.fit_molec.surf_pos, torch.float32, device)
 
     # --- result accumulators (GPU first; host copy only once) ------------------
     all_pairs: list[MoleculePair] = []
@@ -379,36 +418,33 @@ def _align_batch_surf_esp(
     device = pairs[0].device
     lam_scaled = LAM_SCALING * lam
 
-    # Ensure surface tensors (+ ESP) exist on device
+    # Ensure surface tensors (+ ESP) exist on device. Validate the cold pairs with the
+    # same guards/messages and the same "any of the four missing -> rebuild all four"
+    # coupling as the per-pair build; the four _batch_upload calls then do one batched
+    # H2D per array (warm same-device untouched, warm wrong-device moved per-pair).
     for p in pairs:
-        r = getattr(p, "_ref_surf_t", None)
-        f = getattr(p, "_fit_surf_t", None)
-        rc = getattr(p, "_ref_surf_esp_t", None)
-        fc = getattr(p, "_fit_surf_esp_t", None)
-
-        if r is None or f is None or rc is None or fc is None:
+        if (getattr(p, "_ref_surf_t", None) is None or getattr(p, "_fit_surf_t", None) is None
+                or getattr(p, "_ref_surf_esp_t", None) is None
+                or getattr(p, "_fit_surf_esp_t", None) is None):
             if p.ref_molec.surf_pos is None or p.fit_molec.surf_pos is None:
                 raise ValueError("Surface points are None; cannot run _align_batch_surf_esp.")
             if p.ref_molec.surf_esp is None or p.fit_molec.surf_esp is None:
                 raise ValueError("Surface ESP is None; cannot run _align_batch_surf_esp.")
+            p._ref_surf_t = None
+            p._fit_surf_t = None
+            p._ref_surf_esp_t = None
+            p._fit_surf_esp_t = None
+    _batch_upload(pairs, "_ref_surf_t", lambda p: p.ref_molec.surf_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_surf_t", lambda p: p.fit_molec.surf_pos, torch.float32, device)
+    _batch_upload(pairs, "_ref_surf_esp_t", lambda p: p.ref_molec.surf_esp, torch.float32, device)
+    _batch_upload(pairs, "_fit_surf_esp_t", lambda p: p.fit_molec.surf_esp, torch.float32, device)
 
-            p._ref_surf_t = torch.as_tensor(p.ref_molec.surf_pos, dtype=torch.float32, device=device)
-            p._fit_surf_t = torch.as_tensor(p.fit_molec.surf_pos, dtype=torch.float32, device=device)
-            p._ref_surf_esp_t = torch.as_tensor(p.ref_molec.surf_esp, dtype=torch.float32, device=device)
-            p._fit_surf_esp_t = torch.as_tensor(p.fit_molec.surf_esp, dtype=torch.float32, device=device)
-        else:
-            if r.device != device:
-                p._ref_surf_t = r.to(device, non_blocking=True)
-            if f.device != device:
-                p._fit_surf_t = f.to(device, non_blocking=True)
-            if rc.device != device:
-                p._ref_surf_esp_t = rc.to(device, non_blocking=True)
-            if fc.device != device:
-                p._fit_surf_esp_t = fc.to(device, non_blocking=True)
-
-        # Translation centers must be available on device for trans_init.
-        if trans_init and getattr(p, "_ref_xyz_t", None) is None:
-            p._ref_xyz_t = torch.as_tensor(p.ref_molec.atom_pos, dtype=torch.float32, device=device)
+    # Translation centers must be available on device for trans_init. (Cold-only build,
+    # no device-move -- matches the original; left unbatched to preserve those bytes.)
+    if trans_init:
+        for p in pairs:
+            if getattr(p, "_ref_xyz_t", None) is None:
+                p._ref_xyz_t = torch.as_tensor(p.ref_molec.atom_pos, dtype=torch.float32, device=device)
 
     _esp_bucketed_align(
         pairs, alpha=alpha, lam_scaled=lam_scaled,
@@ -603,60 +639,43 @@ def _align_batch_vol_esp(
     device = pairs[0].device
 
     # Ensure heavy-atom coords (+ heavy-atom partial charges) exist on device.
+    # Each attr here follows the clean "cold -> build, warm wrong-device -> move"
+    # pattern, which _batch_upload reproduces exactly (one batched H2D per array).
+    # (The earlier vol_esp/esp_combo "golden mismatch" was traced to GPU cross-job
+    # Triton-kernel non-determinism, NOT this build -- the same-process test showed
+    # _batch_upload == per-pair = EXACTLY 0 diff -- so these are on the batched path
+    # like the other 5 modes.)
     for p in pairs:
         if p.ref_molec.partial_charges is None or p.fit_molec.partial_charges is None:
             raise ValueError("Partial charges are None; cannot run _align_batch_vol_esp.")
 
-        # _ref_xyz_t / _fit_xyz_t (atom_pos) are kept only for trans_init seed
-        # centers (matches per-pair vol_esp, which seeds from atom_pos).
-        rx = getattr(p, "_ref_xyz_t", None)
-        fx = getattr(p, "_fit_xyz_t", None)
-        if rx is None:
-            p._ref_xyz_t = torch.as_tensor(p.ref_molec.atom_pos, dtype=torch.float32, device=device)
-        elif rx.device != device:
-            p._ref_xyz_t = rx.to(device, non_blocking=True)
-        if fx is None:
-            p._fit_xyz_t = torch.as_tensor(p.fit_molec.atom_pos, dtype=torch.float32, device=device)
-        elif fx.device != device:
-            p._fit_xyz_t = fx.to(device, non_blocking=True)
+    # _ref_xyz_t / _fit_xyz_t (atom_pos) are kept only for trans_init seed
+    # centers (matches per-pair vol_esp, which seeds from atom_pos).
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
 
-        # Gaussian centers MUST be the same strict heavy atoms as the charges
-        # below (partial_charges[_nonH_atoms_idx]). atom_pos comes from
-        # Chem.RemoveHs, which RETAINS some H (stereo/isotope/valence), so its
-        # count can exceed len(_nonH_atoms_idx) -- a data-dependent off-by-a-few
-        # (DUD-E decoys hit it) that desyncs the bucketed scatter-fill (coords
-        # n_list != charge length). Index the conformer by _nonH_atoms_idx so
-        # centers stay 1:1 with the charges (bit-identical to atom_pos when
-        # RemoveHs keeps no H, since center_to transforms both together).
-        rxn = getattr(p, "_ref_xyz_noH_t", None)
-        if rxn is None:
-            p._ref_xyz_noH_t = torch.as_tensor(
-                p.ref_molec.mol.GetConformer().GetPositions()[p.ref_molec._nonH_atoms_idx],
-                dtype=torch.float32, device=device)
-        elif rxn.device != device:
-            p._ref_xyz_noH_t = rxn.to(device, non_blocking=True)
-        fxn = getattr(p, "_fit_xyz_noH_t", None)
-        if fxn is None:
-            p._fit_xyz_noH_t = torch.as_tensor(
-                p.fit_molec.mol.GetConformer().GetPositions()[p.fit_molec._nonH_atoms_idx],
-                dtype=torch.float32, device=device)
-        elif fxn.device != device:
-            p._fit_xyz_noH_t = fxn.to(device, non_blocking=True)
+    # Gaussian centers MUST be the same strict heavy atoms as the charges
+    # below (partial_charges[_nonH_atoms_idx]). atom_pos comes from
+    # Chem.RemoveHs, which RETAINS some H (stereo/isotope/valence), so its
+    # count can exceed len(_nonH_atoms_idx) -- a data-dependent off-by-a-few
+    # (DUD-E decoys hit it) that desyncs the bucketed scatter-fill (coords
+    # n_list != charge length). Index the conformer by _nonH_atoms_idx so
+    # centers stay 1:1 with the charges (bit-identical to atom_pos when
+    # RemoveHs keeps no H, since center_to transforms both together). The
+    # _nonH_atoms_idx numpy indexing stays on host inside the src_fn.
+    _batch_upload(pairs, "_ref_xyz_noH_t",
+                  lambda p: p.ref_molec.mol.GetConformer().GetPositions()[p.ref_molec._nonH_atoms_idx],
+                  torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_noH_t",
+                  lambda p: p.fit_molec.mol.GetConformer().GetPositions()[p.fit_molec._nonH_atoms_idx],
+                  torch.float32, device)
 
-        rxe = getattr(p, "_ref_xyz_esp_t", None)
-        if rxe is None:
-            p._ref_xyz_esp_t = torch.as_tensor(
-                p.ref_molec.partial_charges[p.ref_molec._nonH_atoms_idx],
-                dtype=torch.float32, device=device)
-        elif rxe.device != device:
-            p._ref_xyz_esp_t = rxe.to(device, non_blocking=True)
-        fxe = getattr(p, "_fit_xyz_esp_t", None)
-        if fxe is None:
-            p._fit_xyz_esp_t = torch.as_tensor(
-                p.fit_molec.partial_charges[p.fit_molec._nonH_atoms_idx],
-                dtype=torch.float32, device=device)
-        elif fxe.device != device:
-            p._fit_xyz_esp_t = fxe.to(device, non_blocking=True)
+    _batch_upload(pairs, "_ref_xyz_esp_t",
+                  lambda p: p.ref_molec.partial_charges[p.ref_molec._nonH_atoms_idx],
+                  torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_esp_t",
+                  lambda p: p.fit_molec.partial_charges[p.fit_molec._nonH_atoms_idx],
+                  torch.float32, device)
 
     _esp_bucketed_align(
         pairs, alpha=alpha, lam_scaled=lam,            # RAW lam (matches per-pair vol_esp)
@@ -707,36 +726,34 @@ def _align_batch_vol_and_surf_esp(
 
     device = pairs[0].device
 
-    # Ensure required tensors exist on device
+    # Ensure required tensors exist on device. Each attr is independent (cold -> build,
+    # warm wrong-device -> move), the same per-attr contract _batch_upload implements,
+    # so the per-pair _ensure loop collapses to one batched H2D per array name.
+    # (The earlier vol_esp/esp_combo "golden mismatch" was traced to GPU cross-job
+    # Triton-kernel non-determinism, NOT this build -- the same-process test showed
+    # _batch_upload == per-pair = EXACTLY 0 diff -- so this is back on the batched path.)
     for p in pairs:
         if p.ref_molec.surf_pos is None or p.fit_molec.surf_pos is None:
             raise ValueError("Surface points are None; cannot run _align_batch_vol_and_surf_esp.")
         if p.ref_molec.surf_esp is None or p.fit_molec.surf_esp is None:
             raise ValueError("Surface ESP is None; cannot run _align_batch_vol_and_surf_esp.")
 
-        def _ensure(p, attr, src, dtype):
-            t = getattr(p, attr, None)
-            if t is None:
-                setattr(p, attr, torch.as_tensor(src, dtype=dtype, device=device))
-            elif t.device != device:
-                setattr(p, attr, t.to(device, non_blocking=True))
+    _batch_upload(pairs, "_ref_surf_t", lambda p: p.ref_molec.surf_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_surf_t", lambda p: p.fit_molec.surf_pos, torch.float32, device)
+    _batch_upload(pairs, "_ref_surf_esp_t", lambda p: p.ref_molec.surf_esp, torch.float32, device)
+    _batch_upload(pairs, "_fit_surf_esp_t", lambda p: p.fit_molec.surf_esp, torch.float32, device)
+    _batch_upload(pairs, "_ref_centers_w_H_t",
+                  lambda p: p.ref_molec.mol.GetConformer().GetPositions(), torch.float32, device)
+    _batch_upload(pairs, "_fit_centers_w_H_t",
+                  lambda p: p.fit_molec.mol.GetConformer().GetPositions(), torch.float32, device)
+    _batch_upload(pairs, "_ref_partial_t", lambda p: p.ref_molec.partial_charges, torch.float32, device)
+    _batch_upload(pairs, "_fit_partial_t", lambda p: p.fit_molec.partial_charges, torch.float32, device)
+    _batch_upload(pairs, "_ref_radii_t", lambda p: p.ref_molec.radii, torch.float32, device)
+    _batch_upload(pairs, "_fit_radii_t", lambda p: p.fit_molec.radii, torch.float32, device)
 
-        _ensure(p, "_ref_surf_t", p.ref_molec.surf_pos, torch.float32)
-        _ensure(p, "_fit_surf_t", p.fit_molec.surf_pos, torch.float32)
-        _ensure(p, "_ref_surf_esp_t", p.ref_molec.surf_esp, torch.float32)
-        _ensure(p, "_fit_surf_esp_t", p.fit_molec.surf_esp, torch.float32)
-        _ensure(p, "_ref_centers_w_H_t",
-                p.ref_molec.mol.GetConformer().GetPositions(), torch.float32)
-        _ensure(p, "_fit_centers_w_H_t",
-                p.fit_molec.mol.GetConformer().GetPositions(), torch.float32)
-        _ensure(p, "_ref_partial_t", p.ref_molec.partial_charges, torch.float32)
-        _ensure(p, "_fit_partial_t", p.fit_molec.partial_charges, torch.float32)
-        _ensure(p, "_ref_radii_t", p.ref_molec.radii, torch.float32)
-        _ensure(p, "_fit_radii_t", p.fit_molec.radii, torch.float32)
-
-        if trans_init:
-            _ensure(p, "_ref_xyz_t", p.ref_molec.atom_pos, torch.float32)
-            _ensure(p, "_fit_xyz_t", p.fit_molec.atom_pos, torch.float32)
+    if trans_init:
+        _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+        _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
 
     all_pairs: list[MoleculePair] = []
     all_scores: list[torch.Tensor] = []
@@ -961,38 +978,16 @@ def _align_batch_pharm(
 
     device = pairs[0].device
 
-    # Ensure per-pair cached tensors exist on the correct device.
-    for p in pairs:
-        rt = getattr(p, "_ref_pharm_types_t", None)
-        if rt is None:
-            p._ref_pharm_types_t = torch.as_tensor(p.ref_molec.pharm_types, dtype=torch.int64, device=device)
-        elif rt.device != device:
-            p._ref_pharm_types_t = rt.to(device, non_blocking=True)
-        ft = getattr(p, "_fit_pharm_types_t", None)
-        if ft is None:
-            p._fit_pharm_types_t = torch.as_tensor(p.fit_molec.pharm_types, dtype=torch.int64, device=device)
-        elif ft.device != device:
-            p._fit_pharm_types_t = ft.to(device, non_blocking=True)
-        ra = getattr(p, "_ref_pharm_ancs_t", None)
-        if ra is None:
-            p._ref_pharm_ancs_t = torch.as_tensor(p.ref_molec.pharm_ancs, dtype=torch.float32, device=device)
-        elif ra.device != device:
-            p._ref_pharm_ancs_t = ra.to(device, non_blocking=True)
-        fa = getattr(p, "_fit_pharm_ancs_t", None)
-        if fa is None:
-            p._fit_pharm_ancs_t = torch.as_tensor(p.fit_molec.pharm_ancs, dtype=torch.float32, device=device)
-        elif fa.device != device:
-            p._fit_pharm_ancs_t = fa.to(device, non_blocking=True)
-        rv = getattr(p, "_ref_pharm_vecs_t", None)
-        if rv is None:
-            p._ref_pharm_vecs_t = torch.as_tensor(p.ref_molec.pharm_vecs, dtype=torch.float32, device=device)
-        elif rv.device != device:
-            p._ref_pharm_vecs_t = rv.to(device, non_blocking=True)
-        fv = getattr(p, "_fit_pharm_vecs_t", None)
-        if fv is None:
-            p._fit_pharm_vecs_t = torch.as_tensor(p.fit_molec.pharm_vecs, dtype=torch.float32, device=device)
-        elif fv.device != device:
-            p._fit_pharm_vecs_t = fv.to(device, non_blocking=True)
+    # Ensure per-pair cached tensors exist on the correct device. Each attr is the
+    # independent "cold -> build, warm wrong-device -> move" pattern; one batched H2D
+    # per array. pharm_types (int64) is its own _batch_upload call, kept out of the
+    # float32 concat group.
+    _batch_upload(pairs, "_ref_pharm_types_t", lambda p: p.ref_molec.pharm_types, torch.int64, device)
+    _batch_upload(pairs, "_fit_pharm_types_t", lambda p: p.fit_molec.pharm_types, torch.int64, device)
+    _batch_upload(pairs, "_ref_pharm_ancs_t", lambda p: p.ref_molec.pharm_ancs, torch.float32, device)
+    _batch_upload(pairs, "_fit_pharm_ancs_t", lambda p: p.fit_molec.pharm_ancs, torch.float32, device)
+    _batch_upload(pairs, "_ref_pharm_vecs_t", lambda p: p.ref_molec.pharm_vecs, torch.float32, device)
+    _batch_upload(pairs, "_fit_pharm_vecs_t", lambda p: p.fit_molec.pharm_vecs, torch.float32, device)
 
     all_pairs: list[MoleculePair] = []
     all_scores: list[torch.Tensor] = []
@@ -1109,20 +1104,15 @@ def _align_batch_vol_color(
 
     device = pairs[0].device
 
-    def _ensure(p, attr, src, dtype):
-        t = getattr(p, attr, None)
-        if t is None:
-            setattr(p, attr, torch.as_tensor(src, dtype=dtype, device=device))
-        elif t.device != device:
-            setattr(p, attr, t.to(device, non_blocking=True))
-
-    for p in pairs:
-        _ensure(p, "_ref_xyz_t", p.ref_molec.atom_pos, torch.float32)
-        _ensure(p, "_fit_xyz_t", p.fit_molec.atom_pos, torch.float32)
-        _ensure(p, "_ref_pharm_types_t", p.ref_molec.pharm_types, torch.int64)
-        _ensure(p, "_fit_pharm_types_t", p.fit_molec.pharm_types, torch.int64)
-        _ensure(p, "_ref_pharm_ancs_t", p.ref_molec.pharm_ancs, torch.float32)
-        _ensure(p, "_fit_pharm_ancs_t", p.fit_molec.pharm_ancs, torch.float32)
+    # Each attr is the independent "cold -> build, warm wrong-device -> move" pattern;
+    # one batched H2D per array. pharm_types (int64) stays in its own _batch_upload
+    # call, separate from the float32 coordinate/anchor concat group.
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_ref_pharm_types_t", lambda p: p.ref_molec.pharm_types, torch.int64, device)
+    _batch_upload(pairs, "_fit_pharm_types_t", lambda p: p.fit_molec.pharm_types, torch.int64, device)
+    _batch_upload(pairs, "_ref_pharm_ancs_t", lambda p: p.ref_molec.pharm_ancs, torch.float32, device)
+    _batch_upload(pairs, "_fit_pharm_ancs_t", lambda p: p.fit_molec.pharm_ancs, torch.float32, device)
 
     all_pairs: list[MoleculePair] = []
     all_scores: list[torch.Tensor] = []
