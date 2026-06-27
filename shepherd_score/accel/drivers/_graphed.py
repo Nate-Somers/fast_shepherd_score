@@ -29,6 +29,7 @@ a side stream for exactly this.
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 import torch
 
 # Shared env knobs (single source of truth; shape.py and every other driver import these).
@@ -81,8 +82,32 @@ _GRAPH_ES_BLOCK = int(os.environ.get("FINE_GRAPH_ES_BLOCK", 5))
 # graph's mean >= eager across that noise -- cheap for launch-bound modes, minor for surf.
 _GRAPH_ES_MARGIN = int(os.environ.get("FINE_GRAPH_ES_MARGIN", 2))
 
-# Process-wide cache of captured graphs, keyed by (device, mode, shapes, P, steps, params).
-_FINE_GRAPH_CACHE: dict = {}
+# Process-wide LRU cache of captured graphs, keyed by (device, mode, shapes, P, steps, params).
+# It is BOUNDED: each cached graph pins persistent GPU buffers (~P*buffers bytes), so an
+# unbounded cache lets a long/large workload -- a big screen (many library-mol shapes), or a
+# benchmark sweep over many sizes/modes -- accumulate GPU memory until fragmentation/OOM makes
+# new captures fail and the driver silently falls back to eager (measured: later cells in a
+# sweep degraded 12-27x, BELOW even eager). Evicting the least-recently-used graph frees its
+# buffers; FINE_GRAPH_CACHE_MAX caps how many live at once.
+_FINE_GRAPH_CACHE: "OrderedDict" = OrderedDict()
+_GRAPH_CACHE_MAX = int(os.environ.get("FINE_GRAPH_CACHE_MAX", 24))
+
+
+def _evict_lru():
+    """Drop the least-recently-used cached graph and return its buffers to the allocator."""
+    _, old = _FINE_GRAPH_CACHE.popitem(last=False)
+    del old
+    torch.cuda.empty_cache()
+
+
+def reset_graph_cache():
+    """Free every cached graph (and its persistent buffers) and return the blocks to the
+    CUDA allocator. Use between independent measurements (e.g. benchmark cells) so each
+    starts from a clean, unfragmented GPU state -- accumulated graph buffers + freed-block
+    fragmentation otherwise degrade later cells. Leaves the Triton autotune cache intact
+    (that is cheap compiled code, not the memory problem)."""
+    _FINE_GRAPH_CACHE.clear()
+    torch.cuda.empty_cache()
 
 
 class _GraphedFineBase:
@@ -174,13 +199,25 @@ def run_graphed(make, key, inputs, *, es_patience=0, es_tol=1e-5):
     eager early-stop (0 -> run a fixed ``steps`` replays).
     """
     gf = _FINE_GRAPH_CACHE.get(key)
-    if gf is None:
-        gf = make()
-        # Add the margin only when early-stop is enabled (es_patience > 0).
-        gf.es_patience = (int(es_patience) + _GRAPH_ES_MARGIN) if es_patience else 0
-        gf.es_tol = float(es_tol)
-        gf.capture(*inputs)
-        _FINE_GRAPH_CACHE[key] = gf
+    if gf is not None:
+        _FINE_GRAPH_CACHE.move_to_end(key)       # mark most-recently-used
+        return gf.run(*inputs)
+    gf = make()
+    # Add the margin only when early-stop is enabled (es_patience > 0).
+    gf.es_patience = (int(es_patience) + _GRAPH_ES_MARGIN) if es_patience else 0
+    gf.es_tol = float(es_tol)
+    # Capture; if it OOMs, free LRU graphs and retry (rather than failing -> eager forever).
+    while True:
+        try:
+            gf.capture(*inputs)
+            break
+        except Exception as e:
+            if "out of memory" not in str(e).lower() or not _FINE_GRAPH_CACHE:
+                raise                             # non-OOM, or nothing left to free -> propagate
+            _evict_lru()
+    _FINE_GRAPH_CACHE[key] = gf
+    while len(_FINE_GRAPH_CACHE) > _GRAPH_CACHE_MAX:
+        _evict_lru()
     return gf.run(*inputs)
 
 
