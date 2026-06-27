@@ -28,8 +28,15 @@
 
 from __future__ import annotations
 
+import os
 import torch
 from typing import Optional, Tuple
+
+# Use the fused single-kernel shape+color overlap (one launch instead of two) where it is a
+# win -- i.e. small clouds (all pads <= VOL_COLOR_FUSED_MAX_PAD=32); larger molecules fall
+# back to the two separate kernels (the fused kernel's two-channel register footprint blows
+# occupancy at BLOCK=64). Disable with FINE_VOL_COLOR_FUSED=0.
+_FINE_VOL_COLOR_FUSED = os.environ.get("FINE_VOL_COLOR_FUSED", "1") != "0"
 
 from ..kernels.dispatch import (
     fused_adam_qt_with_tangent_proj, pharm_color_score_grad_se3_batch,
@@ -72,6 +79,25 @@ def _color_overlap(q: torch.Tensor,
     return O
 
 
+def _vc_overlaps(c1, c2, a1, a2, q, t, pt1, pt2, tables, alpha, Nc, Mc, Na, Ma):
+    """Both channels' value+grad: (VAB, dQ_s, dT_s, O_c, dQ_c, dT_c). Uses the FUSED single
+    kernel (one launch, shared R(q)) when enabled, on CUDA, and every cloud fits the fused
+    tile; otherwise the two separate kernels (which the fused kernel beats only for small
+    clouds). Drop-in for the shape + color kernel pair in the fine loop and the graph step."""
+    al, Ks, cats = tables
+    if _FINE_VOL_COLOR_FUSED and c1.is_cuda:
+        from ..kernels.vol_color_triton import (
+            vol_color_score_grad_se3_batch, VOL_COLOR_FUSED_MAX_PAD)
+        if max(c1.shape[1], c2.shape[1], a1.shape[1], a2.shape[1]) <= VOL_COLOR_FUSED_MAX_PAD:
+            return vol_color_score_grad_se3_batch(
+                c1, c2, a1, a2, q, t, pt1, pt2, al, Ks, cats, alpha=alpha,
+                N_real_cent=Nc, M_real_cent=Mc, N_real_anc=Na, M_real_anc=Ma)
+    VAB, dQ_s, dT_s = _overlap_in_chunks_volumetric(c1, c2, q, t, alpha=alpha, N_real=Nc, M_real=Mc)
+    O_c, dQ_c, dT_c = pharm_color_score_grad_se3_batch(
+        a1, a2, q, t, pt1, pt2, al, Ks, cats, N_real=Na, M_real=Ma, NEED_GRAD=True)
+    return VAB, dQ_s, dT_s, O_c, dQ_c, dT_c
+
+
 class _GraphedFineVolColor(_GraphedFineBase):
     """CUDA-graph fine loop for vol_color -- the worst host-overhead mode (TWO value+grad
     kernels per step: shape overlap_score_grad_se3_batch + directionless color
@@ -107,11 +133,9 @@ class _GraphedFineVolColor(_GraphedFineBase):
         super().__init__(steps)
 
     def _step(self):
-        VAB, dQs, dTs = overlap_score_grad_se3_batch(
-            self.A, self.B, self.q, self.t, alpha=self.alpha, N_real=self.Nr, M_real=self.Mr)
-        O_c, dQc, dTc = pharm_color_score_grad_se3_batch(
-            self.anc1, self.anc2, self.q, self.t, self.pt1, self.pt2,
-            self.al, self.Ks, self.cats, N_real=self.Npr, M_real=self.Mpr, NEED_GRAD=True)
+        VAB, dQs, dTs, O_c, dQc, dTc = _vc_overlaps(
+            self.A, self.B, self.anc1, self.anc2, self.q, self.t, self.pt1, self.pt2,
+            (self.al, self.Ks, self.cats), self.alpha, self.Nr, self.Mr, self.Npr, self.Mpr)
         # shape Tanimoto + d/dO_s scale
         torch.sub(self.norm_s, VAB, out=self.denom_s)
         torch.div(VAB, self.denom_s, out=self.shape_sim)
@@ -340,18 +364,14 @@ def coarse_fine_vol_color_align_many(
         no_improve_count = 0
 
         for step in range(steps_fine):
-            # --- Shape: value + quaternion gradient (fused kernel) ---
-            VAB, dQ_s, dT_s = _overlap_in_chunks_volumetric(
-                centers_1_k, centers_2_k, q_k, t_k, alpha=alpha, N_real=N_k, M_real=M_k)
+            # --- Shape + color value+grad: one fused kernel where it wins, else two. Both
+            # channels emit dO/dq in the same quaternion space (no R->q projection tail). ---
+            VAB, dQ_s, dT_s, O_c, dQ_c, dT_c = _vc_overlaps(
+                centers_1_k, centers_2_k, anchors_1_k, anchors_2_k, q_k, t_k,
+                ptype_1_k, ptype_2_k, (al, Ks, cats), alpha, N_k, M_k, Np_k, Mp_k)
             denom_s = VAA_plus_VBB - VAB
             shape_sim = VAB / denom_s
             scale_s = (VAA_plus_VBB / (denom_s * denom_s)).unsqueeze(1)   # d shape_T / d O_s
-
-            # --- Color: value + QUATERNION gradient directly from the fused color kernel ---
-            # (dQ_c = dO_c/dq, same convention as the shape kernel; no R->q projection tail)
-            O_c, dQ_c, dT_c = pharm_color_score_grad_se3_batch(
-                anchors_1_k, anchors_2_k, q_k, t_k, ptype_1_k, ptype_2_k,
-                al, Ks, cats, N_real=Np_k, M_real=Mp_k, NEED_GRAD=True)
             denom_c = VAA_c_plus_VBB_c - O_c
             color_sim = O_c / denom_c
             scale_c = (VAA_c_plus_VBB_c / (denom_c * denom_c)).unsqueeze(1)   # d color_T / d O_c
