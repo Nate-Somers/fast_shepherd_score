@@ -13,7 +13,7 @@ from .pharm_overlap import (
 # (pharmacophore_overlap_triton, imported above, is pure PyTorch and needs no dispatch.)
 from ..kernels.dispatch import fused_adam_qt, pharm_score_grad_se3_batch, pharm_grad_dq_se3_batch
 from ...score.analytical_gradients._torch import build_lookup_tables
-from ._graphed import _GraphedFineBase, run_graphed, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
+from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 from . import _common as _fc
 from ._common import (
     check_gpu_available,
@@ -356,9 +356,11 @@ def coarse_fine_pharm_align_many(
     # tanimoto branch is graphed (extended_points/tversky/padded-autograd keep the eager
     # loop). Greenfield (no prior graph path). See drivers/_graphed. ---
     _graphed = None
+    # pharm's directional kernel is heavier per anchor-pair than the gaussian, so it crosses
+    # over sooner (~P=40k) -> a lower work budget than the shape/esp modes.
     if (_FINE_GRAPHS and use_kernel and similarity == 'tanimoto'
             and anchors_1_k.is_cuda and anchors_1_k.dtype == torch.float32
-            and anchors_1_k.shape[0] <= _GRAPH_MAX_P):
+            and anchors_1_k.shape[0] <= graph_cap(N_pad * M_pad, budget=10_000_000)):
         try:
             _graphed = _run_graphed_pharm(
                 anchors_1_k.contiguous(), anchors_2_k.contiguous(),

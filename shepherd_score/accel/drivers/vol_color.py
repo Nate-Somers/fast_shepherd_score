@@ -44,7 +44,7 @@ from ._common import (
     _update_best,
     ES_PATIENCE_OVERRIDE,
 )
-from ._graphed import _GraphedFineBase, run_graphed, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
+from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 from .esp_combo import _overlap_in_chunks_volumetric, _self_overlap_chunks
 from ...score.analytical_gradients._torch import build_lookup_tables
 
@@ -311,7 +311,10 @@ def coarse_fine_vol_color_align_many(
     # the worst host-overhead mode (2 launches/step); graphing removes the per-step host gap.
     # Gated to the launch-bound small/medium-P CUDA fp32 regime (large P / capture failure
     # fall back to the eager loop below). See drivers/_graphed.
-    if (_FINE_GRAPHS and centers_1_k.is_cuda and PK <= _GRAPH_MAX_P
+    # vol_color runs a 2nd (color) kernel per step, so it crosses over sooner than vol -> an
+    # explicit work budget keeps its cap (~120k) below its ~150k crossover regardless of CEIL.
+    if (_FINE_GRAPHS and centers_1_k.is_cuda
+            and PK <= graph_cap(N_pad_cent * M_pad_cent, budget=30_000_000)
             and centers_1_k.dtype == torch.float32):
         try:
             best_score, best_q, best_t = _run_graphed_vol_color(

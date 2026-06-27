@@ -38,6 +38,31 @@ _FINE_GRAPHS = os.environ.get("FINE_CUDA_GRAPHS", "1") != "0"
 # compute-bound there, so the graph stops helping) UNLESS the mode opts into chunked replay
 # via run_graphed_chunked (the launch-bound modes, where it keeps helping at large batch).
 _GRAPH_MAX_P = int(os.environ.get("FINE_GRAPH_MAX_P", 16000))
+
+# --- compute-aware P-cap ----------------------------------------------------------------
+# The graph's win is launch-bound: its launch-savings are ~fixed per step, while its only
+# large-P cost grows with the per-row kernel work. So the P at which the graph stops beating
+# eager (the crossover) scales as work_budget / (per-row work). Measured crossovers (H200):
+# vol (heavy-atom clouds, N_pad*M_pad ~ 256-1024) wins to P ~ 1M; surf (128-point clouds,
+# ~16384) crosses at P ~ 16-18k -- and work*P is ~constant (~3e8) across both, because they
+# share the gaussian kernel. So cap = clamp(BUDGET // (N_pad*M_pad), MIN, CEIL) graphs each
+# mode/bucket exactly where it wins and falls to eager (the baseline -- never a regression)
+# where it would lose. This makes ONE formula cover the vol/surf and vol_esp/surf_esp
+# shared-code splits (light clouds -> high cap, heavy clouds -> low cap) automatically.
+# CEIL bounds the per-graph buffer memory (important for the screen path's large buckets).
+_GRAPH_WORK_BUDGET = int(os.environ.get("FINE_GRAPH_WORK_BUDGET", 300_000_000))
+# Per-graph memory ceiling on P. 256k covers the 100k-library screen buckets (P~187k) for
+# the light modes; their buffers are ~1KB/row so a single graph is ~270MB. Lower this on
+# memory-constrained GPUs (the heavy modes are already work-budget-limited well below it).
+_GRAPH_CAP_CEIL = int(os.environ.get("FINE_GRAPH_CAP_CEIL", 262144))
+_GRAPH_CAP_MIN = int(os.environ.get("FINE_GRAPH_CAP_MIN", 2000))
+
+
+def graph_cap(work, budget=None):
+    """Max pose-rows P to graph for a bucket whose per-row kernel work is ``work`` (e.g.
+    N_pad*M_pad). Below this the graph wins; above it the gating falls back to eager."""
+    b = _GRAPH_WORK_BUDGET if budget is None else budget
+    return max(_GRAPH_CAP_MIN, min(_GRAPH_CAP_CEIL, int(b) // max(int(work), 1)))
 # Fixed replay cap when early-stop is disabled. Otherwise the graph replays UP TO steps_fine
 # and stops early (see below), so this is mostly legacy.
 _GRAPH_STEPS = int(os.environ.get("FINE_GRAPH_STEPS", 50))
@@ -49,6 +74,12 @@ _GRAPH_STEPS = int(os.environ.get("FINE_GRAPH_STEPS", 50))
 # number of steps as eager, so the launch-bound modes keep their big win and the compute-bound
 # modes stop regressing. Set _GRAPH_ES_BLOCK=0 to disable (fixed-step replay).
 _GRAPH_ES_BLOCK = int(os.environ.get("FINE_GRAPH_ES_BLOCK", 5))
+# Extra early-stop margin (in blocks) ADDED to the eager patience for the graph replay loop.
+# The multi-basin modes (surf, esp) land in different near-equal optima under tiny numerical
+# perturbations, so matching the eager step count EXACTLY exposes +/-0.4% basin noise (surf
+# came in at -0.43% with no margin). One extra block of optimisation reliably keeps the
+# graph's mean >= eager across that noise -- cheap for launch-bound modes, minor for surf.
+_GRAPH_ES_MARGIN = int(os.environ.get("FINE_GRAPH_ES_MARGIN", 2))
 
 # Process-wide cache of captured graphs, keyed by (device, mode, shapes, P, steps, params).
 _FINE_GRAPH_CACHE: dict = {}
@@ -145,31 +176,36 @@ def run_graphed(make, key, inputs, *, es_patience=0, es_tol=1e-5):
     gf = _FINE_GRAPH_CACHE.get(key)
     if gf is None:
         gf = make()
-        gf.es_patience = int(es_patience); gf.es_tol = float(es_tol)
+        # Add the margin only when early-stop is enabled (es_patience > 0).
+        gf.es_patience = (int(es_patience) + _GRAPH_ES_MARGIN) if es_patience else 0
+        gf.es_tol = float(es_tol)
         gf.capture(*inputs)
         _FINE_GRAPH_CACHE[key] = gf
     return gf.run(*inputs)
 
 
-def run_graphed_chunked(make, key_for, inputs, *, P, max_p, slice_inputs, cat_results):
+def run_graphed_chunked(make, key_for, inputs, *, P, max_p, es_patience=0, es_tol=1e-5):
     """Cap-lift: drive an arbitrarily large P through graphs of size <= ``max_p``.
 
-    Rows (poses) are independent, so slicing the pose dimension into chunks and running each
-    chunk through its own (cached) graph is exactly equivalent to running all P at once, as
-    long as results are concatenated back in row order. At most two distinct chunk sizes
-    occur (``max_p`` and the remainder), so at most two graphs are captured per key.
+    Poses (rows) are independent, so slicing the pose dimension into chunks and running each
+    chunk through its own (cached) graph is exactly equivalent to running all P at once -- as
+    long as results are concatenated back in row order. Every element of ``inputs`` is a
+    per-pose tensor (dim 0 == P), so slicing is generic (``x[s:e]``) and the three outputs
+    (best, best_q, best_t) concatenate along dim 0. This bounds the per-graph buffer memory
+    (essential for the screen path, where P can be huge) while keeping the launch-bound win;
+    at most two distinct chunk sizes occur (``max_p`` and the remainder), so at most two
+    graphs are captured per key.
 
-      * ``key_for(p_chunk)`` -> cache key for a chunk of that size
       * ``make(p_chunk)``    -> factory for a chunk-sized subclass instance
-      * ``slice_inputs(inputs, s, e)`` -> the inputs tuple sliced to rows [s, e)
-      * ``cat_results(list_of_(best,bq,bt))`` -> the concatenated (best, bq, bt)
+      * ``key_for(p_chunk)`` -> cache key for a chunk of that size
     """
     if P <= max_p:
-        return run_graphed(lambda: make(P), key_for(P), inputs)
-    out = []
+        return run_graphed(lambda: make(P), key_for(P), inputs,
+                           es_patience=es_patience, es_tol=es_tol)
+    outs = []
     for s in range(0, P, max_p):
-        e = min(s + max_p, P)
-        pc = e - s
-        sub = slice_inputs(inputs, s, e)
-        out.append(run_graphed(lambda pc=pc: make(pc), key_for(pc), sub))
-    return cat_results(out)
+        e = min(s + max_p, P); pc = e - s
+        sub = tuple(x[s:e].contiguous() for x in inputs)
+        outs.append(run_graphed(lambda pc=pc: make(pc), key_for(pc), sub,
+                                es_patience=es_patience, es_tol=es_tol))
+    return tuple(torch.cat([o[i] for o in outs], 0) for i in range(len(outs[0])))

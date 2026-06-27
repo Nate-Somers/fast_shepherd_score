@@ -10,7 +10,7 @@ from ..kernels.dispatch import (
     _batch_self_overlap, fused_surf_step_batch, _HAS_TRITON,
 )
 from ._common import batched_seeds_torch, _update_best
-from ._graphed import _GraphedFineBase, run_graphed, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
+from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 from typing import Optional
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -323,9 +323,12 @@ def coarse_fine_align_many(
         except Exception:
             best_score = None                              # fused failed -> graph/eager
 
-    # --- CUDA-graph fast path for the launch-bound small-batch regime --------
-    if (best_score is None and _FINE_GRAPHS and A_batch.is_cuda and P <= _GRAPH_MAX_P
-            and A_batch.dtype == torch.float32):
+    # --- CUDA-graph fast path for the launch-bound regime --------------------
+    # Compute-aware cap: vol's light heavy-atom clouds graph far out (wins to P~1M); surf's
+    # heavy 128-point clouds cap low (eager past P~16-18k, where the graph would lose). One
+    # formula, since vol/surf share this kernel. See graph_cap.
+    if (best_score is None and _FINE_GRAPHS and A_batch.is_cuda
+            and P <= graph_cap(N_pad * M_pad) and A_batch.dtype == torch.float32):
         try:
             best_score, best_q, best_t = _run_graphed_fine(
                 A_k.contiguous(), B_k.contiguous(), q_seed, t_seed, N_k, M_k,

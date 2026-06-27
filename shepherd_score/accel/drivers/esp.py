@@ -20,7 +20,7 @@ from ._common import (
     apply_se3_transform,
     quaternion_to_rotation_matrix
 )
-from ._graphed import run_graphed, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
+from ._graphed import run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 from .shape import _GraphedFineSurf
 
 
@@ -279,7 +279,7 @@ def coarse_fine_esp_align_many(
     # times with ~zero per-step host launch overhead. vol_esp/surf_esp had NO graph path
     # before -- greenfield. Gated to the launch-bound small/medium-P CUDA fp32 regime; large
     # P / capture failure fall back to the eager loop below. See drivers/_graphed.
-    if (_FINE_GRAPHS and A_batch.is_cuda and PK <= _GRAPH_MAX_P
+    if (_FINE_GRAPHS and A_batch.is_cuda and PK <= graph_cap(N_pad * M_pad)
             and A_batch.dtype == torch.float32):
         try:
             best_score, best_q, best_t = _run_graphed_esp(

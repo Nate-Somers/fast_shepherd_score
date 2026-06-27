@@ -27,7 +27,7 @@ from ._common import (
     _update_best,
     ES_PATIENCE_OVERRIDE,
 )
-from ._graphed import _GraphedFineBase, run_graphed, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
+from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 
 
 @torch.no_grad()
@@ -497,8 +497,11 @@ def coarse_fine_esp_combo_align_many(
     # replay it. esp_combo is compute-bound (heavy surface ESP), so this mainly UNIFIES the
     # path; the eager loop below remains the fallback for large P / capture failure. ---
     _graphed = None
+    # Low work budget: esp_combo's per-step is heavy (2 surface-ESP kernels + 2 SE3 transforms)
+    # and it runs full steps, so it crosses over sooner than the shape modes -> graph only the
+    # clearly-winning small/mid-P regime, eager beyond (the baseline -- never a regression).
     if (_FINE_GRAPHS and centers_1_k.is_cuda and centers_1_k.dtype == torch.float32
-            and len(q_k) <= _GRAPH_MAX_P):
+            and len(q_k) <= graph_cap(N_pad_centers * M_pad_centers, budget=8_000_000)):
         try:
             _graphed = _run_graphed_esp_combo(
                 centers_1_k.contiguous(), centers_2_k.contiguous(),
@@ -509,12 +512,13 @@ def coarse_fine_esp_combo_align_many(
                 N_k, M_k, N_atoms_k, M_atoms_k, N_surf_k, M_surf_k,
                 VAA_k, VBB_k, VAA_plus_VBB, q_k, t_k,
                 alpha, lam, probe_radius, esp_weight, lr,
-                # Run up to steps_fine; the blocked early-stop (patience=5, matching eager)
-                # caps it at ~the eager step count -- esp_combo converges slower than the
-                # other modes (heavier ESP landscape), so a fixed 50-step cap under-optimized.
+                # NO blocked early-stop for esp_combo (es_patience defaults to 0 -> full
+                # steps_fine). Its ESP landscape converges slowly AND its trajectory is
+                # non-deterministic, so the trajectory-sensitive early-stop under-ran its
+                # self-copies (0.8513 vs 0.8585). Full steps matches eager (which also runs
+                # ~full here) and recovers parity; esp_combo is launch-heavy so it still wins.
                 steps_fine,
-                N_pad_centers, M_pad_centers, N_pad_w_H, M_pad_w_H, N_surf, M_surf, len(q_k),
-                es_patience=(ES_PATIENCE_OVERRIDE or early_stop_patience), es_tol=early_stop_tol)
+                N_pad_centers, M_pad_centers, N_pad_w_H, M_pad_w_H, N_surf, M_surf, len(q_k))
         except Exception:
             _graphed = None
     if _graphed is not None:

@@ -46,7 +46,7 @@ def _align(batch, mode):
     elif mode == "vol_esp": b.align_with_vol_esp(alpha=0.81, lam=0.3, no_H=True, backend="triton", max_num_steps=100)
     elif mode == "pharm": b.align_with_pharm(backend="triton", max_num_steps=100)
     elif mode == "vol_color": b.align_with_vol_color(color_weight=0.5, backend="triton", max_num_steps=100)
-    elif mode == "vol_and_surf_esp": b.align_with_vol_and_surf_esp(alpha=0.81, backend="triton", max_num_steps=100)
+    elif mode in ("vol_and_surf_esp", "esp_combo"): b.align_with_vol_and_surf_esp(alpha=0.81, backend="triton", max_num_steps=100)
 
 
 def cell(mode, N, out):
