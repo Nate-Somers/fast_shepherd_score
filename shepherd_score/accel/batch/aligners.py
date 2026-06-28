@@ -36,27 +36,34 @@ _INT_BUFFER_CACHE: dict[int, dict[str, torch.Tensor]] = {}
 # = fewer poses = ~linear speedup, but coarser SO(3) coverage risks distinct-pair
 # accuracy -- gated in benchmarks/experiments/speedlab.py. None -> 50.
 _NUM_SEEDS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_SEEDS"))
+_NUM_STEPS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_STEPS"))
 
-# Per-mode default seed count (the FINE_NUM_SEEDS env var overrides all of them). With the
-# structured (+/-90deg PCA-axis) seeds, each mode captures >=99.9% of the fully-converged
-# cross-pair MEAN overlap (and self-copy recovery ~1.0) at the count below -- verified on a
-# 200-cross-pair drug sweep by benchmarks/optimize_defaults.py (knee finder:
-# benchmarks/analyze_defaults.py). The pure-shape/volumetric channels (vol/vol_esp/vol_color)
-# converge fastest and shed seeds to ~28. The modes whose extra channel makes the landscape
-# inherently multi-basin (surf surface / surf_esp charge / pharm pharmacophore /
-# vol_and_surf_esp combo) keep more seeds: their MEAN keeps creeping with seed count, so the
-# per-pair tail (not the mean) is the limiter -- vol_and_surf_esp is the most seed-hungry of
-# all (40 seeds -> only 99.9%, 6% tail), which is why it stays at 50. Raise a value for
-# libraries far larger / more symmetric than drug-like. vol_esp shares surf_esp's ESP channel.
-# (surf_esp and vol_and_surf_esp are the canonical names for the legacy esp / esp_combo modes.)
-_MODE_SEEDS = {"vol": 18, "surf": 20, "surf_esp": 28, "vol_esp": 28, "vol_and_surf_esp": 50,
-               "pharm": 40, "vol_color": 28}
+# Per-mode default (seed count, fine-step count) -- the SINGLE SOURCE OF TRUTH, read by
+# _seeds_for/_steps_for and used by BOTH backends (triton/numba) and BOTH workloads (pairwise
+# MoleculePairBatch.align_with_* and the streaming screen path). FINE_NUM_SEEDS / FINE_NUM_STEPS
+# override every mode. These are the cheapest (seeds, steps) per mode that still hold all three:
+# (a) MEAN cross-overlap >= 99.7% of the per-pair ceiling, (b) a <= 8% per-pair tail (fraction of
+# pairs > 1% below the ceiling -- the tightest tail surf can reach), and (c) self-copy recovery
+# 1.0. Re-validated 2026-06 on the standard drugs.smi cross-pair sweep by
+# benchmarks/optimize_defaults.py + a tail-aware pick (the optimizer itself gates on mean+self
+# only, so the tail bound is applied on top). The multi-basin modes keep their MEAN creeping with
+# seed count, so surf / vol_and_surf_esp / pharm need many seeds (64); the fast-converging shape
+# / ESP channels need far fewer. Steps sit at the 40/70 knee. (surf_esp / vol_and_surf_esp are
+# the canonical names for the legacy esp / esp_combo modes.)
+_MODE_SEEDS = {"vol": 16, "surf": 64, "surf_esp": 12, "vol_esp": 8, "vol_and_surf_esp": 64,
+               "pharm": 64, "vol_color": 20}
+_MODE_STEPS = {"vol": 40, "surf": 40, "surf_esp": 70, "vol_esp": 40, "vol_and_surf_esp": 70,
+               "pharm": 70, "vol_color": 40}
 
 
 def _seeds_for(mode: str) -> int:
-    """Seed count for ``mode``: the FINE_NUM_SEEDS env override if set, else the per-mode
-    optimal (legacy fallback 50 for any mode not in the table)."""
+    """Per-mode default seed count (FINE_NUM_SEEDS env overrides; legacy fallback 50)."""
     return _NUM_SEEDS if _NUM_SEEDS else _MODE_SEEDS.get(mode, 50)
+
+
+def _steps_for(mode: str) -> int:
+    """Per-mode default fine-step count (FINE_NUM_STEPS env overrides; legacy fallback 50)."""
+    return _NUM_STEPS if _NUM_STEPS else _MODE_STEPS.get(mode, 50)
 
 
 def _batch_upload(pairs, attr, src_fn, dtype, device):

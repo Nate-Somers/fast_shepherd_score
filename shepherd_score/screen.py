@@ -858,9 +858,12 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
 
 
 def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
-    """Translate screen()'s align_kwargs to the ``_align_batch_<mode>`` kwargs,
-    mirroring the defaults the ``MoleculePairBatch.align_with_*`` triton path uses."""
-    steps = ak.get("max_num_steps", 200)
+    """Translate screen()'s align_kwargs to the ``_align_batch_<mode>`` kwargs, mirroring the
+    defaults the ``MoleculePairBatch.align_with_*`` triton path uses -- in particular the PER-MODE
+    fine-step count from the single-source ``_steps_for()`` table (NOT the old flat 200 leftover,
+    which ran screen ~4x slower than pairwise for the same accuracy)."""
+    from shepherd_score.accel.batch.aligners import _steps_for
+    steps = ak.get("max_num_steps", _steps_for(mode))
     if mode in ("vol", "surf"):
         return dict(alpha=ak.get("alpha", 0.81), steps_fine=steps)
     if mode == "surf_esp":

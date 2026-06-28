@@ -21,6 +21,14 @@ from shepherd_score.container._batch_utils import (
 )
 
 
+def _default_steps(mode: str) -> int:
+    """Per-mode default fine-step count from the single-source table in
+    ``accel.batch.aligners`` (``_steps_for``). Lazy-imported so this module stays importable
+    without the accel/torch stack. Used to resolve ``max_num_steps=None`` in ``align_with_*``."""
+    from shepherd_score.accel.batch.aligners import _steps_for
+    return _steps_for(mode)
+
+
 def _compute_bucket_splits(sizes_a, sizes_b, num_buckets):
     """Sort pairs by (max(a,b), min(a,b)) and split into buckets.
 
@@ -247,7 +255,7 @@ class MoleculePairBatch:
                        num_repeats: int = 50,
                        trans_init: bool = False,
                        lr: float = 0.1,
-                       max_num_steps: int = 50,
+                       max_num_steps: int = None,
                        num_workers: int = 1,
                        use_shmap: bool = True,
                        num_buckets: int = 1,
@@ -327,6 +335,8 @@ class MoleculePairBatch:
             if not no_H:
                 raise NotImplementedError(
                     "the Triton/numba vol backend aligns heavy atoms only (no_H=True)")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol,
             dict(alpha=alpha, steps_fine=max_num_steps),
@@ -463,7 +473,7 @@ class MoleculePairBatch:
                            num_repeats: int = 50,
                            trans_init: bool = False,
                            lr: float = 0.1,
-                           max_num_steps: int = 50,
+                           max_num_steps: int = None,
                            num_workers: int = 1,
                            use_shmap: bool = True,
                            num_buckets: int = 1,
@@ -533,6 +543,8 @@ class MoleculePairBatch:
             if not no_H:
                 raise NotImplementedError(
                     "the Triton/numba vol_esp backend aligns heavy atoms only (no_H=True)")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_esp")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_esp,
             dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
@@ -704,7 +716,7 @@ class MoleculePairBatch:
                         num_repeats: int = 50,
                         trans_init: bool = False,
                         lr: float = 0.1,
-                        max_num_steps: int = 50,
+                        max_num_steps: int = None,
                         use_jax: bool = True,
                         use_analytical: bool = True,
                         num_workers: int = 1,
@@ -760,6 +772,8 @@ class MoleculePairBatch:
             routes to ``MoleculePair._align_batch_surf`` (multi-GPU-aware). ``return_aligned``
             controls building the aligned-surface list (off by default = pure delegation).
         """
+        if max_num_steps is None:
+            max_num_steps = _default_steps("surf")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_surf,
             dict(alpha=alpha, steps_fine=max_num_steps),
@@ -834,7 +848,7 @@ class MoleculePairBatch:
                        num_repeats: int = 50,
                        trans_init: bool = False,
                        lr: float = 0.1,
-                       max_num_steps: int = 50,
+                       max_num_steps: int = None,
                        use_jax: bool = True,
                        use_analytical: bool = True,
                        num_workers: int = 1,
@@ -894,6 +908,8 @@ class MoleculePairBatch:
             same internal LAM_SCALING as this path, so ``lam`` is consistent across
             backends). ``return_aligned`` controls the aligned-surface list.
         """
+        if max_num_steps is None:
+            max_num_steps = _default_steps("surf_esp")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_surf_esp,
             dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
@@ -978,7 +994,7 @@ class MoleculePairBatch:
                              num_repeats: int = 50,
                              trans_init: bool = False,
                              lr: float = 0.1,
-                             max_num_steps: int = 50,
+                             max_num_steps: int = None,
                              verbose: bool = False,
                              backend: str = "jax",
                              return_aligned: bool = False,
@@ -1013,6 +1029,8 @@ class MoleculePairBatch:
             Aligned fit surface coordinates per pair (``None`` entries unless
             ``return_aligned=True`` on the Triton backend).
         """
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_and_surf_esp")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_and_surf_esp,
             dict(alpha=alpha, lam=lam, probe_radius=probe_radius,
@@ -1046,7 +1064,7 @@ class MoleculePairBatch:
                              num_repeats: int = 50,
                              trans_init: bool = False,
                              lr: float = 0.1,
-                             max_num_steps: int = 50,
+                             max_num_steps: int = None,
                              verbose: bool = False,
                              backend: str = "jax",
                              return_aligned: bool = False,
@@ -1085,6 +1103,8 @@ class MoleculePairBatch:
             Aligned fit atom coordinates per pair (``None`` entries unless
             ``return_aligned=True`` on the batched backend).
         """
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_color")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_color,
             dict(alpha=alpha, color_weight=color_weight, trans_init=trans_init,
@@ -1175,7 +1195,7 @@ class MoleculePairBatch:
                          num_repeats: int = 50,
                          trans_init: bool = False,
                          lr: float = 0.1,
-                         max_num_steps: int = 70,
+                         max_num_steps: int = None,
                          num_workers: int = 1,
                          use_shmap: bool = True,
                          num_buckets: int = 1,
@@ -1246,6 +1266,8 @@ class MoleculePairBatch:
             ``return_aligned=True`` the aligned anchors (rotate+translate) and vectors
             (rotate only) are rebuilt GPU-batched from the cached fit tensors.
         """
+        if max_num_steps is None:
+            max_num_steps = _default_steps("pharm")
         if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
             if backend in self._NUMBA_BACKENDS:
                 self._prepare_numba()
