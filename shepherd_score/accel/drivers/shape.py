@@ -241,7 +241,8 @@ def coarse_fine_align_many(
                                         # self=1.0). esp/pharm converge slower -> they
                                         # keep 5 (patience 2 there cost ~8e-3).
         early_stop_tol: float = 1e-5,
-        seeds: tuple | None = None):
+        seeds: tuple | None = None,
+        prune_after: int = 0, prune_keep: int = 0):
     """
     Vectorised padding-aware alignment over a batch of (A, B) pairs.
 
@@ -354,6 +355,10 @@ def coarse_fine_align_many(
         es_tol = _ES_TOL if _ES_TOL is not None else early_stop_tol
         prev_max_score = -float('inf')
         no_improve_count = 0
+        # Coarse-to-fine seed prune: caller (per-mode) override takes precedence over the
+        # global FINE_PRUNE_* env. surf passes (15, 24); vol passes 0 (its 16 seeds < keep).
+        _pa = prune_after or _PRUNE_AFTER
+        _pk = prune_keep or _PRUNE_KEEP
 
         for step in range(steps_fine):
             VAB, dQ, dT = _overlap_in_chunks(
@@ -367,8 +372,8 @@ def coarse_fine_align_many(
             best_score, best_q, best_t = _update_best(score, q_k, t_k, best_score, best_q, best_t)
 
             # --- early seed-prune (H1): keep only top-KEEP seeds/pair, finish those ---
-            if _PRUNE_AFTER and _PRUNE_KEEP and step == _PRUNE_AFTER - 1 and S > _PRUNE_KEEP:
-                topi = best_score.view(BATCH, S).topk(_PRUNE_KEEP, dim=1).indices
+            if _pa and _pk and step == _pa - 1 and S > _pk:
+                topi = best_score.view(BATCH, S).topk(_pk, dim=1).indices
                 gidx = (topi + torch.arange(BATCH, device=device).unsqueeze(1) * S).reshape(-1)
                 q_k = q_k[gidx].contiguous(); t_k = t_k[gidx].contiguous()
                 m_q = m_q[gidx].contiguous(); v_q = v_q[gidx].contiguous()
@@ -378,7 +383,7 @@ def coarse_fine_align_many(
                 A_k = A_k[gidx].contiguous(); B_k = B_k[gidx].contiguous()
                 N_k = N_k[gidx].contiguous(); M_k = M_k[gidx].contiguous()
                 VAA_plus_VBB = VAA_plus_VBB[gidx].contiguous()
-                S = _PRUNE_KEEP
+                S = _pk
 
             # Early stopping check, gated to every 5 steps to avoid a per-step
             # GPU->CPU sync. Gating only makes early-stop *less* aggressive.

@@ -56,6 +56,14 @@ _MODE_SEEDS = {"vol": 16, "surf": 64, "surf_esp": 12, "vol_esp": 8, "vol_and_sur
                "pharm": 64, "vol_color": 20}
 _MODE_STEPS = {"vol": 40, "surf": 40, "surf_esp": 70, "vol_esp": 40, "vol_and_surf_esp": 70,
                "pharm": 70, "vol_color": 40}
+# Coarse-to-fine seed prune (after_steps, keep), wired per-mode but OFF by default. It speeds surf
+# on bandwidth-limited GPUs (L40s: ~1.46x at 99.8% of the 64-seed mean) BUT is net-NEGATIVE on
+# H200: the mid-loop seed-slice spikes memory, shrinks the _subbatched_align chunks, and the lower
+# occupancy hurts more on the higher-SM H200 (measured surf pairwise 9.5k->6.5k). So it's available
+# opt-in (set entries here, or env FINE_PRUNE_AFTER/FINE_PRUNE_KEEP) but not a default. The clean
+# large-N surf win is the bucket upfront cap (_bucket._cap_upfront), which is on by default.
+_MODE_PRUNE: dict = {}
+def _prune_for(mode): return _MODE_PRUNE.get(mode, (0, 0))
 
 
 def _seeds_for(mode: str) -> int:
@@ -362,6 +370,7 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
         # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
         # memory-pressured chunking never re-pays the launch-bound seed-gen.
         seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds_for("surf"))
+        _pa, _pk = _prune_for("surf")
 
         # ---- coarse + fine alignment (same engine as volumetric), processed in
         # GPU-memory-safe sub-batches sized per bucket (pairs are independent)
@@ -370,7 +379,7 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
             return coarse_fine_align_many(
                 ref_pad[sl], fit_pad[sl], VAA[sl], VBB[sl],
                 N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine,
-                seeds=(seeds_q[sl], seeds_t[sl]))
+                seeds=(seeds_q[sl], seeds_t[sl]), prune_after=_pa, prune_keep=_pk)
         scores, q_batch, t_batch = _subbatched_align(
             _proc, K, key=("surf", N_pad, M_pad, 50), device=device)
 

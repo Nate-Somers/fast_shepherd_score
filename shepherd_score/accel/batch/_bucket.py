@@ -61,6 +61,31 @@ _CTAS_PER_SM = int(os.environ.get("FINE_BUCKET_CTAS_PER_SM", "16"))
 # that wastes compute and stresses the heavy kernels' indexing/memory (an illegal-access crash
 # was observed for vol_and_surf_esp screen @100k before this cap).
 _MERGE_MAX_WAVES = float(os.environ.get("FINE_BUCKET_MAX_WAVES", "2"))
+# Cap the UPFRONT held memory (padded clouds + hoisted seeds) per bucket. Occupancy merging
+# never splits a full same-size cell, so at large N one cell becomes a single giant bucket whose
+# hoisted pad+seeds -- held resident across the WHOLE fine loop -- starve _subbatched_align's
+# chunks: the held bytes inflate the measured per-pair footprint and shrink each chunk, an
+# occupancy death-spiral (measured surf 100k=11.5k/s, fp=1.6MB -> 300k=6.9k/s, fp=4.1MB -> 1M OOM
+# on 48GB). Splitting an oversized bucket into <=_MAX_UPFRONT-byte pieces is result-identical
+# (pairs are independent, same as the sub-batcher) and bounds the upfront so chunks stay large.
+_MAX_UPFRONT_BYTES = float(os.environ.get("FINE_BUCKET_MAX_UPFRONT_GB", "1.5")) * (1024 ** 3)
+
+
+def _cap_upfront(buckets: list, spec: "PadSpec", device) -> list:
+    """Split any bucket whose hoisted pad+seed footprint exceeds ``_MAX_UPFRONT_BYTES``."""
+    if getattr(device, "type", None) != "cuda" or _MAX_UPFRONT_BYTES <= 0:
+        return buckets
+    out: list = []
+    for b in buckets:
+        # bytes/pair held upfront: padded coords (sum of merge pads x 3 x f32) + seeds (q4+t3 f32)
+        per_pair = sum(int(b.pad[n]) for n in spec.merge) * 12 + int(spec.seeds) * 28
+        max_k = max(1, int(_MAX_UPFRONT_BYTES // max(1, per_pair)))
+        if b.K <= max_k:
+            out.append(b)
+        else:
+            for s in range(0, b.K, max_k):
+                out.append(Bucket(b.members[s:s + max_k], dict(b.pad)))
+    return out
 
 
 def _min_wave(device) -> int:
@@ -194,7 +219,7 @@ def plan_buckets(items, spec: PadSpec, device) -> list[Bucket]:
         return pad
 
     if not _ADAPTIVE:                                   # legacy: one bucket per exact cell
-        return [Bucket(c[0], _pad_of(c)) for c in cells.values()]
+        return _cap_upfront([Bucket(c[0], _pad_of(c)) for c in cells.values()], spec, device)
 
     # group by partition signature (never merge across different partition values), then
     # greedy-merge within each group along the merge dims.
@@ -206,7 +231,7 @@ def plan_buckets(items, spec: PadSpec, device) -> list[Bucket]:
     out: list[Bucket] = []
     for buckets in groups.values():
         out.extend(_merge_group(buckets, spec, mw))
-    return out
+    return _cap_upfront(out, spec, device)
 
 
 def _merge_group(buckets: list[Bucket], spec: PadSpec, min_wave: int) -> list[Bucket]:
