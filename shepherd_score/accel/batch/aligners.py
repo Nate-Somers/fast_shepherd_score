@@ -24,6 +24,7 @@ if TYPE_CHECKING:                     # annotations only; never imported at runt
     from shepherd_score.container._core import MoleculePair
 
 from ._pad import _band_key, _subbatched_align, _scatter_fill
+from ._bucket import plan_buckets, PadSpec
 from ._dispatch import _should_distribute, _run_distributed, _dev_idx
 
 
@@ -135,15 +136,14 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    # --- band bucketing -----------------------------------------------------
-    buckets: dict[tuple[int, int], list[MoleculePair]] = {}
-    for p in pairs:
-        n_band = _band_key(p._ref_xyz_t.shape[0])
-        m_band = _band_key(p._fit_xyz_t.shape[0])
-        buckets.setdefault((n_band, m_band), []).append(p)
-
-    for (N_pad, M_pad), bucket in buckets.items():
-        K = len(bucket)
+    # --- adaptive band bucketing (P1-4: mode-agnostic cost-model planner) ----
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_t.shape[0]},
+                    seeds=_seeds_for("vol"))
+    for _bk in plan_buckets(pairs, _spec, device):
+        N_pad, M_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = _bk.K
 
         # ---- integer buffers (reuse) ---------------------------------------
         ib_key = (_dev_idx(device), K)
@@ -292,15 +292,14 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    # --- band bucketing (by padded N/M) ---------------------------------------
-    buckets: dict[tuple[int, int], list[MoleculePair]] = {}
-    for p in pairs:
-        n_band = _band_key(p._ref_surf_t.shape[0])
-        m_band = _band_key(p._fit_surf_t.shape[0])
-        buckets.setdefault((n_band, m_band), []).append(p)
-
-    for (N_pad, M_pad), bucket in buckets.items():
-        K = len(bucket)
+    # --- adaptive band bucketing (P1-4: mode-agnostic cost-model planner) -----
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_surf_t.shape[0],
+                           "fit": lambda p: p._fit_surf_t.shape[0]},
+                    seeds=_seeds_for("surf"))
+    for _bk in plan_buckets(pairs, _spec, device):
+        N_pad, M_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = _bk.K
 
         # ---- integer buffers (reuse) ------------------------------------------
         ib_key = (_dev_idx(device), K)
@@ -492,20 +491,23 @@ def _esp_bucketed_align(
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    # Bucket by padded point-cloud sizes; for translation-seeded mode, also bucket
-    # by exact number of translation centers (legacy uses 10*P + 5 seeds).
-    buckets: dict[tuple[int, int, int], list[MoleculePair]] = {}
-    for p in pairs:
-        n_band = _band_key(getattr(p, ref_pts_attr).shape[0])
-        m_band = _band_key(getattr(p, fit_pts_attr).shape[0])
-        tc = int(p._ref_xyz_t.shape[0]) if trans_init else 0
-        buckets.setdefault((n_band, m_band, tc), []).append(p)
+    # Bucket by padded point-cloud sizes; for translation-seeded mode also PARTITION by the
+    # exact number of translation centers (it fixes the legacy 10*P+5 seed count, so it must
+    # stay uniform within a bucket). Adaptive cost-model planner (P1-4); result-identical
+    # because the kernel masks padding to the real counts.
+    _tc_of = (lambda p: int(p._ref_xyz_t.shape[0])) if trans_init else (lambda p: 0)
+    _spec = PadSpec(merge={"ref": lambda p: getattr(p, ref_pts_attr).shape[0],
+                           "fit": lambda p: getattr(p, fit_pts_attr).shape[0]},
+                    seeds=_seeds_for(subbatch_tag),
+                    partition={"tc": _tc_of})
 
     # Workspace caches keyed by (N_pad, M_pad, K)
     workspaces: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
     int_buffers: dict[int, dict[str, torch.Tensor]] = {}
 
-    for (N_pad, M_pad, tc), bucket in buckets.items():
+    for _bk in plan_buckets(pairs, _spec, device):
+        N_pad, M_pad, tc = _bk.pad["ref"], _bk.pad["fit"], _bk.pad["tc"]
+        bucket = _bk.members
         K = len(bucket)
 
         ib = int_buffers.get(K)
@@ -760,25 +762,34 @@ def _align_batch_vol_and_surf_esp(
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    buckets: dict[tuple[int, int, int, int, int, int, int], list[MoleculePair]] = {}
-    for p in pairs:
-        n_surf_band = _band_key(p._ref_surf_t.shape[0])
-        m_surf_band = _band_key(p._fit_surf_t.shape[0])
-        n_wH_band = _band_key(p._ref_centers_w_H_t.shape[0])
-        m_wH_band = _band_key(p._fit_centers_w_H_t.shape[0])
-
-        # Shape "centers" use volumetric atoms when alpha==0.81, else surface points.
-        if alpha == 0.81:
-            n_cent_band = _band_key(p._ref_xyz_t.shape[0])
-            m_cent_band = _band_key(p._fit_xyz_t.shape[0])
-        else:
-            n_cent_band = n_surf_band
-            m_cent_band = m_surf_band
-
-        tc = int(p._ref_xyz_t.shape[0]) if trans_init else 0
-        buckets.setdefault((n_wH_band, m_wH_band, n_cent_band, m_cent_band, n_surf_band, m_surf_band, tc), []).append(p)
-
-    for (n_wH_pad, m_wH_pad, n_cent_pad, m_cent_pad, n_surf_pad, m_surf_pad, tc), bucket in buckets.items():
+    # Adaptive cost-model planner (P1-4) over the SIX cost dims (atoms-w-H, shape centers,
+    # surface points -- ref & fit) + the exact tc partition. "centers" are volumetric atoms
+    # when alpha==0.81, else the surface points (constant for the whole call). The work model
+    # is the SUM of the three channel products (shape + the two ESP comparisons) -- exactly
+    # why PadSpec.work is a callable, not a hardcoded N*M. Result-identical (kernel masks pad).
+    _a0 = (alpha == 0.81)
+    _tc_of = (lambda p: int(p._ref_xyz_t.shape[0])) if trans_init else (lambda p: 0)
+    _spec = PadSpec(
+        merge={
+            "n_wH":   lambda p: p._ref_centers_w_H_t.shape[0],
+            "m_wH":   lambda p: p._fit_centers_w_H_t.shape[0],
+            "n_surf": lambda p: p._ref_surf_t.shape[0],
+            "m_surf": lambda p: p._fit_surf_t.shape[0],
+            "n_cent": (lambda p: p._ref_xyz_t.shape[0]) if _a0 else (lambda p: p._ref_surf_t.shape[0]),
+            "m_cent": (lambda p: p._fit_xyz_t.shape[0]) if _a0 else (lambda p: p._fit_surf_t.shape[0]),
+        },
+        seeds=_seeds_for("vol_and_surf_esp"),
+        partition={"tc": _tc_of},
+        work=lambda pad: (pad["n_cent"] * pad["m_cent"]
+                          + pad["n_surf"] * pad["m_wH"]
+                          + pad["m_surf"] * pad["n_wH"]),
+    )
+    for _bk in plan_buckets(pairs, _spec, device):
+        n_wH_pad, m_wH_pad = _bk.pad["n_wH"], _bk.pad["m_wH"]
+        n_cent_pad, m_cent_pad = _bk.pad["n_cent"], _bk.pad["m_cent"]
+        n_surf_pad, m_surf_pad = _bk.pad["n_surf"], _bk.pad["m_surf"]
+        tc = _bk.pad["tc"]
+        bucket = _bk.members
         K = len(bucket)
 
         # Allocate padded blocks
@@ -994,14 +1005,15 @@ def _align_batch_pharm(
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    buckets: dict[tuple[int, int, int], list[MoleculePair]] = {}
-    for p in pairs:
-        n_band = _band_key(p._ref_pharm_ancs_t.shape[0])
-        m_band = _band_key(p._fit_pharm_ancs_t.shape[0])
-        tc = int(p._ref_pharm_ancs_t.shape[0]) if trans_init else 0
-        buckets.setdefault((n_band, m_band, tc), []).append(p)
-
-    for (N_pad, M_pad, tc), bucket in buckets.items():
+    # Adaptive planner (P1-4): merge by padded anchor counts, partition by exact tc.
+    _tc_of = (lambda p: int(p._ref_pharm_ancs_t.shape[0])) if trans_init else (lambda p: 0)
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_pharm_ancs_t.shape[0],
+                           "fit": lambda p: p._fit_pharm_ancs_t.shape[0]},
+                    seeds=_seeds_for("pharm"),
+                    partition={"tc": _tc_of})
+    for _bk in plan_buckets(pairs, _spec, device):
+        N_pad, M_pad, tc = _bk.pad["ref"], _bk.pad["fit"], _bk.pad["tc"]
+        bucket = _bk.members
         K = len(bucket)
 
         ref_types = torch.zeros(K, N_pad, device=device, dtype=torch.int64)
@@ -1119,23 +1131,21 @@ def _align_batch_vol_color(
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    # COLLAPSED bucket key: shape bands only (n_cent, m_cent[, tc]) -- matching vol exactly.
-    # The pharmacophore-anchor counts are deliberately NOT in the key: their pad width is
-    # cheap and padded anchor slots are Dummy-typed (never scored) + masked out by
-    # N_real_pharm, so two pairs that share a shape bucket but differ in feature count stay
-    # together and their anchors are padded to the bucket's max feature band. This is
-    # RESULT-IDENTICAL (the masked color kernel ignores the extra slots) but collapses the
-    # bucket count back to the vol baseline -- vol_color was the worst-fragmented mode (its
-    # old 5-tuple key split each shape bucket by two orthogonal feature-count dims, starving
-    # each batched kernel of occupancy).
-    buckets: dict[tuple[int, int, int], list[MoleculePair]] = {}
-    for p in pairs:
-        n_cent = _band_key(p._ref_xyz_t.shape[0])
-        m_cent = _band_key(p._fit_xyz_t.shape[0])
-        tc = int(p._ref_xyz_t.shape[0]) if trans_init else 0
-        buckets.setdefault((n_cent, m_cent, tc), []).append(p)
-
-    for (n_cent_pad, m_cent_pad, tc), bucket in buckets.items():
+    # COLLAPSED bucket key + adaptive planner (P1-4): merge by shape-center bands only,
+    # partition by exact tc. The pharmacophore-anchor counts are deliberately NOT keyed --
+    # their pad slots are Dummy-typed (never scored) + masked by N_real_pharm, so two pairs
+    # that share a shape bucket but differ in feature count stay together and their anchors are
+    # padded to the bucket's max feature band (recomputed below). RESULT-IDENTICAL (the masked
+    # color kernel ignores the extra slots); keeps vol_color on the vol shape-bucket granularity
+    # (its old 5-tuple key split each shape bucket by two feature-count dims, starving occupancy).
+    _tc_of = (lambda p: int(p._ref_xyz_t.shape[0])) if trans_init else (lambda p: 0)
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_t.shape[0]},
+                    seeds=_seeds_for("vol_color"),
+                    partition={"tc": _tc_of})
+    for _bk in plan_buckets(pairs, _spec, device):
+        n_cent_pad, m_cent_pad, tc = _bk.pad["ref"], _bk.pad["fit"], _bk.pad["tc"]
+        bucket = _bk.members
         K = len(bucket)
 
         ref_cent_ts = [p._ref_xyz_t for p in bucket]
