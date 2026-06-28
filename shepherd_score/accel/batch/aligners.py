@@ -47,10 +47,12 @@ _NUM_STEPS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_STEPS"))
 # 1.0. Re-validated 2026-06 on the standard drugs.smi cross-pair sweep by
 # benchmarks/optimize_defaults.py + a tail-aware pick (the optimizer itself gates on mean+self
 # only, so the tail bound is applied on top). The multi-basin modes keep their MEAN creeping with
-# seed count, so surf / vol_and_surf_esp / pharm need many seeds (64); the fast-converging shape
-# / ESP channels need far fewer. Steps sit at the 40/70 knee. (surf_esp / vol_and_surf_esp are
-# the canonical names for the legacy esp / esp_combo modes.)
-_MODE_SEEDS = {"vol": 16, "surf": 64, "surf_esp": 12, "vol_esp": 8, "vol_and_surf_esp": 64,
+# seed count, so surf / pharm need many seeds (64); the fast-converging shape / ESP channels need
+# far fewer. vol_and_surf_esp now seeds from its VOLUME centers (esp_combo._VOL_SEEDS, default on)
+# rather than the multi-basin surface, so 24 seeds match the legacy 64 surface seeds (99.7% mean,
+# ~1.96x). Steps sit at the 40/70 knee. (surf_esp / vol_and_surf_esp are the canonical names for
+# the legacy esp / esp_combo modes.)
+_MODE_SEEDS = {"vol": 16, "surf": 64, "surf_esp": 12, "vol_esp": 8, "vol_and_surf_esp": 24,
                "pharm": 64, "vol_color": 20}
 _MODE_STEPS = {"vol": 40, "surf": 40, "surf_esp": 70, "vol_esp": 40, "vol_and_surf_esp": 70,
                "pharm": 70, "vol_color": 40}

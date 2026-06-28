@@ -4,8 +4,32 @@
 
 from __future__ import annotations
 
+import os
 import torch
 from typing import Tuple, Optional
+
+# Lever: sparse ESP scoring. vol_and_surf_esp steers the pose by the SHAPE gradient ONLY (the
+# ESP enters just the TRACKED combo score, never the SE(3) derivative), so the optimisation
+# trajectory is byte-identical whether or not the (expensive) ESP score is evaluated on a given
+# step -- per step the ESP costs 2 surface-ESP kernels (N_surf x M_atoms) + 2 SE(3) cloud
+# transforms, ~the bulk of the work, vs one small shape value+grad kernel. We can therefore
+# evaluate the combo score every FINE_ESP_STRIDE steps (always including the final step) and
+# track the best among those, skipping the ESP work on the off-steps. The pose path, gradient,
+# and shape early-stop are unchanged; only best-pose *selection* is sampled more coarsely.
+# Accuracy-gated (the trajectory converges, so the combo peak sits near the scored tail). =1
+# reproduces the dense baseline exactly.
+_ESP_STRIDE = max(1, int(os.environ.get("FINE_ESP_STRIDE", "5")))
+
+# Lever (DEFAULT ON): seed from the VOLUME centers instead of the surface points. vol_and_surf_esp
+# steers the pose by the volume (centers) shape gradient, but historically seeded from the surface
+# clouds -- a mismatch: the surface is far more multi-basin than the heavy-atom volume (vol needs
+# 16 seeds, surf 64), so surface seeds needed many more starts to be sure a volume basin was
+# covered. Seeding from the centers aligns the seed PCA starts with the basins the optimiser
+# actually descends, so far fewer seeds reach the same combo score: vol-seed @24 == surf-seed @64
+# on the mean (99.7%; tested on the bench-380 and drugs.smi sets), at ~1.96x the throughput. The
+# matching seed count (24, vs the legacy 64) lives in aligners._MODE_SEEDS. Set FSS_VASE_VOL_SEEDS=0
+# to revert to legacy surface seeds (then bump the seed count back to ~64).
+_VOL_SEEDS = os.environ.get("FSS_VASE_VOL_SEEDS", "1") != "0"
 
 # Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
 # esp_combo reuses the SAME Gaussian shape kernel (vol overlap) as fast_se3/surface
@@ -388,10 +412,15 @@ def coarse_fine_esp_combo_align_many(
         # fine-optimise ALL seeds and take the per-pair max -- NO coarse-grid +
         # top-k pruning. Pruning on the raw (un-optimised) overlap dropped the
         # true basin for pseudo-symmetric molecules; see
-        # fast_se3.coarse_fine_align_many for the full rationale. Seeds use the
-        # surface point clouds (same as the coarse grid did).
-        quats, t_seeds = batched_seeds_torch(points_1, points_2, N_real_surf_1,
-                                             M_real_surf_2, num_seeds=num_seeds)
+        # fast_se3.coarse_fine_align_many for the full rationale. Seed from the
+        # VOLUME centers (matches the shape gradient) when _VOL_SEEDS, else the
+        # legacy surface point clouds.
+        if _VOL_SEEDS:
+            quats, t_seeds = batched_seeds_torch(centers_1, centers_2, N_real_centers,
+                                                 M_real_centers, num_seeds=num_seeds)
+        else:
+            quats, t_seeds = batched_seeds_torch(points_1, points_2, N_real_surf_1,
+                                                 M_real_surf_2, num_seeds=num_seeds)
         P = quats.size(1)
         q_best = quats.clone()
         t_best = t_seeds.clone()
@@ -527,38 +556,36 @@ def coarse_fine_esp_combo_align_many(
     for step in range(steps_fine):
         if _graphed is not None:
             break
-        # Use shape gradients for optimization (ESP doesn't affect SE3 derivatives much).
-        # Transform the fit clouds the ESP comparison needs (atoms-with-H + surface
-        # points of molecule 2). The shape-"centers" of molecule 2 are NOT transformed
-        # here -- the shape kernel rotates them internally from (q_k, t_k), and its VAB
-        # is reused for the score (so no separate centers_2_t / shape recompute).
-        centers_w_H_2_t = apply_se3_transform(centers_w_H_2_k, q_k, t_k)
-        points_2_t = apply_se3_transform(points_2_k, q_k, t_k)
-
-        # Get shape value + gradients from kernel
+        # Shape value + gradient EVERY step -- this drives the trajectory AND the early-stop.
+        # The shape "centers" of molecule 2 are NOT transformed here; the shape kernel rotates
+        # them internally from (q_k, t_k), and its VAB is reused for the combo score below.
         VAB, dQ, dT = _overlap_in_chunks_volumetric(
             centers_1_k, centers_2_k, q_k, t_k,
             alpha=alpha, N_real=N_k, M_real=M_k)
 
-        # Compute full combo score for tracking (reuse VAB from the gradient kernel)
-        score = _batch_esp_combo_score(
-            centers_w_H_1_k, centers_w_H_2_t,
-            centers_1_k, centers_2_k,
-            points_1_k, points_2_t,
-            partial_charges_1_k, partial_charges_2_k,
-            point_charges_1_k, point_charges_2_k,
-            radii_1_k, radii_2_k,
-            alpha, lam, probe_radius, esp_weight,
-            VAA_k, VBB_k, N_k, M_k,
-            N_atoms_k, M_atoms_k, N_surf_k, M_surf_k,
-            VAB_shape=VAB)
-
-        # Scale gradients for shape component
+        # Scale gradients for shape component (needed every step for the Adam update)
         denom = VAA_plus_VBB - VAB
         scale = VAA_plus_VBB / (denom * denom)
 
-        # Track best (q, t) per pose by score
-        best_score, best_q, best_t = _update_best(score, q_k, t_k, best_score, best_q, best_t)
+        # Sparse ESP: evaluate the full combo score (2 surface-ESP kernels + the 2 SE(3) cloud
+        # transforms they need) only every _ESP_STRIDE steps, plus the final step. The pose path
+        # is shape-driven, so off-step poses are still visited -- we just skip re-scoring them.
+        # Track the best combo pose among the scored steps.
+        if (step % _ESP_STRIDE == 0) or (step == steps_fine - 1):
+            centers_w_H_2_t = apply_se3_transform(centers_w_H_2_k, q_k, t_k)
+            points_2_t = apply_se3_transform(points_2_k, q_k, t_k)
+            score = _batch_esp_combo_score(
+                centers_w_H_1_k, centers_w_H_2_t,
+                centers_1_k, centers_2_k,
+                points_1_k, points_2_t,
+                partial_charges_1_k, partial_charges_2_k,
+                point_charges_1_k, point_charges_2_k,
+                radii_1_k, radii_2_k,
+                alpha, lam, probe_radius, esp_weight,
+                VAA_k, VBB_k, N_k, M_k,
+                N_atoms_k, M_atoms_k, N_surf_k, M_surf_k,
+                VAB_shape=VAB)
+            best_score, best_q, best_t = _update_best(score, q_k, t_k, best_score, best_q, best_t)
 
         # Early stopping check every 5 iterations to reduce GPU→CPU sync overhead
         if step % 5 == 0:
