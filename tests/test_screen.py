@@ -139,7 +139,9 @@ def test_screen_guards(tmp_path):
 
     class _Q:
         num_surf_points = 64
-    with pytest.raises(ValueError, match="esp_combo requires an explicit alpha"):
+    # legacy mode name "esp_combo" must still resolve (to canonical vol_and_surf_esp) and
+    # hit the alpha guard; the message reports the canonical name, so match name-agnostically.
+    with pytest.raises(ValueError, match="requires an explicit alpha"):
         screen(_Q(), store, mode="esp_combo", backend="numba")
     with pytest.raises(ValueError, match="heavy atoms only"):
         screen(_Q(), store, mode="vol", backend="numba", no_H=False)

@@ -120,6 +120,18 @@ class TestSE3:
         sol_repeated = torch.Tensor(self.sol_points_transformed).repeat((2, 1, 1))
         assert torch.allclose(out_transformed, sol_repeated)
 
+    def test_apply_se3_transform_torch_R1_collapses_to_single(self):
+        """Fork contract: a singleton batch (R==1) of (1,N,3)+(1,4,4) returns (N,3), not
+        (1,N,3), and equals the single-instance result. The accel/autograd optimizers rely
+        on this so num_repeats==1 batched calls agree with the unbatched path. Pin it."""
+        pts_single = torch.Tensor(self.ex_set_of_points)
+        tf_single = torch.Tensor(self.sol_se3_transform)
+        out_single = apply_SE3_transform(pts_single, tf_single)
+        out_r1 = apply_SE3_transform(pts_single.unsqueeze(0), tf_single.unsqueeze(0))
+        assert out_r1.shape == (self.ex_set_of_points.shape[0], 3), out_r1.shape
+        assert torch.allclose(out_r1, out_single)
+        assert torch.allclose(out_r1, torch.Tensor(self.sol_points_transformed))
+
     # Jax functions (single instance)
     @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")
     def test_quaternion_to_rotation_matrix_jax(self):

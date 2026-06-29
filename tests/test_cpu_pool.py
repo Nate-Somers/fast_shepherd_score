@@ -109,7 +109,7 @@ def test_pool_matches_single_process(mode, num_workers):
     plateaus a step or two apart), but a clean optimum converges to the same point."""
     rng = np.random.default_rng(0)
     raw = _make_pairs(10, rng, kind="se3")
-    sc_attr = bm._MODE_SPEC[mode]["out"][1]
+    sc_attr = bm._MODE_SPEC[_cpu_pool._LEGACY_MODE_ALIASES.get(mode, mode)]["out"][1]
 
     ref_pairs = [_Pair(*r) for r in raw]
     getattr(bm, "_align_batch_" + mode)([p for p in ref_pairs], **_KW[mode])
@@ -129,7 +129,7 @@ def test_pool_distinct_pairs_sanity(mode):
     >>5e-2, while the batch-global early-stop drift on these harder optima stays under it."""
     rng = np.random.default_rng(7)
     raw = _make_pairs(8, rng, kind="distinct")
-    sc_attr = bm._MODE_SPEC[mode]["out"][1]
+    sc_attr = bm._MODE_SPEC[_cpu_pool._LEGACY_MODE_ALIASES.get(mode, mode)]["out"][1]
     ref_pairs = [_Pair(*r) for r in raw]
     getattr(bm, "_align_batch_" + mode)([p for p in ref_pairs], **_KW[mode])
     ref = np.array([float(getattr(p, sc_attr)) for p in ref_pairs])
@@ -146,7 +146,7 @@ def test_pool_self_copy_exact(mode):
     sharding mechanism itself is exact (the small drift above is purely early-stop)."""
     rng = np.random.default_rng(2)
     raw = _make_pairs(8, rng, kind="exact")            # fit = exact copy of ref
-    sc_attr = bm._MODE_SPEC[mode]["out"][1]
+    sc_attr = bm._MODE_SPEC[_cpu_pool._LEGACY_MODE_ALIASES.get(mode, mode)]["out"][1]
 
     ref_pairs = [_Pair(*r) for r in raw]
     getattr(bm, "_align_batch_" + mode)([p for p in ref_pairs], **_KW[mode])

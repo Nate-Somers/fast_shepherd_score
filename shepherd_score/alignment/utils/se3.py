@@ -167,6 +167,8 @@ def apply_SE3_transform(points: torch.Tensor,
     -------
     transformed_points : torch.Tensor (batch, N, 3) or (N, 3)
         Set of coordinates transformed by the corresponding SE(3) transformation.
+        Note: a singleton batch (batch==1) is collapsed to (N, 3) so single-vs-batch
+        handling agrees at num_repeats==1 (see the implementation comment below).
     """
     if points.shape[-1] != 3:
         raise ValueError(f'"points" should have shape (N_points, 3) or (batch, N_points, 3). Instead the shape given was: {points.shape}')
