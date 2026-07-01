@@ -35,7 +35,7 @@ from ...score.constants import COULOMB_SCALING, LAM_SCALING
 _K_PI = math.pi ** 1.5
 
 
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _overlap_grad_kernel(A, B, q, t, Nr, Mr, alpha, need_grad):
     """Fused overlap value + SE(3) gradient, one pose per prange iteration.
 
@@ -162,7 +162,7 @@ def fused_surf_step_batch(*args, **kwargs):
 #  by the (SE(3)-invariant) charge weight (folded into g). The two exps are fused
 #  into one exp(-a/2 r^2 - c2/lam) (algebraically identical; the L5 lever).
 # ===========================================================================
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _overlap_grad_esp_kernel(A, B, CA, CB, q, t, Nr, Mr, alpha, inv_lam, need_grad):
     K = A.shape[0]
     Kc = _K_PI / (2.0 * alpha) ** 1.5
@@ -241,7 +241,7 @@ def overlap_score_grad_esp_se3_batch(A, B, charges_A, charges_B, q, t, *,
 #  math.exp vs the Triton exp2 is the only intended divergence. No gradient
 #  (esp_combo steers the pose with the shape gradient).
 # ===========================================================================
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _esp_comparison_kernel(P, A, Q, R, PE, Nr, Mr, inv_lam, coulomb, probe):
     K = P.shape[0]
     S = np.zeros(K, dtype=np.float64)
@@ -300,7 +300,7 @@ def esp_comparison_batch(points, atoms, charges, point_esp, radii, *,
 #  type-match + non-dummy(cat!=3) masking; returns O, grad_R (3x3), grad_t. FIT=i
 #  (rotated by R,t), REF=j (fixed); type/alpha/K/cat from FIT.
 # ===========================================================================
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _pharm_grad_kernel(RaA, FaB, RvA, FvB, RtA, FtB, R, t, alphas, Ks, cats, Nr, Mr, need_grad):
     P = RaA.shape[0]
     O = np.zeros(P, dtype=np.float64)
@@ -417,7 +417,7 @@ def pharm_score_grad_se3_batch(R, t, ref_types, fit_types, ref_anchors, fit_anch
 #  dx = A - rot(B): identical sign convention to _overlap_grad_kernel, so the dV/dq
 #  tail below is byte-identical to the (validated) shape-kernel tail.
 # ===========================================================================
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _pharm_color_grad_kernel(A, B, q, t, At, Bt, alphas, Ks, cats, Nr, Mr, need_grad):
     P = A.shape[0]
     O = np.zeros(P, dtype=np.float64)
@@ -505,7 +505,7 @@ def pharm_color_score_grad_se3_batch(A, B, q, t, ref_types, fit_types, alphas, K
 #  "force" (sum_j aKwE*(rotfit-ref)) and the body-frame fit ANCHOR, and once with
 #  the weight "force" (sum_j coeff*ref_vn) and the body-frame fit VECTOR.
 # ===========================================================================
-@njit(parallel=True, fastmath=False, cache=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _pharm_grad_dq_kernel(A, B, q, t, At, Bt, RvA, FvB, alphas, Ks, cats, Nr, Mr, need_grad):
     P = A.shape[0]
     O = np.zeros(P, dtype=np.float64)

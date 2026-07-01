@@ -23,6 +23,7 @@ from ._common import (
     apply_so3_transform,
     quaternion_to_rotation_matrix
 )
+from .shape import _CPU_FUSED
 
 # Analytical (autograd-free) pharmacophore value+gradient, reused from the
 # upstream analytical-gradients module. Used to drive the fine loop without
@@ -372,6 +373,23 @@ def coarse_fine_pharm_align_many(
             _graphed = None
     if _graphed is not None:
         best_score, best_q, best_t = _graphed
+
+    # --- opt-in CPU (numba) fast path: fully-fused fine loop, NO torch in the hot loop ------
+    # Only the default-kernel tanimoto branch (use_kernel) is fused; tversky / extended_points /
+    # the padded-autograd path keep the eager loop. The in-register dQ kernel keeps q ~unit each
+    # step (like the shape kernel), so the Tanimoto/Adam tail is shared.
+    if (_graphed is None and _CPU_FUSED and not anchors_1.is_cuda and use_kernel
+            and similarity == 'tanimoto' and anchors_1_k.dtype == torch.float32):
+        try:
+            from ..kernels.cpu_fused import cpu_fused_pharm
+            _al, _Ks, _cats = _pk_tables
+            best_score, best_q, best_t = cpu_fused_pharm(
+                anchors_1_k, anchors_2_k, vectors_1_k, vectors_2_k, types_1_k, types_2_k,
+                q_param, t_param, N_k, M_k, VAA_an + VBB_an, _al, _Ks, _cats, lr, steps_fine,
+                (_fc.ES_PATIENCE_OVERRIDE or early_stop_patience), early_stop_tol)
+            _graphed = True                                # skip the eager loop below
+        except Exception:
+            pass                                           # fall through to the eager loop
 
     for step in range(steps_fine):
         if _graphed is not None:

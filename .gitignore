@@ -189,3 +189,9 @@ benchmarks/results_cpu/*.log
 benchmarks/results_cpu/**/slurm-*.out
 # Personal conda env (upstream environment.yml is the canonical one)
 environment.local.yml
+
+# optimization-sweep output jsons (kept on cluster, not tracked)
+benchmarks/optall.json
+benchmarks/optimize_defaults_results.json
+benchmarks/vesp380.json
+benchmarks/volopt_esp_combo.json

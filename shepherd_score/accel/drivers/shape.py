@@ -120,6 +120,12 @@ _PRUNE_KEEP = int(os.environ.get("FINE_PRUNE_KEEP", 0))
 _ES_PATIENCE = (lambda v: int(v) if v else None)(os.environ.get("FINE_ES_PATIENCE"))
 _ES_TOL = (lambda v: float(v) if v else None)(os.environ.get("FINE_ES_TOL"))
 
+# Opt-in fully-fused CPU (numba) fine loop — a FIRST-CLASS CPU path, not the GPU eager fallback.
+# Removes torch from the hot loop (the per-step torch score/best/Adam tail AND the constant-array
+# torch->numpy re-marshalling), running the validated numba overlap kernel + an njit Adam/score
+# tail entirely in prange. Same seeds/steps as the Triton path. Disable with FSS_CPU_FUSED=0.
+_CPU_FUSED = os.environ.get("FSS_CPU_FUSED", "1") != "0"
+
 
 class _GraphedFineSurf(_GraphedFineBase):
     """Capture one in-place surf/vol fine step into a CUDA graph; replay = N steps.
@@ -338,6 +344,20 @@ def coarse_fine_align_many(
                 es_tol=(_ES_TOL if _ES_TOL is not None else early_stop_tol))
         except Exception:
             best_score = None                              # capture failed -> eager
+
+    # --- opt-in CPU (numba) fast path: fully-fused fine loop, NO torch in the hot loop ------
+    # Skipped when a seed-prune is requested (surf; handled by the eager loop) or for fp64;
+    # any failure falls through to the eager loop. Same seeds/steps as every other path.
+    if (best_score is None and _CPU_FUSED and not A_batch.is_cuda
+            and A_batch.dtype == torch.float32 and (prune_after or _PRUNE_AFTER) == 0):
+        try:
+            from ..kernels.cpu_fused import cpu_fused_shape
+            best_score, best_q, best_t = cpu_fused_shape(
+                A_k, B_k, q_seed, t_seed, N_k, M_k, VAA_plus_VBB, alpha, lr, steps_fine,
+                _ES_PATIENCE if _ES_PATIENCE is not None else early_stop_patience,
+                _ES_TOL if _ES_TOL is not None else early_stop_tol)
+        except Exception:
+            best_score = None                              # fused failed -> eager
 
     # --- eager fall-back (large P, non-CUDA, fp64, or capture failure) -------
     if best_score is None:

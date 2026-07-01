@@ -53,6 +53,7 @@ from ._common import (
 )
 from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 from .esp_combo import _overlap_in_chunks_volumetric, _self_overlap_chunks
+from .shape import _CPU_FUSED
 from ...score.analytical_gradients._torch import build_lookup_tables
 
 # Padding type for pharmacophore slots: P_TYPES index 8 == 'Dummy' (lookup category 3 ->
@@ -351,6 +352,19 @@ def coarse_fine_vol_color_align_many(
                 es_patience=early_stop_patience, es_tol=early_stop_tol)
         except Exception:
             best_score = None                              # capture failed -> eager
+
+    # --- opt-in CPU (numba) fast path: fully-fused fine loop, NO torch in the hot loop ------
+    if (best_score is None and _CPU_FUSED and not centers_1_k.is_cuda
+            and centers_1_k.dtype == torch.float32):
+        try:
+            from ..kernels.cpu_fused import cpu_fused_vol_color
+            best_score, best_q, best_t = cpu_fused_vol_color(
+                centers_1_k, centers_2_k, anchors_1_k, anchors_2_k, ptype_1_k, ptype_2_k,
+                q_k, t_k, N_k, M_k, Np_k, Mp_k, VAA_plus_VBB, VAA_c_plus_VBB_c,
+                al, Ks, cats, alpha, color_weight, lr, steps_fine,
+                early_stop_patience, early_stop_tol)
+        except Exception:
+            best_score = None                              # fused failed -> eager
 
     if best_score is None:
         m_q = torch.zeros_like(q_k); v_q = torch.zeros_like(q_k)
