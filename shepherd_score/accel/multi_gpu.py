@@ -32,14 +32,14 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-# Public per-mode result attributes written in-place by align_with_*.
-_SCORE_ATTR = {"vol": "sim_aligned_vol_noH", "surf": "sim_aligned_surf",
-               "surf_esp": "sim_aligned_surf_esp", "pharm": "sim_aligned_pharm"}
-_TRANSFORM_ATTR = {"vol": "transform_vol_noH", "surf": "transform_surf",
-                   "surf_esp": "transform_surf_esp", "pharm": "transform_pharm"}
-# Legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp); normalized at the
-# public align entry points so old callers keep working.
-_LEGACY_MODE_ALIASES = {"esp": "surf_esp", "esp_combo": "vol_and_surf_esp"}
+# Public per-mode result attributes written in-place by align_with_*. The multi-GPU process path
+# supports exactly the registry's PROCESS_MODES (those with a _MODE_SPEC entry); derive both maps
+# (and the validation set ``list(_SCORE_ATTR)``) from the registry so they can't drift from the
+# canonical attribute names. Legacy aliases (esp/esp_combo) likewise come from the registry.
+from ._modes import (MODE_ATTRS as _MODE_ATTRS, PROCESS_MODES as _PROCESS_MODES,
+                     LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES)
+_TRANSFORM_ATTR = {m: _MODE_ATTRS[m][0] for m in _PROCESS_MODES}
+_SCORE_ATTR = {m: _MODE_ATTRS[m][1] for m in _PROCESS_MODES}
 
 
 def _cap_threads(threads):

@@ -60,25 +60,15 @@ import numpy as np
 __all__ = ["MoleculeProfile", "ProfileStore", "screen", "screen_many", "Hit"]
 
 
-# Per-mode result attributes written in-place by ``MoleculePairBatch.align_with_*``.
-_SCORE_ATTR = {
-    "vol": "sim_aligned_vol_noH", "vol_esp": "sim_aligned_vol_esp_noH",
-    "surf": "sim_aligned_surf", "surf_esp": "sim_aligned_surf_esp",
-    "vol_and_surf_esp": "sim_aligned_vol_and_surf_esp", "pharm": "sim_aligned_pharm",
-    "vol_color": "sim_aligned_vol_color",
-}
-_TRANSFORM_ATTR = {
-    "vol": "transform_vol_noH", "vol_esp": "transform_vol_esp_noH",
-    "surf": "transform_surf", "surf_esp": "transform_surf_esp",
-    "vol_and_surf_esp": "transform_vol_and_surf_esp", "pharm": "transform_pharm",
-    "vol_color": "transform_vol_color",
-}
+# Per-mode result attributes written in-place by ``MoleculePairBatch.align_with_*``, and the
+# legacy mode-name aliases -- both sourced from the mode registry (``accel/_modes.py``) so the
+# screen front-end and the accel layers can never disagree on attribute names or valid modes.
+from shepherd_score.accel._modes import (
+    MODE_ATTRS as _MODE_ATTRS, LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES, canonical as _canon_mode,
+)
+_TRANSFORM_ATTR = {m: a[0] for m, a in _MODE_ATTRS.items()}
+_SCORE_ATTR = {m: a[1] for m, a in _MODE_ATTRS.items()}
 _VALID_MODES = tuple(_SCORE_ATTR)
-# Legacy mode aliases: old user-facing mode names -> canonical. Normalized at every
-# public entry point so old code (``mode="esp"``/``"esp_combo"``) keeps working.
-_LEGACY_MODE_ALIASES = {"esp": "surf_esp", "esp_combo": "vol_and_surf_esp"}
-def _canon_mode(mode):
-    return _LEGACY_MODE_ALIASES.get(mode, mode)
 # Modes whose surface ``alpha`` should auto-default to ALPHA(num_surf_points).
 _SURF_ALPHA_MODES = {"surf", "surf_esp"}
 

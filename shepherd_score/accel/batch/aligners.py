@@ -38,24 +38,11 @@ _INT_BUFFER_CACHE: dict[int, dict[str, torch.Tensor]] = {}
 _NUM_SEEDS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_SEEDS"))
 _NUM_STEPS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_STEPS"))
 
-# Per-mode default (seed count, fine-step count) -- the SINGLE SOURCE OF TRUTH, read by
-# _seeds_for/_steps_for and used by BOTH backends (triton/numba) and BOTH workloads (pairwise
-# MoleculePairBatch.align_with_* and the streaming screen path). FINE_NUM_SEEDS / FINE_NUM_STEPS
-# override every mode. These are the cheapest (seeds, steps) per mode that still hold all three:
-# (a) MEAN cross-overlap >= 99.7% of the per-pair ceiling, (b) a <= 8% per-pair tail (fraction of
-# pairs > 1% below the ceiling -- the tightest tail surf can reach), and (c) self-copy recovery
-# 1.0. Re-validated 2026-06 on the standard drugs.smi cross-pair sweep by
-# benchmarks/optimize_defaults.py + a tail-aware pick (the optimizer itself gates on mean+self
-# only, so the tail bound is applied on top). The multi-basin modes keep their MEAN creeping with
-# seed count, so surf / pharm need many seeds (64); the fast-converging shape / ESP channels need
-# far fewer. vol_and_surf_esp now seeds from its VOLUME centers (esp_combo._VOL_SEEDS, default on)
-# rather than the multi-basin surface, so 24 seeds match the legacy 64 surface seeds (99.7% mean,
-# ~1.96x). Steps sit at the 40/70 knee. (surf_esp / vol_and_surf_esp are the canonical names for
-# the legacy esp / esp_combo modes.)
-_MODE_SEEDS = {"vol": 16, "surf": 64, "surf_esp": 12, "vol_esp": 8, "vol_and_surf_esp": 24,
-               "pharm": 64, "vol_color": 20}
-_MODE_STEPS = {"vol": 40, "surf": 40, "surf_esp": 70, "vol_esp": 40, "vol_and_surf_esp": 70,
-               "pharm": 70, "vol_color": 40}
+# Per-mode default (seed count, fine-step count). The data + its tuning rationale now live in
+# the mode registry (``accel/_modes.py``: MODE_SEEDS / MODE_STEPS); imported here under the
+# historical names that _seeds_for/_steps_for (and external refs) use. FINE_NUM_SEEDS /
+# FINE_NUM_STEPS env vars still override every mode.
+from .._modes import MODE_SEEDS as _MODE_SEEDS, MODE_STEPS as _MODE_STEPS
 # Coarse-to-fine seed prune (after_steps, keep), wired per-mode but OFF by default. It speeds surf
 # on bandwidth-limited GPUs (L40s: ~1.46x at 99.8% of the 64-seed mean) BUT is net-NEGATIVE on
 # H200: the mid-loop seed-slice spikes memory, shrinks the _subbatched_align chunks, and the lower
