@@ -1,5 +1,5 @@
 """Batched coarse-to-fine SE(3) alignment drivers -- one module per mode
-(:mod:`shape` / vol, :mod:`surface`, :mod:`esp`, :mod:`esp_combo`, :mod:`pharm`).
+(:mod:`shape` / vol+surf, :mod:`esp`, :mod:`esp_combo`, :mod:`pharm`, :mod:`vol_color`).
 
 Each driver runs seed generation, the Adam fine-tuning loop, and per-pair best-pose
 selection over the whole batch on the dispatched kernels

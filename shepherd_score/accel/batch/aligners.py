@@ -213,7 +213,7 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
                 N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine,
                 seeds=(seeds_q[sl], seeds_t[sl]))
         scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=("vol", N_pad, M_pad, 50), device=device)
+            _proc, K, key=("vol", N_pad, M_pad, _seeds_for("vol")), device=device)
 
         all_pairs.extend(bucket)
         all_scores.append(scores)
@@ -368,7 +368,7 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
                 N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine,
                 seeds=(seeds_q[sl], seeds_t[sl]), prune_after=_pa, prune_keep=_pk)
         scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=("surf", N_pad, M_pad, 50), device=device)
+            _proc, K, key=("surf", N_pad, M_pad, _seeds_for("surf")), device=device)
 
         all_pairs.extend(bucket)
         all_scores.append(scores)

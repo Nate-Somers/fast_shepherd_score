@@ -29,16 +29,12 @@ _LIBRARY: list = []
 _MODE = ""
 _KW: dict = {}
 
-# mode -> (align method name, aligned-similarity attribute on MoleculePair)
-_ALIGN_ATTR = {
-    "vol":              ("align_with_vol",              "sim_aligned_vol_noH"),
-    "vol_esp":          ("align_with_vol_esp",          "sim_aligned_vol_esp_noH"),
-    "surf":             ("align_with_surf",             "sim_aligned_surf"),
-    "surf_esp":         ("align_with_surf_esp",         "sim_aligned_surf_esp"),
-    "vol_and_surf_esp": ("align_with_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp"),
-    "pharm":            ("align_with_pharm",            "sim_aligned_pharm"),
-    "vol_color":        ("align_with_vol_color",        "sim_aligned_vol_color"),
-}
+# mode -> (align method name, aligned-similarity attribute on MoleculePair). Derived from
+# the single-source-of-truth mode registry (_modes.MODE_ATTRS) instead of a third hand-kept
+# copy: the batch method is always ``align_with_<mode>`` and the score attr is the registry's
+# score_attr. (_modes is pure data / no torch, so importing it here stays fork-safe.)
+from ._modes import MODE_ATTRS as _MODE_ATTRS
+_ALIGN_ATTR = {m: (f"align_with_{m}", score_attr) for m, (_tf, score_attr) in _MODE_ATTRS.items()}
 
 
 def _shard(index_range):

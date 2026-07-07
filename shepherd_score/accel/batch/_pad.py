@@ -128,10 +128,14 @@ def _scatter_fill(out: torch.Tensor, tensors: list[torch.Tensor], sizes: list[in
     """
     K, P_pad = out.shape[0], out.shape[1]
     device = out.device
-    n = torch.as_tensor(sizes, device=device, dtype=torch.long)
-    S = int(n.sum())
+    # ``sizes`` is already a host list[int]; sum it on the host. The old
+    # ``int(n.sum())`` on a device tensor forced a CUDA stream sync + scalar
+    # copyback on EVERY scatter (2-10x per bucket for the multi-channel modes),
+    # serializing the host against the GPU for a value we already know. Same result.
+    S = sum(sizes)
     if S == 0:
         return
+    n = torch.as_tensor(sizes, device=device, dtype=torch.long)
     flat = torch.cat(tensors, dim=0)                       # (S, *feat)
     starts = torch.cumsum(n, 0) - n                        # (K,) first flat-row of each pair
     seg = torch.repeat_interleave(starts, n)               # (S,) segment start per flat row

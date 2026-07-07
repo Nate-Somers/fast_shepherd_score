@@ -9,15 +9,65 @@ import triton.language as tl
 import torch
 
 
-# ----------------- score and gradients wrt quaternion q and translation t -----------------     
+# ----------------- score and gradients wrt quaternion q and translation t -----------------
 # No hardcoded, GPU-specific tile/warp choice: triton.autotune benchmarks these
 # candidates on the ACTUAL device and caches the best per (N_pad, M_pad), so the
 # kernel self-tunes to whatever GPU / Triton version it runs on. (Hardcoding
 # BLOCK=16/num_warps=1 was optimal only for this RTX 4050 + triton 3.6.0.)
+#
+# Candidate range: BLOCK in {16,32,64} x num_warps in {1,2,4}. Deliberately does NOT
+# include larger tiles (BLOCK=128) or 8 warps: this kernel runs ONE CTA per pair, so a
+# batch already launches thousands of CTAs and occupancy comes from the pair count, not
+# from bigger per-CTA tiles. Measured on L40S AND H200 (2026-07): offering BLOCK=128 and
+# num_warps=8 as candidates, autotune STILL selects BLOCK16/w1 (surf/vol) or BLOCK32/w1
+# (surf_esp) -- the big tiles are never chosen and throughput is flat -- so adding them
+# only lengthens the cold-start autotune sweep. If a future GPU/kernel-shape does prefer
+# larger tiles, re-add them here (autotune will pick them only if they actually win).
 _OVERLAP_CONFIGS = [
     triton.Config({'BLOCK': _b}, num_warps=_w, num_stages=_s)
     for _b in (16, 32, 64) for _w in (1, 2, 4) for _s in (1, 2, 3, 4)
 ]
+
+
+# --- shared SE(3) device functions (inlined at zero cost by @triton.jit) ------------------
+# The quaternion->rotation-matrix build and the overlap-force->quaternion-gradient tail were
+# copy-pasted byte-for-byte into every overlap kernel (shape + ESP here, and imported by
+# esp_triton). Factoring them into these @triton.jit helpers makes a correctness fix a SINGLE
+# edit instead of N identical ones and removes the silent-divergence risk. Triton inlines a
+# @triton.jit callee into its caller, so this is bit-identical to the inline blocks (validated
+# by benchmarks/experiments/check_kernels.py: kernel V/dQ/dT match a torch-autograd reference).
+@triton.jit
+def _quat_to_rotmat(qr, qi, qj, qk):
+    """Rotation matrix (row-major r00..r22) from a quaternion (w,x,y,z). q need NOT be unit
+    -- the value kernels apply this to the raw optimiser state and the norm cancels in the
+    Tanimoto ratio (renormalisation happens in the Adam step)."""
+    two = 2.0
+    r00 = 1 - two*(qj*qj + qk*qk); r01 = two*(qi*qj - qk*qr); r02 = two*(qi*qk + qj*qr)
+    r10 = two*(qi*qj + qk*qr);     r11 = 1 - two*(qi*qi + qk*qk); r12 = two*(qj*qk - qi*qr)
+    r20 = two*(qi*qk - qj*qr);     r21 = two*(qj*qk + qi*qr);     r22 = 1 - two*(qi*qi + qj*qj)
+    return r00, r01, r02, r10, r11, r12, r20, r21, r22
+
+
+@triton.jit
+def _quat_grad_tail(fx, fy, fz, bx0, by0, bz0, qr, qi, qj, qk):
+    """Per-point quaternion-gradient contributions (dw,dx,dy,dz) from the translation-force
+    components (fx,fy,fz) and the body-frame fit coords (bx0,by0,bz0). Analytic d(R b)/dq
+    contracted with the force; caller masks padding and reduces. Works elementwise, so fx..bz0
+    may be scalars or per-lane vectors."""
+    two = 2.0; four = 4.0
+    dw = (fx * (-two*qk*by0 + two*qj*bz0)
+          + fy * ( two*qk*bx0 - two*qi*bz0)
+          + fz * (-two*qj*bx0 + two*qi*by0))
+    dxq = (fx * ( two*qj*by0 + two*qk*bz0)
+           + fy * ( two*qj*bx0 - four*qi*by0 - two*qr*bz0)
+           + fz * ( two*qk*bx0 + two*qr*by0 - four*qi*bz0))
+    dyq = (fx * (-four*qj*bx0 + two*qi*by0 + two*qr*bz0)
+           + fy * ( two*qi*bx0                 + two*qk*bz0)
+           + fz * (-two*qr*bx0 + two*qk*by0 - four*qj*bz0))
+    dzq = (fx * (-four*qk*bx0 - two*qr*by0 + two*qi*bz0)
+           + fy * ( two*qr*bx0 - four*qk*by0 + two*qj*bz0)
+           + fz * ( two*qi*bx0 + two*qj*by0))
+    return dw, dxq, dyq, dzq
 
 
 # cache_results=True persists the chosen (BLOCK, num_warps) to the Triton cache dir
@@ -54,11 +104,8 @@ def _gauss_overlap_se3_tiled(
     qj = tl.load(Q_ptr + 2); qk = tl.load(Q_ptr + 3)
     tx = tl.load(T_ptr + 0); ty = tl.load(T_ptr + 1); tz = tl.load(T_ptr + 2)
 
-    # rotation matrix (registers)
-    two = 2.0
-    r00 = 1 - two*(qj*qj + qk*qk); r01 = two*(qi*qj - qk*qr); r02 = two*(qi*qk + qj*qr)
-    r10 = two*(qi*qj + qk*qr);     r11 = 1 - two*(qi*qi + qk*qk); r12 = two*(qj*qk - qi*qr)
-    r20 = two*(qi*qk - qj*qr);     r21 = two*(qj*qk + qi*qr);     r22 = 1 - two*(qi*qi + qj*qj)
+    # rotation matrix (registers) -- shared device fn (inlined, bit-identical)
+    r00, r01, r02, r10, r11, r12, r20, r21, r22 = _quat_to_rotmat(qr, qi, qj, qk)
 
     # -------- accumulators (register) -------------------
     Vab_acc = 0.0
@@ -118,32 +165,9 @@ def _gauss_overlap_se3_tiled(
                 dTy += tl.sum(fy)
                 dTz += tl.sum(fz)
 
-                # quaternion grads (reuse original body-frame coords bx0,by0,bz0)
-                # mask_m already applied via fx,fy,fz sums above (masked zeros)
-                wq = qr; xq = qi; yq = qj; zq = qk
-                four = 4.0
-
-                # contributions per j
-                dw = (
-                    fx * (-two*zq*by0 + two*yq*bz0) +
-                    fy * ( two*zq*bx0 - two*xq*bz0) +
-                    fz * (-two*yq*bx0 + two*xq*by0)
-                )
-                dxq = (
-                    fx * ( two*yq*by0 + two*zq*bz0) +
-                    fy * ( two*yq*bx0 - four*xq*by0 - two*wq*bz0) +
-                    fz * ( two*zq*bx0 + two*wq*by0 - four*xq*bz0)
-                )
-                dyq = (
-                    fx * (-four*yq*bx0 + two*xq*by0 + two*wq*bz0) +
-                    fy * (  two*xq*bx0                 + two*zq*bz0) +
-                    fz * (-two*wq*bx0 + two*zq*by0 - four*yq*bz0)
-                )
-                dzq = (
-                    fx * (-four*zq*bx0 - two*wq*by0 + two*xq*bz0) +
-                    fy * ( two*wq*bx0 - four*zq*by0 + two*yq*bz0) +
-                    fz * ( two*xq*bx0 + two*yq*by0                )
-                )
+                # quaternion grads (shared device fn; reuses body-frame coords bx0,by0,bz0).
+                # mask_m already applied via fx,fy,fz sums above (masked zeros).
+                dw, dxq, dyq, dzq = _quat_grad_tail(fx, fy, fz, bx0, by0, bz0, qr, qi, qj, qk)
 
                 # mask again (safer if any fx,fy,fz lanes picked noise)
                 dw  = tl.where(mask_m, dw,  0.0)

@@ -11,7 +11,7 @@ from .pharm_overlap import (
 )
 # Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
 # (pharmacophore_overlap_triton, imported above, is pure PyTorch and needs no dispatch.)
-from ..kernels.dispatch import fused_adam_qt, pharm_score_grad_se3_batch, pharm_grad_dq_se3_batch
+from ..kernels.dispatch import fused_adam_qt, pharm_grad_dq_se3_batch
 from ...score.analytical_gradients._torch import build_lookup_tables
 from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
 from . import _common as _fc
