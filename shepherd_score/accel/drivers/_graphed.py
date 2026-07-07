@@ -55,6 +55,9 @@ _GRAPH_WORK_BUDGET = int(os.environ.get("FINE_GRAPH_WORK_BUDGET", 300_000_000))
 # Per-graph memory ceiling on P. 256k covers the 100k-library screen buckets (P~187k) for
 # the light modes; their buffers are ~1KB/row so a single graph is ~270MB. Lower this on
 # memory-constrained GPUs (the heavy modes are already work-budget-limited well below it).
+# NOTE: raising this ADAPTIVELY with free memory to cut the residual large-N chunk/sync
+# "stitching" cost was measured to REGRESS (bigger graph buffers starve the fine loop's
+# sub-batch chunks -> more chunks, not fewer; vol kernel@1M -6% -> -13%). Kept fixed.
 _GRAPH_CAP_CEIL = int(os.environ.get("FINE_GRAPH_CAP_CEIL", 262144))
 _GRAPH_CAP_MIN = int(os.environ.get("FINE_GRAPH_CAP_MIN", 2000))
 

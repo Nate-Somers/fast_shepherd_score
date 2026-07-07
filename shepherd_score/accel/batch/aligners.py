@@ -870,37 +870,33 @@ def _align_batch_vol_and_surf_esp(
             trans_centers_batch = torch.stack([p._ref_xyz_t for p in bucket])
             trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
 
-        _, q_batch, t_batch, scores = fast_optimize_esp_combo_score_overlay_batch(
-            centers_w_H_1,
-            centers_w_H_2,
-            centers_1,
-            centers_2,
-            points_1,
-            points_2,
-            partial_1,
-            partial_2,
-            point_charges_1,
-            point_charges_2,
-            radii_1,
-            radii_2,
-            alpha,
-            lam=lam,
-            probe_radius=probe_radius,
-            esp_weight=esp_weight,
-            N_real_atoms_w_H_1=N_real_atoms_w_H_1,
-            M_real_atoms_w_H_2=M_real_atoms_w_H_2,
-            N_real_centers=N_real_centers,
-            M_real_centers=M_real_centers,
-            N_real_surf_1=N_real_surf_1,
-            M_real_surf_2=M_real_surf_2,
-            trans_centers_batch=trans_centers_batch,
-            trans_centers_real=trans_centers_real,
-            num_repeats_per_trans=num_repeats_per_trans,
-            topk=topk,
-            steps_fine=steps_fine,
-            lr=lr,
-            num_seeds=_seeds_for("vol_and_surf_esp"),
-        )
+        # Memory-safe fine loop, GPU-adaptive: the combo driver expands the bucket by
+        # num_seeds internally, so on a large bucket its fine-loop tensors can exceed free
+        # memory (an 11.6 GB alloc OOMed a 44 GB L40S at N=1M). Route it through the same
+        # _subbatched_align vol/surf use -- it sizes each chunk from mem_get_info() free memory
+        # and HALVES-and-retries on OOM -- so the combo can never OOM and adapts to any GPU.
+        # Pairs are independent (each result is its own max over seeds), so chunking is
+        # result-identical to one big call.
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_esp_combo_score_overlay_batch(
+                centers_w_H_1[sl], centers_w_H_2[sl], centers_1[sl], centers_2[sl],
+                points_1[sl], points_2[sl], partial_1[sl], partial_2[sl],
+                point_charges_1[sl], point_charges_2[sl], radii_1[sl], radii_2[sl],
+                alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight,
+                N_real_atoms_w_H_1=N_real_atoms_w_H_1[sl],
+                M_real_atoms_w_H_2=M_real_atoms_w_H_2[sl],
+                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
+                N_real_surf_1=N_real_surf_1[sl], M_real_surf_2=M_real_surf_2[sl],
+                trans_centers_batch=(None if trans_centers_batch is None else trans_centers_batch[sl]),
+                trans_centers_real=(None if trans_centers_real is None else trans_centers_real[sl]),
+                num_repeats_per_trans=num_repeats_per_trans, topk=topk,
+                steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("vol_and_surf_esp"))
+            return sc, q, t
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_and_surf_esp", n_wH_pad, m_wH_pad, n_cent_pad,
+                           m_cent_pad, n_surf_pad, m_surf_pad, _seeds_for("vol_and_surf_esp")),
+            device=device)
 
         all_pairs.extend(bucket)
         all_scores.append(scores)
