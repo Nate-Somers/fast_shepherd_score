@@ -65,21 +65,58 @@ _MERGE_MAX_WAVES = float(os.environ.get("FINE_BUCKET_MAX_WAVES", "2"))
 # never splits a full same-size cell, so at large N one cell becomes a single giant bucket whose
 # hoisted pad+seeds -- held resident across the WHOLE fine loop -- starve _subbatched_align's
 # chunks: the held bytes inflate the measured per-pair footprint and shrink each chunk, an
-# occupancy death-spiral (measured surf 100k=11.5k/s, fp=1.6MB -> 300k=6.9k/s, fp=4.1MB -> 1M OOM
-# on 48GB). Splitting an oversized bucket into <=_MAX_UPFRONT-byte pieces is result-identical
-# (pairs are independent, same as the sub-batcher) and bounds the upfront so chunks stay large.
-_MAX_UPFRONT_BYTES = float(os.environ.get("FINE_BUCKET_MAX_UPFRONT_GB", "1.5")) * (1024 ** 3)
+# occupancy death-spiral (measured surf 100k=11.5k/s, fp=1.6MB -> 300k=6.9k/s, fp=4.1MB -> 1M OOM).
+# Splitting an oversized bucket into <=cap-byte pieces is result-identical (pairs are independent,
+# same as the sub-batcher) and bounds the upfront so chunks stay large.
+#
+# The cap is ADAPTIVE: a fraction of the device's FREE memory read at call time (mem_get_info),
+# NOT a fixed literal -- so buckets shrink on a smaller/busier GPU (or under multi-process
+# sharing) and grow on a big idle one, and the upfront always leaves the rest for the fine loop.
+# FINE_BUCKET_UPFRONT_FRAC sets the fraction (default 0.25); FINE_BUCKET_MAX_UPFRONT_GB, if set,
+# is an optional HARD CEILING on top of the adaptive value (0 disables capping entirely).
+# The fraction bounds the bucket's PEAK (upfront held + seed-gen float64 transient, see per_pair
+# below) -- both freed before the fine loop, which _subbatched_align budgets separately -- so
+# 0.25 leaves ample room and keeps the light modes' 1M in a single bucket (no over-split dip)
+# while sizing the heavy modes (surf) small enough that their seed-gen transient can't OOM.
+_UPFRONT_FRAC = float(os.environ.get("FINE_BUCKET_UPFRONT_FRAC", "0.25"))
+_UPFRONT_CEIL_GB = os.environ.get("FINE_BUCKET_MAX_UPFRONT_GB")   # None -> no fixed ceiling
+_UPFRONT_FLOOR_BYTES = 256 * (1024 ** 2)                          # never split below 256 MB
+
+
+def _max_upfront_bytes(device) -> float:
+    """Per-bucket upfront-memory cap, derived from the device's current FREE memory."""
+    if _UPFRONT_CEIL_GB is not None and float(_UPFRONT_CEIL_GB) <= 0:
+        return float("inf")                                       # capping disabled
+    try:
+        free, _ = torch.cuda.mem_get_info(device)
+    except Exception:
+        free = 8 * (1024 ** 3)                                    # conservative if unavailable
+    cap = _UPFRONT_FRAC * float(free)
+    if _UPFRONT_CEIL_GB is not None:
+        cap = min(cap, float(_UPFRONT_CEIL_GB) * (1024 ** 3))
+    return max(_UPFRONT_FLOOR_BYTES, cap)
 
 
 def _cap_upfront(buckets: list, spec: "PadSpec", device) -> list:
-    """Split any bucket whose hoisted pad+seed footprint exceeds ``_MAX_UPFRONT_BYTES``."""
-    if getattr(device, "type", None) != "cuda" or _MAX_UPFRONT_BYTES <= 0:
+    """Split any bucket whose hoisted pad+seed footprint exceeds the adaptive upfront cap."""
+    if getattr(device, "type", None) != "cuda":
+        return buckets
+    max_bytes = _max_upfront_bytes(device)
+    if max_bytes == float("inf"):
         return buckets
     out: list = []
     for b in buckets:
-        # bytes/pair held upfront: padded coords (sum of merge pads x 3 x f32) + seeds (q4+t3 f32)
-        per_pair = sum(int(b.pad[n]) for n in spec.merge) * 12 + int(spec.seeds) * 28
-        max_k = max(1, int(_MAX_UPFRONT_BYTES // max(1, per_pair)))
+        # Peak bytes/pair = UPFRONT held (padded coords 12 B/pt + seed q/t 28 B) PLUS the
+        # SEED-GEN transient. batched_seeds_torch converts the clouds to float64 and materializes
+        # a 4x fit-cloud expansion (A64 + B64 + fit4 + masks) -- a large transient run on the WHOLE
+        # bucket that is NOT sub-batched, so it must bound the bucket size too. Omitting it OOMed
+        # surf kernel_screen @1M once the adaptive cap grew past the old fixed 1.5 GB. ~176 B per
+        # point of the LARGEST cloud covers that float64 transient (24*N + 152*M, upper-bounded by
+        # the max merge pad); it scales with cloud size, so heavy modes (surf) get small buckets
+        # and light modes (vol) stay large.
+        merge_pads = [int(b.pad[n]) for n in spec.merge]
+        per_pair = sum(merge_pads) * 12 + int(spec.seeds) * 28 + max(merge_pads) * 176
+        max_k = max(1, int(max_bytes // max(1, per_pair)))
         if b.K <= max_k:
             out.append(b)
         else:

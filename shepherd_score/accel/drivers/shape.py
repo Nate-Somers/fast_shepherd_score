@@ -7,7 +7,7 @@ import torch, math, os
 # diagnostic consumers; it no longer drives kernel selection (the device does).
 from ..kernels.dispatch import (
     overlap_score_grad_se3_batch, fused_adam_qt_with_tangent_proj,
-    _batch_self_overlap, fused_surf_step_batch, _HAS_TRITON,
+    _batch_self_overlap,
 )
 from ._common import batched_seeds_torch, _update_best
 from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
@@ -92,19 +92,6 @@ def _self_overlap_in_chunks(P_pad, N_real, alpha=0.81):
 # large P and any capture failure fall back to the eager loop. Disable with
 # FINE_CUDA_GRAPHS=0. The capture/replay machinery + env knobs (_FINE_GRAPHS,
 # _GRAPH_MAX_P, _GRAPH_STEPS) now live in ._graphed and are shared by all 7 modes.
-
-# Single-kernel fused fine step (overlap value+grad + score + best + Adam + renorm
-# in one launch/step, vs ~10 in the eager loop). Prototype behind a flag.
-#
-# VERDICT (RTX 4050, benchmarks/fused_ab.py): parity is exact (max|Δscore|~5e-7),
-# but it is NOT a win -- only 1.04-1.09x at batch<=1024 and 0.85x (a REGRESSION) at
-# batch 4096. Fusing the Adam/best tail onto the overlap kernel raises register
-# pressure, lowering occupancy; surf is occupancy-bound at large batch, so the
-# fusion backfires there. This confirms surf's GPU starvation is intra-kernel
-# latency/occupancy, NOT launch overhead (collapsing 10 launches->1 barely helped).
-# Kept behind a default-OFF flag (zero impact on the shipping path) in case a more
-# launch-bound GPU benefits; enable with FINE_FUSED_STEP=1. Do not enable here.
-_FINE_FUSED = os.environ.get("FINE_FUSED_STEP", "0") != "0"
 
 # Early seed-prune (H1): after _PRUNE_AFTER fine steps, keep only the top
 # _PRUNE_KEEP seeds per pair (by current best score) and finish only those. Cuts
@@ -200,38 +187,6 @@ def _run_graphed_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps
         es_patience=es_patience, es_tol=es_tol)
 
 
-def _run_fused_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps_fine,
-                    early_stop_patience=5, early_stop_tol=1e-5):
-    """Eager loop of the single-kernel fused fine step. Same per-step math, same
-    early-stop schedule as the reference eager loop -- only the ~10 launches/step
-    collapse to 1. State is updated in place by the kernel."""
-    device = A_k.device
-    A_k = A_k.contiguous(); B_k = B_k.contiguous()
-    q_k = q_seed.clone(); t_k = t_seed.clone()
-    m_q = torch.zeros_like(q_k); v_q = torch.zeros_like(q_k)
-    m_t = torch.zeros_like(t_k); v_t = torch.zeros_like(t_k)
-    best_score = torch.full((q_k.shape[0],), -float('inf'), device=device)
-    best_q = q_seed.clone(); best_t = t_seed.clone()
-    norm_c = norm.contiguous()
-    N32 = N_k.to(torch.int32); M32 = M_k.to(torch.int32)
-
-    prev_max_score = -float('inf'); no_improve_count = 0
-    for step in range(steps_fine):
-        fused_surf_step_batch(A_k, B_k, q_k, t_k, m_q, v_q, m_t, v_t,
-                              best_score, best_q, best_t, norm_c, N32, M32,
-                              alpha=alpha, lr=lr)
-        if step % 5 == 0:
-            current_max = best_score.max().item()
-            if current_max - prev_max_score < early_stop_tol:
-                no_improve_count += 1
-                if no_improve_count >= early_stop_patience:
-                    break
-            else:
-                no_improve_count = 0
-                prev_max_score = current_max
-    return best_score, best_q, best_t
-
-
 def coarse_fine_align_many(
         A_batch, B_batch, VAA, VBB, *,
         alpha: float = 0.81,
@@ -318,17 +273,6 @@ def coarse_fine_align_many(
     P = q_seed.shape[0]
 
     best_score = best_q = best_t = None
-
-    # --- fused single-kernel fine loop (1 launch/step vs ~10) ----------------
-    # Takes priority when enabled; targets the launch-bound regime the graph
-    # path doesn't cover (large P). Same per-step math + early-stop as the eager
-    # reference, so it is a drop-in. Disabled by default (FINE_FUSED_STEP).
-    if (_FINE_FUSED and A_batch.is_cuda and A_batch.dtype == torch.float32):
-        try:
-            best_score, best_q, best_t = _run_fused_fine(
-                A_k, B_k, q_seed, t_seed, N_k, M_k, VAA_plus_VBB, alpha, lr, steps_fine)
-        except Exception:
-            best_score = None                              # fused failed -> graph/eager
 
     # --- CUDA-graph fast path for the launch-bound regime --------------------
     # Compute-aware cap: vol's light heavy-atom clouds graph far out (wins to P~1M); surf's

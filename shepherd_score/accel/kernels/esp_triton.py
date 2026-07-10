@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 import torch
 
-from .shape_triton import _OVERLAP_CONFIGS
+from .shape_triton import _OVERLAP_CONFIGS, _quat_to_rotmat, _quat_grad_tail
 from ...score.constants import COULOMB_SCALING, LAM_SCALING
 
 
@@ -62,11 +62,8 @@ def _gauss_overlap_esp_se3_tiled(
     qj = tl.load(Q_ptr + 2); qk = tl.load(Q_ptr + 3)
     tx = tl.load(T_ptr + 0); ty = tl.load(T_ptr + 1); tz = tl.load(T_ptr + 2)
 
-    # rotation matrix (registers)
-    two = 2.0
-    r00 = 1 - two*(qj*qj + qk*qk); r01 = two*(qi*qj - qk*qr); r02 = two*(qi*qk + qj*qr)
-    r10 = two*(qi*qj + qk*qr);     r11 = 1 - two*(qi*qi + qk*qk); r12 = two*(qj*qk - qi*qr)
-    r20 = two*(qi*qk - qj*qr);     r21 = two*(qj*qk + qi*qr);     r22 = 1 - two*(qi*qi + qj*qj)
+    # rotation matrix (registers) -- shared device fn (inlined, bit-identical)
+    r00, r01, r02, r10, r11, r12, r20, r21, r22 = _quat_to_rotmat(qr, qi, qj, qk)
 
     # -------- accumulators (register) -------------------
     Vab_acc = 0.0
@@ -147,31 +144,8 @@ def _gauss_overlap_esp_se3_tiled(
                 dTy += tl.sum(fy)
                 dTz += tl.sum(fz)
 
-                # quaternion grads (reuse original body-frame coords bx0,by0,bz0)
-                wq = qr; xq = qi; yq = qj; zq = qk
-                four = 4.0
-
-                # contributions per j
-                dw = (
-                    fx * (-two*zq*by0 + two*yq*bz0) +
-                    fy * ( two*zq*bx0 - two*xq*bz0) +
-                    fz * (-two*yq*bx0 + two*xq*by0)
-                )
-                dxq = (
-                    fx * ( two*yq*by0 + two*zq*bz0) +
-                    fy * ( two*yq*bx0 - four*xq*by0 - two*wq*bz0) +
-                    fz * ( two*zq*bx0 + two*wq*by0 - four*xq*bz0)
-                )
-                dyq = (
-                    fx * (-four*yq*bx0 + two*xq*by0 + two*wq*bz0) +
-                    fy * (  two*xq*bx0                 + two*zq*bz0) +
-                    fz * (-two*wq*bx0 + two*zq*by0 - four*yq*bz0)
-                )
-                dzq = (
-                    fx * (-four*zq*bx0 - two*wq*by0 + two*xq*bz0) +
-                    fy * ( two*wq*bx0 - four*zq*by0 + two*yq*bz0) +
-                    fz * ( two*xq*bx0 + two*yq*by0                )
-                )
+                # quaternion grads (shared device fn; reuses body-frame coords bx0,by0,bz0)
+                dw, dxq, dyq, dzq = _quat_grad_tail(fx, fy, fz, bx0, by0, bz0, qr, qi, qj, qk)
 
                 # mask again
                 dw  = tl.where(mask_m, dw,  0.0)

@@ -42,7 +42,7 @@ Example
 >>> # SCREEN (streamed; never holds the library in RAM)
 >>> query = Molecule(query_mol, num_surf_points=200, pharm_multi_vector=False)
 >>> hits = screen(query, ProfileStore.open("lib.fss"), mode="surf_esp",
-...               lam=0.3, num_repeats=50, top_k=1000)   # backend auto: triton on GPU, numba on CPU
+...               lam=0.3, top_k=1000)   # seeds/steps default per-mode; backend auto (triton GPU / numba CPU)
 >>> hits[0].score, hits[0].id            # best match
 """
 from __future__ import annotations
@@ -852,31 +852,31 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
     defaults the ``MoleculePairBatch.align_with_*`` triton path uses -- in particular the PER-MODE
     fine-step count from the single-source ``_steps_for()`` table (NOT the old flat 200 leftover,
     which ran screen ~4x slower than pairwise for the same accuracy)."""
-    from shepherd_score.accel.batch.aligners import _steps_for
+    from shepherd_score.accel.batch.aligners import _steps_for, _seeds_for
     steps = ak.get("max_num_steps", _steps_for(mode))
     if mode in ("vol", "surf"):
         return dict(alpha=ak.get("alpha", 0.81), steps_fine=steps)
     if mode == "surf_esp":
         return dict(alpha=ak.get("alpha", 0.81), lam=ak.get("lam", 0.3),
-                    num_repeats=ak.get("num_repeats", 50), trans_init=False,
+                    num_repeats=ak.get("num_repeats", _seeds_for(mode)), trans_init=False,
                     lr=ak.get("lr", 0.1), steps_fine=steps)
     if mode == "pharm":
         return dict(similarity=ak.get("similarity", "tanimoto"),
                     extended_points=ak.get("extended_points", False),
                     only_extended=ak.get("only_extended", False), trans_init=False,
-                    num_repeats=ak.get("num_repeats", 50), steps_fine=steps, lr=ak.get("lr", 0.1))
+                    num_repeats=ak.get("num_repeats", _seeds_for(mode)), steps_fine=steps, lr=ak.get("lr", 0.1))
     if mode == "vol_color":
         return dict(alpha=ak.get("alpha", 0.81), color_weight=ak.get("color_weight", 0.5),
-                    trans_init=False, num_repeats=ak.get("num_repeats", 50),
+                    trans_init=False, num_repeats=ak.get("num_repeats", _seeds_for(mode)),
                     steps_fine=steps, lr=ak.get("lr", 0.1))
     if mode == "vol_esp":   # mirrors align_with_vol_esp(backend="triton") dispatch
         return dict(alpha=ak.get("alpha", 0.81), lam=ak["lam"],
-                    num_repeats=ak.get("num_repeats", 50), trans_init=False,
+                    num_repeats=ak.get("num_repeats", _seeds_for(mode)), trans_init=False,
                     lr=ak.get("lr", 0.1), steps_fine=steps)
     if mode == "vol_and_surf_esp":  # mirrors align_with_vol_and_surf_esp(backend="triton") dispatch
         return dict(alpha=ak["alpha"], lam=ak.get("lam", 0.001),
                     probe_radius=ak.get("probe_radius", 1.0), esp_weight=ak.get("esp_weight", 0.5),
-                    num_repeats=ak.get("num_repeats", 50), trans_init=False,
+                    num_repeats=ak.get("num_repeats", _seeds_for(mode)), trans_init=False,
                     lr=ak.get("lr", 0.1), steps_fine=steps)
     raise ValueError(mode)
 

@@ -42,7 +42,15 @@ def has_triton() -> bool:
 
 # Informational flag for external consumers (tests, diagnostics). Kernel selection no
 # longer depends on it -- it is now per-call and device-driven (see module docstring).
-_HAS_TRITON = has_triton()
+# Exposed LAZILY via module __getattr__ so merely importing this module (which every
+# accel/container import does, and every spawned CPU-pool / multi-GPU worker) does NOT
+# eagerly ``import triton`` -- that cost is only paid the first time a CUDA tensor is
+# actually dispatched (or someone reads ``dispatch._HAS_TRITON``). Keeps CPU-only / numba
+# runs triton-free, as the module docstring promises.
+def __getattr__(name):
+    if name == "_HAS_TRITON":
+        return has_triton()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Lazily-imported, cached source modules, keyed by a short tag.
 _MODS: dict = {}

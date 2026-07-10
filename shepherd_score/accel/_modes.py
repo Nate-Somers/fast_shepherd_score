@@ -52,12 +52,15 @@ PROCESS_MODES = ("vol", "surf", "surf_esp", "pharm")
 # These are the cheapest (seeds, steps) per mode that still hold all three: (a) MEAN cross-overlap
 # >= 99.7% of the per-pair ceiling, (b) a <= 8% per-pair tail (fraction of pairs > 1% below the
 # ceiling -- the tightest tail surf can reach), and (c) self-copy recovery 1.0. Re-validated
-# 2026-06 on the standard drugs.smi cross-pair sweep by benchmarks/optimize_defaults.py + a
-# tail-aware pick. Multi-basin modes (surf / pharm) keep their MEAN creeping with seed count so
-# need many seeds (64); the fast-converging shape / ESP channels need far fewer. vol_and_surf_esp
-# seeds from its VOLUME centers (esp_combo._VOL_SEEDS, default on) so 24 seeds match the legacy 64
-# surface seeds (99.7% mean, ~1.96x). Steps sit at the 40/70 knee.
-MODE_SEEDS = {"vol": 16, "surf": 64, "surf_esp": 12, "vol_esp": 8, "vol_and_surf_esp": 24,
-              "pharm": 64, "vol_color": 20}
+# 2026-07 on THREE diverse cross-pair sweeps (drugs.smi tuning set, library.smi 460-mol diverse
+# ZINC-style, molecules.smi drug-like) via investigate_seeds_acc.py + a tail-aware pick.
+# surf was massively over-seeded: 16 holds 99.8-100% mean/ceiling with tail <= 3% on all three
+# (4x fewer than the legacy 64, essentially free). pharm is the one genuinely multi-basin mode --
+# even 64 only reaches ~99.4% mean/ceiling on the diverse library, so 48 seeds are indistinguishable
+# from 64 (<= 0.27% loss, tail <= 4.3%) while saving 1.33x. The fast-converging shape / ESP channels
+# need far fewer still. vol_and_surf_esp seeds from its VOLUME centers (esp_combo._VOL_SEEDS, default
+# on) so 24 seeds match the legacy 64 surface seeds (99.7% mean, ~1.96x). Steps sit at the 40/70 knee.
+MODE_SEEDS = {"vol": 16, "surf": 16, "surf_esp": 12, "vol_esp": 8, "vol_and_surf_esp": 24,
+              "pharm": 48, "vol_color": 20}
 MODE_STEPS = {"vol": 40, "surf": 40, "surf_esp": 70, "vol_esp": 40, "vol_and_surf_esp": 70,
               "pharm": 70, "vol_color": 40}
