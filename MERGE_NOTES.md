@@ -93,3 +93,22 @@ torch/np `directional`/`color_weight`; `pharm_utils/pharmacophore.py` `feature_s
 - **Parametrized validation harness** for the 4 gates keyed on the registry.
 - **Config dup:** `pytest.ini` and `pyproject.toml` both define pytest config; pytest warns it
   ignores the `pyproject.toml` one. Pick one during unification.
+
+## 6. Gentle registry consolidation applied (post-Phase-2)
+
+`container/_core.py` now derives two per-mode blocks from the registry instead of hand-listing
+them (behavior-identical; suite green):
+- `MoleculePair.__init__` result slots (`transform_<mode>`/`sim_aligned_<mode>` = eye/None) are a
+  loop over `accel/_modes.MODE_ATTRS` + a 2-entry tuple for the legacy `no_H` variants
+  (`transform_vol`, `transform_vol_esp`) that are not registry modes.
+- The batched-aligner static-method binds are applied by an `@_bind_batch_aligners` class
+  decorator (one per `CANONICAL_MODES` + `LEGACY_MODE_ALIASES`) instead of explicit lines.
+
+Merge note: both regions were **already** fork-divergent — the static-method binds are fork-only
+(the original `_core.py` has no `accel`/`_align_batch`/`_modes` references at all), and the
+`__init__` slot block was already rewritten by the esp→surf_esp rename + `vol_color` addition +
+property aliases. So this consolidation opens **no new** fork↔original conflict surface; it only
+changes content within hunks that already diverge, and adds a `_core.py → accel/_modes` import
+(inside the pre-existing `_core.py → accel.batch` coupling). Pinned by
+`tests/test_mode_registry.py::test_moleculepair_batch_aligner_binds_are_registry_driven` and
+`::test_moleculepair_init_result_slots_cover_registry`.

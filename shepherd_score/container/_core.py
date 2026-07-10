@@ -26,6 +26,11 @@ from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_over
 from shepherd_score.alignment import optimize_vol_color_overlay
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.accel import batch as _ba
+from shepherd_score.accel._modes import (
+    MODE_ATTRS as _MODE_ATTRS,
+    CANONICAL_MODES as _CANONICAL_MODES,
+    LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES,
+)
 
 
 def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) -> Chem.Mol:
@@ -265,6 +270,20 @@ class Molecule:
         )
 
 
+def _bind_batch_aligners(cls):
+    """Bind ``accel.batch._align_batch_<mode>`` onto ``cls`` as static methods -- one per
+    canonical registry mode, plus the legacy-name aliases (esp->surf_esp,
+    esp_combo->vol_and_surf_esp) -- so ``MoleculePair._align_batch_vol(pairs, ...)`` etc. still
+    resolve here and adding a mode needs no per-mode edit. Exactly mirrors the old explicit
+    staticmethod block; driven off accel/_modes so the registry is the single source."""
+    for _m in _CANONICAL_MODES:
+        setattr(cls, "_align_batch_" + _m, staticmethod(getattr(_ba, "_align_batch_" + _m)))
+    for _legacy, _canon in _LEGACY_MODE_ALIASES.items():
+        setattr(cls, "_align_batch_" + _legacy, staticmethod(getattr(_ba, "_align_batch_" + _canon)))
+    return cls
+
+
+@_bind_batch_aligners
 class MoleculePair:
     """ Pair of Molecule objects to facilitate alignment. """
 
@@ -343,32 +362,17 @@ class MoleculePair:
                                           dtype=torch.float32,
                                           device=device)          # (M,3)
 
-        self.transform_vol = np.eye(4)
-        self.sim_aligned_vol = None
-
-        self.transform_vol_noH = np.eye(4)
-        self.sim_aligned_vol_noH = None
-
-        self.transform_surf = np.eye(4)
-        self.sim_aligned_surf = None
-
-        self.transform_surf_esp = np.eye(4)
-        self.sim_aligned_surf_esp = None
-
-        self.transform_vol_esp = np.eye(4)
-        self.sim_aligned_vol_esp = None
-
-        self.transform_vol_esp_noH = np.eye(4)
-        self.sim_aligned_vol_esp_noH = None
-
-        self.transform_vol_and_surf_esp = np.eye(4)
-        self.sim_aligned_vol_and_surf_esp = None
-
-        self.transform_pharm = np.eye(4)
-        self.sim_aligned_pharm = None
-
-        self.transform_vol_color = np.eye(4)
-        self.sim_aligned_vol_color = None
+        # Result slots (transform=identity, score=None until aligned). The 7 canonical modes
+        # are driven by the registry (accel/_modes.MODE_ATTRS); adding a mode there auto-creates
+        # its slots here. The two no_H-variant slots below are legacy extras written by
+        # align_with_vol/align_with_vol_esp(no_H=False) and are intentionally not registry modes.
+        for _t, _s in _MODE_ATTRS.values():
+            setattr(self, _t, np.eye(4))
+            setattr(self, _s, None)
+        for _t, _s in (("transform_vol", "sim_aligned_vol"),
+                       ("transform_vol_esp", "sim_aligned_vol_esp")):
+            setattr(self, _t, np.eye(4))
+            setattr(self, _s, None)
 
     # --- legacy result-attribute aliases (renamed modes; old names kept working) ---
     # esp -> surf_esp, esp_combo -> vol_and_surf_esp. The canonical attributes set in
@@ -391,19 +395,9 @@ class MoleculePair:
     def transform_esp_combo(self, v): self.transform_vol_and_surf_esp = v
 
     # --- batched GPU/Triton aligners -------------------------------------
-    # Implemented as free functions in ``_batch_align`` (kept out of this file
-    # for size); bound here as static methods so the public seam is unchanged --
-    # ``MoleculePair._align_batch_vol(pairs, ...)`` etc. still resolve here.
-    _align_batch_vol       = staticmethod(_ba._align_batch_vol)
-    _align_batch_surf      = staticmethod(_ba._align_batch_surf)
-    _align_batch_surf_esp  = staticmethod(_ba._align_batch_surf_esp)
-    _align_batch_vol_esp   = staticmethod(_ba._align_batch_vol_esp)
-    _align_batch_vol_and_surf_esp = staticmethod(_ba._align_batch_vol_and_surf_esp)
-    _align_batch_pharm     = staticmethod(_ba._align_batch_pharm)
-    _align_batch_vol_color = staticmethod(_ba._align_batch_vol_color)
-    # legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp)
-    _align_batch_esp       = _align_batch_surf_esp
-    _align_batch_esp_combo = _align_batch_vol_and_surf_esp
+    # Implemented as free functions in ``accel.batch``; bound as static methods (one per
+    # registry mode + legacy aliases) by the ``@_bind_batch_aligners`` class decorator above, so
+    # the public seam ``MoleculePair._align_batch_vol(pairs, ...)`` etc. still resolves here.
 
     def align_with_vol(self,
                        no_H: bool = True,
