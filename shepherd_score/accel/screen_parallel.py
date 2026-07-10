@@ -43,7 +43,7 @@ def _shard(index_range):
     import torch
     import numba
     torch.set_num_threads(1)          # each worker is one core; no torch tail contention
-    numba.set_num_threads(1)          # C workers x 1 thread = C-way parallelism
+    numba.set_num_threads(1)          # active-count mask (pool size is capped by the parent env)
     from shepherd_score.container import MoleculePair, MoleculePairBatch
 
     method, attr = _ALIGN_ATTR[_MODE]
@@ -70,9 +70,27 @@ def screen_parallel(query, library, mode, n_workers=None, **align_kwargs):
     _QUERY, _LIBRARY, _MODE, _KW = query, library, mode, align_kwargs
     chunks = _chunks(n, n_workers)
 
-    # Always fork (even for 1 worker): keeps the parent numba-clean so the fork is libgomp-safe.
-    with get_context("fork").Pool(len(chunks)) as pool:      # fork -> COW-inherit the library
-        shards = pool.map(_shard, chunks)
+    # Cap each worker's thread pool to ONE thread BEFORE forking. numba fixes its pool size from
+    # NUMBA_NUM_THREADS at IMPORT time; a forked child inherits that value and its own
+    # numba.set_num_threads(1) only masks it, leaving cpu_count-1 idle threads that spin-wait -- so C
+    # workers oversubscribe C x cpu_count threads and aggregate throughput REGRESSES past ~16 workers
+    # (measured 64<16). Setting the env here works only if this process has not yet imported numba
+    # (screen_parallel's numba-clean contract holds for that); for a GUARANTEED cap, export
+    # NUMBA_NUM_THREADS=1 (+ OMP_NUM_THREADS=1) before starting the process. Restored in finally.
+    _cap = {"NUMBA_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1", "OMP_WAIT_POLICY": "passive", "KMP_BLOCKTIME": "0"}
+    _saved = {k: os.environ.get(k) for k in _cap}
+    os.environ.update(_cap)
+    try:
+        # Always fork (even for 1 worker): keeps the parent numba-clean so the fork is libgomp-safe.
+        with get_context("fork").Pool(len(chunks)) as pool:  # fork -> COW-inherit the library
+            shards = pool.map(_shard, chunks)
+    finally:
+        for k, v in _saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     scores = [None] * n
     for shard in shards:
