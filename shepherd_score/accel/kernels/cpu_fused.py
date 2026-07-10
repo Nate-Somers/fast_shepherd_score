@@ -41,6 +41,25 @@ except Exception:
     _SVML = False
 _USE_SOA = (os.environ.get("FSS_CPU_SOA", "1") != "0") and _SVML
 
+# One-time warning so nobody unknowingly runs the CPU path in the ~3-6x-slower unvectorized
+# regime: numba 0.61+ dropped the SVML-patched LLVM, so a default `numba` (>=0.61) build has
+# USING_SVML=False and the overlap kernels emit scalar exp. The fix is the SVML env
+# (environment-cpu-svml.yml: numba<=0.59 + icc_rt). Fires only when a CPU align actually runs.
+_SVML_WARNED = False
+
+
+def _warn_if_no_svml():
+    global _SVML_WARNED
+    if not _SVML and not _SVML_WARNED:
+        _SVML_WARNED = True
+        import warnings
+        warnings.warn(
+            "fast_shepherd_score CPU alignment is running WITHOUT numba SVML "
+            "(USING_SVML=False; numba>=0.61 dropped it), so the overlap kernels are unvectorized "
+            "and ~3-6x slower than they should be. For full CPU speed, build the SVML env "
+            "(environment-cpu-svml.yml: numba<=0.59 + icc_rt). Suppress via warnings filters.",
+            RuntimeWarning, stacklevel=3)
+
 
 @njit(parallel=True, fastmath=False, cache=True)
 def _tail_tanimoto(O, dQ, dT, q, t, mq, vq, mt, vt, best, bq, bt, norm, lr):
@@ -177,6 +196,7 @@ def fine_loop_cpu(overlap_fn, q_seed, t_seed, norm, *, lr, steps,
     q_seed/t_seed/norm: float32 numpy (P,4)/(P,3)/(P,). Returns (best, bq, bt) float32 numpy.
     Early-stop semantics match the eager loop (global best, checked every 5 steps).
     """
+    _warn_if_no_svml()
     P = q_seed.shape[0]
     q = q_seed.copy(); t = t_seed.copy()
     mq = np.zeros((P, 4), np.float32); vq = np.zeros((P, 4), np.float32)

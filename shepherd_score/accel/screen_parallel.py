@@ -61,7 +61,8 @@ def screen_parallel(query, library, mode, n_workers=None, **align_kwargs):
     """Screen ``query`` against ``library`` (lists of pre-featurized ``Molecule``s) with the
     numba CPU backend, sharded across ``n_workers`` processes. Returns aligned similarity scores
     in library order. ``align_kwargs`` are the mode's required kwargs (e.g. ``alpha=0.81`` for
-    surf, ``lam=0.3`` for vol_esp). Falls back to a single in-process shard for n_workers==1."""
+    surf, ``lam=0.3`` for vol_esp). ALWAYS forks (even for n_workers==1) so this parent never runs
+    numba in-process and stays libgomp-safe for the fork."""
     global _QUERY, _LIBRARY, _MODE, _KW
     if mode not in _ALIGN_ATTR:
         raise ValueError(f"unknown mode {mode!r}; expected one of {sorted(_ALIGN_ATTR)}")
