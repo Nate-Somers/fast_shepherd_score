@@ -21,7 +21,7 @@ Usage
 -----
     python -m benchmarks.benchmark_vol_color                 # CPU (or CUDA if visible)
     python -m benchmarks.benchmark_vol_color --device cpu --n 30
-    python -m benchmarks.benchmark_vol_color --device cuda --num-repeats 50 --steps 100
+    python -m benchmarks.benchmark_vol_color --device cuda
     python -m benchmarks.benchmark_vol_color --json out.json
 """
 from __future__ import annotations
@@ -86,10 +86,15 @@ def build_pairs(n, device, seed=3, feature_set="rdkit_base", directionless=True)
     return pairs
 
 
-def align_all(pairs, color_weight, num_repeats, steps):
+from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS
+_SEEDS, _STEPS = MODE_SEEDS["vol_color"], MODE_STEPS["vol_color"]   # reported, never passed
+
+
+def align_all(pairs, color_weight):
     for mp in pairs:
-        mp.align_with_vol_color(color_weight=color_weight, num_repeats=num_repeats,
-                                max_num_steps=steps)
+        # No num_repeats / max_num_steps: MoleculePair.align_with_vol_color now resolves the
+        # shipped per-mode defaults (MODE_SEEDS/MODE_STEPS), same as the batched API.
+        mp.align_with_vol_color(color_weight=color_weight)
     return np.array([float(mp.sim_aligned_vol_color) for mp in pairs])
 
 
@@ -109,8 +114,6 @@ def main():
     ap = argparse.ArgumentParser(description="vol_color per-pair throughput benchmark")
     ap.add_argument("--device", default=None, choices=["cpu", "cuda"])
     ap.add_argument("--n", type=int, default=30, help="number of pairs")
-    ap.add_argument("--num-repeats", type=int, default=50)
-    ap.add_argument("--steps", type=int, default=100)
     ap.add_argument("--color-weight", type=float, default=0.5)
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--budget", type=float, default=30.0)
@@ -130,7 +133,7 @@ def main():
     gpu = torch.cuda.get_device_name(0) if (a.device == "cuda" and torch.cuda.is_available()) else None
 
     print(f"vol_color benchmark | device={a.device} {gpu or ''} | n={a.n} "
-          f"num_repeats={a.num_repeats} steps={a.steps} color_weight={a.color_weight}", flush=True)
+          f"seeds={_SEEDS} steps={_STEPS} (shipped defaults) color_weight={a.color_weight}", flush=True)
 
     t0 = time.perf_counter()
     pairs = build_pairs(a.n, dev, seed=a.seed)
@@ -139,16 +142,16 @@ def main():
           f"(embed + RDKit BaseFeatures.fdef directionless featurize)", flush=True)
 
     best, nrep = best_of_n(
-        lambda: align_all(pairs, a.color_weight, a.num_repeats, a.steps),
+        lambda: align_all(pairs, a.color_weight),
         a.reps, a.budget, sync)
-    scores = align_all(pairs, a.color_weight, a.num_repeats, a.steps)
+    scores = align_all(pairs, a.color_weight)
 
     n = len(pairs)
     pps = n / best
     out = {
         "mode": "vol_color", "device": a.device, "gpu": gpu, "cpu": platform.processor(),
         "host": platform.node(), "torch": torch.__version__,
-        "n_pairs": n, "num_repeats": a.num_repeats, "steps": a.steps,
+        "n_pairs": n, "num_repeats": _SEEDS, "steps": _STEPS,
         "color_weight": a.color_weight, "reps": nrep,
         "compute_s": best, "pairs_per_s": pps,
         "self_score_mean": float(scores.mean()), "self_score_min": float(scores.min()),

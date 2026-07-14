@@ -22,10 +22,11 @@ _ESP_STRIDE = max(1, int(os.environ.get("FINE_ESP_STRIDE", "5")))
 
 # Lever (DEFAULT ON): seed from the VOLUME centers instead of the surface points. vol_and_surf_esp
 # steers the pose by the volume (centers) shape gradient, but historically seeded from the surface
-# clouds -- a mismatch: the surface is far more multi-basin than the heavy-atom volume (vol needs
-# 16 seeds, surf 64), so surface seeds needed many more starts to be sure a volume basin was
-# covered. Seeding from the centers aligns the seed PCA starts with the basins the optimiser
-# actually descends, so far fewer seeds reach the same combo score: vol-seed @24 == surf-seed @64
+# clouds -- a mismatch: the surface is far more multi-basin than the heavy-atom volume (legacy
+# standalone surf needed 64 seeds vs vol's 16), so surface seeds needed many more starts to be
+# sure a volume basin was covered. Seeding from the centers aligns the seed PCA starts with the
+# basins the optimiser actually descends, so far fewer seeds reach the same combo score: vol-seed
+# @24 == surf-seed @64
 # on the mean (99.7%; tested on the bench-380 and drugs.smi sets), at ~1.96x the throughput. The
 # matching seed count (24, vs the legacy 64) lives in aligners._MODE_SEEDS. Set FSS_VASE_VOL_SEEDS=0
 # to revert to legacy surface seeds (then bump the seed count back to ~64).

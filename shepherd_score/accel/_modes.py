@@ -49,15 +49,36 @@ PROCESS_MODES = ("vol", "surf", "surf_esp", "pharm")
 # Per-mode default (seed count, fine-step count) -- read by aligners._seeds_for/_steps_for and
 # used by BOTH backends (triton/numba) and BOTH workloads (pairwise MoleculePairBatch.align_with_*
 # and the streaming screen path). FINE_NUM_SEEDS / FINE_NUM_STEPS env vars override every mode.
-# These are the cheapest (seeds, steps) per mode that still hold all three: (a) MEAN cross-overlap
-# >= 99.7% of the per-pair ceiling, (b) a <= 8% per-pair tail (fraction of pairs > 1% below the
-# ceiling -- the tightest tail surf can reach), and (c) self-copy recovery 1.0. Re-validated
-# 2026-06 on the standard drugs.smi cross-pair sweep by benchmarks/optimize_defaults.py + a
-# tail-aware pick. Multi-basin modes (surf / pharm) keep their MEAN creeping with seed count so
-# need many seeds (64); the fast-converging shape / ESP channels need far fewer. vol_and_surf_esp
-# seeds from its VOLUME centers (esp_combo._VOL_SEEDS, default on) so 24 seeds match the legacy 64
-# surface seeds (99.7% mean, ~1.96x). Steps sit at the 40/70 knee.
-MODE_SEEDS = {"vol": 16, "surf": 64, "surf_esp": 12, "vol_esp": 8, "vol_and_surf_esp": 24,
-              "pharm": 64, "vol_color": 20}
-MODE_STEPS = {"vol": 40, "surf": 40, "surf_esp": 70, "vol_esp": 40, "vol_and_surf_esp": 70,
-              "pharm": 70, "vol_color": 40}
+#
+# These are BALANCED defaults: tuned for throughput-per-unit-accuracy, not for maximum accuracy.
+# Benchmarks must NOT override them -- they exist so that "how fast can I align molecules with this
+# package" and "how well does it enrich" are both answered by the shipped configuration.
+#
+# Tuned 2026-07-13 against three metrics measured together (2026-07 sweeps):
+#   (1) ROC-AUC   -- full 41-target DUDE-Z retrospective screen (8 query actives vs ~3k decoys),
+#                    an 11 seeds {1..64} x 3 steps {40,70,200} grid = 9,471 screened cells. This is
+#                    the authoritative screening signal.
+#   (2) mean/ceil + tail% -- synthetic cross-pair overlap recovery vs a 64x200 ceiling, on a drug-like
+#                    and a ZINC-diverse set.
+#   (3) pairwise aligns/sec -- pure alignment throughput (the "how fast can I align" number).
+#
+# The key finding: seed count is CHEAP in ROC-AUC but EXPENSIVE in throughput. An accuracy-maximizing
+# pick (e.g. vol/vol_color at 48 seeds) buys only +0.002-0.006 ROC-AUC while costing 1.2-4.9x pairwise
+# throughput. ROC-AUC plateaus at low seed counts for every mode (the Pareto knee is sharp), so these
+# defaults sit at the knee rather than past it. Measured cost of the balanced pick vs an accuracy-maxed
+# one, in ROC-AUC / pairwise speedup:
+#   vol               10x50  -0.0021 / 4.9x faster   (vol ROC is flat in BOTH seeds and steps -- 100
+#                    steps bought nothing measurable, so the step count was halved to 50)
+#   surf              8x40   -0.0005 / 1.5x faster   (n.s.)
+#   surf_esp          8x40   -0.0005 / 1.9x faster
+#   vol_and_surf_esp  8x60   -0.0001 / ~2.3x faster  (ROC statistically IDENTICAL to 24x70)
+#   vol_esp          16x50   -0.0015 / ~1.2x faster  (ESP-bound: leaning buys little speed)
+#   pharm            32x50   ~-0.001 / ~1.4x faster  (steps 50 recovers most of the 40-step loss)
+#   vol_color        16x40   -0.0064 / 3.1x faster   (the sharpest trade -- vol_color is the one mode
+#                    whose ROC climbs monotonically with seeds; 16 is the deliberate speed-side choice)
+# mean/ceil lands at 0.990-0.996 (vs 0.997-0.999 for the accuracy-maxed picks): still >=99% recovery of
+# the best-achievable overlap. FINE_NUM_SEEDS / FINE_NUM_STEPS env vars still override every mode.
+MODE_SEEDS = {"vol": 10, "surf": 8, "surf_esp": 8, "vol_esp": 16, "vol_and_surf_esp": 8,
+              "pharm": 32, "vol_color": 16}
+MODE_STEPS = {"vol": 50, "surf": 40, "surf_esp": 40, "vol_esp": 50, "vol_and_surf_esp": 60,
+              "pharm": 50, "vol_color": 40}

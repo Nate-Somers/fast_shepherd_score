@@ -92,9 +92,31 @@ SELF_SCORE_WARN = 0.95          # self-copy optimum is 1.0; warn below this
 
 
 def _cfg_from_args(a):
-    """Shared alignment knobs passed to both engines (via MoleculePairBatch)."""
-    return dict(num_repeats=a.num_repeats, steps=a.steps, lr=a.lr,
-                alpha=a.alpha, lam=a.lam, surf_per_atom=SURF_PER_ATOM)
+    """Shared alignment knobs passed to both engines (via MoleculePairBatch).
+
+    Deliberately carries NO seed/step count: each engine runs its own shipped default effort
+    (fork: per-mode MODE_SEEDS/MODE_STEPS in ``shepherd_score/accel/_modes.py``; original: its
+    50 restarts x 200 steps signature defaults). A benchmark that pinned the effort would be
+    measuring a configuration nobody ships.
+    """
+    return dict(lr=a.lr, alpha=a.alpha, lam=a.lam, surf_per_atom=SURF_PER_ATOM)
+
+
+def _effort_disclosure():
+    """What (seeds, steps) each engine ACTUALLY ran at.
+
+    Neither engine is pinned by this benchmark any more, so the effort is no longer a shared
+    constant -- it is a property of each package. Record it, because the speed ratio now means
+    "how fast can I align if I use this package (as shipped)", not "same work, faster kernels".
+    """
+    try:
+        from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS
+        fork = {m: [MODE_SEEDS[m], MODE_STEPS[m]] for m in MODE_SEEDS}
+    except Exception:
+        fork = "unavailable"
+    return {"fork": fork,                      # per-mode MODE_SEEDS x MODE_STEPS
+            "orig": [50, 200],                 # upstream align_with_* signature defaults
+            "note": "each engine runs its own shipped default; effort is NOT matched across engines"}
 
 
 # ===========================================================================
@@ -348,23 +370,20 @@ def _fork_align(mode, pairs, cfg):
     Results land in-place on each pair (``sim_aligned_*`` / ``transform_*``)."""
     from shepherd_score.container import MoleculePairBatch
     b = MoleculePairBatch(pairs)
+    # No num_repeats / max_num_steps: the fork runs its shipped per-mode defaults (MODE_SEEDS /
+    # MODE_STEPS), which is the configuration a user actually gets.
     if mode == "vol":
-        b.align_with_vol(no_H=True, backend="triton",
-                         alpha=cfg["alpha"], max_num_steps=cfg["steps"])
+        b.align_with_vol(no_H=True, backend="triton", alpha=cfg["alpha"])
     elif mode == "surf":
-        b.align_with_surf(alpha=cfg["alpha"], backend="triton",
-                          max_num_steps=cfg["steps"])
+        b.align_with_surf(alpha=cfg["alpha"], backend="triton")
     elif mode == "esp":
-        b.align_with_esp(alpha=cfg["alpha"], lam=cfg["lam"],
-                         num_repeats=cfg["num_repeats"], lr=cfg["lr"],
-                         backend="triton", max_num_steps=cfg["steps"])
+        b.align_with_esp(alpha=cfg["alpha"], lam=cfg["lam"], lr=cfg["lr"],
+                         backend="triton")
     elif mode == "pharm":
-        b.align_with_pharm(num_repeats=cfg["num_repeats"], lr=cfg["lr"],
-                           backend="triton", max_num_steps=cfg["steps"])
+        b.align_with_pharm(lr=cfg["lr"], backend="triton")
     elif mode == "vol_color":
         b.align_with_vol_color(color_weight=cfg.get("color_weight", 0.5),
-                               num_repeats=cfg["num_repeats"], lr=cfg["lr"],
-                               backend="triton", max_num_steps=cfg["steps"])
+                               lr=cfg["lr"], backend="triton")
     else:
         raise ValueError(mode)
 
@@ -612,21 +631,21 @@ def orig_cell(planfile):
         return m
 
     def align(mode, pairs):
+        # No num_repeats / max_num_steps: the ORIGINAL package runs its own shipped defaults
+        # (50 restarts x 200 steps, from its align_with_* signatures). Pinning it to the fork's
+        # effort would measure a configuration upstream does not ship. Each engine is timed at
+        # the setting a user gets out of the box; the effort actually used is disclosed per run.
         b = MoleculePairBatch(pairs)
         if mode == "vol":
-            return b.align_with_vol(no_H=True, num_repeats=cfg["num_repeats"],
-                                    lr=cfg["lr"], max_num_steps=cfg["steps"], num_workers=1)[0]
+            return b.align_with_vol(no_H=True, lr=cfg["lr"], num_workers=1)[0]
         if mode == "surf":
-            return b.align_with_surf(alpha=cfg["alpha"], num_repeats=cfg["num_repeats"],
-                                     lr=cfg["lr"], max_num_steps=cfg["steps"], num_workers=1,
+            return b.align_with_surf(alpha=cfg["alpha"], lr=cfg["lr"], num_workers=1,
                                      use_shmap=False)[0]
         if mode == "esp":
-            return b.align_with_esp(alpha=cfg["alpha"], lam=cfg["lam"], num_repeats=cfg["num_repeats"],
-                                    lr=cfg["lr"], max_num_steps=cfg["steps"], num_workers=1,
-                                    use_shmap=False)[0]
+            return b.align_with_esp(alpha=cfg["alpha"], lam=cfg["lam"], lr=cfg["lr"],
+                                    num_workers=1, use_shmap=False)[0]
         if mode == "pharm":
-            return b.align_with_pharm(num_repeats=cfg["num_repeats"], lr=cfg["lr"],
-                                      max_num_steps=cfg["steps"], num_workers=1, use_shmap=False)[0]
+            return b.align_with_pharm(lr=cfg["lr"], num_workers=1, use_shmap=False)[0]
         raise ValueError(mode)
 
     if plan["task"] == "speed":
@@ -910,7 +929,8 @@ def run_speed(args):
             print(f"(no previous original data to carry over: {type(e).__name__}: {e})")
 
     meta = {"hardware": _hardware_info(), "timestamp": _now_str(), "cap": args.cap,
-            "tag": args.tag, "cfg": cfg, "modes": modes, "buckets": buckets, "sizes": sizes}
+            "tag": args.tag, "cfg": cfg, "modes": modes, "buckets": buckets, "sizes": sizes,
+            "effort": _effort_disclosure()}
     data["_meta"] = meta
 
     with open(out_json, "w") as fh:
@@ -1024,9 +1044,7 @@ def main():
     ap.add_argument("--out-dir", default=None,
                     help="explicit output directory; overrides --tag "
                          "(default: results/ , or results/<tag> when --tag is given)")
-    ap.add_argument("--seed", type=int, default=3)
-    ap.add_argument("--num-repeats", type=int, default=16)
-    ap.add_argument("--steps", type=int, default=100)
+    ap.add_argument("--seed", type=int, default=3)   # cohort/rotation RNG -- NOT an alignment restart count
     ap.add_argument("--lr", type=float, default=0.1)
     ap.add_argument("--alpha", type=float, default=0.81)
     ap.add_argument("--lam", type=float, default=0.3)

@@ -89,8 +89,9 @@ SHMAP_DEFAULT = {"vol": True, "surf": False, "esp": False, "pharm": True}
 
 
 def _cfg_from_args(a):
-    return dict(num_repeats=a.num_repeats, steps=a.steps, lr=a.lr,
-                alpha=a.alpha, lam=a.lam, surf_per_atom=SURF_PER_ATOM)
+    """Shared alignment knobs. Carries NO seed/step count: each engine runs its own shipped
+    default effort (fork: MODE_SEEDS/MODE_STEPS; original: 50x200). See benchmark.py."""
+    return dict(lr=a.lr, alpha=a.alpha, lam=a.lam, surf_per_atom=SURF_PER_ATOM)
 
 
 def _default_procs():
@@ -108,19 +109,18 @@ def _numba_align(mode, pairs, cfg, num_workers=1):
     (``_cpu_pool``). Results land in-place (``sim_aligned_*`` / ``transform_*``)."""
     from shepherd_score.container import MoleculePairBatch
     b = MoleculePairBatch(pairs)
+    # No num_repeats / max_num_steps: the fork runs its shipped per-mode defaults (MODE_SEEDS /
+    # MODE_STEPS).
     if mode == "vol":
         b.align_with_vol(no_H=True, backend="numba", num_workers=num_workers,
-                         alpha=cfg["alpha"], max_num_steps=cfg["steps"])
+                         alpha=cfg["alpha"])
     elif mode == "surf":
-        b.align_with_surf(alpha=cfg["alpha"], backend="numba", num_workers=num_workers,
-                          max_num_steps=cfg["steps"])
+        b.align_with_surf(alpha=cfg["alpha"], backend="numba", num_workers=num_workers)
     elif mode == "esp":
         b.align_with_esp(alpha=cfg["alpha"], lam=cfg["lam"], num_workers=num_workers,
-                         num_repeats=cfg["num_repeats"], lr=cfg["lr"],
-                         backend="numba", max_num_steps=cfg["steps"])
+                         lr=cfg["lr"], backend="numba")
     elif mode == "pharm":
-        b.align_with_pharm(num_repeats=cfg["num_repeats"], lr=cfg["lr"], num_workers=num_workers,
-                           backend="numba", max_num_steps=cfg["steps"])
+        b.align_with_pharm(lr=cfg["lr"], num_workers=num_workers, backend="numba")
     else:
         raise ValueError(mode)
 
@@ -255,8 +255,9 @@ def orig_cpu_cell(planfile):
         b = MoleculePairBatch(pairs)
         # The mode's documented default path: shmap (vol/pharm) or multiprocessing
         # (surf/esp). At W=1 both reduce to the sequential path inside align_with_*.
-        kw = dict(num_repeats=cfg["num_repeats"], lr=cfg["lr"],
-                  max_num_steps=cfg["steps"], num_workers=W, use_shmap=SHMAP_DEFAULT[mode])
+        # No num_repeats / max_num_steps: the ORIGINAL package runs its own shipped defaults
+        # (50 restarts x 200 steps). Effort is not matched across engines -- see benchmark.py.
+        kw = dict(lr=cfg["lr"], num_workers=W, use_shmap=SHMAP_DEFAULT[mode])
         if mode == "vol":
             return b.align_with_vol(no_H=True, **kw)[0]
         if mode == "surf":
@@ -673,8 +674,6 @@ def main():
     ap.add_argument("--tag", default=None, help="write to results_cpu/<tag>/ instead of results_cpu/")
     ap.add_argument("--out-dir", default=None, help="explicit output dir; overrides --tag")
     ap.add_argument("--seed", type=int, default=3)
-    ap.add_argument("--num-repeats", type=int, default=16)
-    ap.add_argument("--steps", type=int, default=100)
     ap.add_argument("--lr", type=float, default=0.1)
     ap.add_argument("--alpha", type=float, default=0.81)
     ap.add_argument("--lam", type=float, default=0.3)

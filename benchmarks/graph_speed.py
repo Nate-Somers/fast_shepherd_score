@@ -40,13 +40,13 @@ def _build_lib():
 def _align(batch, mode):
     from shepherd_score.container import MoleculePairBatch
     b = MoleculePairBatch(batch)
-    if mode == "vol": b.align_with_vol(no_H=True, backend="triton", alpha=0.81, max_num_steps=100)
-    elif mode == "surf": b.align_with_surf(alpha=0.81, backend="triton", max_num_steps=100)
-    elif mode == "esp": b.align_with_esp(alpha=0.81, lam=0.3, backend="triton", max_num_steps=100)
-    elif mode == "vol_esp": b.align_with_vol_esp(alpha=0.81, lam=0.3, no_H=True, backend="triton", max_num_steps=100)
-    elif mode == "pharm": b.align_with_pharm(backend="triton", max_num_steps=100)
-    elif mode == "vol_color": b.align_with_vol_color(color_weight=0.5, backend="triton", max_num_steps=100)
-    elif mode in ("vol_and_surf_esp", "esp_combo"): b.align_with_vol_and_surf_esp(alpha=0.81, backend="triton", max_num_steps=100)
+    if mode == "vol": b.align_with_vol(no_H=True, backend="triton", alpha=0.81)
+    elif mode == "surf": b.align_with_surf(alpha=0.81, backend="triton")
+    elif mode == "esp": b.align_with_esp(alpha=0.81, lam=0.3, backend="triton")
+    elif mode == "vol_esp": b.align_with_vol_esp(alpha=0.81, lam=0.3, no_H=True, backend="triton")
+    elif mode == "pharm": b.align_with_pharm(backend="triton")
+    elif mode == "vol_color": b.align_with_vol_color(color_weight=0.5, backend="triton")
+    elif mode in ("vol_and_surf_esp", "esp_combo"): b.align_with_vol_and_surf_esp(alpha=0.81, backend="triton")
 
 
 def cell(mode, N, out):

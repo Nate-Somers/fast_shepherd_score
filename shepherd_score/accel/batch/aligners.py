@@ -11,7 +11,7 @@ There is no runtime dependency on ``_core`` (only a TYPE_CHECKING import), so th
 module imports cheaply and the spawn-based multi-GPU worker stays picklable.
 """
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 import os
 
 import numpy as np
@@ -920,7 +920,7 @@ def _align_batch_pharm(
     extended_points: bool = False,
     only_extended: bool = False,
     trans_init: bool = False,
-    num_repeats: int = 50,
+    num_repeats: Optional[int] = None,
     topk: int = 30,
     steps_fine: int = 100,
     lr: float = 0.075,
@@ -934,6 +934,11 @@ def _align_batch_pharm(
     """
     if not pairs:
         return
+    # Single source of truth: default the SO(3) multi-start count to the per-mode MODE_SEEDS
+    # value (FINE_NUM_SEEDS-aware) so the fast batched kernel AND the per-pair fallbacks below
+    # (CPU-without-numba / driver-import failure) all honor it. An explicit num_repeats overrides.
+    if num_repeats is None:
+        num_repeats = _seeds_for("pharm")
     if _should_distribute(pairs):
         return _run_distributed(_align_batch_pharm, pairs,
                                 similarity=similarity, extended_points=extended_points,
@@ -1055,14 +1060,14 @@ def _align_batch_pharm(
                 ref_types[sl], fit_types[sl], ref_ancs[sl], fit_ancs[sl],
                 ref_vecs[sl], fit_vecs[sl],
                 similarity=similarity, extended_points=extended_points,
-                only_extended=only_extended, num_repeats=_seeds_for("pharm"),
+                only_extended=only_extended, num_repeats=num_repeats,
                 trans_centers_batch=tcb, trans_centers_real=tcr,
                 num_repeats_per_trans=10, N_real=N_real[sl], M_real=M_real[sl],
                 topk=topk, steps_fine=steps_fine, lr=lr,
             )
             return sc, q, t
         scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=("pharm", N_pad, M_pad, _seeds_for("pharm")), device=device)
+            _proc, K, key=("pharm", N_pad, M_pad, num_repeats), device=device)
 
         all_pairs.extend(bucket)
         all_scores.append(scores)
