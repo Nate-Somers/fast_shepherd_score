@@ -29,8 +29,13 @@ surface builder don't exist on the CPU-only Windows box. It's CPU-only at run ti
 ## What makes it fair
 
 Every pair is a **real drug aligned to a rigid SE(3) copy of itself** (optimum
-score = 1.0), so each cell self-reports accuracy. Both engines share the molcache,
-seed, and alignment cfg; warmup (numba/JAX JIT) is excluded; each cell is best-of-N,
+score = 1.0), so each cell self-reports accuracy. Both engines share the molcache and
+the RNG seed, but **each runs its own shipped default alignment effort** — the fork uses
+its per-mode `MODE_SEEDS`/`MODE_STEPS` (`shepherd_score/accel/_modes.py`), the original
+uses its 50-restart × 200-step signature defaults. Neither is pinned by the benchmark, so
+the question answered is *"how fast can I align if I use this package, as shipped"* rather
+than *"same work, faster kernels"*; the effort actually used is recorded per run under
+`_meta.effort`. Warmup (numba/JAX JIT) is excluded; each cell is best-of-N,
 time-budgeted, and runs in its **own isolated subprocess** (both packages are named
 `shepherd_score`). `esp_combo` is excluded — it has no numba path.
 

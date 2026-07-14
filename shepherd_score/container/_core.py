@@ -13,6 +13,22 @@ import torch
 
 from shepherd_score.score.constants import COULOMB_SCALING, LAM_SCALING, ALPHA  # noqa: F401
 
+
+def _default_seeds(mode: str) -> int:
+    """Per-mode default SE(3) seed count (``MODE_SEEDS``) from the single source of truth in
+    ``accel/_modes.py``, via ``accel.batch.aligners._seeds_for`` (so ``FINE_NUM_SEEDS`` still wins).
+    Lazy-imported to keep this module importable without the accel/torch stack. Resolves
+    ``num_repeats=None`` in ``align_with_*`` so the per-pair API ships the SAME defaults as the
+    batched API -- previously it hardcoded 50/200 and could never reach the mode table."""
+    from shepherd_score.accel.batch.aligners import _seeds_for
+    return _seeds_for(mode)
+
+
+def _default_steps(mode: str) -> int:
+    """Per-mode default fine-step count (``MODE_STEPS``); see ``_default_seeds``."""
+    from shepherd_score.accel.batch.aligners import _steps_for
+    return _steps_for(mode)
+
 from shepherd_score.generate_point_cloud import get_atom_coords, get_atomic_vdw_radii, get_molecular_surface, get_molecular_surface_const_density
 from shepherd_score.score.gaussian_overlap_np import get_overlap_np
 from shepherd_score.score.gaussian_overlap import get_overlap
@@ -26,6 +42,11 @@ from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_over
 from shepherd_score.alignment import optimize_vol_color_overlay
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.accel import batch as _ba
+from shepherd_score.accel._modes import (
+    MODE_ATTRS as _MODE_ATTRS,
+    CANONICAL_MODES as _CANONICAL_MODES,
+    LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES,
+)
 
 
 def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) -> Chem.Mol:
@@ -265,6 +286,20 @@ class Molecule:
         )
 
 
+def _bind_batch_aligners(cls):
+    """Bind ``accel.batch._align_batch_<mode>`` onto ``cls`` as static methods -- one per
+    canonical registry mode, plus the legacy-name aliases (esp->surf_esp,
+    esp_combo->vol_and_surf_esp) -- so ``MoleculePair._align_batch_vol(pairs, ...)`` etc. still
+    resolve here and adding a mode needs no per-mode edit. Exactly mirrors the old explicit
+    staticmethod block; driven off accel/_modes so the registry is the single source."""
+    for _m in _CANONICAL_MODES:
+        setattr(cls, "_align_batch_" + _m, staticmethod(getattr(_ba, "_align_batch_" + _m)))
+    for _legacy, _canon in _LEGACY_MODE_ALIASES.items():
+        setattr(cls, "_align_batch_" + _legacy, staticmethod(getattr(_ba, "_align_batch_" + _canon)))
+    return cls
+
+
+@_bind_batch_aligners
 class MoleculePair:
     """ Pair of Molecule objects to facilitate alignment. """
 
@@ -343,32 +378,17 @@ class MoleculePair:
                                           dtype=torch.float32,
                                           device=device)          # (M,3)
 
-        self.transform_vol = np.eye(4)
-        self.sim_aligned_vol = None
-
-        self.transform_vol_noH = np.eye(4)
-        self.sim_aligned_vol_noH = None
-
-        self.transform_surf = np.eye(4)
-        self.sim_aligned_surf = None
-
-        self.transform_surf_esp = np.eye(4)
-        self.sim_aligned_surf_esp = None
-
-        self.transform_vol_esp = np.eye(4)
-        self.sim_aligned_vol_esp = None
-
-        self.transform_vol_esp_noH = np.eye(4)
-        self.sim_aligned_vol_esp_noH = None
-
-        self.transform_vol_and_surf_esp = np.eye(4)
-        self.sim_aligned_vol_and_surf_esp = None
-
-        self.transform_pharm = np.eye(4)
-        self.sim_aligned_pharm = None
-
-        self.transform_vol_color = np.eye(4)
-        self.sim_aligned_vol_color = None
+        # Result slots (transform=identity, score=None until aligned). The 7 canonical modes
+        # are driven by the registry (accel/_modes.MODE_ATTRS); adding a mode there auto-creates
+        # its slots here. The two no_H-variant slots below are legacy extras written by
+        # align_with_vol/align_with_vol_esp(no_H=False) and are intentionally not registry modes.
+        for _t, _s in _MODE_ATTRS.values():
+            setattr(self, _t, np.eye(4))
+            setattr(self, _s, None)
+        for _t, _s in (("transform_vol", "sim_aligned_vol"),
+                       ("transform_vol_esp", "sim_aligned_vol_esp")):
+            setattr(self, _t, np.eye(4))
+            setattr(self, _s, None)
 
     # --- legacy result-attribute aliases (renamed modes; old names kept working) ---
     # esp -> surf_esp, esp_combo -> vol_and_surf_esp. The canonical attributes set in
@@ -391,26 +411,16 @@ class MoleculePair:
     def transform_esp_combo(self, v): self.transform_vol_and_surf_esp = v
 
     # --- batched GPU/Triton aligners -------------------------------------
-    # Implemented as free functions in ``_batch_align`` (kept out of this file
-    # for size); bound here as static methods so the public seam is unchanged --
-    # ``MoleculePair._align_batch_vol(pairs, ...)`` etc. still resolve here.
-    _align_batch_vol       = staticmethod(_ba._align_batch_vol)
-    _align_batch_surf      = staticmethod(_ba._align_batch_surf)
-    _align_batch_surf_esp  = staticmethod(_ba._align_batch_surf_esp)
-    _align_batch_vol_esp   = staticmethod(_ba._align_batch_vol_esp)
-    _align_batch_vol_and_surf_esp = staticmethod(_ba._align_batch_vol_and_surf_esp)
-    _align_batch_pharm     = staticmethod(_ba._align_batch_pharm)
-    _align_batch_vol_color = staticmethod(_ba._align_batch_vol_color)
-    # legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp)
-    _align_batch_esp       = _align_batch_surf_esp
-    _align_batch_esp_combo = _align_batch_vol_and_surf_esp
+    # Implemented as free functions in ``accel.batch``; bound as static methods (one per
+    # registry mode + legacy aliases) by the ``@_bind_batch_aligners`` class decorator above, so
+    # the public seam ``MoleculePair._align_batch_vol(pairs, ...)`` etc. still resolves here.
 
     def align_with_vol(self,
                        no_H: bool = True,
-                       num_repeats: int = 50,
+                       num_repeats: int = None,
                        trans_init: bool = False,
                        lr: float = 0.1,
-                       max_num_steps: int = 200,
+                       max_num_steps: int = None,
                        use_jax: bool = False,
                        use_analytical: bool = True,
                        verbose: bool = False) -> np.ndarray:
@@ -425,7 +435,8 @@ class MoleculePair:
         no_H : bool
             Whether to not include hydrogens in volumetric similarity. Default is ``True``.
         num_repeats : int, optional
-            Number of different random initializations of SO(3) transformation parameters. Default is 50.
+            Number of different random initializations of SO(3) transformation parameters.
+            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s center of mass (COM) is translated to
             each ``ref_molec``'s atoms, with 10 rotations for each translation. So the
@@ -435,7 +446,8 @@ class MoleculePair:
         lr : float, optional
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
-            Maximum number of steps to optimize over. Default is 200.
+            Maximum number of steps to optimize over.
+            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         use_analytical : bool, optional
@@ -449,6 +461,10 @@ class MoleculePair:
         aligned_fit_points : np.ndarray
             Coordinates of transformed atoms. Shape: (N, 3).
         """
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol")
         if no_H:
             ref_atom_pos = self.ref_molec.atom_pos
             fit_atom_pos = self.fit_molec.atom_pos
@@ -507,10 +523,10 @@ class MoleculePair:
     def align_with_vol_esp(self,
                            lam: float,
                            no_H: bool = True,
-                           num_repeats: int = 50,
+                           num_repeats: int = None,
                            trans_init: bool = False,
                            lr: float = 0.1,
-                           max_num_steps: int = 200,
+                           max_num_steps: int = None,
                            use_jax: bool = False,
                            use_analytical: bool = True,
                            verbose: bool = False) -> np.ndarray:
@@ -540,7 +556,8 @@ class MoleculePair:
         lr : float, optional
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
-            Maximum number of steps to optimize over. Default is 200.
+            Maximum number of steps to optimize over.
+            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         verbose : bool, optional
@@ -552,6 +569,10 @@ class MoleculePair:
         aligned_fit_points : np.ndarray
             Coordinates of transformed atoms. Shape: (N, 3).
         """
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_esp")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_esp")
         if no_H:
             ref_mol_partial_charges = self.ref_molec.partial_charges[self.ref_molec._nonH_atoms_idx]
             fit_mol_partial_charges = self.fit_molec.partial_charges[self.fit_molec._nonH_atoms_idx]
@@ -621,10 +642,10 @@ class MoleculePair:
 
     def align_with_surf(self,
                         alpha: float,
-                        num_repeats: int = 50,
+                        num_repeats: int = None,
                         trans_init: bool = False,
                         lr: float = 0.1,
-                        max_num_steps: int = 200,
+                        max_num_steps: int = None,
                         use_jax: bool = False,
                         use_analytical: bool = True,
                         verbose: bool = False) -> np.ndarray:
@@ -651,7 +672,8 @@ class MoleculePair:
         lr : float, optional
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
-            Maximum number of steps to optimize over. Default is 200.
+            Maximum number of steps to optimize over.
+            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         use_analytical : bool, optional
@@ -665,6 +687,10 @@ class MoleculePair:
         aligned_fit_points : np.ndarray
             Coordinates of transformed atoms. Shape: (N, 3).
         """
+        if num_repeats is None:
+            num_repeats = _default_seeds("surf")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("surf")
         if self.num_surf_points is None:
             raise ValueError('The Molecule objects were initialized with no surface points so this method cannot be used.')
         if use_jax: # Use Jax optimization implementation
@@ -710,10 +736,10 @@ class MoleculePair:
     def align_with_surf_esp(self,
                        alpha: float,
                        lam: float = 0.3,
-                       num_repeats: int = 50,
+                       num_repeats: int = None,
                        trans_init: bool = False,
                        lr: float = 0.1,
-                       max_num_steps: int = 200,
+                       max_num_steps: int = None,
                        use_jax: bool = False,
                        use_analytical: bool = True,
                        use_fast: bool = False,
@@ -746,7 +772,8 @@ class MoleculePair:
         lr : float, optional
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
-            Maximum number of steps to optimize over. Default is 200.
+            Maximum number of steps to optimize over.
+            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         verbose : bool, optional
@@ -758,6 +785,10 @@ class MoleculePair:
         aligned_fit_points : np.ndarray
             Coordinates of transformed atoms. Shape: (N, 3).
         """
+        if num_repeats is None:
+            num_repeats = _default_seeds("surf_esp")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("surf_esp")
         lam_scaled = LAM_SCALING * lam
         if self.num_surf_points is None:
             raise ValueError('The Molecule objects were initialized with no surface points so this method cannot be used.')
@@ -853,10 +884,10 @@ class MoleculePair:
                              lam: float = 0.001,
                              probe_radius: float = 1.0,
                              esp_weight: float = 0.5,
-                             num_repeats: int = 50,
+                             num_repeats: int = None,
                              trans_init: bool = False,
                              lr: float = 0.1,
-                             max_num_steps: int = 200,
+                             max_num_steps: int = None,
                              use_jax: bool = False,
                              use_fast: bool = False,
                              verbose: bool = False):
@@ -882,7 +913,8 @@ class MoleculePair:
         esp_weight : float, optional
             How much to weight shape vs esp_combo similarity ([0,1]). Default is 0.5.
         num_repeats : int, optional
-            Number of different random initializations of SO(3) transformation parameters. Default is 50.
+            Number of different random initializations of SO(3) transformation parameters.
+            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s COM is translated
             to each ``ref_molecs``'s atoms, with 10 rotations for each translation. So the
@@ -892,7 +924,8 @@ class MoleculePair:
         lr : float, optional
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
-            Maximum number of steps to optimize over. Default is 200.
+            Maximum number of steps to optimize over.
+            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         verbose : bool, optional
@@ -904,6 +937,10 @@ class MoleculePair:
         aligned_fit_points : np.ndarray (N, 3)
             Coordinates of transformed atoms. Shape: (N, 3).
         """
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_and_surf_esp")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_and_surf_esp")
         if self.num_surf_points is None:
             raise ValueError('The Molecule objects were initialized with no surface points so this method cannot be used.')
         if use_jax: # Use Jax optimization implementation
@@ -1060,10 +1097,10 @@ class MoleculePair:
                              directional: bool = False,
                              extended_points: bool = False,
                              only_extended: bool = False,
-                             num_repeats: int = 50,
+                             num_repeats: int = None,
                              trans_init: bool = False,
                              lr: float = 0.1,
-                             max_num_steps: int = 200,
+                             max_num_steps: int = None,
                              verbose: bool = False,
                              use_fast: bool = False) -> np.ndarray:
         """
@@ -1110,6 +1147,10 @@ class MoleculePair:
         aligned_fit_centers : np.ndarray (M, 3)
             Transformed fit atom (heavy-atom) coordinates.
         """
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_color")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_color")
         if self.ref_molec.pharm_types is None or self.fit_molec.pharm_types is None:
             raise ValueError(
                 'Both Molecule objects must have pharmacophores to use align_with_vol_color. '
@@ -1174,10 +1215,10 @@ class MoleculePair:
                          similarity: _SIM_TYPE = 'tanimoto',
                          extended_points: bool = False,
                          only_extended: bool = False,
-                         num_repeats: int = 50,
+                         num_repeats: int = None,
                          trans_init: bool = False,
                          lr: float = 0.1,
-                         max_num_steps: int = 200,
+                         max_num_steps: int = None,
                          use_jax: bool = False,
                          verbose: bool = False,
                          use_vectorized: bool = True,
@@ -1215,7 +1256,8 @@ class MoleculePair:
         lr : float, optional
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
-            Maximum number of steps to optimize over. Default is 200.
+            Maximum number of steps to optimize over.
+            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         verbose : bool, optional
@@ -1237,6 +1279,10 @@ class MoleculePair:
             aligned_fit_vectors : np.ndarray
                 Aligned coordinates of pharmacophore vectors. Shape: (P, 3).
         """
+        if num_repeats is None:
+            num_repeats = _default_seeds("pharm")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("pharm")
         if use_jax:
             if 'jax' not in sys.modules or 'jax.numpy' not in sys.modules:
                 try:

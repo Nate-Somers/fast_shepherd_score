@@ -70,3 +70,44 @@ def test_screen_attr_maps_cover_all_modes():
     assert screen._canon_mode("esp_combo") == "vol_and_surf_esp"
     for m, (tf, sc) in M.MODE_ATTRS.items():
         assert screen._TRANSFORM_ATTR[m] == tf and screen._SCORE_ATTR[m] == sc
+
+
+def test_moleculepair_batch_aligner_binds_are_registry_driven():
+    """The @_bind_batch_aligners decorator must bind accel.batch._align_batch_<mode> for every
+    canonical mode AND every legacy alias, identically to the old explicit staticmethod block."""
+    pytest.importorskip("torch")
+    pytest.importorskip("rdkit")
+    from shepherd_score.container._core import MoleculePair
+    from shepherd_score.accel import batch as _ba
+    for m in M.CANONICAL_MODES:
+        assert getattr(MoleculePair, "_align_batch_" + m) is getattr(_ba, "_align_batch_" + m), m
+    for legacy, canon in M.LEGACY_MODE_ALIASES.items():
+        assert getattr(MoleculePair, "_align_batch_" + legacy) is getattr(_ba, "_align_batch_" + canon), legacy
+
+
+def test_moleculepair_init_result_slots_cover_registry():
+    """The registry-driven __init__ block must pre-init every MODE_ATTRS slot (transform=eye,
+    score=None) plus the two legacy no_H-variant extras, and legacy-name reads must still resolve
+    through the property aliases. Guards against the loop dropping a slot."""
+    import numpy as np
+    pytest.importorskip("torch")
+    Chem = pytest.importorskip("rdkit.Chem")
+    from rdkit.Chem import AllChem
+    from shepherd_score.container import MoleculePair
+
+    def _mol(smi):
+        m = Chem.AddHs(Chem.MolFromSmiles(smi))
+        AllChem.EmbedMolecule(m, AllChem.ETKDGv3())
+        return m
+
+    mp = MoleculePair(_mol("CCO"), _mol("CCN"))  # num_surf_points=None -> no Open3D
+    eye = np.eye(4)
+    for tf, sc in M.MODE_ATTRS.values():
+        assert np.array_equal(getattr(mp, tf), eye), tf
+        assert getattr(mp, sc) is None, sc
+    for tf, sc in (("transform_vol", "sim_aligned_vol"), ("transform_vol_esp", "sim_aligned_vol_esp")):
+        assert np.array_equal(getattr(mp, tf), eye), tf
+        assert getattr(mp, sc) is None, sc
+    # legacy-name reads resolve to canonical storage via the property aliases
+    assert np.array_equal(mp.transform_esp, mp.transform_surf_esp)
+    assert np.array_equal(mp.transform_esp_combo, mp.transform_vol_and_surf_esp)

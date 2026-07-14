@@ -29,7 +29,7 @@ _TWO_PI_3 = 2.0 * math.pi / 3.0
 # bit-faithful float64). The seed-gen prologue is compute-bound on the float64 PCA over the
 # 4x-expanded fit clouds; float32 roughly halves that work -- measured +7-15% total screen
 # throughput (vol +15%, vol_color +10%, surf_esp +8%, surf +7% on L40S). BUT it ships OPT-IN,
-# not default: the seed-parity gate (benchmarks/seed_parity_gate.py) shows fp32 seeds drop
+# not default: the seed-parity A/B showed fp32 seeds drop
 # the multi-basin esp mode's self-copy recovery to ~0.93 (below the 0.95 bar) -- the fine
 # optimiser doesn't fully recover the coarser fp32 seeds there. On real distinct-molecule
 # screens the ranking is unchanged (mean overlap identical to 3 decimals), so it is a good

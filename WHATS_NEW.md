@@ -2,9 +2,61 @@
 
 This fork adds a **Triton GPU engine** for molecular alignment on top of upstream
 [`shepherd-score`](https://github.com/coleygroup/shepherd-score). It keeps the entire
-original API and behavior, and adds opt-in, **additive** surfaces — the GPU/CPU
-`backend=` seam, and an out-of-core streaming-screen module — that leave existing
-behavior untouched.
+original API surface, and adds opt-in, **additive** surfaces — the GPU/CPU
+`backend=` seam, and an out-of-core streaming-screen module.
+
+---
+
+## ⚠️ BEHAVIOR CHANGE — `num_repeats` / `max_num_steps` now default to the per-mode tables
+
+**This is the one place the fork's *behavior* deviates from upstream's defaults. Read this if
+you call `align_with_*` without passing `num_repeats` / `max_num_steps`.**
+
+Upstream hardcodes `num_repeats=50, max_num_steps=200` in every `align_with_*` signature —
+the same effort for every mode. This fork ships **per-mode tuned defaults** in
+[`shepherd_score/accel/_modes.py`](shepherd_score/accel/_modes.py) (`MODE_SEEDS` / `MODE_STEPS`),
+and **both** the batched (`MoleculePairBatch`) and per-pair (`MoleculePair`) APIs now resolve
+`num_repeats=None` / `max_num_steps=None` to those tables:
+
+| mode | fss default (seeds × steps) | upstream |
+|---|---|---|
+| `vol` | 10 × 100 | 50 × 200 |
+| `vol_esp` | 16 × 50 | 50 × 200 |
+| `surf` | 8 × 40 | 50 × 200 |
+| `surf_esp` | 8 × 40 | 50 × 200 |
+| `vol_and_surf_esp` | 8 × 60 | 50 × 200 |
+| `pharm` | 32 × 50 | 50 × 200 |
+| `vol_color` | 16 × 40 | 50 × 200 |
+
+**Why:** the defaults were tuned against three metrics measured together — DUDE-Z ROC-AUC over
+41 targets (a 9,471-cell seeds × steps × modes grid), synthetic mean/ceiling overlap recovery,
+and pairwise throughput. SE(3) restarts turn out to be **cheap in ROC-AUC but expensive in
+throughput**: an accuracy-maximizing pick buys only +0.002–0.006 ROC-AUC while costing 1.2–4.9×
+throughput. Each mode's default now sits at its own Pareto knee, so the budgets are deliberately
+**unequal across modes**.
+
+**What this means for you:**
+- Calling `align_with_*()` with no effort args is now **faster** and **mode-specific** — it is
+  no longer 50 × 200. To reproduce upstream exactly, pass `num_repeats=50, max_num_steps=200`
+  explicitly.
+- Passing either argument explicitly still overrides the table, as before. `FINE_NUM_SEEDS` /
+  `FINE_NUM_STEPS` env vars still override every mode.
+- Previously the per-pair `MoleculePair.align_with_*` could *never* reach the mode table (it
+  hardcoded 50/200), so the fork had two different "defaults" depending on which API you called.
+  That inconsistency is now gone — **`_modes.py` is the single source of truth for both.**
+
+**Benchmarks no longer pin effort.** Every benchmark in `benchmarks/` (and in the paper repo)
+had its `num_repeats`/`max_num_steps`/`--steps`/`--num-repeats`/`FINE_NUM_SEEDS` overrides
+**removed**, so each engine is timed at the configuration it actually ships. The speed
+comparison now answers *"how fast can I align if I use this package, as shipped"* rather than
+*"same work, faster kernels"* — the original engine runs its own 50 × 200, and the effort used
+is recorded per run under `_meta.effort`. The seed-sweep tooling that existed only to derive
+these numbers (`optimize_defaults.py`, `analyze_defaults.py`, `validate_new_defaults.py`,
+`seed_parity_gate.py`, `esp_combo_seed_probe.py`) was **deleted** — its conclusions are baked
+into `_modes.py`, and keeping seed-setting code inside `benchmarks/` was a standing source of
+confusion about what was actually being measured.
+
+---
 
 - **One new public knob:** a `backend=` argument on the existing
   `MoleculePairBatch.align_with_*` methods — `"triton"` for the GPU path, or `"numba"`
@@ -754,7 +806,7 @@ last decimal.
    selected per problem shape via `@triton.autotune` and validated to be bit-identical.
 10. **Per-mode default seed/step counts, accuracy-tuned** (2026-06). Swept `(num_seeds ×
     fine-steps)` for all seven modes against the fully-converged reference on 200 distinct
-    drug cross-pairs (`benchmarks/optimize_defaults.py` → `analyze_defaults.py`), keeping the
+    drug cross-pairs (via a seeds x steps sweep harness, since removed), keeping the
     cheapest setting that still captures **≥99.9% of the converged mean overlap** (with a
     bounded per-pair tail and intact self-copy recovery; alignment scores are
     backend-independent, so the knees found on the numba CPU sweep transfer to the Triton GPU
@@ -765,12 +817,14 @@ last decimal.
     landscape:** the volumetric modes shed seeds — `esp`/`vol_esp`/`vol_color` go **40 → 28**
     in `_MODE_SEEDS` — while the most seed-sensitive multi-basin modes (`surf` 20, `pharm` 40,
     `esp_combo` 50) keep their counts, because their mean keeps creeping with seed count.
-    Validated to lose **≤0.08%** vs the prior defaults (`benchmarks/validate_new_defaults.py`).
+    Validated at the time to lose **≤0.08%** vs the prior defaults. (Superseded: see the
+    behavior-change note at the top -- the defaults were retuned in 2026-07 against DUDE-Z
+    ROC-AUC + throughput, and the sweep harnesses were removed.)
     **Bug fixed in passing:** `esp_combo` silently *ignored* the seed config — its driver chain
     (`_align_batch_esp_combo` → `fast_optimize_esp_combo_score_overlay_batch` →
     `coarse_fine_esp_combo_align_many`) never threaded `num_seeds` through, hardwiring 50 — so
     it is now wired to `_seeds_for`/`_MODE_SEEDS` like every other mode (the value stays 50; the
-    probe in `benchmarks/esp_combo_seed_probe.py` confirms `esp_combo` is the most seed-hungry
+    a seed probe (since removed) confirmed `esp_combo` is the most seed-hungry
     mode, so 50 is justified — it just wasn't *tunable* before).
 
 ### D. Multi-GPU & very large batches (cluster / L40S work)
@@ -908,7 +962,7 @@ work — without losing overlap quality. Both are on by default; neither changes
   landscapes have many near-equal optima), so they are kept higher for per-pair stability. Net:
   the same recovered overlap at fewer seeds — up to **~1.4× faster on `esp`**, with the shape
   modes using ~2.5× fewer seeds.
-- **Parity gate.** [`benchmarks/seed_parity_gate.py`](benchmarks/seed_parity_gate.py) runs the
+- **Parity gate.** A `seed_parity_gate.py` harness (since removed) ran the
   legacy 50-seed path against each mode's new default in isolated subprocesses and asserts no
   regression in **mean overlap** or self-copy recovery. Mean overlap is the stable quality
   metric here: the multi-basin modes differ *per pair* between **any** two seed sets — even

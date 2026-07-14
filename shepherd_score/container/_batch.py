@@ -29,6 +29,16 @@ def _default_steps(mode: str) -> int:
     return _steps_for(mode)
 
 
+def _default_seeds(mode: str) -> int:
+    """Per-mode default SE(3) seed count (``MODE_SEEDS``) from the single-source table in
+    ``accel.batch.aligners`` (``_seeds_for``). Lazy-imported, same as ``_default_steps``. Used to
+    resolve ``num_repeats=None`` in ``align_with_*`` so the shipped per-mode default is what
+    actually runs. Resolved to an int here (rather than passing ``None`` down) because the JAX,
+    cpu_pool and per-pair fallback branches all require a concrete count."""
+    from shepherd_score.accel.batch.aligners import _seeds_for
+    return _seeds_for(mode)
+
+
 def _compute_bucket_splits(sizes_a, sizes_b, num_buckets):
     """Sort pairs by (max(a,b), min(a,b)) and split into buckets.
 
@@ -252,7 +262,7 @@ class MoleculePairBatch:
 
     def align_with_vol(self,
                        no_H: bool = True,
-                       num_repeats: int = 50,
+                       num_repeats: int = None,
                        trans_init: bool = False,
                        lr: float = 0.1,
                        max_num_steps: int = None,
@@ -289,7 +299,8 @@ class MoleculePairBatch:
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
             Maximum optimization steps. Default is 50 (45-50 steps fully converge the
-            fine optimizer on drug-like pairs; see benchmarks/optimize_defaults.py).
+            fine optimizer on drug-like pairs; see shepherd_score/accel/_modes.py --
+            MODE_SEEDS / MODE_STEPS).
         num_workers : int
             Number of parallel workers.  ``1`` (default) runs sequentially
             in-process. When ``use_shmap=True`` (the default), this value is informational;
@@ -337,6 +348,8 @@ class MoleculePairBatch:
                     "the Triton/numba vol backend aligns heavy atoms only (no_H=True)")
         if max_num_steps is None:
             max_num_steps = _default_steps("vol")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol,
             dict(alpha=alpha, steps_fine=max_num_steps),
@@ -470,7 +483,7 @@ class MoleculePairBatch:
     def align_with_vol_esp(self,
                            lam: float,
                            no_H: bool = True,
-                           num_repeats: int = 50,
+                           num_repeats: int = None,
                            trans_init: bool = False,
                            lr: float = 0.1,
                            max_num_steps: int = None,
@@ -509,7 +522,8 @@ class MoleculePairBatch:
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
             Maximum optimization steps. Default is 50 (45-50 steps fully converge the
-            fine optimizer on drug-like pairs; see benchmarks/optimize_defaults.py).
+            fine optimizer on drug-like pairs; see shepherd_score/accel/_modes.py --
+            MODE_SEEDS / MODE_STEPS).
         num_workers : int
             Number of parallel worker processes. ``1`` (default) runs
             sequentially in-process. Values greater than ``len(self.pairs)``
@@ -545,6 +559,8 @@ class MoleculePairBatch:
                     "the Triton/numba vol_esp backend aligns heavy atoms only (no_H=True)")
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_esp")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_esp")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_esp,
             dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
@@ -713,7 +729,7 @@ class MoleculePairBatch:
 
     def align_with_surf(self,
                         alpha: float,
-                        num_repeats: int = 50,
+                        num_repeats: int = None,
                         trans_init: bool = False,
                         lr: float = 0.1,
                         max_num_steps: int = None,
@@ -746,7 +762,8 @@ class MoleculePairBatch:
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
             Maximum optimization steps. Default is 50 (45-50 steps fully converge the
-            fine optimizer on drug-like pairs; see benchmarks/optimize_defaults.py).
+            fine optimizer on drug-like pairs; see shepherd_score/accel/_modes.py --
+            MODE_SEEDS / MODE_STEPS).
         use_jax : bool
             Whether to use JAX backend. Default is True.
         use_analytical : bool
@@ -774,6 +791,8 @@ class MoleculePairBatch:
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("surf")
+        if num_repeats is None:
+            num_repeats = _default_seeds("surf")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_surf,
             dict(alpha=alpha, steps_fine=max_num_steps),
@@ -845,7 +864,7 @@ class MoleculePairBatch:
     def align_with_surf_esp(self,
                        alpha: float,
                        lam: float = 0.3,
-                       num_repeats: int = 50,
+                       num_repeats: int = None,
                        trans_init: bool = False,
                        lr: float = 0.1,
                        max_num_steps: int = None,
@@ -881,7 +900,8 @@ class MoleculePairBatch:
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
             Maximum optimization steps. Default is 50 (45-50 steps fully converge the
-            fine optimizer on drug-like pairs; see benchmarks/optimize_defaults.py).
+            fine optimizer on drug-like pairs; see shepherd_score/accel/_modes.py --
+            MODE_SEEDS / MODE_STEPS).
         use_jax : bool
             Whether to use JAX backend. Default is True.
         use_analytical : bool
@@ -910,6 +930,8 @@ class MoleculePairBatch:
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("surf_esp")
+        if num_repeats is None:
+            num_repeats = _default_seeds("surf_esp")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_surf_esp,
             dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
@@ -991,7 +1013,7 @@ class MoleculePairBatch:
                              lam: float = 0.001,
                              probe_radius: float = 1.0,
                              esp_weight: float = 0.5,
-                             num_repeats: int = 50,
+                             num_repeats: int = None,
                              trans_init: bool = False,
                              lr: float = 0.1,
                              max_num_steps: int = None,
@@ -1031,6 +1053,8 @@ class MoleculePairBatch:
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_and_surf_esp")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_and_surf_esp")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_and_surf_esp,
             dict(alpha=alpha, lam=lam, probe_radius=probe_radius,
@@ -1061,7 +1085,7 @@ class MoleculePairBatch:
     def align_with_vol_color(self,
                              color_weight: float = 0.5,
                              alpha: float = 0.81,
-                             num_repeats: int = 50,
+                             num_repeats: int = None,
                              trans_init: bool = False,
                              lr: float = 0.1,
                              max_num_steps: int = None,
@@ -1105,6 +1129,8 @@ class MoleculePairBatch:
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_color")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_color")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_color,
             dict(alpha=alpha, color_weight=color_weight, trans_init=trans_init,
@@ -1192,7 +1218,7 @@ class MoleculePairBatch:
                          similarity: str = 'tanimoto',
                          extended_points: bool = False,
                          only_extended: bool = False,
-                         num_repeats: int = 50,
+                         num_repeats: int = None,
                          trans_init: bool = False,
                          lr: float = 0.1,
                          max_num_steps: int = None,
@@ -1268,6 +1294,8 @@ class MoleculePairBatch:
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("pharm")
+        if num_repeats is None:
+            num_repeats = _default_seeds("pharm")
         if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
             if backend in self._NUMBA_BACKENDS:
                 self._prepare_numba()

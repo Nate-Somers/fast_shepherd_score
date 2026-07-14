@@ -192,6 +192,5 @@ environment.local.yml
 
 # optimization-sweep output jsons (kept on cluster, not tracked)
 benchmarks/optall.json
-benchmarks/optimize_defaults_results.json
 benchmarks/vesp380.json
 benchmarks/volopt_esp_combo.json
