@@ -992,8 +992,7 @@ class MoleculePair:
                              trans_init: bool = False,
                              lr: float = 0.1,
                              max_num_steps: int = None,
-                             verbose: bool = False,
-                             use_fast: bool = False) -> np.ndarray:
+                             verbose: bool = False) -> np.ndarray:
         """
         Align using a ROCS/ROSHAMBO-style combined atom-centred Gaussian *shape* (volume) +
         directionless *color* (pharmacophore) overlay (a TanimotoCombo analogue).
@@ -1051,31 +1050,6 @@ class MoleculePair:
 
         dev = self.device
 
-        # Opt-in per-pair fast path: the batched fused-kernel driver (shape Triton/numba
-        # kernel + fused directionless color kernel). Only covers the directionless tanimoto
-        # case it implements; otherwise falls through to the torch optimizer.
-        if (use_fast and torch.cuda.is_available() and not directional
-                and similarity == 'tanimoto' and not extended_points):
-            try:
-                from shepherd_score.accel.drivers.vol_color import fast_optimize_vol_color_overlay
-            except ImportError:
-                fast_optimize_vol_color_overlay = None
-            if fast_optimize_vol_color_overlay is not None:
-                aligned_fit_centers, se3_transform, score = fast_optimize_vol_color_overlay(
-                    ref_centers=self._ref_xyz_t,
-                    fit_centers=self._fit_xyz_t,
-                    ref_types=torch.as_tensor(self.ref_molec.pharm_types, dtype=torch.int64, device=dev),
-                    fit_types=torch.as_tensor(self.fit_molec.pharm_types, dtype=torch.int64, device=dev),
-                    ref_ancs=torch.as_tensor(self.ref_molec.pharm_ancs, dtype=torch.float32, device=dev),
-                    fit_ancs=torch.as_tensor(self.fit_molec.pharm_ancs, dtype=torch.float32, device=dev),
-                    alpha=alpha, color_weight=color_weight, num_repeats=num_repeats,
-                    trans_centers=self._ref_xyz_t if trans_init else None,
-                    steps_fine=max_num_steps, lr=lr,
-                )
-                self.transform_vol_color = se3_transform.numpy()
-                self.sim_aligned_vol_color = score.numpy()
-                return aligned_fit_centers.numpy()
-
         aligned_fit_centers, se3_transform, score = optimize_vol_color_overlay(
             ref_centers=self._ref_xyz_t,
             fit_centers=self._fit_xyz_t,
@@ -1114,7 +1088,6 @@ class MoleculePair:
                          verbose: bool = False,
                          use_vectorized: bool = True,
                          use_analytical: bool = True,
-                         use_fast: bool = False,
                          ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Align fit_molec to ref_molec using pharmacophore similarity.
@@ -1204,51 +1177,6 @@ class MoleculePair:
             self.transform_pharm = np.array(se3_transform)
             self.sim_aligned_pharm = np.array(score)
             return np.array(aligned_fit_anchors), np.array(aligned_fit_vectors)
-
-        # PyTorch (opt-in CUDA fast path via use_fast)
-        if use_fast and torch.cuda.is_available():
-            try:
-                from shepherd_score.accel.drivers.pharm import fast_optimize_pharm_overlay
-            except ImportError:
-                fast_optimize_pharm_overlay = None
-
-            if fast_optimize_pharm_overlay is not None:
-                if getattr(self, "_ref_pharm_types_t", None) is None:
-                    self._ref_pharm_types_t = torch.as_tensor(self.ref_molec.pharm_types, dtype=torch.int64, device=self.device)
-                if getattr(self, "_fit_pharm_types_t", None) is None:
-                    self._fit_pharm_types_t = torch.as_tensor(self.fit_molec.pharm_types, dtype=torch.int64, device=self.device)
-                if getattr(self, "_ref_pharm_ancs_t", None) is None:
-                    self._ref_pharm_ancs_t = torch.as_tensor(self.ref_molec.pharm_ancs, dtype=torch.float32, device=self.device)
-                if getattr(self, "_fit_pharm_ancs_t", None) is None:
-                    self._fit_pharm_ancs_t = torch.as_tensor(self.fit_molec.pharm_ancs, dtype=torch.float32, device=self.device)
-                if getattr(self, "_ref_pharm_vecs_t", None) is None:
-                    self._ref_pharm_vecs_t = torch.as_tensor(self.ref_molec.pharm_vecs, dtype=torch.float32, device=self.device)
-                if getattr(self, "_fit_pharm_vecs_t", None) is None:
-                    self._fit_pharm_vecs_t = torch.as_tensor(self.fit_molec.pharm_vecs, dtype=torch.float32, device=self.device)
-
-                trans_centers = self._ref_pharm_ancs_t if trans_init else None
-
-                aligned_fit_anchors_t, aligned_fit_vectors_t, se3_transform_t, score_t = fast_optimize_pharm_overlay(
-                    ref_pharms=self._ref_pharm_types_t,
-                    fit_pharms=self._fit_pharm_types_t,
-                    ref_anchors=self._ref_pharm_ancs_t,
-                    fit_anchors=self._fit_pharm_ancs_t,
-                    ref_vectors=self._ref_pharm_vecs_t,
-                    fit_vectors=self._fit_pharm_vecs_t,
-                    similarity=similarity,
-                    extended_points=extended_points,
-                    only_extended=only_extended,
-                    num_repeats=num_repeats,
-                    trans_centers=trans_centers,
-                    num_repeats_per_trans=10,
-                    topk=30,
-                    steps_fine=max_num_steps,
-                    lr=lr,
-                )
-
-                self.transform_pharm = se3_transform_t.numpy()
-                self.sim_aligned_pharm = score_t.numpy()
-                return aligned_fit_anchors_t.numpy(), aligned_fit_vectors_t.numpy()
 
         # PyTorch
         _pharm_fn = optimize_pharm_overlay_analytical if use_analytical else optimize_pharm_overlay
