@@ -935,8 +935,8 @@ def _align_batch_pharm(
     if not pairs:
         return
     # Single source of truth: default the SO(3) multi-start count to the per-mode MODE_SEEDS
-    # value (FINE_NUM_SEEDS-aware) so the fast batched kernel AND the per-pair fallbacks below
-    # (CPU-without-numba / driver-import failure) all honor it. An explicit num_repeats overrides.
+    # value (FINE_NUM_SEEDS-aware) so the fast batched kernel honors it. An explicit num_repeats
+    # overrides.
     if num_repeats is None:
         num_repeats = _seeds_for("pharm")
     if _should_distribute(pairs):
