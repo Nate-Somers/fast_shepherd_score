@@ -6,7 +6,7 @@ and — explicitly — the four places where existing behavior changes.
 
 The update is **additive in structure**: no upstream file is deleted, and no upstream public
 name is removed. It is **not entirely additive in behavior**: four changes are visible to existing
-callers and are documented in [Behavior changes](#behavior-changes-read-this) below. Read that
+callers and are documented in [Behavior changes](#7-behavior-changes-read-this) below. Read that
 section before upgrading.
 
 ---
@@ -18,9 +18,10 @@ section before upgrading.
 3. [Organization: what every file does](#3-organization-what-every-file-does)
 4. [New features](#4-new-features)
 5. [API reference](#5-api-reference)
-6. [Behavior changes (read this)](#behavior-changes-read-this)
-7. [Testing and validation](#7-testing-and-validation)
-8. [Known gaps](#8-known-gaps)
+6. [Extensibility: the two agent skills](#6-extensibility-the-two-agent-skills) — **not implemented yet**
+7. [Behavior changes (read this)](#7-behavior-changes-read-this)
+8. [Testing and validation](#8-testing-and-validation)
+9. [Known gaps](#9-known-gaps)
 
 ---
 
@@ -89,7 +90,7 @@ conflicts.
 
 | File | Change | Additive? |
 |---|---:|---|
-| `shepherd_score/container/_core.py` | +306 / −71 | Mostly. See [Behavior changes](#behavior-changes-read-this) |
+| `shepherd_score/container/_core.py` | +306 / −71 | Mostly. See [Behavior changes](#7-behavior-changes-read-this) |
 | `shepherd_score/container/_batch.py` | +453 / −26 | Mostly. Same |
 | `shepherd_score/generate_point_cloud.py` | +249 / −13 | Yes — lazy Open3D + the opt-in `smooth_sdf` surfacer |
 | `shepherd_score/alignment/_torch.py` | +255 / −0 | Yes — one appended hunk, zero upstream lines touched |
@@ -173,94 +174,252 @@ front-end pick it up from the registry.
 
 ## 4. New features
 
-### 4.1 Two new alignment modes
+### 4.1 The seven modes — and what each one actually scores
 
-The library now has **seven** modes. Two are new:
+Every mode uses a Gaussian Tanimoto `V_AB / (V_AA + V_BB − V_AB)`, with self-overlaps computed
+through the same kernel at the identity pose.
 
-- **`vol_and_surf_esp`** — combined volumetric shape + surface-ESP scoring. Available on
-  `MoleculePairBatch` for the first time (upstream had a combo mode on `MoleculePair` only).
-- **`vol_color`** — atom-centred Gaussian **shape** overlap plus a **directionless
-  pharmacophore ("color")** overlap, the ROCS/ROSHAMBO-style scoring function. The SE(3) step
-  descends on the weighted objective, so *both* channels steer the pose:
+| Mode | Scores | Pose is steered by |
+|---|---|---|
+| `vol` | Gaussian shape overlap of heavy-atom centers | shape gradient |
+| `surf` | the same, over surface points | shape gradient |
+| `vol_esp` | shape overlap, each pair term weighted by `exp(−(C_i − C_j)²/λ)` on partial charges | shape+ESP gradient |
+| `surf_esp` | the same, over surface points with surface ESP | shape+ESP gradient |
+| `vol_and_surf_esp` | `esp_weight · ESP_sim + (1 − esp_weight) · shape_sim`, where `ESP_sim` is a ShaEP-style masked Gaussian of the ESP difference at each surface point | **shape gradient only** — see below |
+| `pharm` | typed pharmacophore Gaussians (per-type α), same-type only, with a direction weight | pharmacophore gradient |
+| `vol_color` | `(1 − color_weight) · shape_Tanimoto + color_weight · color_Tanimoto`; color is the pharmacophore Gaussian with all direction weighting removed (the ROCS/ROSHAMBO convention) | **joint** — both channels |
 
-  ```
-  score = (1 - color_weight) * shape_Tanimoto + color_weight * color_Tanimoto
-  ```
+Two modes are new:
 
-  New on both `MoleculePair` and `MoleculePairBatch`, and available to the screening front-end.
+**`vol_and_surf_esp`** — combined volumetric shape + surface-ESP scoring. New on
+`MoleculePairBatch` (upstream had a combo mode on `MoleculePair` only).
+
+> **The SE(3) descent direction for this mode is the shape gradient alone.** The electrostatic
+> term enters only the *tracked score*, never the derivative — the mode optimizes shape and
+> *reports* a shape+ESP score. Because the trajectory is shape-driven, the expensive ESP score is
+> evaluated only every 5th step plus the final step (`_ESP_STRIDE` in
+> `accel/drivers/esp_combo.py`); set it to 1 to score densely.
+
+**`vol_color`** — atom-centred Gaussian shape overlap plus a **directionless pharmacophore
+("color")** overlap. Unlike `vol_and_surf_esp`, the SE(3) step here descends on the **joint**
+weighted objective, so *both* channels steer the pose. New on both `MoleculePair` and
+`MoleculePairBatch`.
+
+The two `vol_color` signatures differ: `MoleculePair.align_with_vol_color` accepts `similarity`,
+`directional`, `extended_points` and `only_extended`; the batch version accepts none of them.
+
+`pharm` also supports `similarity='tversky' | 'tversky_ref' | 'tversky_fit'` alongside the default
+`'tanimoto'`. Tversky forfeits both the CUDA-graph and the fused-CPU fast paths.
 
 ### 4.2 A `backend=` argument on every batch aligner
 
-`MoleculePairBatch.align_with_*` takes `backend="jax" | "triton" | "numba"`.
+`MoleculePairBatch.align_with_*` takes `backend="jax" | "triton" | "numba"`. Aliases are accepted:
+`"cuda"` / `"gpu"` → triton, `"cpu"` → numba.
 
-- `"jax"` is the **default** and runs the original, unchanged JAX code path.
+- `"jax"` is the **default** and runs the original, unchanged JAX path — **except on the two new
+  modes.** `align_with_vol_and_surf_esp` and `align_with_vol_color` have no JAX kernel, so
+  `backend="jax"` there falls through to the per-pair **PyTorch** path, run serially.
 - `"triton"` runs hand-written Triton GPU kernels.
-- `"numba"` runs op-for-op numba CPU mirrors of the same kernels.
+- `"numba"` runs numba CPU kernels.
 
 Kernel selection is per call, by tensor device, so one process can run both — a CPU batch and a
 GPU batch in the same program each get the right kernel.
 
-### 4.3 CUDA-graph fine loop
+> #### Scores are not comparable across backends
+>
+> The accelerated backends use a **different SE(3) seed set** than the JAX/torch path. Both begin
+> with identity + 4 PCA-alignment quaternions, but the accelerated seeder then adds up to **six
+> structured ±90° rotations about each reference principal axis** — covering the axis *swaps* that
+> PCA alignment alone misses — before falling back to a Fibonacci fill. At the shipped per-mode
+> seed counts those structured seeds absorb most of the budget: at `vol`'s default of 10 seeds the
+> accelerated path emits **zero** Fibonacci rotations, where JAX emits five.
+>
+> The two backends therefore explore different orientations and return different (not worse)
+> scores. `backend=` is **not** a pure-performance switch, and a Triton run will not reproduce a
+> JAX baseline.
 
-All seven modes share one CUDA-graph implementation (`accel/drivers/_graphed.py`). One fine
-step is captured and replayed, removing per-step host launch overhead. It engages automatically
-on CUDA float32 batches inside a work budget; larger batches and capture failures fall back to
-the eager loop.
+Three backend-specific limits:
 
-### 4.4 Adaptive bucketing
+- **`no_H=False` is unsupported** on `triton`/`numba` for `vol` and `vol_esp` — they align heavy
+  atoms only and raise `NotImplementedError`. It still works on `jax`.
+- `vol` and `surf` **ignore `num_repeats`, `trans_init` and `lr`** on `triton`/`numba`; the kernels
+  re-derive seeds internally. Every other mode passes them through. `jax` is unaffected.
+- **`backend="numba"` permanently moves the batch to CPU.** It sets `pair.device = cpu` on every
+  pair and never restores it, so a subsequent `backend="triton"` call on the same
+  `MoleculePairBatch` will not run on the GPU. Rebuild the batch to switch back.
 
-`accel/batch/_bucket.py` replaces the hand-rolled fixed-width size bands with one planner used
-by every mode. It is **result-identical** by construction: the kernels are one-CTA-per-pose and
-mask padding to the real point counts, and seeds are keyed on the real counts rather than the
-pad width, so padding two different-sized molecules into the same bucket cannot change a score.
+### 4.3 The optimizer: seeds, analytic gradients, CUDA graphs
+
+**There is no coarse grid and no top-k prune on the default path.** Despite the "coarse-to-fine"
+naming, every seed goes straight into the fine loop and the per-pair maximum is taken. Ranking
+seeds on raw un-optimized overlap repeatedly discarded the true basin for pseudo-symmetric
+molecules, so it was removed. The coarse-grid + top-k path runs **only** when `trans_init=True`.
+The practical consequence: cost scales linearly with `num_repeats`, and there is no cheap-prune
+knob.
+
+**Gradients are analytic, not autograd.** Every kernel emits closed-form `dV/dq` (4) and `dV/dt`
+(3), so no autograd graph is built in the fine loop at all. The pharmacophore and color kernels go
+further and emit `dO/dq` in-register, dropping the rotation-matrix→quaternion projection tail.
+
+**The Adam is not `torch.optim.Adam`.** β₁=0.9, β₂=0.999, ε=1e-8 *inside* the sqrt, **no bias
+correction**, a quaternion tangent-space projection fused into the kernel, and unit-quaternion
+renormalization every step. `lr` does not mean what it means in `torch.optim.Adam`. The drivers'
+internal default is `lr=0.075`, not the `lr=0.1` the public API advertises.
+
+**Early stopping is on, per-mode, and batch-global.** Patience is 2 for `vol`/`surf`/`vol_color`
+and 5 for the ESP and pharmacophore modes; tolerance 1e-5; checked every 5 steps to avoid a
+per-step GPU→CPU sync. The criterion is a **batch-global maximum**, so a pair's step count depends
+on which pairs share its batch — in every path, not just the worker-pool one.
+
+**CUDA graphs.** All seven modes share one implementation (`accel/drivers/_graphed.py`): one fine
+step is captured and replayed, removing per-step host launch overhead. Engagement is *not* uniform
+— `pharm` is graphed only for `tanimoto` + `extended_points=False`, `vol_and_surf_esp` is graphed
+with early-stop disabled (it runs the full step count), and the work budget differs per mode.
+Captured graphs live in a bounded LRU cache of 24 and **pin GPU buffers for the process lifetime**;
+call `accel.drivers._graphed.reset_graph_cache()` to free them if you hit fragmentation between
+large runs.
+
+**Triton autotune is cached to disk.** Every kernel is autotuned on `(N_pad, M_pad)` with
+`cache_results=True`, so the roughly-4-seconds-per-shape sweep is paid once per machine rather
+than once per process. A first run on a new shape looks slow; later runs (and fresh processes)
+do not. The legacy `BLOCK` / `num_warps` / `num_stages` kwargs on the kernel wrappers are accepted
+and **ignored**.
+
+### 4.4 Adaptive bucketing and automatic GPU-memory sub-batching
+
+`accel/batch/_bucket.py` replaces the hand-rolled fixed-width size bands with one planner used by
+every mode. It is **result-identical** by construction: the kernels are one-CTA-per-pose and mask
+padding to the real point counts, and seeds key on the real counts rather than the pad width, so
+padding two different-sized molecules into one bucket cannot change a score.
+
+Under-occupied buckets are merged toward a full CTA wave (`SM_count × 16` poses), capped at two
+waves. On CPU the wave floor is 1, so occupancy merging is disabled entirely. A bucket's hoisted
+memory is capped at 25% of *current free* device memory — read at call time — and oversized buckets
+are split, so buckets shrink automatically on a busy or smaller GPU.
+
+Separately, `accel/batch/_pad.py` sub-batches each bucket to keep peak memory under 70% of free
+memory, learns the per-pair byte footprint per `(device, mode, pad shape, seed count)`, and
+**halves the chunk and retries on OOM**. Both are result-identical, because pairs are independent.
 
 ### 4.5 A virtual-screening front-end (`shepherd_score.screen`)
 
 New top-level module. It featurizes a molecule library once into an on-disk **`ProfileStore`**
-(sharded `.npz` + a manifest), then streams shards through the accelerated aligners against one
-or many queries, keeping a top-K heap.
+(sharded `.npz` + a `manifest.json`), then streams shards through the accelerated aligners against
+one or many queries, keeping a top-K heap.
 
 ```python
+from shepherd_score.container import Molecule
 from shepherd_score.screen import ProfileStore, screen
 
-store = ProfileStore.create("lib.store", num_surf_points=200, modes=["surf_esp", "vol"])
-for mol in library:
-    store.add(mol)
-store.close()
+# The store's num_surf_points must match how the Molecules were built.
+with ProfileStore.create("lib.store", num_surf_points=200,
+                         modes=["surf_esp", "vol"]) as store:
+    for rdmol in library:
+        store.add(Molecule(rdmol, num_surf_points=200))   # Molecule, not a raw RDKit Mol
 
-hits = screen(query_mol, ProfileStore.open("lib.store"), mode="surf_esp", top_k=1000)
+query = Molecule(query_rdmol, num_surf_points=200)
+hits = screen(query, ProfileStore.open("lib.store"), mode="surf_esp",
+              alpha=0.81, top_k=1000)
+# each hit is a Hit(score, id, transform); transform is a 4x4 numpy array
 ```
 
 `screen_many` streams the library **once** for a list of queries. Both accept `ndev=` to shard
-across GPUs.
+across GPUs, and `scores_out=` to write full score vectors (memmap-friendly).
+
+Things that will bite you if you don't know them:
+
+- **`ProfileStore.add` takes a `Molecule`, not an RDKit `Mol`** — it reads `atom_pos`, `surf_pos`,
+  and friends. Every molecule in a store must share the same `num_surf_points`, and a mismatch
+  fails at flush time, potentially thousands of `add()` calls later.
+- **The default `dtype="float16"` is lossy** (~0.01 Å, the surface-resampling noise floor). Screen
+  scores will differ slightly from a pairwise `MoleculePair` run for this reason alone. Pass
+  `dtype="float32"` if you need comparable numbers.
+- **A store only serves modes it has the arrays for.** `vol` works on any store; `vol_color` needs
+  a pharmacophore store; `vol_and_surf_esp` needs surfaces, ESP, charges, radii and with-H centers,
+  so build for it explicitly. An unsupported mode raises `ValueError`.
+- **Some modes require explicit parameters.** `vol_and_surf_esp` requires `alpha=`, `vol_esp`
+  requires `lam=`, and `no_H=False` is rejected outright — screening is heavy-atom-only. `alpha`
+  auto-fills for `surf`/`surf_esp` only.
+- **`Hit.transform` is in the pre-centered frame.** On a `pre_centered=True` store (the default)
+  library molecules are stored shifted by their own centre of mass and the query is centered too,
+  so the 4×4 maps *centered* onto *centered*. To apply it to original coordinates, subtract that
+  molecule's COM first — or build the store with `pre_centered=False`.
+- **`shard_size` is a GPU-memory knob**, not just an I/O knob: on the fast path a whole shard is
+  uploaded as device tensors at once.
+- **`trans_init=True`, `backend="jax"`, or a non-pre-centered store** silently drop you off the
+  fast path onto a much slower object path.
+- The manifest is rewritten after every shard flush, so **a killed build leaves a readable store**
+  containing every completed shard. A store directory is **single-writer**.
 
 ### 4.6 Multi-GPU data parallelism
 
-Alignment is host-bound rather than kernel-bound, so driving N GPUs from one process serialises
-on the GIL. The path that scales is one OS process per GPU, exposed explicitly:
+Alignment is host-bound rather than kernel-bound, so driving N GPUs from one process serialises on
+the GIL. The path that scales is one OS process per GPU, exposed explicitly:
 
 ```python
 from shepherd_score.container import MultiGPUAligner, align_multi_gpu
 
-scores = align_multi_gpu(pairs, "surf", ndev=4)          # one-shot
-aligner = MultiGPUAligner(pairs, ndev=4)                  # persistent; reuses each GPU's shard
-scores = aligner.align("surf")
+if __name__ == "__main__":                       # required: align_multi_gpu spawns
+    scores, transforms = align_multi_gpu(pairs, "surf", ndev=4, alpha=0.81)
+
+    with MultiGPUAligner(pairs, ndev=4) as pool:  # persistent; reuses each GPU's shard
+        scores, transforms = pool.align("surf", alpha=0.81)
 ```
 
-This is deliberately **opt-in**. A library must not spawn worker processes behind the user's
-back, because `spawn` re-imports the caller's `__main__` and breaks scripts without an
-`if __name__ == "__main__":` guard. A large batch on a multi-GPU host therefore runs on a
-single GPU and emits a one-time warning pointing at `MultiGPUAligner`.
+Both return `(scores, transforms)` — and both forward `**align_kwargs` straight into
+`align_with_<mode>`, so a mode's **required** arguments are required here too (`alpha` for `surf`,
+`alpha`+`lam` for `surf_esp`, and so on).
 
-### 4.7 Two CPU parallelism paths
+This is deliberately **opt-in**: a library must not spawn worker processes behind the user's back,
+because `spawn` re-imports the caller's `__main__` and breaks unguarded scripts. A large batch on a
+multi-GPU host therefore runs on a **single GPU** and emits a one-time warning pointing at
+`MultiGPUAligner`. (The warning only fires above 4,096 pairs per GPU.)
 
-- **`num_workers=N` with `backend="numba"`** uses a persistent pool of single-threaded worker
-  processes (`accel/cpu_pool.py`), sharding *pairs* across processes. Pairs are independent, so
-  this does not change the optimization problem. Agreement with one large call is to convergence
-  tolerance, not bitwise: the fine loop's early-stop tests a batch-global maximum, so a pair's
-  step count depends on which pairs share its batch.
-- **`accel.screen_parallel.screen_parallel`** forks workers for query-vs-library screening,
-  sharing the featurized library copy-on-write.
+- **`align_multi_gpu` always spawns**, so it always needs the `__main__` guard.
+- **`MultiGPUAligner` prefers `fork`** for fast startup, and falls back to `spawn` — with a warning
+  — only if CUDA is already initialized or Open3D is already imported, since either poisons
+  `fork`+CUDA. So: build the pool *before* doing CUDA work, and the `__main__` guard is only needed
+  on the spawn fallback.
+- **Only `vol`, `surf`, `surf_esp` and `pharm` have a worker-process path.** `vol_esp`,
+  `vol_and_surf_esp` and `vol_color` raise `ValueError` here. (`screen(ndev>1)` is a *separate*
+  multi-GPU implementation and does serve all seven.)
+- Worker threads are capped to `cores // ndev`; the cap is mandatory, since uncapped workers
+  oversubscribe and scaling collapses below 1×.
+- `Molecule` objects must be picklable; they are what crosses the process boundary.
+
+### 4.7 Two CPU parallelism paths, and the SVML kernels
+
+**`num_workers=N` with `backend="numba"`** uses a persistent pool of single-threaded worker
+processes (`accel/cpu_pool.py`), sharding *pairs* across processes. Pairs are independent, so this
+does not change the optimization problem — but agreement with one large call is to **convergence
+tolerance, not bitwise**, because the fine loop's early-stop tests a batch-global maximum and a
+pair's step count depends on which pairs share its shard.
+
+- It uses `spawn`, so it needs an **`if __name__ == "__main__":` guard**.
+- It applies to **`vol`, `surf`, `surf_esp` and `pharm` only**. On `vol_esp`, `vol_and_surf_esp`
+  and `vol_color` it is a silent no-op (the latter two do not even accept `num_workers`). It is
+  also ignored on CUDA tensors.
+
+**`accel.screen_parallel.screen_parallel(query, library, mode, n_workers=...)`** forks workers for
+query-vs-library screening, sharing the featurized library copy-on-write. It is a *different* API
+from `screen()`: it takes a RAM-resident list of `Molecule`s rather than a `ProfileStore`, is
+CPU/numba-only, and returns a plain list of scores in library order — no `Hit`s, no transforms, no
+top-K. It accepts canonical mode names only.
+
+> It **always forks**, so it is POSIX-only. And it must run **before** any in-process numba
+> alignment: a live libgomp thread pool at `fork` aborts the child. Featurize, then screen.
+
+**The SVML CPU kernels change precision, not just speed.** When numba can emit Intel SVML vector
+math, the fused CPU loop automatically switches the shape and ESP inner loops to **fp32
+structure-of-arrays** kernels. That is where the CPU speed comes from, but it means *enabling* SVML
+changes results: values agree to ~1e-6 relative, gradients to ~1e-4. There is no way to turn it off.
+The fused CPU loop is also not applied uniformly — `surf_esp` is deliberately excluded from it (as
+the most shape-degenerate mode, the fused trajectory settles in different, equally valid basins),
+and `pharm` is fused only for `tanimoto` without extended points.
+
+The numba kernels run with `fastmath=True` and `parallel=True`, using `NUMBA_NUM_THREADS`
+(defaulting to *all* cores). That oversubscribes badly if you also use the process pool — which is
+exactly why `screen_parallel` pins it to 1.
 
 ### 4.8 A mesh-free surface generator (opt-in)
 
@@ -269,21 +428,39 @@ signed-distance field plus stochastic sampling, instead of Open3D ball-pivoting 
 It needs no Open3D and no mesh.
 
 **The default is unchanged.** `surface_method="mesh"` reproduces the original code path exactly.
-The smooth surfacer rounds the concave atom-border seams, so a model trained on mesh surfaces
-sees a distribution shift — validate before using it in a generative pipeline.
+The smooth surfacer rounds the concave atom-border seams, so a model trained on mesh surfaces sees
+a **distribution shift** — validate before using it in a generative pipeline.
 
-`shepherd_score.surface_diagnostics` quantifies that: it measures how much a point cloud "leaks"
-atom positions (points sitting exactly on one atom's sphere) and detects the crimps at
-sphere-intersection seams.
+`surface_method="smooth_sdf"` requires `num_surf_points` and **raises `ValueError` if you pass
+`density=`** instead. Aliases `'sdf'`, `'smooth'` and `'fast'` are accepted; an unknown method
+raises. Its tunables (`sdf_s`, `sdf_iters`, `sdf_knn`, `sdf_jitter`, `even`, `seed`) are exposed on
+`get_molecular_surface`, with defaults in the module-level `SMOOTH_SDF_*` constants. It samples 15
+candidates per atom, against the mesh path's 25.
+
+`shepherd_score.surface_diagnostics` is how you validate a surfacer. Its core quantity is the
+**shell residual** — the distance from a point to an atom's *sphere*, not to its center:
+
+- `leak_metrics` → how much the cloud "leaks" atom positions. A point sitting exactly on one
+  sphere makes that atom's center directly recoverable. **Lower residual = more leak.** For scale,
+  the `mesh` surfacer gives a ~0.010 Å median.
+- `crimp_points` → points on one sphere *and* near a second: the concave atom-border seams.
+- `center_recovery_attack` → a strongest-case attack that Kasa-fits a sphere to recover each atom.
+  **Higher error = safer.**
+- `local_curvature`, `summarize` → per-point non-flatness, and the whole gate in one call.
 
 ### 4.9 Directionless ("color") pharmacophores
 
 `Molecule(..., directionless=True)` and `get_pharmacophores(..., directionless=True)` build
 isotropic, zero-vector pharmacophores for every family — the ROCS/ROSHAMBO "color" convention —
-rather than oriented feature vectors. `feature_set="rdkit_base"` selects RDKit's base feature
-definitions instead of ShEPhERD's SMARTS set.
+rather than oriented feature vectors. Both default to the original behavior.
 
-Both default to the original behavior (`directionless=False`, `feature_set="shepherd"`).
+> **`directionless=True` changes the pharmacophore *count*, not just the vectors.** The
+> donor/acceptor multi-vector branches are skipped entirely, so a donor that upstream expanded into
+> one anchor *per hydrogen* now emits a single anchor at the feature position.
+
+`feature_set="rdkit_base"` selects RDKit's base feature definitions instead of ShEPhERD's SMARTS
+set. It keeps six families and renames three (`PosIonizable`→`Cation`, `NegIonizable`→`Anion`,
+`LumpedHydrophobe`→`Hydrophobe`) — **`Halogen` and `ZnBinder` disappear.**
 
 ### 4.10 Lazy Open3D
 
@@ -291,16 +468,27 @@ Both default to the original behavior (`directionless=False`, `feature_set="shep
 a slow import and is fork-hostile — importing it poisons a later `fork` + CUDA, which would
 break the fork-based worker pools. Alignment-only code paths never pay for it.
 
-The observable consequence is an improvement: `import shepherd_score.container` now works
-without Open3D installed. If Open3D is missing, the error moves from import time to the first
-surface generation, and its type (`ModuleNotFoundError`) is unchanged.
+The observable consequence is an improvement: `import shepherd_score.container` now works without
+Open3D installed. If Open3D is missing, the error moves from import time to the first surface
+generation, and its type (`ModuleNotFoundError`) is unchanged.
+
+One caveat: the module global `o3d` is now a lazy **proxy object**, not the module. Attribute
+access works, but `from shepherd_score.generate_point_cloud import o3d` no longer yields something
+`isinstance`/`inspect` will treat as a module.
+
+Note also that `import shepherd_score.container` now eagerly imports `shepherd_score.accel.batch`
+and `shepherd_score.accel.multi_gpu`, so the accel stack loads with the container. This adds no new
+dependency (torch was already required), but it is not free.
 
 ### 4.11 `return_aligned=`
 
-`MoleculePairBatch.align_with_*(return_aligned=False)` is the default on the accelerated
-backends and skips materializing the aligned coordinate arrays, returning `[None] * N` in their
-place. The transforms are still written to each pair. Pass `return_aligned=True` to get them.
-The JAX path is unaffected.
+`MoleculePairBatch.align_with_*(return_aligned=False)` is the default on the accelerated backends
+and skips materializing the aligned coordinate arrays, returning `[None] * N` in their place. The
+transforms are still written to each pair. Pass `return_aligned=True` to get them. The JAX path is
+unaffected.
+
+`align_with_pharm` returns a **3-tuple** `(scores, [None]*N, [None]*N)` where the other modes
+return a 2-tuple, so code that indexes `[1]` expecting arrays gets `None`s.
 
 ---
 
@@ -363,8 +551,10 @@ read/write properties forwarding to the new names.
 
 Every method gains `backend='jax'` and `return_aligned=False`. `align_with_vol` and
 `align_with_vol_esp` additionally gain `alpha=0.81`. Two methods are new
-(`align_with_vol_and_surf_esp`, `align_with_vol_color`) and two are renamed with aliases, exactly
-as on `MoleculePair`.
+(`align_with_vol_and_surf_esp`, `align_with_vol_color`) and two are renamed with aliases.
+
+`MoleculePairBatch.align_with_vol_color` does **not** take `similarity`, `directional`,
+`extended_points` or `only_extended` — those exist only on the `MoleculePair` version.
 
 ```python
 align_with_vol(no_H=True, num_repeats=None, trans_init=False, lr=0.1, max_num_steps=None,
@@ -445,6 +635,52 @@ canonical(mode) -> str      # resolve a legacy name; unknown names pass through
 
 `MODE_SEEDS` and `MODE_STEPS` are what `num_repeats=None` and `max_num_steps=None` resolve to.
 
+#### Lower-level entry points
+
+These are importable and callable, though most users will not need them. They are **not** covered
+by a stability promise.
+
+```python
+# shepherd_score.accel.kernels.dispatch — device-dispatched kernels (CUDA -> Triton, CPU -> numba)
+overlap_score_grad_se3_batch(...)        # shape overlap + dV/dq, dV/dt
+overlap_score_grad_esp_se3_batch(...)    # shape+ESP overlap + gradient
+esp_comparison_batch(...)                # ShaEP-style masked ESP comparison
+pharm_score_grad_se3_batch(...)          # directional pharmacophore + gradient
+pharm_grad_dq_se3_batch(...)             # ... with in-register dO/dq
+pharm_color_score_grad_se3_batch(...)    # directionless (color) variant
+fused_adam_qt(...)                       # the fused Adam step
+fused_adam_qt_with_tangent_proj(...)     # ... with quaternion tangent projection
+has_triton() -> bool
+
+# shepherd_score.accel.drivers.<mode> — the batched optimizers
+coarse_fine_align_many(...)              # shape.py   (vol, surf)
+coarse_fine_esp_align_many(...)          # esp.py     (vol_esp, surf_esp)
+coarse_fine_esp_combo_align_many(...)    # esp_combo.py
+coarse_fine_pharm_align_many(...)        # pharm.py
+coarse_fine_vol_color_align_many(...)    # vol_color.py
+
+# shepherd_score.accel.drivers._graphed
+graph_cap(work) -> int                   # the pose cap at which graphs engage
+reset_graph_cache()                      # free all captured graphs + their pinned GPU buffers
+
+# shepherd_score.accel.cpu_pool
+get_pool(num_workers) -> CpuAlignPool    # process-global singleton
+align_pairs(...)
+```
+
+#### Tunable module-level constants
+
+None of these are env vars any more; they are constants you can edit or monkey-patch.
+
+| Constant | Module | Default | Effect |
+|---|---|---|---|
+| `_ESP_STRIDE` | `accel/drivers/esp_combo.py` | 5 | ESP re-scoring interval; 1 = dense |
+| `VOL_COLOR_FUSED_MAX_PAD` | `accel/kernels/vol_color_triton.py` | 32 | Above this pad, the fused vol_color kernel is not used |
+| `_GRAPH_WORK_BUDGET`, `_GRAPH_CAP_CEIL`, `_GRAPH_CAP_MIN` | `accel/drivers/_graphed.py` | 300M, 262144, 2000 | When a CUDA graph engages, and its memory ceiling |
+| `_GRAPH_CACHE_MAX` | `accel/drivers/_graphed.py` | 24 | Live captured graphs (each pins GPU buffers) |
+| `_BAND` | `accel/batch/_pad.py` | 16 | Legacy fixed-band pad granularity |
+| `SMOOTH_SDF_*` | `generate_point_cloud.py` | — | Smooth-SDF surfacer defaults |
+
 ### 5.4 Surface generation
 
 ```python
@@ -505,7 +741,62 @@ build_lookup_tables_cached(..., directionless=False)
 
 ---
 
-## Behavior changes (read this)
+## 6. Extensibility: the two agent skills
+
+> **Status: not implemented.** This section reserves the design. The two skills described below
+> are **not shipped in this release** — neither is written, and the two internal playbooks that
+> specified them (`docs/ADDING_A_FAST_MODE.md` and `accel/agent_prompt.md`) were removed from the
+> release tree. What *does* ship is the machinery they will drive: the mode registry, the layered
+> `accel/` architecture, and `vol_color` as a complete worked example of the path end to end.
+> Treat everything in this section as a roadmap, not an API.
+
+Adding a new alignment type to this library is a four-step path. Every step already exists as a
+real, shipped extension point — `vol_color` was built by walking exactly this path:
+
+| # | Step | What you write | Extension point |
+|---|---|---|---|
+| 1 | **Define representation + overlap objective** | A feature channel and a normalized (Tanimoto) overlap, in torch | `score/` |
+| 2 | **Reference + eager optimizer** | A per-pair Adam optimizer over `objective_<mode>_overlay`. This is your autograd ground truth | `alignment/_torch.py` |
+| 3 | **Kernel twins** | A numba (CPU) and a Triton (GPU) kernel with *identical signatures* | `accel/kernels/`, `accel/drivers/` |
+| 4 | **Validate** | Parity against the step-2 oracle, plus a throughput gate | `tests/` |
+
+The output plugs into the same optimizer, the same public API, and the same backends as the seven
+built-in modes, and produces the same kind of outputs.
+
+The two planned skills each cover half of that path:
+
+### Skill 1 — *author a new alignment type* (steps 1–2)
+
+Takes a scoring idea to a working, correct, **eager** implementation: define the representation
+and the overlap objective, then wrap it in the per-pair Adam optimizer so it becomes the gradient
+oracle everything downstream is checked against. A user who stops here has a correct new mode on
+the existing torch path — just not an accelerated one.
+
+Anchor: register the mode in `shepherd_score/accel/_modes.py` (name, result attributes, seed and
+step defaults). The batch layer and the screening front-end pick it up from the registry;
+`tests/test_mode_registry.py` will fail if the registry and the tensor spec drift apart.
+
+### Skill 2 — *add an optimized backend* (steps 3–4)
+
+Takes that working eager objective onto the fast path: port it to a fused Triton GPU kernel and
+its op-for-op numba CPU twin, wire them into the per-call device dispatcher, and gate the result
+on parity against the step-2 oracle plus a throughput measurement.
+
+The intended shortcut, and the reason step 2 matters, is that a correct autograd objective can
+first be *batched* over pairs for a no-kernel GPU speedup. Only if the per-step autograd is still
+the bottleneck do you need to write kernels at all.
+
+### What is missing before these can ship
+
+- Both skills need to be written; neither exists.
+- The two playbooks they were derived from were removed from this release and would need to be
+  restored (in a user-facing form) or rewritten.
+- The parity and throughput gates the skills depend on for step 4 are **not currently in the test
+  suite** — see [Known gaps](#9-known-gaps).
+
+---
+
+## 7. Behavior changes (read this)
 
 Four changes are visible to code written against the previous release.
 
@@ -608,23 +899,39 @@ Values are unchanged; only the shape collapses. No call site inside the library 
 the batched and gradient paths remain bitwise identical to before. But two caveats matter:
 
 - **`apply_SO3_transform` was not given the same collapse.** With an `R == 1` batch the two
-  functions now return different ranks, and upstream pairs them on adjacent lines in five places.
-  This mis-broadcasts silently rather than failing loudly.
+  functions now return different ranks, and upstream pairs them on adjacent lines in **three**
+  places (`alignment/_torch.py:1100`, `:1265`, and `_torch_analytical.py:315`). This
+  mis-broadcasts silently rather than failing loudly.
 - The single-instance (non-batched) path differs by about **one float32 ULP** (~1.2e-7) from the
   old `(R @ P.T).T + t`. Harmless numerically, but it breaks bit-for-bit reproduction of golden
   values on the `num_repeats == 1` path.
 
+`se3.py` also gains a new public function, `quaternions_to_SE3_batch(q, t) -> (K, 4, 4)`, used by
+all the batched aligners.
+
 ### Minor
 
 - `align_with_vol_esp(lam=...)` — `lam` was a required positional; it now defaults to `0.1`.
-  Strictly widening.
-- `backend="triton"` on `vol` and `surf` ignores `num_repeats`, `trans_init`, and `lr` (the
-  kernels re-derive seeds internally). Every other mode passes them through. `backend="jax"` is
-  unaffected.
+  Strictly widening, so no existing call breaks.
+- `MoleculePair.__init__` now eagerly allocates two torch tensors on the target device, so
+  constructing a pair touches GPU memory before any `align_*` call.
+- `get_overlap_pharm(directional=False)` raises `ValueError` if combined with
+  `precomputed_self_overlaps`, and silently forces `extended_points` / `only_extended` off. The
+  numpy variant forces the flags off without raising. Neither affects the `directional=True`
+  default.
+- `get_pharm_combo_score`'s combination changed from `(pharm + shape) / 2` to
+  `(1 − color_weight) · shape + color_weight · pharm`. At the default `color_weight=0.5` these are
+  **exactly** equal in IEEE-754, so results are bit-identical. (Verified over 2 × 10⁶ random pairs
+  in both float32 and float64: zero mismatches.)
+
+The `backend=`-specific limits — the different seed set, `no_H=False`, the ignored
+`num_repeats`/`trans_init`/`lr` on `vol`/`surf`, and the permanent CPU move under `numba` — are in
+[§4.2](#42-a-backend-argument-on-every-batch-aligner), since they affect only the new backends and
+not any existing caller.
 
 ---
 
-## 7. Testing and validation
+## 8. Testing and validation
 
 - **244 passed, 76 skipped, 0 failed.** All of upstream's tests still pass. The only upstream
   test file touched is `tests/test_alignment_utils.py`, which gains one appended test pinning the
@@ -637,13 +944,37 @@ the batched and gradient paths remain bitwise identical to before. But two cavea
   `vol_color`, `pharm` over 30 cross-pairs) captured before the final cleanup pass: **every array
   is bit-identical**.
 
-## 8. Known gaps
+## 9. Known gaps
 
-- **`accel/` and `screen.py` have no Sphinx API pages.** They are not in `docs/api/`.
+**Validation**
+
 - **The parity gates for three optimizations are not in the test suite.** The adaptive bucketer,
   the CUDA-graph fine loop, and the fused `vol_color` kernel were validated by standalone scripts
-  that lived in the (now removed) `benchmarks/` tree. They should be rewritten as CUDA-gated
-  tests. Nothing in `tests/` currently covers those three paths.
-- **No JAX ↔ Triton/numba cross-backend parity test exists.** Backends are validated against
-  self-copy recovery and against the torch reference, not against each other.
-- **The `ProfileStore` on-disk format is provisional** (`VERSION = 1`).
+  in the (now removed) `benchmarks/` tree. Nothing in `tests/` currently covers those three paths.
+  They should be rewritten as CUDA-gated tests — and the two agent skills in
+  [§6](#6-extensibility-the-two-agent-skills) depend on exactly this gate existing.
+- **No JAX ↔ Triton/numba cross-backend parity test exists** — and, given the different seed sets
+  ([§4.2](#42-a-backend-argument-on-every-batch-aligner)), a naive one would fail. What is needed
+  is a *quality* comparison (does each backend recover the same optimum?), not an equality test.
+- Also untested: the sparse-ESP stride, the SoA/SVML fp32 kernels, the fused CPU loop's
+  basin agreement with eager, and `vol_and_surf_esp`'s shape-only gradient.
+- **~45 of the 61 new tests are skipped in CI**, which installs neither numba, nor triton, nor a
+  GPU. Adding `numba` to the CI install would activate most of them at no hardware cost.
+
+**Documentation**
+
+- **`accel/` and `screen.py` have no Sphinx API pages.** They are not wired into `docs/api/`, so
+  none of the API in [§5](#5-api-reference) renders on the docs site.
+- The two agent skills ([§6](#6-extensibility-the-two-agent-skills)) are **not implemented**.
+
+**Interface**
+
+- **The `ProfileStore` on-disk format is provisional** (`VERSION = 1`). The version is written into
+  the manifest but **never validated on open**, so a future v2 store will not fail loudly against a
+  v1 reader.
+- `screen(ndev>1)` **silently ignores `scores_out=` and `progress=`.** They work single-process only.
+- `ProfileStore.create(overwrite=True)` deletes **every** `.npz` in the target directory, not only
+  the ones it wrote.
+- The process-global caches (`_ALIGN_WORKSPACES`, `_INT_BUFFER_CACHE`, `_PAIR_FOOTPRINT_BYTES`, the
+  graph cache) never shrink. A long-lived process that sees many distinct pad shapes will hold
+  device memory until exit.

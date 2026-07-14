@@ -2,7 +2,6 @@
 # Common utilities shared across fast GPU-accelerated alignment methods.
 
 import math
-import os
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
@@ -286,10 +285,20 @@ def batched_seeds_torch(A_batch: torch.Tensor,
                         num_seeds: int = 50) -> Tuple[torch.Tensor, torch.Tensor]:
     """GPU-native, fully batched replacement for the per-pair seed loop.
 
-    Produces the SAME seed set as calling ``_initialize_se3_params`` per pair
-    (identity + 4 principal-component-alignment quaternions + Fibonacci-sampled
-    rotations, all with COM-aligning translations), but for the whole cohort in
-    one vectorized pass with NO ``.cpu()``/numpy round-trip. The principal-axis
+    Seed set: identity + 4 principal-component-alignment quaternions + up to 6
+    STRUCTURED seeds (+/-90 degree rotations about each reference principal axis, which
+    cover the axis SWAPS that PCA alignment alone misses) + a Fibonacci fill for any
+    remaining budget -- all with COM-aligning translations.
+
+    NOTE: this is NOT the same seed set as ``alignment._torch._initialize_se3_params``
+    (the per-pair / JAX path), which goes straight from the 4 PCA quaternions to a
+    Fibonacci fill with no structured axis-swap seeds. At the shipped per-mode seed
+    counts the structured seeds absorb most of the budget, so the accelerated backends
+    explore DIFFERENT orientations than ``backend="jax"`` and return different (not
+    worse) scores. Do not expect cross-backend score equality.
+
+    Computed for the whole cohort in one vectorized pass with NO ``.cpu()``/numpy
+    round-trip. The principal-axis
     PCA is done in float64 for near-degenerate stability, via an analytic closed-form
     3x3 eigensolver rather than a synchronizing cuSOLVER call.
 
@@ -307,7 +316,7 @@ def batched_seeds_torch(A_batch: torch.Tensor,
     -------
     quats : (K, num_seeds, 4)   t : (K, num_seeds, 3)
     """
-    from shepherd_score.alignment._torch import _get_45_fibo, _quats_from_fibo
+    from shepherd_score.alignment._torch import _quats_from_fibo
 
     device = A_batch.device
     dtype = A_batch.dtype

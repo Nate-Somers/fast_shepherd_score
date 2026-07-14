@@ -554,7 +554,7 @@ class MoleculePair:
             Whether to not include hydrogens in volumetric similarity. Default is ``True``.
         num_repeats : int, optional
             Number of different random initializations of SO(3) transformation parameters.
-            Default is 50.
+            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s center of mass
             (COM) is translated to each ``ref_molec``'s atoms, with 10 rotations for each translation.
@@ -669,7 +669,7 @@ class MoleculePair:
             Gaussian width parameter for overlap.
         num_repeats : int, optional
             Number of different random initializations of SO(3) transformation parameters.
-            Default is 50.
+            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s center of mass
             (COM) is translated to each ``ref_molec``'s atoms, with 10 rotations for each
@@ -769,7 +769,7 @@ class MoleculePair:
             Weighting factor for ESP scoring. Scaled internally. Default is 0.3.
         num_repeats : int, optional
             Number of different random initializations of SO(3) transformation parameters.
-            Default is 50.
+            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s COM is translated to
             each ``ref_molecs``'s atoms, with 10 rotations for each translation. So the
@@ -1022,13 +1022,13 @@ class MoleculePair:
         extended_points, only_extended : bool, optional
             Forwarded to the color scorer (ignored when ``directional=False``).
         num_repeats : int, optional
-            Number of SE(3) initializations. Default is 50.
+            Number of SE(3) initializations. Default (``None``) is ``MODE_SEEDS['vol_color']`` (16).
         trans_init : bool, optional
             Translation-seeded initialization from the reference atoms. Default is ``False``.
         lr : float, optional
             Learning rate. Default is 0.1.
         max_num_steps : int, optional
-            Maximum optimization steps. Default is 200.
+            Maximum optimization steps. Default (``None``) is ``MODE_STEPS['vol_color']`` (40).
         verbose : bool, optional
             Print progress. Default is ``False``.
 
@@ -1110,7 +1110,7 @@ class MoleculePair:
             (ignore anchor overlaps). Default is ``False``.
         num_repeats : int, optional
             Number of different random initializations of SO(3) transformation parameters.
-            Default is 50.
+            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s COM is translated to
             each ``ref_molecs``'s pharmacophore, with 10 rotations for each translation. So the

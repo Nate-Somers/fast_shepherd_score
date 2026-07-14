@@ -2,18 +2,17 @@
 """Size bucketing, GPU-memory-safe sub-batching, and batched scatter-fill
 primitives shared by the batched aligners."""
 from __future__ import annotations
-import os
 import torch
 
 
 ### BEGIN size_bucketing #####################################################
-# Every heavy-atom count 3‒150 is mapped to a “band” of 8 atoms
-# (   1-8, 9-16, 17-24, … ).  Pairs that fall in the same band
-# share a common padded tensor size → one GPU launch.
-_BAND = 16                     # change to 16/32 if you want larger bands
+# Every point count is mapped up to a multiple of _BAND. Pairs in the same band share a
+# common padded tensor size -> one kernel launch. This is the legacy fixed-band key; the
+# adaptive planner in _bucket.py supersedes it and only snaps its pads to this grid.
+_BAND = 16
 
 def _band_key(n: int) -> int:
-    "return the *upper* bound of the 8-atom band this n falls into"
+    "return the *upper* bound of the _BAND-sized band this n falls into"
     return ((n + _BAND - 1) // _BAND) * _BAND
 ### END size_bucketing #######################################################
 

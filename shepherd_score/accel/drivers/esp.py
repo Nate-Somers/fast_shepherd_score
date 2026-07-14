@@ -161,6 +161,11 @@ def coarse_fine_esp_align_many(
     Vectorized padding-aware ESP alignment over a batch of (A, B) pairs.
 
     Uses coarse-to-fine strategy:
+    NOTE: by default there is NO coarse grid and NO top-k prune -- every seed is
+    fine-optimized and the per-pair max is taken (ranking seeds on raw un-optimized
+    overlap discarded the true basin for pseudo-symmetric molecules). The coarse-grid
+    path below runs ONLY when ``trans_centers`` is supplied (``trans_init=True``).
+
     1. Build 500 pose hypotheses (250 rotations × 2 translations)
     2. Evaluate all poses (coarse scoring)
     3. Select top-k poses

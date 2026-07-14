@@ -355,7 +355,7 @@ class ProfileStore:
         modes : sequence of str
             Which alignment modes this store must support. Only the arrays those
             modes need are stored (``"vol"`` works from any store -- ``atom_pos``
-            is always kept). Valid: ``vol vol_esp surf surf_esp pharm vol_and_surf_esp``
+            is always kept). Valid: ``vol vol_esp surf surf_esp pharm vol_color vol_and_surf_esp``
             (legacy ``esp``/``esp_combo`` also accepted).
         dtype : {"float16", "float32"}
             On-disk dtype for coordinate/charge arrays. ``float16`` halves disk +

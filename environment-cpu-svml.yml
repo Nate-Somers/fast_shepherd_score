@@ -8,8 +8,10 @@
 # llvmlite 0.44+ dropped it (config.USING_SVML == False there, even with icc_rt installed).
 #
 # Verify after install:  python -c "import numba.core.config as c; print(c.USING_SVML)"  -> True
-# The fused CPU driver (cpu_fused.py) auto-detects this (FSS_CPU_SOA, default on when SVML);
-# with SVML absent it transparently falls back to the fp64 AoS kernels (correct, just slower).
+# The fused CPU driver (cpu_fused.py) auto-detects SVML and switches the shape/ESP inner loops
+# to fp32 structure-of-arrays kernels; with SVML absent it falls back to the fp64 AoS kernels
+# (correct, just slower). NOTE the SoA path is fp32: values agree to ~1e-6 relative, gradients
+# to ~1e-4, so enabling SVML changes results slightly as well as speeding them up.
 name: fss-cpu-svml
 channels:
   - numba

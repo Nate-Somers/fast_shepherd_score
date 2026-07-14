@@ -145,9 +145,12 @@ class MoleculePairBatch:
 
         ``num_workers > 1`` on the CPU (numba) path shards the pairs across a persistent
         single-threaded process pool (:mod:`shepherd_score.accel.cpu_pool`) for
-        near-linear multi-core scaling; results are bit-identical (pairs are
-        independent). It is ignored on CUDA tensors and for modes the pool does not
-        cover (those run the original single call).
+        near-linear multi-core scaling. Pairs are independent, so sharding does not
+        change the optimization problem, but results agree to convergence tolerance
+        rather than bitwise: the fine loop's early-stop tests a batch-GLOBAL max, so a
+        pair's step count depends on which pairs share its shard. It is ignored on CUDA
+        tensors and for modes the pool does not cover -- only ``vol``, ``surf``,
+        ``surf_esp`` and ``pharm`` have a pool path; the rest run the single call.
 
         ``align_fn(self.pairs, **align_kwargs)`` is byte-identical to calling the
         Triton static method directly, so alignment throughput is unchanged (and it
@@ -1118,8 +1121,9 @@ class MoleculePairBatch:
             ``MoleculePair._align_batch_vol_color`` driver — the shape channel runs on
             the Triton (CUDA) / numba (CPU) kernel and the directionless color channel
             on pure PyTorch, so the batched path runs on either device. The batched
-            path is shape-gradient-optimized + color-scored (FastROCS-style), like
-            ``esp_combo``; the per-pair (``"jax"``) path optimizes the joint gradient.
+            path descends on the JOINT weighted gradient -- both the shape and the color
+            channel steer the pose. NOTE ``backend="jax"`` is a misnomer for this mode:
+            there is no JAX kernel, so it runs the per-pair PyTorch path sequentially.
         return_aligned : bool
             For the batched backend, build the aligned-fit-atom list when ``True``.
 

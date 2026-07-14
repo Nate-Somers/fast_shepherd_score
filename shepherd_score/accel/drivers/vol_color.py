@@ -28,14 +28,13 @@
 
 from __future__ import annotations
 
-import os
 import torch
 from typing import Optional, Tuple
 
-# Use the fused single-kernel shape+color overlap (one launch instead of two) where it is a
-# win -- i.e. small clouds (all pads <= VOL_COLOR_FUSED_MAX_PAD=32); larger molecules fall
-# back to the two separate kernels (the fused kernel's two-channel register footprint blows
-# occupancy at BLOCK=64). Disable with FINE_VOL_COLOR_FUSED=0.
+# The fused single-kernel shape+color overlap (one launch instead of two) is used only where
+# it wins -- small clouds, i.e. every pad <= VOL_COLOR_FUSED_MAX_PAD (32). Larger molecules
+# fall back to the two separate kernels, because the fused kernel's two-channel register
+# footprint destroys occupancy at BLOCK=64.
 
 from ..kernels.dispatch import (
     fused_adam_qt_with_tangent_proj, pharm_color_score_grad_se3_batch,
