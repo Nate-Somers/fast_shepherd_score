@@ -7,41 +7,12 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
-# Structured seeds (default ON). Adds +/-90deg principal-axis rotations (the axis-SWAP
-# starts, analog of ROSHAMBO2's discrete start modes) to the identity + 4 PCA core, so
-# far fewer seeds match the old 50-seed quality. Set FSS_STRUCT_SEEDS=0 to revert to the
-# legacy identity + 4 PCA + Fibonacci seed set (used by the parity gate).
-_STRUCT_SEEDS = os.environ.get("FSS_STRUCT_SEEDS", "1") != "0"
-
-# Analytic closed-form 3x3 symmetric eigensolver for the PCA-seed principal axes
-# (default ON). Replaces the batched cuSOLVER ``torch.linalg.eigh`` -- which is a
-# STREAM-SYNCHRONIZING barrier stalling the (otherwise async) host-bound seed-gen
-# prologue, and needs a 4096-chunk workaround for its K>8192 batch limit -- with a
-# pure-elementwise Cardano-eigenvalue + cross-product-eigenvector pass. Measured
-# ~1.2-1.36x on vol / ~1.15x on surf, parity-safe (self-copy 1.0000; distinct-pair
-# corr 0.9998). Because it is device-blind arithmetic it also drops the cuSOLVER
-# chunking hack and portability caveats. Set FSS_ANALYTIC_EIGH=0 to revert to
-# cuSOLVER eigh (the score-parity gate pins the two paths agree).
-_ANALYTIC_EIGH = os.environ.get("FSS_ANALYTIC_EIGH", "1") != "0"
 _TWO_PI_3 = 2.0 * math.pi / 3.0
-
-# Compute the PCA-seed principal axes in float32 instead of float64 (default OFF =
-# bit-faithful float64). The seed-gen prologue is compute-bound on the float64 PCA over the
-# 4x-expanded fit clouds; float32 roughly halves that work -- measured +7-15% total screen
-# throughput (vol +15%, vol_color +10%, surf_esp +8%, surf +7% on L40S). BUT it ships OPT-IN,
-# not default: the seed-parity A/B showed fp32 seeds drop
-# the multi-basin esp mode's self-copy recovery to ~0.93 (below the 0.95 bar) -- the fine
-# optimiser doesn't fully recover the coarser fp32 seeds there. On real distinct-molecule
-# screens the ranking is unchanged (mean overlap identical to 3 decimals), so it is a good
-# speed/robustness trade for shape-first screening; enable with FSS_SEED_FP32=1.
-_SEED_FP32 = os.environ.get("FSS_SEED_FP32", "0") != "0"
-_SEED_WORK_DTYPE = torch.float32 if _SEED_FP32 else torch.float64
 
 # Shared early-stop patience override for the esp/pharm fine loops (None -> use the
 # call's default). Lever 2: patience=5 over-runs ~25 steps after convergence on the
 # fast-converging self-copy benchmark. Set via speedlab; accuracy-gated. (surf/vol
 # uses fast_se3._ES_PATIENCE.)
-ES_PATIENCE_OVERRIDE = (lambda v: int(v) if v else None)(os.environ.get("FINE_ES_PATIENCE"))
 
 
 def check_gpu_available() -> bool:
@@ -50,9 +21,10 @@ def check_gpu_available() -> bool:
 
 
 def _update_best(score, q_k, t_k, best_score, best_q, best_t):
-    """Track the best (q, t) per pose by score -- the sync-free ``torch.where``
-    update shared by the coarse-to-fine drivers. Returns the updated
-    ``(best_score, best_q, best_t)``; bit-identical to the inline block."""
+    """Track the best (q, t) per pose by score. Uses ``torch.where`` so the update is
+    fixed-shape and sync-free, and RETURNS new ``(best_score, best_q, best_t)`` tensors
+    rather than mutating in place -- the fine loops are CUDA-graph captured and must not
+    do data-dependent or in-place best-pose updates."""
     better = score > best_score
     best_score = torch.where(better, score, best_score)
     mask_q = better.unsqueeze(1)
@@ -235,8 +207,8 @@ def _fallback_quats(num: int, device, dtype) -> torch.Tensor:
 
 def _analytic_sym3x3_axes(M: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """Eigenvectors (rows, descending eigenvalue) of a batch of symmetric 3x3
-    matrices ``M`` (K,3,3), returned in the same (K,3,3) rows=longest-axis-first
-    convention as the cuSOLVER path. Closed form, fully vectorized, no host sync:
+    matrices ``M`` (K,3,3), returned as (K,3,3) with rows = longest-axis-first.
+    Closed form, fully vectorized, no host sync:
 
       * eigenvalues via the trigonometric (Cardano) solution of the characteristic
         cubic of a symmetric 3x3 (Smith 1961);
@@ -300,21 +272,11 @@ def _masked_principal_axes(points: torch.Tensor, mask: torch.Tensor) -> torch.Te
     Bmat = torch.bmm(centered.transpose(1, 2), centered)            # (K,3,3)
     eye = torch.eye(3, device=points.device, dtype=points.dtype)
     inertia = A.view(-1, 1, 1) * eye - Bmat                         # (K,3,3)
-    if _ANALYTIC_EIGH:
-        # Closed-form; no cuSOLVER sync, no batch-size chunking (see _analytic_sym3x3_axes).
-        return _analytic_sym3x3_axes(inertia)
-    # cusolver batched eigh hits CUSOLVER_STATUS_INVALID_VALUE for K > ~8192;
-    # chunk to stay under the limit.
-    _EIGH_CHUNK = 4096
-    K = inertia.shape[0]
-    if K <= _EIGH_CHUNK:
-        _, eigvecs = torch.linalg.eigh(inertia)
-    else:
-        eigvecs = torch.empty_like(inertia)
-        for s in range(0, K, _EIGH_CHUNK):
-            e = min(s + _EIGH_CHUNK, K)
-            _, eigvecs[s:e] = torch.linalg.eigh(inertia[s:e])
-    return torch.flip(eigvecs, (2,)).transpose(1, 2)               # rows = descending axes
+    # Closed-form eigensolver, not ``torch.linalg.eigh``: batched cuSOLVER eigh is a
+    # stream-synchronizing barrier that stalls the otherwise-async seed-gen prologue,
+    # and it fails with CUSOLVER_STATUS_INVALID_VALUE for K > ~8192 (the fit-side call
+    # below passes a 4K-row batch, so that limit is routinely exceeded).
+    return _analytic_sym3x3_axes(inertia)
 
 
 def batched_seeds_torch(A_batch: torch.Tensor,
@@ -328,9 +290,8 @@ def batched_seeds_torch(A_batch: torch.Tensor,
     (identity + 4 principal-component-alignment quaternions + Fibonacci-sampled
     rotations, all with COM-aligning translations), but for the whole cohort in
     one vectorized pass with NO ``.cpu()``/numpy round-trip. The principal-axis
-    PCA is done in float64 for near-degenerate stability (FSS_SEED_FP32=1 -> float32,
-    ~2x cheaper, parity-safe not bit-exact), via an analytic closed-form 3x3 eigensolver
-    (FSS_ANALYTIC_EIGH, default on) rather than a synchronizing cuSOLVER call.
+    PCA is done in float64 for near-degenerate stability, via an analytic closed-form
+    3x3 eigensolver rather than a synchronizing cuSOLVER call.
 
     Pairs with < 3 real points or non-finite coordinates fall back to a fixed
     deterministic rotation set + COM-to-COM translation (matching the per-pair
@@ -377,10 +338,8 @@ def batched_seeds_torch(A_batch: torch.Tensor,
     fit_com = (B_batch * mask_m.unsqueeze(-1)).sum(1) / mreal.unsqueeze(-1)   # (K,3)
 
     # ---- 4 principal-component-alignment quaternions per pair ----
-    # Work dtype is float64 for near-degenerate stability (default); FSS_SEED_FP32=1
-    # runs the PCA in float32 (~2x cheaper seed-gen, parity-safe not bit-exact). The
-    # ``*64`` names are historical -- they now hold the work dtype (fp64 or fp32).
-    _wd = _SEED_WORK_DTYPE
+    # PCA runs in float64 for near-degenerate stability.
+    _wd = torch.float64
     A64 = torch.nan_to_num(A_batch.to(_wd))
     B64 = torch.nan_to_num(B_batch.to(_wd))
     mask_n64 = mask_n.to(_wd)
@@ -427,10 +386,10 @@ def batched_seeds_torch(A_batch: torch.Tensor,
 
     # Structured seeds: +/-90deg rotations about each ref principal axis, composed onto
     # the base PCA alignment. The 4 PCA quats already cover axis SIGN-flips (180deg); these
-    # add the axis SWAPS that PCA-alignment alone misses (ROSHAMBO2 gets them from its
-    # discrete start modes). Vectorized and reuses the already-computed principal axes, so
-    # the cost is negligible next to the float64 PCA eigensolve it rides on.
-    n_struct = min(max(num_seeds - 5, 0), 6) if _STRUCT_SEEDS else 0
+    # add the axis SWAPS that PCA-alignment alone misses. Vectorized and reuses the
+    # already-computed principal axes, so the cost is negligible next to the float64 PCA
+    # eigensolve it rides on.
+    n_struct = min(max(num_seeds - 5, 0), 6)
     if n_struct > 0:
         base_pca = pca_quats[:, 0]                                  # (K,4) no-sign-flip PCA align
         axes = ref_axes.to(dtype)                                   # (K,3,3) rows = principal axes

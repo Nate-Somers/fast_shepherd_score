@@ -1,6 +1,9 @@
-# shepherd_score/accel/kernels/shape_triton.py
-# A fused (forward + backward) Gaussian‐Tanimoto kernel using Triton.
-#
+"""Fused forward+backward Gaussian-Tanimoto overlap kernels in Triton.
+
+Provides the value + SE(3) gradient (dV/dq, dV/dt) kernel used by the batched
+coarse-to-fine aligners on CUDA tensors, plus the fused Adam quaternion/translation
+update. The numba CPU twins live in :mod:`~shepherd_score.accel.kernels.cpu`.
+"""
 from __future__ import annotations
 
 import math
@@ -10,19 +13,11 @@ import torch
 
 
 # ----------------- score and gradients wrt quaternion q and translation t -----------------
-# No hardcoded, GPU-specific tile/warp choice: triton.autotune benchmarks these
-# candidates on the ACTUAL device and caches the best per (N_pad, M_pad), so the
-# kernel self-tunes to whatever GPU / Triton version it runs on. (Hardcoding
-# BLOCK=16/num_warps=1 was optimal only for this RTX 4050 + triton 3.6.0.)
-#
-# Candidate range: BLOCK in {16,32,64} x num_warps in {1,2,4}. Deliberately does NOT
-# include larger tiles (BLOCK=128) or 8 warps: this kernel runs ONE CTA per pair, so a
-# batch already launches thousands of CTAs and occupancy comes from the pair count, not
-# from bigger per-CTA tiles. Measured on L40S AND H200 (2026-07): offering BLOCK=128 and
-# num_warps=8 as candidates, autotune STILL selects BLOCK16/w1 (surf/vol) or BLOCK32/w1
-# (surf_esp) -- the big tiles are never chosen and throughput is flat -- so adding them
-# only lengthens the cold-start autotune sweep. If a future GPU/kernel-shape does prefer
-# larger tiles, re-add them here (autotune will pick them only if they actually win).
+# BLOCK/num_warps/num_stages are chosen by triton.autotune per (N_pad, M_pad) on the actual
+# device and cached, so the kernel self-tunes to any GPU / Triton version. Candidates are
+# deliberately small tiles (BLOCK <= 64, <= 4 warps): the kernel runs ONE CTA per pair, so a
+# batch already launches thousands of CTAs and occupancy comes from the pair count -- larger
+# tiles are never selected and only lengthen the cold-start autotune sweep.
 _OVERLAP_CONFIGS = [
     triton.Config({'BLOCK': _b}, num_warps=_w, num_stages=_s)
     for _b in (16, 32, 64) for _w in (1, 2, 4) for _s in (1, 2, 3, 4)
@@ -34,8 +29,8 @@ _OVERLAP_CONFIGS = [
 # copy-pasted byte-for-byte into every overlap kernel (shape + ESP here, and imported by
 # esp_triton). Factoring them into these @triton.jit helpers makes a correctness fix a SINGLE
 # edit instead of N identical ones and removes the silent-divergence risk. Triton inlines a
-# @triton.jit callee into its caller, so this is bit-identical to the inline blocks (validated
-# by benchmarks/experiments/check_kernels.py: kernel V/dQ/dT match a torch-autograd reference).
+# @triton.jit callee into its caller, so this is bit-identical to the inline blocks (validated:
+# kernel V/dQ/dT match a torch-autograd reference).
 @triton.jit
 def _quat_to_rotmat(qr, qi, qj, qk):
     """Rotation matrix (row-major r00..r22) from a quaternion (w,x,y,z). q need NOT be unit
@@ -265,7 +260,7 @@ def _adam_qt(
     lr: tl.constexpr,
     beta1: tl.constexpr = 0.9,
     beta2: tl.constexpr = 0.999,
-    eps:   tl.constexpr = 1e-8,      
+    eps:   tl.constexpr = 1e-8,
     BLOCK: tl.constexpr = 256,     # threads per CTA (must divide 1024)
     PROJECT: tl.constexpr = False, # if True, tangent-project dQ: dQ -= q*(dQ.q)
 ):
@@ -321,7 +316,7 @@ def _adam_qt(
     vt1 = tl.load(Vt_ptr + offs*3 + 1, mask=mask)
     vt2 = tl.load(Vt_ptr + offs*3 + 2, mask=mask)
 
-    # ---------------- Adam update (each component) ------------------------     
+    # ---------------- Adam update (each component) ------------------------
     mq0 = beta1*mq0 + (1-beta1)*dq0;  vq0 = beta2*vq0 + (1-beta2)*dq0*dq0
     mq1 = beta1*mq1 + (1-beta1)*dq1;  vq1 = beta2*vq1 + (1-beta2)*dq1*dq1
     mq2 = beta1*mq2 + (1-beta1)*dq2;  vq2 = beta2*vq2 + (1-beta2)*dq2*dq2
@@ -373,7 +368,7 @@ def _adam_qt(
     tl.store(Vt_ptr + offs*3 + 2, vt2, mask=mask)
 
 def fused_adam_qt(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr):
-    _warmup_adam_qt()                       # lazy one-time PTX build (was at import)
+    _warmup_adam_qt()                       # lazy one-time PTX build (must not run at import)
     K = q.shape[0]
     grid = (triton.cdiv(K, 256),)
 
@@ -410,216 +405,13 @@ def fused_adam_qt_with_tangent_proj(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr):
         K, lr=lr, PROJECT=True
     )
 
-# ---------------------------------------------------------------------------
-#  FUSED per-step surf kernel: overlap value+grad  ->  Tanimoto score + scale
-#  ->  best-pose tracking  ->  tangent-projected Adam  ->  quaternion renorm,
-#  ALL in one CTA-per-pose launch. The eager fine step is ~10 launches (overlap
-#  kernel + 7 elementwise torch ops + the Adam kernel); this collapses them to 1
-#  and keeps Vab/dQ/dT in registers (no global round-trip between overlap and
-#  Adam). The overlap body is copied VERBATIM from _gauss_overlap_se3_tiled so
-#  Vab/dQ/dT are bit-identical; the tail reproduces the eager math exactly
-#  (score=Vab/(norm-Vab); scale=norm/(norm-Vab)^2; grad=-scale*dV; dQ_tan=dQ-q(dQ.q);
-#  Adam beta1/beta2/eps as in _adam_qt_with_tangent_proj). State (q/t/moments/best)
-#  is updated in place, so a Python loop of N launches == N fine steps.
-@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
-@triton.jit
-def _fused_surf_adam_step(
-    A_ptr, B_ptr,                 # flat (P*N_pad*3), (P*M_pad*3)
-    Q_ptr, T_ptr,                 # (P*4), (P*3)   updated in place
-    Nreal_ptr, Mreal_ptr,         # (P,)
-    Mq_ptr, Vq_ptr, Mt_ptr, Vt_ptr,   # Adam moments, in place
-    Best_ptr, BQ_ptr, BT_ptr,     # best score (P,), best q (P*4), best t (P*3), in place
-    Norm_ptr,                     # VAA+VBB (P,)
-    BATCH, M_pad, N_pad,
-    half_alpha, k_const, lr,
-    BLOCK: tl.constexpr,
-    beta1: tl.constexpr = 0.9,
-    beta2: tl.constexpr = 0.999,
-    eps:   tl.constexpr = 1e-8,
-):
-    pid = tl.program_id(0)
-    realN = tl.load(Nreal_ptr + pid)
-    realM = tl.load(Mreal_ptr + pid)
-
-    A_ptr = A_ptr + pid * N_pad * 3
-    B_ptr = B_ptr + pid * M_pad * 3
-    Q_ptr = Q_ptr + pid * 4
-    T_ptr = T_ptr + pid * 3
-
-    qr = tl.load(Q_ptr + 0); qi = tl.load(Q_ptr + 1)
-    qj = tl.load(Q_ptr + 2); qk = tl.load(Q_ptr + 3)
-    tx = tl.load(T_ptr + 0); ty = tl.load(T_ptr + 1); tz = tl.load(T_ptr + 2)
-
-    two = 2.0
-    r00 = 1 - two*(qj*qj + qk*qk); r01 = two*(qi*qj - qk*qr); r02 = two*(qi*qk + qj*qr)
-    r10 = two*(qi*qj + qk*qr);     r11 = 1 - two*(qi*qi + qk*qk); r12 = two*(qj*qk - qi*qr)
-    r20 = two*(qi*qk - qj*qr);     r21 = two*(qj*qk + qi*qr);     r22 = 1 - two*(qi*qi + qj*qj)
-
-    Vab_acc = 0.0
-    dTx = 0.0; dTy = 0.0; dTz = 0.0
-    dQw = 0.0; dQx = 0.0; dQy = 0.0; dQz = 0.0
-    inv_ln2 = 1.4426950408889634
-
-    for n0 in range(0, N_pad, BLOCK):
-        offs_n = n0 + tl.arange(0, BLOCK)
-        mask_n = offs_n < realN
-        a_idx = tl.where(mask_n, offs_n, 0)
-        ax = tl.load(A_ptr + a_idx * 3 + 0, mask=mask_n, other=0.0)
-        ay = tl.load(A_ptr + a_idx * 3 + 1, mask=mask_n, other=0.0)
-        az = tl.load(A_ptr + a_idx * 3 + 2, mask=mask_n, other=0.0)
-
-        for m0 in range(0, M_pad, BLOCK):
-            offs_m = m0 + tl.arange(0, BLOCK)
-            mask_m = offs_m < realM
-            b_idx = tl.where(mask_m, offs_m, 0)
-            bx0 = tl.load(B_ptr + b_idx * 3 + 0, mask=mask_m, other=0.0)
-            by0 = tl.load(B_ptr + b_idx * 3 + 1, mask=mask_m, other=0.0)
-            bz0 = tl.load(B_ptr + b_idx * 3 + 2, mask=mask_m, other=0.0)
-
-            bx = r00*bx0 + r01*by0 + r02*bz0 + tx
-            by = r10*bx0 + r11*by0 + r12*bz0 + ty
-            bz = r20*bx0 + r21*by0 + r22*bz0 + tz
-
-            dx = ax[:, None] - bx[None, :]
-            dy = ay[:, None] - by[None, :]
-            dz = az[:, None] - bz[None, :]
-            r2 = dx*dx + dy*dy + dz*dz
-
-            g = tl.exp2((-half_alpha * r2) * inv_ln2) * k_const
-            pair_mask = mask_n[:, None] & mask_m[None, :]
-            g = tl.where(pair_mask, g, 0.0)
-
-            Vab_acc += tl.sum(g)
-
-            coeff = (2.0 * half_alpha) * g
-            fx = tl.sum(coeff * dx, 0)
-            fy = tl.sum(coeff * dy, 0)
-            fz = tl.sum(coeff * dz, 0)
-            dTx += tl.sum(fx); dTy += tl.sum(fy); dTz += tl.sum(fz)
-
-            wq = qr; xq = qi; yq = qj; zq = qk
-            four = 4.0
-            dw = (
-                fx * (-two*zq*by0 + two*yq*bz0) +
-                fy * ( two*zq*bx0 - two*xq*bz0) +
-                fz * (-two*yq*bx0 + two*xq*by0)
-            )
-            dxq = (
-                fx * ( two*yq*by0 + two*zq*bz0) +
-                fy * ( two*yq*bx0 - four*xq*by0 - two*wq*bz0) +
-                fz * ( two*zq*bx0 + two*wq*by0 - four*xq*bz0)
-            )
-            dyq = (
-                fx * (-four*yq*bx0 + two*xq*by0 + two*wq*bz0) +
-                fy * (  two*xq*bx0                 + two*zq*bz0) +
-                fz * (-two*wq*bx0 + two*zq*by0 - four*yq*bz0)
-            )
-            dzq = (
-                fx * (-four*zq*bx0 - two*wq*by0 + two*xq*bz0) +
-                fy * ( two*wq*bx0 - four*zq*by0 + two*yq*bz0) +
-                fz * ( two*xq*bx0 + two*yq*by0                )
-            )
-            dw  = tl.where(mask_m, dw,  0.0)
-            dxq = tl.where(mask_m, dxq, 0.0)
-            dyq = tl.where(mask_m, dyq, 0.0)
-            dzq = tl.where(mask_m, dzq, 0.0)
-            dQw += tl.sum(dw); dQx += tl.sum(dxq); dQy += tl.sum(dyq); dQz += tl.sum(dzq)
-
-    # ---- score + scale (Tanimoto), matching the eager elementwise ops ----
-    norm = tl.load(Norm_ptr + pid)
-    denom = norm - Vab_acc
-    score = Vab_acc / denom
-    scale = norm / (denom * denom)
-
-    # ---- best-pose tracking: keep the CURRENT (q,t) that produced score ----
-    best = tl.load(Best_ptr + pid)
-    better = score > best
-    tl.store(Best_ptr + pid, tl.where(better, score, best))
-    bq0 = tl.load(BQ_ptr + pid*4 + 0); bq1 = tl.load(BQ_ptr + pid*4 + 1)
-    bq2 = tl.load(BQ_ptr + pid*4 + 2); bq3 = tl.load(BQ_ptr + pid*4 + 3)
-    tl.store(BQ_ptr + pid*4 + 0, tl.where(better, qr, bq0))
-    tl.store(BQ_ptr + pid*4 + 1, tl.where(better, qi, bq1))
-    tl.store(BQ_ptr + pid*4 + 2, tl.where(better, qj, bq2))
-    tl.store(BQ_ptr + pid*4 + 3, tl.where(better, qk, bq3))
-    bt0 = tl.load(BT_ptr + pid*3 + 0); bt1 = tl.load(BT_ptr + pid*3 + 1); bt2 = tl.load(BT_ptr + pid*3 + 2)
-    tl.store(BT_ptr + pid*3 + 0, tl.where(better, tx, bt0))
-    tl.store(BT_ptr + pid*3 + 1, tl.where(better, ty, bt1))
-    tl.store(BT_ptr + pid*3 + 2, tl.where(better, tz, bt2))
-
-    # ---- gradient of -score wrt (q,t), then tangent projection ----
-    gq0 = -dQw * scale; gq1 = -dQx * scale; gq2 = -dQy * scale; gq3 = -dQz * scale
-    gt0 = -dTx * scale; gt1 = -dTy * scale; gt2 = -dTz * scale
-    radial = gq0*qr + gq1*qi + gq2*qj + gq3*qk
-    gq0 = gq0 - qr*radial; gq1 = gq1 - qi*radial; gq2 = gq2 - qj*radial; gq3 = gq3 - qk*radial
-
-    # ---- Adam on q ----
-    mq0 = tl.load(Mq_ptr + pid*4 + 0); mq1 = tl.load(Mq_ptr + pid*4 + 1)
-    mq2 = tl.load(Mq_ptr + pid*4 + 2); mq3 = tl.load(Mq_ptr + pid*4 + 3)
-    vq0 = tl.load(Vq_ptr + pid*4 + 0); vq1 = tl.load(Vq_ptr + pid*4 + 1)
-    vq2 = tl.load(Vq_ptr + pid*4 + 2); vq3 = tl.load(Vq_ptr + pid*4 + 3)
-    mq0 = beta1*mq0 + (1-beta1)*gq0; vq0 = beta2*vq0 + (1-beta2)*gq0*gq0
-    mq1 = beta1*mq1 + (1-beta1)*gq1; vq1 = beta2*vq1 + (1-beta2)*gq1*gq1
-    mq2 = beta1*mq2 + (1-beta1)*gq2; vq2 = beta2*vq2 + (1-beta2)*gq2*gq2
-    mq3 = beta1*mq3 + (1-beta1)*gq3; vq3 = beta2*vq3 + (1-beta2)*gq3*gq3
-    nqr = qr - lr*mq0/tl.sqrt(vq0+eps)
-    nqi = qi - lr*mq1/tl.sqrt(vq1+eps)
-    nqj = qj - lr*mq2/tl.sqrt(vq2+eps)
-    nqk = qk - lr*mq3/tl.sqrt(vq3+eps)
-
-    # ---- Adam on t ----
-    mt0 = tl.load(Mt_ptr + pid*3 + 0); mt1 = tl.load(Mt_ptr + pid*3 + 1); mt2 = tl.load(Mt_ptr + pid*3 + 2)
-    vt0 = tl.load(Vt_ptr + pid*3 + 0); vt1 = tl.load(Vt_ptr + pid*3 + 1); vt2 = tl.load(Vt_ptr + pid*3 + 2)
-    mt0 = beta1*mt0 + (1-beta1)*gt0; vt0 = beta2*vt0 + (1-beta2)*gt0*gt0
-    mt1 = beta1*mt1 + (1-beta1)*gt1; vt1 = beta2*vt1 + (1-beta2)*gt1*gt1
-    mt2 = beta1*mt2 + (1-beta1)*gt2; vt2 = beta2*vt2 + (1-beta2)*gt2*gt2
-    nt0 = tx - lr*mt0/tl.sqrt(vt0+eps)
-    nt1 = ty - lr*mt1/tl.sqrt(vt1+eps)
-    nt2 = tz - lr*mt2/tl.sqrt(vt2+eps)
-
-    # ---- renormalise quaternion ----
-    inv_norm = 1.0 / tl.sqrt(nqr*nqr + nqi*nqi + nqj*nqj + nqk*nqk)
-    nqr *= inv_norm; nqi *= inv_norm; nqj *= inv_norm; nqk *= inv_norm
-
-    tl.store(Q_ptr + 0, nqr); tl.store(Q_ptr + 1, nqi); tl.store(Q_ptr + 2, nqj); tl.store(Q_ptr + 3, nqk)
-    tl.store(T_ptr + 0, nt0); tl.store(T_ptr + 1, nt1); tl.store(T_ptr + 2, nt2)
-    tl.store(Mq_ptr + pid*4 + 0, mq0); tl.store(Mq_ptr + pid*4 + 1, mq1)
-    tl.store(Mq_ptr + pid*4 + 2, mq2); tl.store(Mq_ptr + pid*4 + 3, mq3)
-    tl.store(Vq_ptr + pid*4 + 0, vq0); tl.store(Vq_ptr + pid*4 + 1, vq1)
-    tl.store(Vq_ptr + pid*4 + 2, vq2); tl.store(Vq_ptr + pid*4 + 3, vq3)
-    tl.store(Mt_ptr + pid*3 + 0, mt0); tl.store(Mt_ptr + pid*3 + 1, mt1); tl.store(Mt_ptr + pid*3 + 2, mt2)
-    tl.store(Vt_ptr + pid*3 + 0, vt0); tl.store(Vt_ptr + pid*3 + 1, vt1); tl.store(Vt_ptr + pid*3 + 2, vt2)
-
-
-def fused_surf_step_batch(A, B, q, t, m_q, v_q, m_t, v_t, best, best_q, best_t,
-                          norm, N_real, M_real, *, alpha=0.81, lr=0.075):
-    """One fused surf fine step over P poses, in place. q/t/moments/best_* are
-    updated; nothing is returned. A/B must be contiguous (P,N_pad,3)/(P,M_pad,3);
-    q/t/m_*/v_*/best/best_q/best_t contiguous and on the same device."""
-    P, N_pad, _ = A.shape
-    _, M_pad, _ = B.shape
-    half_alpha = 0.5 * alpha
-    k_const = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
-    N_real = N_real.to(device=A.device, dtype=torch.int32, copy=False)
-    M_real = M_real.to(device=A.device, dtype=torch.int32, copy=False)
-    _fused_surf_adam_step[(P,)](
-        A.view(-1), B.view(-1),
-        q.view(-1), t.view(-1),
-        N_real.contiguous(), M_real.contiguous(),
-        m_q.view(-1), v_q.view(-1), m_t.view(-1), v_t.view(-1),
-        best, best_q.view(-1), best_t.view(-1),
-        norm.contiguous(),
-        P, M_pad, N_pad,
-        half_alpha, k_const, float(lr),
-    )
-
 
 #  One-time _adam_qt warm-up so the first real call doesn't pay the PTX build.
-#  DEFERRED to first use (see fused_adam_qt) instead of running at import: importing
-#  this module must NOT initialize CUDA -- both to avoid allocating GPU memory just
-#  by importing, and (crucially) so the fork-based multi-GPU pool
-#  (shepherd_score.accel.multi_gpu) can fork its workers cheaply, which is only
-#  CUDA-safe when the parent process hasn't initialized CUDA yet. Triton JIT-compiles
-#  on first launch regardless; this only front-loads it.
+#  Must stay lazy -- never call this at import. Importing this module must NOT
+#  initialize CUDA: it would allocate GPU memory just by importing, and (crucially)
+#  it would poison the fork-based multi-GPU pool (shepherd_score.accel.multi_gpu),
+#  which can only fork its workers while the parent has not initialized CUDA.
+#  Triton JIT-compiles on first launch regardless; this only front-loads it.
 _ADAM_QT_WARMED = False
 
 

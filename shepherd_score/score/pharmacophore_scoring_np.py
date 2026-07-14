@@ -492,8 +492,8 @@ def get_pharm_combo_score(centers_1: np.ndarray,
     """ Compute a combined shape and pharmacophore score.
 
     The combined score is ``(1 - color_weight) * shape + color_weight * pharm``
-    (``color_weight=0.5`` reproduces the previous unweighted average). Set
-    ``directional=False`` for ROCS/ROSHAMBO-style isotropic "color" scoring. """
+    (``color_weight=0.5`` is the unweighted average of the two channels). Set
+    ``directional=False`` for isotropic "color" scoring. """
     # Similarity scoring
     if similarity.lower() == 'tanimoto':
         similarity_func = tanimoto_func_np

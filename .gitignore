@@ -178,19 +178,5 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Upstream repo clone (compared against in benchmarks; never committed)
-shepherd-score-original-repo/
-# Generated benchmark artifacts.
-# molcache/ = regenerable deterministic molecule cache (not committed).
-# results/ IS committed (saved benchmark outputs: RTX 4050 laptop + L40S 1/4-GPU).
-benchmarks/molcache/
-# Benchmark run logs (transient; the plot/table/json under results*/ are the outputs).
-benchmarks/results_cpu/*.log
-benchmarks/results_cpu/**/slurm-*.out
 # Personal conda env (upstream environment.yml is the canonical one)
 environment.local.yml
-
-# optimization-sweep output jsons (kept on cluster, not tracked)
-benchmarks/optall.json
-benchmarks/vesp380.json
-benchmarks/volopt_esp_combo.json

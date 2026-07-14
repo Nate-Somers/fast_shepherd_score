@@ -115,8 +115,7 @@ class MoleculePairBatch:
 
     def _run_fast_or_fallthrough(self, backend, align_fn, align_kwargs, score_attr,
                                  transform_attr, fit_attr, return_aligned, *,
-                                 num_workers: int = 1, precheck=None,
-                                 numba_ok: bool = True, numba_msg: str = ""):
+                                 num_workers: int = 1, precheck=None):
         """Shared ``backend=`` dispatch for the modes whose fast path is a single
         ``_triton_align`` call (vol/vol_esp/surf/esp/esp_combo).
 
@@ -125,11 +124,8 @@ class MoleculePairBatch:
         so the caller runs the original JAX path; any other value raises ``ValueError``.
         ``precheck`` (if given) runs AFTER ``_prepare_numba`` for the numba backend,
         preserving the original ordering of mode-specific guards (e.g. the ``no_H``
-        check). ``numba_ok=False`` rejects the numba backend up front with
-        ``numba_msg`` (used by any mode whose CPU path is not implemented).
+        check).
         """
-        if backend in self._NUMBA_BACKENDS and not numba_ok:
-            raise NotImplementedError(numba_msg)
         if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
             if backend in self._NUMBA_BACKENDS:
                 self._prepare_numba()
@@ -292,15 +288,17 @@ class MoleculePairBatch:
         no_H : bool
             Whether to exclude hydrogens. Default is True.
         num_repeats : int
-            Number of SE(3) initializations per pair. Default is 50.
+            Number of SE(3) initializations per pair.
+            Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
+            (MODE_SEEDS / MODE_STEPS).
         trans_init : bool
             If True, initialize translations to each ref atom position. Default is False.
         lr : float
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
-            Maximum optimization steps. Default is 50 (45-50 steps fully converge the
-            fine optimizer on drug-like pairs; see shepherd_score/accel/_modes.py --
-            MODE_SEEDS / MODE_STEPS).
+            Maximum optimization steps.
+            Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
+            (MODE_SEEDS / MODE_STEPS).
         num_workers : int
             Number of parallel workers.  ``1`` (default) runs sequentially
             in-process. When ``use_shmap=True`` (the default), this value is informational;
@@ -481,7 +479,7 @@ class MoleculePairBatch:
         return scores, aligned_list
 
     def align_with_vol_esp(self,
-                           lam: float,
+                           lam: float = 0.1,
                            no_H: bool = True,
                            num_repeats: int = None,
                            trans_init: bool = False,
@@ -515,15 +513,17 @@ class MoleculePairBatch:
         no_H : bool
             Whether to exclude hydrogens. Default is True.
         num_repeats : int
-            Number of SE(3) initializations per pair. Default is 50.
+            Number of SE(3) initializations per pair.
+            Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
+            (MODE_SEEDS / MODE_STEPS).
         trans_init : bool
             If True, initialize translations to each ref atom position. Default is False.
         lr : float
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
-            Maximum optimization steps. Default is 50 (45-50 steps fully converge the
-            fine optimizer on drug-like pairs; see shepherd_score/accel/_modes.py --
-            MODE_SEEDS / MODE_STEPS).
+            Maximum optimization steps.
+            Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
+            (MODE_SEEDS / MODE_STEPS).
         num_workers : int
             Number of parallel worker processes. ``1`` (default) runs
             sequentially in-process. Values greater than ``len(self.pairs)``
@@ -755,15 +755,17 @@ class MoleculePairBatch:
         alpha : float
             Gaussian width parameter for overlap.
         num_repeats : int
-            Number of SE(3) initializations per pair. Default is 50.
+            Number of SE(3) initializations per pair.
+            Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
+            (MODE_SEEDS / MODE_STEPS).
         trans_init : bool
             Apply translation initialization for alignment. Default is False.
         lr : float
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
-            Maximum optimization steps. Default is 50 (45-50 steps fully converge the
-            fine optimizer on drug-like pairs; see shepherd_score/accel/_modes.py --
-            MODE_SEEDS / MODE_STEPS).
+            Maximum optimization steps.
+            Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
+            (MODE_SEEDS / MODE_STEPS).
         use_jax : bool
             Whether to use JAX backend. Default is True.
         use_analytical : bool
@@ -893,15 +895,17 @@ class MoleculePairBatch:
         lam : float
             Weighting factor for ESP scoring. Scaled internally. Default is 0.3.
         num_repeats : int
-            Number of SE(3) initializations per pair. Default is 50.
+            Number of SE(3) initializations per pair.
+            Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
+            (MODE_SEEDS / MODE_STEPS).
         trans_init : bool
             Apply translation initialization for alignment. Default is False.
         lr : float
             Optimizer learning rate. Default is 0.1.
         max_num_steps : int
-            Maximum optimization steps. Default is 50 (45-50 steps fully converge the
-            fine optimizer on drug-like pairs; see shepherd_score/accel/_modes.py --
-            MODE_SEEDS / MODE_STEPS).
+            Maximum optimization steps.
+            Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
+            (MODE_SEEDS / MODE_STEPS).
         use_jax : bool
             Whether to use JAX backend. Default is True.
         use_analytical : bool
@@ -1136,7 +1140,7 @@ class MoleculePairBatch:
             dict(alpha=alpha, color_weight=color_weight, trans_init=trans_init,
                  num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
             "sim_aligned_vol_color", "transform_vol_color", "_fit_xyz_t",
-            return_aligned, numba_ok=True)
+            return_aligned)
         if handled:
             return _result
 

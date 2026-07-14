@@ -8,13 +8,12 @@ through the **existing** :class:`~shepherd_score.container.MoleculePairBatch` /
 the fly. Only one shard is resident at a time, so host RAM never holds the whole
 library.
 
-Three pieces, all additive — nothing here changes ``Molecule`` / ``MoleculePair``
-/ ``MoleculePairBatch`` / the kernels:
+Three pieces:
 
 * :class:`MoleculeProfile` -- an RDKit-free, duck-typed stand-in for ``Molecule``
-  holding only the numeric arrays the batched aligners read. Dropping the RDKit
-  ``Mol`` (~66% of a ``Molecule``'s bytes) is what keeps shard reload at
-  array-copy speed instead of reconstruction-bound.
+  holding only the numeric arrays the batched aligners read. The RDKit ``Mol`` is
+  not stored, so reloading a shard is an array copy rather than a molecule
+  reconstruction.
 * :class:`ProfileStore` -- a sharded, on-disk store of profiles. Shards are
   independent ``.npz`` files, so the (expensive) build parallelises across
   workers/nodes with no locking, and a screen streams them back one at a time.
@@ -49,22 +48,21 @@ from __future__ import annotations
 
 import copy
 import heapq
-import itertools
 import json
 import os
 from collections import namedtuple
-from typing import Iterable, Iterator, List, Optional, Sequence, Union
+from typing import Iterator, List, Optional, Sequence
 
 import numpy as np
 
 __all__ = ["MoleculeProfile", "ProfileStore", "screen", "screen_many", "Hit"]
 
 
-# Per-mode result attributes written in-place by ``MoleculePairBatch.align_with_*``, and the
-# legacy mode-name aliases -- both sourced from the mode registry (``accel/_modes.py``) so the
-# screen front-end and the accel layers can never disagree on attribute names or valid modes.
+# Per-mode result attributes written in-place by ``MoleculePairBatch.align_with_*``, sourced from
+# the mode registry (``accel/_modes.py``) so the screen front-end and the accel layers can never
+# disagree on attribute names or valid modes. Legacy mode names resolve via ``canonical()``.
 from shepherd_score.accel._modes import (
-    MODE_ATTRS as _MODE_ATTRS, LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES, canonical as _canon_mode,
+    MODE_ATTRS as _MODE_ATTRS, canonical as _canon_mode,
 )
 _TRANSFORM_ATTR = {m: a[0] for m, a in _MODE_ATTRS.items()}
 _SCORE_ATTR = {m: a[1] for m, a in _MODE_ATTRS.items()}
@@ -540,12 +538,6 @@ class ProfileStore:
         with np.load(os.path.join(self.path, sh["name"])) as data:
             return {k: data[k] for k in data.files}
 
-    def iter_shard_raw(self) -> Iterator[tuple]:
-        """Yield ``(shard_meta, arrays_dict)`` per shard -- raw contiguous arrays for
-        the direct device path (no per-molecule objects)."""
-        for sh in self.manifest["shards"]:
-            yield sh, self._load_raw(sh)
-
     def read_shard(self, idx: int) -> tuple:
         """Return ``(shard_meta, arrays_dict)`` for shard ``idx`` (random access; used
         by the multi-GPU shard pool so each worker reads only its assigned shards)."""
@@ -557,14 +549,6 @@ class ProfileStore:
         for sh in self.manifest["shards"]:
             with np.load(os.path.join(self.path, sh["name"])) as data:
                 yield self._reconstruct(data, sh)
-
-    def iter_pair_shards(self, query, *, do_center=False, device="cpu"):
-        """Yield one shard at a time as a ``list[MoleculePair]`` (query vs each
-        profile), ready for :class:`MoleculePairBatch`."""
-        from shepherd_score.container import MoleculePair
-        for profiles in self.iter_shards():
-            yield [MoleculePair(query, p, do_center=do_center, device=device)
-                   for p in profiles]
 
     def read_profiles(self, idx: int) -> List["MoleculeProfile"]:
         """Reconstruct shard ``idx`` as ``list[MoleculeProfile]`` (random access)."""
@@ -652,10 +636,6 @@ def _centered_copy(query):
 # serves every query.
 # --------------------------------------------------------------------------- #
 _FAST_MODES = ("vol", "surf", "surf_esp", "pharm", "vol_color", "vol_esp", "vol_and_surf_esp")
-# Modes whose batched aligner reads ``p.ref_molec.<attr>`` *eagerly* (vol_color probes
-# pharm; vol_esp/vol_and_surf_esp do a None-guard on partial_charges / surf_pos+surf_esp), so
-# the fast path attaches a tiny ``_ArrView`` to satisfy those reads (tensors still pre-cached).
-_NEEDS_ARRVIEW = ("vol_color", "vol_esp", "vol_and_surf_esp")
 
 
 class _ArrView:
@@ -738,7 +718,8 @@ def _query_ref_arrays(q, mode: str) -> dict:
 
 def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
     import torch
-    f = lambda a: torch.as_tensor(a, dtype=torch.float32, device=device)
+    def f(a):
+        return torch.as_tensor(a, dtype=torch.float32, device=device)
     if mode == "vol":
         return {"_ref_xyz_t": f(ra["xyz"])}
     if mode == "surf":
@@ -772,18 +753,20 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
 
 def _build_fit_fast_pairs(arrs: dict, mode: str, device):
     """Load one shard's FIT arrays as device tensors once; return (ids, [_FastPair])
-    whose fit tensors are views into them. The per-molecule views are produced with a
-    single torch.split/unbind (and np.split for the numpy holders) rather than a
-    K-iteration Python slicing loop -- the views are byte-for-byte identical, but the
-    slicing collapses into one C call (otherwise ~250k aten::slice/select calls per
-    100k-molecule shard, the dominant per-shard host cost for the fast modes)."""
+    whose fit tensors are views into them. The per-molecule views come from a single
+    ``torch.split``/``unbind`` (and ``np.split`` for the numpy holders) rather than a
+    K-iteration Python slicing loop: the views are identical, but the slicing collapses
+    into one C call."""
     import torch
     ids = arrs["ids"]
     K = len(ids)
     pairs = [_FastPair(device) for _ in range(K)]
-    f = lambda a: torch.as_tensor(a, dtype=torch.float32, device=device)
-    splitT = lambda big, off: torch.split(big, np.diff(off).tolist())   # K variable device views
-    splitN = lambda arr, off: np.split(arr, off[1:-1])                   # K variable numpy views
+    def f(a):
+        return torch.as_tensor(a, dtype=torch.float32, device=device)
+    def splitT(big, off):                      # K variable device views
+        return torch.split(big, np.diff(off).tolist())
+    def splitN(arr, off):                      # K variable numpy views
+        return np.split(arr, off[1:-1])
 
     if mode == "vol":
         for p, c in zip(pairs, splitT(f(arrs["atom_pos"]), arrs["atom_off"])):
@@ -793,13 +776,16 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
             p._fit_surf_t = s
     elif mode == "surf_esp":
         for p, s, e in zip(pairs, torch.unbind(f(arrs["surf_pos"])), torch.unbind(f(arrs["surf_esp"]))):
-            p._fit_surf_t = s; p._fit_surf_esp_t = e
+            p._fit_surf_t = s
+            p._fit_surf_esp_t = e
     elif mode == "pharm":
         off = arrs["pharm_off"]
         bt = torch.as_tensor(arrs["pharm_types"], dtype=torch.int64, device=device)
         for p, t, a, v in zip(pairs, torch.split(bt, np.diff(off).tolist()),
                               splitT(f(arrs["pharm_ancs"]), off), splitT(f(arrs["pharm_vecs"]), off)):
-            p._fit_pharm_types_t = t; p._fit_pharm_ancs_t = a; p._fit_pharm_vecs_t = v
+            p._fit_pharm_types_t = t
+            p._fit_pharm_ancs_t = a
+            p._fit_pharm_vecs_t = v
     elif mode == "vol_color":
         aoff, poff = arrs["atom_off"], arrs["pharm_off"]
         bt = torch.as_tensor(arrs["pharm_types"], dtype=torch.int64, device=device)
@@ -808,7 +794,9 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
                 pairs, splitT(f(arrs["atom_pos"]), aoff),
                 torch.split(bt, np.diff(poff).tolist()), splitT(f(arrs["pharm_ancs"]), poff),
                 splitN(np_atom, aoff), splitN(np_pt, poff), splitN(np_pa, poff)):
-            p._fit_xyz_t = at; p._fit_pharm_types_t = pt; p._fit_pharm_ancs_t = pa
+            p._fit_xyz_t = at
+            p._fit_pharm_types_t = pt
+            p._fit_pharm_ancs_t = pa
             p.fit_molec = _ArrView(an, ptn, pan)        # numpy holder for the aligner's eager reads
     elif mode == "vol_esp":
         aoff = arrs["atom_off"]
@@ -826,7 +814,8 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
             heavy_all = arrs["charges"]
         for p, at, xn, ht, hn in zip(pairs, atom_t, xnoH_t,
                                      splitT(f(heavy_all), hoff), splitN(heavy_all, hoff)):
-            p._fit_xyz_esp_t = ht; p.fit_molec = _ArrView(partial_charges=hn)
+            p._fit_xyz_esp_t = ht
+            p.fit_molec = _ArrView(partial_charges=hn)
             p._fit_xyz_noH_t = xn               # heavy centers, 1:1 with heavy charges
             p._fit_xyz_t = at                   # RemoveHs atom_pos (trans-init centers only)
     elif mode == "vol_and_surf_esp":
@@ -837,8 +826,11 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
                 splitT(f(arrs["cwh"]), alloff), splitT(f(arrs["charges"]), alloff),
                 splitT(f(arrs["radii"]), alloff), splitT(f(arrs["atom_pos"]), aoff),
                 splitN(arrs["charges"], alloff), splitN(arrs["radii"], alloff), splitN(arrs["cwh"], alloff))):
-            p._fit_surf_t = s; p._fit_surf_esp_t = e
-            p._fit_centers_w_H_t = c; p._fit_partial_t = pa; p._fit_radii_t = r
+            p._fit_surf_t = s
+            p._fit_surf_esp_t = e
+            p._fit_centers_w_H_t = c
+            p._fit_partial_t = pa
+            p._fit_radii_t = r
             p._fit_xyz_t = at                   # heavy atoms (alpha=0.81 shape channel)
             p.fit_molec = _ArrView(surf_pos=np_surf[i], surf_esp=np_se[i], partial_charges=partn,
                                    radii=radn, mol=_MolShim(cwhn))
@@ -849,9 +841,9 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
 
 def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
     """Translate screen()'s align_kwargs to the ``_align_batch_<mode>`` kwargs, mirroring the
-    defaults the ``MoleculePairBatch.align_with_*`` triton path uses -- in particular the PER-MODE
-    fine-step count from the single-source ``_steps_for()`` table (NOT the old flat 200 leftover,
-    which ran screen ~4x slower than pairwise for the same accuracy)."""
+    defaults the ``MoleculePairBatch.align_with_*`` triton path uses. The per-mode fine-step
+    count comes from the single-source ``_steps_for()`` table so the screen and pairwise paths
+    cannot drift apart."""
     from shepherd_score.accel.batch.aligners import _steps_for, _seeds_for
     steps = ak.get("max_num_steps", _steps_for(mode))
     if mode in ("vol", "surf"):
@@ -900,7 +892,9 @@ class _TopK:
     __slots__ = ("k", "heap", "_c")
 
     def __init__(self, k):
-        self.k = k; self.heap = []; self._c = 0
+        self.k = k
+        self.heap = []
+        self._c = 0
 
     def _push(self, score, id_, transform):
         self._c += 1
@@ -961,12 +955,14 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                        n_total):
     """Process ``shard_idxs`` against the query panel, one shard load per shard,
     aligning every query against it. Returns a ``_TopK`` per query."""
-    # This driver already shards the library manually (one shard per call), so suppress
-    # the aligner's transparent multi-GPU re-distribution. Otherwise, on a multi-GPU host
-    # with a large shard, _should_distribute can fire; under FSS_MGPU_BACKEND=process the
-    # process backend reads Molecule arrays off each pair (p.ref_molec.atom_pos), which the
-    # lightweight _FastPair stand-ins don't carry -> AttributeError. Mirrors the multi-GPU
-    # screen worker; restored afterward since this runs in the caller's process/thread.
+    # This driver shards the library itself (one shard per call), so the aligner's
+    # transparent multi-GPU dispatch must be suppressed for the duration: the pairs here
+    # are lightweight ``_FastPair`` stand-ins that carry only cached tensors -- no
+    # ``Molecule`` -- so any dispatch path that re-materializes per-pair Molecule arrays
+    # (``p.ref_molec.atom_pos``) would raise AttributeError, and on a multi-GPU host a
+    # large shard would otherwise trip the dispatcher's single-GPU warning mid-screen.
+    # Restore the previous value afterwards: this runs in the caller's process/thread and
+    # may itself be nested inside a per-GPU worker that already set the flag.
     try:
         from shepherd_score.accel.batch import _DISPATCH_LOCAL
     except Exception:
@@ -1256,7 +1252,8 @@ def _screen_many_multigpu(qs, store_path, mode, ndev, batch_kw, top_k, progress)
             p = ctx.Process(target=_screen_worker,
                             args=(r, threads, store_path, ref_arrays_list, mode,
                                   batch_kw, top_k, shard_q, out_q))
-            p.start(); procs.append(p)
+            p.start()
+            procs.append(p)
         results, errs = {}, []
         for _ in range(ndev):
             msg = out_q.get()

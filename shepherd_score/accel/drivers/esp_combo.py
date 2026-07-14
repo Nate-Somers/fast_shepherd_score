@@ -4,33 +4,8 @@
 
 from __future__ import annotations
 
-import os
 import torch
 from typing import Tuple, Optional
-
-# Lever: sparse ESP scoring. vol_and_surf_esp steers the pose by the SHAPE gradient ONLY (the
-# ESP enters just the TRACKED combo score, never the SE(3) derivative), so the optimisation
-# trajectory is byte-identical whether or not the (expensive) ESP score is evaluated on a given
-# step -- per step the ESP costs 2 surface-ESP kernels (N_surf x M_atoms) + 2 SE(3) cloud
-# transforms, ~the bulk of the work, vs one small shape value+grad kernel. We can therefore
-# evaluate the combo score every FINE_ESP_STRIDE steps (always including the final step) and
-# track the best among those, skipping the ESP work on the off-steps. The pose path, gradient,
-# and shape early-stop are unchanged; only best-pose *selection* is sampled more coarsely.
-# Accuracy-gated (the trajectory converges, so the combo peak sits near the scored tail). =1
-# reproduces the dense baseline exactly.
-_ESP_STRIDE = max(1, int(os.environ.get("FINE_ESP_STRIDE", "5")))
-
-# Lever (DEFAULT ON): seed from the VOLUME centers instead of the surface points. vol_and_surf_esp
-# steers the pose by the volume (centers) shape gradient, but historically seeded from the surface
-# clouds -- a mismatch: the surface is far more multi-basin than the heavy-atom volume (legacy
-# standalone surf needed 64 seeds vs vol's 16), so surface seeds needed many more starts to be
-# sure a volume basin was covered. Seeding from the centers aligns the seed PCA starts with the
-# basins the optimiser actually descends, so far fewer seeds reach the same combo score: vol-seed
-# @24 == surf-seed @64
-# on the mean (99.7%; tested on the bench-380 and drugs.smi sets), at ~1.96x the throughput. The
-# matching seed count (24, vs the legacy 64) lives in aligners._MODE_SEEDS. Set FSS_VASE_VOL_SEEDS=0
-# to revert to legacy surface seeds (then bump the seed count back to ~64).
-_VOL_SEEDS = os.environ.get("FSS_VASE_VOL_SEEDS", "1") != "0"
 
 # Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
 # esp_combo reuses the SAME Gaussian shape kernel (vol overlap) as fast_se3/surface
@@ -50,9 +25,17 @@ from ._common import (
     apply_se3_transform,
     quaternion_to_rotation_matrix,
     _update_best,
-    ES_PATIENCE_OVERRIDE,
 )
-from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
+from ._graphed import _GraphedFineBase, run_graphed, graph_cap
+
+# Sparse ESP scoring. vol_and_surf_esp steers the pose by the SHAPE gradient ONLY (the ESP
+# enters just the TRACKED combo score, never the SE(3) derivative), so the optimisation
+# trajectory is identical whether or not the expensive ESP score is evaluated on a given step.
+# The combo score is therefore evaluated every _ESP_STRIDE steps (always including the final
+# step) and the best among those is tracked, skipping the ESP work on the off-steps. The pose
+# path, gradient, and shape early-stop are unchanged; only best-pose *selection* is sampled
+# more coarsely. Setting this to 1 reproduces the dense baseline exactly.
+_ESP_STRIDE = 5
 
 
 @torch.no_grad()
@@ -244,9 +227,7 @@ class _GraphedFineEspCombo(_GraphedFineBase):
     enters only the TRACKED combo score. The captured step mirrors the eager body verbatim
     with the best-update made in-place. Per-step temporaries (transformed clouds, ESP sums,
     score) are fresh, served from the graph's private pool on replay; only the loop-carried
-    state (q/t, Adam moments, best*) is persistent. esp_combo is compute-bound, so graphing
-    mainly UNIFIES the path; the eager loop remains the fallback for large P / capture
-    failure."""
+    state (q/t, Adam moments, best*) is persistent."""
 
     def __init__(self, Nc, Mc, NwH, MwH, Ns, Ms, P, steps,
                  alpha, lam, probe_radius, esp_weight, lr, device):
@@ -413,15 +394,13 @@ def coarse_fine_esp_combo_align_many(
         # fine-optimise ALL seeds and take the per-pair max -- NO coarse-grid +
         # top-k pruning. Pruning on the raw (un-optimised) overlap dropped the
         # true basin for pseudo-symmetric molecules; see
-        # fast_se3.coarse_fine_align_many for the full rationale. Seed from the
-        # VOLUME centers (matches the shape gradient) when _VOL_SEEDS, else the
-        # legacy surface point clouds.
-        if _VOL_SEEDS:
-            quats, t_seeds = batched_seeds_torch(centers_1, centers_2, N_real_centers,
-                                                 M_real_centers, num_seeds=num_seeds)
-        else:
-            quats, t_seeds = batched_seeds_torch(points_1, points_2, N_real_surf_1,
-                                                 M_real_surf_2, num_seeds=num_seeds)
+        # coarse_fine_align_many for the full rationale.
+        # Seed from the VOLUME centers, not the surface clouds: the pose is steered by
+        # the volume shape gradient, so seeding from the centers aligns the seed PCA
+        # starts with the basins the optimiser actually descends. The matching per-mode
+        # seed count lives in shepherd_score/accel/_modes.py::MODE_SEEDS.
+        quats, t_seeds = batched_seeds_torch(centers_1, centers_2, N_real_centers,
+                                             M_real_centers, num_seeds=num_seeds)
         P = quats.size(1)
         q_best = quats.clone()
         t_best = t_seeds.clone()
@@ -524,13 +503,12 @@ def coarse_fine_esp_combo_align_many(
     no_improve_count = 0
 
     # --- CUDA-graph fast path: capture the (shape-grad + 2 value-only ESP + 2 SE3) step and
-    # replay it. esp_combo is compute-bound (heavy surface ESP), so this mainly UNIFIES the
-    # path; the eager loop below remains the fallback for large P / capture failure. ---
+    # replay it; the eager loop below is the fallback for large P / capture failure. ---
     _graphed = None
-    # Low work budget: esp_combo's per-step is heavy (2 surface-ESP kernels + 2 SE3 transforms)
-    # and it runs full steps, so it crosses over sooner than the shape modes -> graph only the
-    # clearly-winning small/mid-P regime, eager beyond (the baseline -- never a regression).
-    if (_FINE_GRAPHS and centers_1_k.is_cuda and centers_1_k.dtype == torch.float32
+    # Low work budget: the per-step cost here is heavy (2 surface-ESP kernels + 2 SE(3)
+    # transforms), so the graph crosses over sooner than the shape modes -- graph only the
+    # small/mid-P regime, eager beyond.
+    if (centers_1_k.is_cuda and centers_1_k.dtype == torch.float32
             and len(q_k) <= graph_cap(N_pad_centers * M_pad_centers, budget=8_000_000)):
         try:
             _graphed = _run_graphed_esp_combo(
@@ -543,10 +521,9 @@ def coarse_fine_esp_combo_align_many(
                 VAA_k, VBB_k, VAA_plus_VBB, q_k, t_k,
                 alpha, lam, probe_radius, esp_weight, lr,
                 # NO blocked early-stop for esp_combo (es_patience defaults to 0 -> full
-                # steps_fine). Its ESP landscape converges slowly AND its trajectory is
-                # non-deterministic, so the trajectory-sensitive early-stop under-ran its
-                # self-copies (0.8513 vs 0.8585). Full steps matches eager (which also runs
-                # ~full here) and recovers parity; esp_combo is launch-heavy so it still wins.
+                # steps_fine). Its ESP landscape converges slowly and its trajectory is
+                # non-deterministic, so a trajectory-sensitive early-stop under-runs; full
+                # steps matches the eager loop, which also runs ~full here.
                 steps_fine,
                 N_pad_centers, M_pad_centers, N_pad_w_H, M_pad_w_H, N_surf, M_surf, len(q_k))
         except Exception:
@@ -593,7 +570,7 @@ def coarse_fine_esp_combo_align_many(
             current_max = best_score.max().item()
             if current_max - prev_max_score < early_stop_tol:
                 no_improve_count += 1
-                if no_improve_count >= (ES_PATIENCE_OVERRIDE or early_stop_patience):
+                if no_improve_count >= early_stop_patience:
                     break
             else:
                 no_improve_count = 0
@@ -769,7 +746,6 @@ def fast_optimize_esp_combo_score_overlay_batch(
     t_best : torch.Tensor (B, 3)
     scores : torch.Tensor (B,)
     """
-    device = ref_centers_batch.device
     BATCH = ref_centers_batch.shape[0]
 
     if N_real_centers is None:

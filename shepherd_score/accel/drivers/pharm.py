@@ -13,7 +13,7 @@ from .pharm_overlap import (
 # (pharmacophore_overlap_triton, imported above, is pure PyTorch and needs no dispatch.)
 from ..kernels.dispatch import fused_adam_qt, pharm_grad_dq_se3_batch
 from ...score.analytical_gradients._torch import build_lookup_tables
-from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
+from ._graphed import _GraphedFineBase, run_graphed, graph_cap
 from . import _common as _fc
 from ._common import (
     check_gpu_available,
@@ -23,7 +23,6 @@ from ._common import (
     apply_so3_transform,
     quaternion_to_rotation_matrix
 )
-from .shape import _CPU_FUSED
 
 # Analytical (autograd-free) pharmacophore value+gradient, reused from the
 # upstream analytical-gradients module. Used to drive the fine loop without
@@ -312,7 +311,7 @@ def coarse_fine_pharm_align_many(
 
     # The Triton value+grad kernel (pharm_score_grad_se3_batch) is the fast,
     # masking-aware path: it matches compute_overlap_and_grad_pharm to ~1e-7 on
-    # value AND gradient (benchmarks/pharm_kernel_parity.py) and is ~20-100x
+    # value AND gradient, and is ~20-100x
     # faster, and -- unlike the analytical torch path -- it handles N_real/M_real
     # masking, so it also covers padded buckets (which previously fell back to the
     # slow per-step autograd path). It implements the base overlap; extended_points
@@ -359,7 +358,7 @@ def coarse_fine_pharm_align_many(
     _graphed = None
     # pharm's directional kernel is heavier per anchor-pair than the gaussian, so it crosses
     # over sooner (~P=40k) -> a lower work budget than the shape/esp modes.
-    if (_FINE_GRAPHS and use_kernel and similarity == 'tanimoto'
+    if (use_kernel and similarity == 'tanimoto'
             and anchors_1_k.is_cuda and anchors_1_k.dtype == torch.float32
             and anchors_1_k.shape[0] <= graph_cap(N_pad * M_pad, budget=10_000_000)):
         try:
@@ -368,7 +367,7 @@ def coarse_fine_pharm_align_many(
                 vectors_1_k.contiguous(), vectors_2_k.contiguous(),
                 types_1_k, types_2_k, N_k, M_k, VAA_an + VBB_an, q_param, t_param,
                 _pk_tables, lr, steps_fine, N_pad, M_pad, anchors_1_k.shape[0],
-                es_patience=(_fc.ES_PATIENCE_OVERRIDE or early_stop_patience), es_tol=early_stop_tol)
+                es_patience=early_stop_patience, es_tol=early_stop_tol)
         except Exception:
             _graphed = None
     if _graphed is not None:
@@ -378,7 +377,7 @@ def coarse_fine_pharm_align_many(
     # Only the default-kernel tanimoto branch (use_kernel) is fused; tversky / extended_points /
     # the padded-autograd path keep the eager loop. The in-register dQ kernel keeps q ~unit each
     # step (like the shape kernel), so the Tanimoto/Adam tail is shared.
-    if (_graphed is None and _CPU_FUSED and not anchors_1.is_cuda and use_kernel
+    if (_graphed is None and not anchors_1.is_cuda and use_kernel
             and similarity == 'tanimoto' and anchors_1_k.dtype == torch.float32):
         try:
             from ..kernels.cpu_fused import cpu_fused_pharm
@@ -386,7 +385,7 @@ def coarse_fine_pharm_align_many(
             best_score, best_q, best_t = cpu_fused_pharm(
                 anchors_1_k, anchors_2_k, vectors_1_k, vectors_2_k, types_1_k, types_2_k,
                 q_param, t_param, N_k, M_k, VAA_an + VBB_an, _al, _Ks, _cats, lr, steps_fine,
-                (_fc.ES_PATIENCE_OVERRIDE or early_stop_patience), early_stop_tol)
+                early_stop_patience, early_stop_tol)
             _graphed = True                                # skip the eager loop below
         except Exception:
             pass                                           # fall through to the eager loop
@@ -477,7 +476,7 @@ def coarse_fine_pharm_align_many(
             current_max = best_score.max().item()
             if current_max - prev_max_score < early_stop_tol:
                 no_improve_count += 1
-                if no_improve_count >= (_fc.ES_PATIENCE_OVERRIDE or early_stop_patience):
+                if no_improve_count >= early_stop_patience:
                     break
             else:
                 no_improve_count = 0
@@ -718,7 +717,6 @@ def fast_optimize_pharm_overlay_batch(
     t_batch : torch.Tensor (B, 3)
     scores : torch.Tensor (B,)
     """
-    device = ref_anchors_batch.device
     BATCH = ref_anchors_batch.shape[0]
     N_pad = ref_anchors_batch.shape[1]
     M_pad = fit_anchors_batch.shape[1]

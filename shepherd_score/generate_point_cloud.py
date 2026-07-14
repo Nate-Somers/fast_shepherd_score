@@ -7,10 +7,17 @@ Surface generation workflow adapted from Open Drug Discovery Toolkit:
 """
 from __future__ import annotations   # annotations as strings -> o3d not needed at import
 
-from typing import Tuple, List
+from typing import Tuple, List, Union
 
 import numpy as np
+import rdkit
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from scipy.spatial import distance
+from scipy.special import logsumexp
+
 from shepherd_score.score.constants import COULOMB_SCALING
+
 
 # Open3D is imported LAZILY (on first real use), not at module load: it is a ~30s
 # cold import and -- importantly -- it is fork-hostile (importing it poisons a later
@@ -26,13 +33,6 @@ class _LazyOpen3D:
 
 o3d = _LazyOpen3D()
 
-import rdkit
-from rdkit import Chem
-from rdkit.Chem import AllChem
-from scipy.spatial import distance
-from scipy.special import logsumexp
-from typing import Union
-
 PT = Chem.GetPeriodicTable()
 
 # ---------------------------------------------------------------------------
@@ -41,11 +41,11 @@ PT = Chem.GetPeriodicTable()
 # Molecule surface (method='mesh') is unchanged. `s` is the smooth-min sharpness:
 # smaller rounds the concave atom-border "crimps" more (less atom-position leak) and
 # pushes points farther off the exact spheres; larger -> sharper union (more leak).
-SMOOTH_SDF_S = 10.0       # smooth-min sharpness; s~10 ~matches the mesh's ~0.010 A off-sphere level
-                          # (smaller rounds crimps more / less leak; larger -> sharp on-sphere union)
-SMOOTH_SDF_NSPA = 15      # candidate samples/atom for the smooth path (vs 25 for the mesh, which
-                          # needs the denser cloud to mesh). 15 keeps blue-noise evenness while
-                          # ~halving the candidate+projection+FPS cost vs 25 (validated).
+SMOOTH_SDF_S = 10.0       # smooth-min sharpness; smaller rounds the concave atom-border crimps more
+                          # (points sit farther off the exact spheres, less atom-position leak),
+                          # larger approaches the sharp sphere union
+SMOOTH_SDF_NSPA = 15      # candidate samples/atom for the smooth path (the mesh path uses 25
+                          # because it needs a denser cloud to mesh)
 SMOOTH_SDF_ITERS = 6      # Newton projection steps
 SMOOTH_SDF_KNN = 8        # nearest atoms per point in the smooth-min (cost ~ O(M*knn))
 SMOOTH_SDF_JITTER = 0.0   # optional extra off-sphere jitter (A) to mimic mesh facet noise
@@ -489,8 +489,8 @@ def get_molecular_surface(centers:np.ndarray,
 # =============================================================================
 # Mesh-free smooth + stochastic surfacer (opt-in; Open3D-free)
 # -----------------------------------------------------------------------------
-# Replaces the ~50 ms Open3D ball-pivoting mesh used purely to evenly resample
-# surface points. For the GENERATIVE pipeline the surface must (a) be smooth so a
+# Replaces the Open3D ball-pivoting mesh used purely to evenly resample surface
+# points. For the GENERATIVE pipeline the surface must (a) be smooth so a
 # network cannot read atom centers off it ("leak") and (b) be stochastic. This
 # path keeps both: it samples the union-of-(vdW+probe)-spheres envelope, projects
 # the points onto a smooth-min implicit iso-surface (which rounds the concave
@@ -612,8 +612,8 @@ def get_molecular_surface_smooth_sdf(centers: np.ndarray,
     Smoothness / anti-leak is tuned by ``s`` (smaller = smoother / more off-sphere / less leak).
 
     IMPORTANT: this is opt-in. The default ``Molecule`` surface (``method='mesh'``) is unchanged.
-    Using this on the generative path is a distribution shift relative to a model trained on the
-    mesh surface; it must be validated (leak metric + the external ConditionalEval / retrain).
+    Using this instead of the mesh surface is a distribution shift relative to a model trained on
+    the mesh surface.
 
     Parameters
     ----------

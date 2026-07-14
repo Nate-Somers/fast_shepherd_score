@@ -1,17 +1,14 @@
 """Generic CUDA-graph fine-loop: capture ONE Adam optimisation step, replay it N times.
 
-The per-pose fine loop is launch-bound at small/medium batch (~10 kernel launches per
-step for the single-channel modes, ~2x that for vol_color). We capture one in-place fine
-step into a CUDA graph and replay it ``steps`` times -- replay carries loop state between
-steps through persistent buffers, so N replays == N eager steps with ~zero per-step host
-launch overhead. This is fss's analogue of ROSHAMBO2's in-kernel optimisation loop (one
-launch drives the whole optimisation; the GPU never waits on the host between steps).
+The per-pose fine loop is launch-bound at small/medium batch. One in-place fine step is
+captured into a CUDA graph and replayed ``steps`` times -- replay carries loop state between
+steps through persistent buffers, so N replays == N eager steps, with ~zero per-step host
+launch overhead.
 
-Originally this lived only in ``shape.py`` (``_GraphedFineSurf``), covering vol/surf. This
-module lifts the mode-agnostic capture/replay machinery into a base class so every mode can
-share it: a subclass only supplies its persistent buffers (``__init__``/``_alloc``), the
-per-step body (``_step``), how a bucket's inputs load into the buffers (``_load``), the
-loop-state reset (``_reset``), and the result (``_result``).
+The capture/replay machinery is mode-agnostic and lives in the base class here: a subclass
+supplies only its persistent buffers (``__init__``), the per-step body (``_step``), how a
+bucket's inputs load into the buffers (``_load``), the loop-state reset (``_reset``), and the
+result (``_result``).
 
 Why intra-capture kernel allocations are fine
 ---------------------------------------------
@@ -19,47 +16,30 @@ The value+grad kernels (``overlap_score_grad_se3_batch`` etc.) allocate their ou
 tensors internally each call. That is *not* a capture blocker: under ``torch.cuda.graph``
 those allocations come from the graph's private memory pool and get fixed addresses reused
 on every replay. The two things that DO break capture -- and that every ``_step`` must
-avoid -- are (1) host syncs / data-dependent control flow inside the loop (the ``.item()``
-early-stop: dropped here in favour of a fixed replay count) and (2) Python rebinding of
-loop-carried tensors (the functional ``_update_best`` that returns new tensors: every
-``_step`` instead updates ``best``/``best_q``/``best_t`` in place via ``where(..., out=)``).
-Autotune/JIT must also be warmed BEFORE capture -- ``capture()`` does three warmup steps in
-a side stream for exactly this.
+avoid -- are (1) host syncs / data-dependent control flow inside the captured step (the
+blocked early-stop's ``.item()`` sync therefore happens OUTSIDE the graph, between replays)
+and (2) Python rebinding of loop-carried tensors (so a ``_step`` must not use the functional
+``_update_best``, which returns new tensors; it updates ``best``/``best_q``/``best_t`` in
+place via ``where(..., out=)``). Autotune/JIT must also be warmed BEFORE capture --
+``capture()`` does three warmup steps in a side stream for exactly this.
 """
 from __future__ import annotations
 
-import os
 from collections import OrderedDict
 import torch
 
-# Shared env knobs (single source of truth; shape.py and every other driver import these).
-# Disable the whole graph fast path with FINE_CUDA_GRAPHS=0.
-_FINE_GRAPHS = os.environ.get("FINE_CUDA_GRAPHS", "1") != "0"
-# Max pose-rows P for a single captured graph. Above this the eager loop is used (it is
-# compute-bound there, so the graph stops helping) UNLESS the mode opts into chunked replay
-# via run_graphed_chunked (the launch-bound modes, where it keeps helping at large batch).
-_GRAPH_MAX_P = int(os.environ.get("FINE_GRAPH_MAX_P", 16000))
-
 # --- compute-aware P-cap ----------------------------------------------------------------
-# The graph's win is launch-bound: its launch-savings are ~fixed per step, while its only
-# large-P cost grows with the per-row kernel work. So the P at which the graph stops beating
-# eager (the crossover) scales as work_budget / (per-row work). Measured crossovers (H200):
-# vol (heavy-atom clouds, N_pad*M_pad ~ 256-1024) wins to P ~ 1M; surf (128-point clouds,
-# ~16384) crosses at P ~ 16-18k -- and work*P is ~constant (~3e8) across both, because they
-# share the gaussian kernel. So cap = clamp(BUDGET // (N_pad*M_pad), MIN, CEIL) graphs each
-# mode/bucket exactly where it wins and falls to eager (the baseline -- never a regression)
-# where it would lose. This makes ONE formula cover the vol/surf and vol_esp/surf_esp
-# shared-code splits (light clouds -> high cap, heavy clouds -> low cap) automatically.
-# CEIL bounds the per-graph buffer memory (important for the screen path's large buckets).
-_GRAPH_WORK_BUDGET = int(os.environ.get("FINE_GRAPH_WORK_BUDGET", 300_000_000))
-# Per-graph memory ceiling on P. 256k covers the 100k-library screen buckets (P~187k) for
-# the light modes; their buffers are ~1KB/row so a single graph is ~270MB. Lower this on
-# memory-constrained GPUs (the heavy modes are already work-budget-limited well below it).
-# NOTE: raising this ADAPTIVELY with free memory to cut the residual large-N chunk/sync
-# "stitching" cost was measured to REGRESS (bigger graph buffers starve the fine loop's
-# sub-batch chunks -> more chunks, not fewer; vol kernel@1M -6% -> -13%). Kept fixed.
-_GRAPH_CAP_CEIL = int(os.environ.get("FINE_GRAPH_CAP_CEIL", 262144))
-_GRAPH_CAP_MIN = int(os.environ.get("FINE_GRAPH_CAP_MIN", 2000))
+# The graph's win is launch-bound: its per-step launch savings are ~fixed, while its cost
+# grows with the per-row kernel work. So the P at which it stops beating eager scales as
+# budget / (per-row work): cap = clamp(BUDGET // (N_pad*M_pad), MIN, CEIL) graphs each
+# mode/bucket only where it wins and falls back to the eager loop (the baseline -- never a
+# regression) where it would lose. One formula therefore covers the light-cloud and
+# heavy-cloud splits that share a kernel (vol/surf, vol_esp/surf_esp) automatically.
+# CEIL is a fixed per-graph memory ceiling on P (buffers are ~1KB/row, so 256k rows is a
+# ~270MB graph); lower it on memory-constrained GPUs.
+_GRAPH_WORK_BUDGET = 300_000_000
+_GRAPH_CAP_CEIL = 262144
+_GRAPH_CAP_MIN = 2000
 
 
 def graph_cap(work, budget=None):
@@ -67,33 +47,24 @@ def graph_cap(work, budget=None):
     N_pad*M_pad). Below this the graph wins; above it the gating falls back to eager."""
     b = _GRAPH_WORK_BUDGET if budget is None else budget
     return max(_GRAPH_CAP_MIN, min(_GRAPH_CAP_CEIL, int(b) // max(int(work), 1)))
-# Fixed replay cap when early-stop is disabled. Otherwise the graph replays UP TO steps_fine
-# and stops early (see below), so this is mostly legacy.
-_GRAPH_STEPS = int(os.environ.get("FINE_GRAPH_STEPS", 50))
-# Blocked early-stop for the replay loop: check best.max() every _GRAPH_ES_BLOCK replays
-# (one host sync per block, NOT per step) and stop on the same patience/tol schedule as the
-# eager loop. This is essential -- without it the graph runs a FIXED step count and OVER-RUNS
-# vs the eager early-stop, which regresses the COMPUTE-bound modes (surf, esp_combo, pharm at
-# large batch) where the extra steps cost real kernel time. With it, the graph runs ~the same
-# number of steps as eager, so the launch-bound modes keep their big win and the compute-bound
-# modes stop regressing. Set _GRAPH_ES_BLOCK=0 to disable (fixed-step replay).
-_GRAPH_ES_BLOCK = int(os.environ.get("FINE_GRAPH_ES_BLOCK", 5))
-# Extra early-stop margin (in blocks) ADDED to the eager patience for the graph replay loop.
-# The multi-basin modes (surf, esp) land in different near-equal optima under tiny numerical
-# perturbations, so matching the eager step count EXACTLY exposes +/-0.4% basin noise (surf
-# came in at -0.43% with no margin). One extra block of optimisation reliably keeps the
-# graph's mean >= eager across that noise -- cheap for launch-bound modes, minor for surf.
-_GRAPH_ES_MARGIN = int(os.environ.get("FINE_GRAPH_ES_MARGIN", 2))
+# Blocked early-stop for the replay loop: check best.max() every _GRAPH_ES_BLOCK replays (one
+# host sync per block, NOT per step) and stop on the same patience/tol schedule as the eager
+# loop. The blocked early-stop MUST reproduce the eager schedule: otherwise the graph runs a
+# fixed step count, OVER-RUNS the eager early-stop, and the compute-bound modes (surf,
+# esp_combo, pharm at large batch) regress on the extra kernel time.
+_GRAPH_ES_BLOCK = 5
+# Extra early-stop margin, in blocks, ADDED to the eager patience for the graph replay loop.
+# The multi-basin modes (surf, surf_esp) land in different near-equal optima under tiny
+# numerical perturbations, so they need this margin for the graph never to score below eager.
+_GRAPH_ES_MARGIN = 2
 
 # Process-wide LRU cache of captured graphs, keyed by (device, mode, shapes, P, steps, params).
-# It is BOUNDED: each cached graph pins persistent GPU buffers (~P*buffers bytes), so an
-# unbounded cache lets a long/large workload -- a big screen (many library-mol shapes), or a
-# benchmark sweep over many sizes/modes -- accumulate GPU memory until fragmentation/OOM makes
-# new captures fail and the driver silently falls back to eager (measured: later cells in a
-# sweep degraded 12-27x, BELOW even eager). Evicting the least-recently-used graph frees its
-# buffers; FINE_GRAPH_CACHE_MAX caps how many live at once.
+# It MUST stay bounded: each cached graph pins persistent GPU buffers (~P*buffers bytes), so an
+# unbounded cache lets a long/large workload accumulate GPU memory until fragmentation/OOM makes
+# new captures fail and the driver silently falls back to eager. Evicting the least-recently-used
+# graph frees its buffers; _GRAPH_CACHE_MAX caps how many live at once.
 _FINE_GRAPH_CACHE: "OrderedDict" = OrderedDict()
-_GRAPH_CACHE_MAX = int(os.environ.get("FINE_GRAPH_CACHE_MAX", 24))
+_GRAPH_CACHE_MAX = 24
 
 
 def _evict_lru():
@@ -162,15 +133,13 @@ class _GraphedFineBase:
         """Load this bucket, reset loop state, replay the captured step (with blocked
         early-stop when enabled), and return the best pose."""
         self._load(*inputs); self._reset()
-        if self.es_patience and self.es_block:
-            # Mirror the eager early-stop schedule EXACTLY. Eager checks best.max() at steps
-            # 0, 5, 10, ... and seeds its baseline `prev` with the STEP-0 value (the best of
-            # the seed poses). best is max-over-past-poses, so after one replay it equals
-            # eager's step-0 best. So: replay one step, seed `prev`, then check every es_block
-            # replays. Matching the *schedule* (not just patience/tol) is essential -- seeding
-            # `prev` a block late made the graph stop ~one block early, which regressed
-            # slow-converging surf_esp by ~1%. With this, the graph stops at the same step as
-            # eager, so best is bit-equivalent.
+        if self.es_patience:
+            # Mirror the eager early-stop SCHEDULE exactly, not just its patience/tol. Eager
+            # checks best.max() at steps 0, 5, 10, ... and seeds its baseline `prev` with the
+            # STEP-0 value (the best of the seed poses). `best` is a max over past poses, so
+            # after one replay it equals eager's step-0 best: replay one step, seed `prev`
+            # from it, then check every es_block replays. The graph then stops at the same
+            # step as eager and `best` is equivalent.
             self.graph.replay()
             done = 1
             prev = self.best.max().item(); no_improve = 0
@@ -222,30 +191,3 @@ def run_graphed(make, key, inputs, *, es_patience=0, es_tol=1e-5):
     while len(_FINE_GRAPH_CACHE) > _GRAPH_CACHE_MAX:
         _evict_lru()
     return gf.run(*inputs)
-
-
-def run_graphed_chunked(make, key_for, inputs, *, P, max_p, es_patience=0, es_tol=1e-5):
-    """Cap-lift: drive an arbitrarily large P through graphs of size <= ``max_p``.
-
-    Poses (rows) are independent, so slicing the pose dimension into chunks and running each
-    chunk through its own (cached) graph is exactly equivalent to running all P at once -- as
-    long as results are concatenated back in row order. Every element of ``inputs`` is a
-    per-pose tensor (dim 0 == P), so slicing is generic (``x[s:e]``) and the three outputs
-    (best, best_q, best_t) concatenate along dim 0. This bounds the per-graph buffer memory
-    (essential for the screen path, where P can be huge) while keeping the launch-bound win;
-    at most two distinct chunk sizes occur (``max_p`` and the remainder), so at most two
-    graphs are captured per key.
-
-      * ``make(p_chunk)``    -> factory for a chunk-sized subclass instance
-      * ``key_for(p_chunk)`` -> cache key for a chunk of that size
-    """
-    if P <= max_p:
-        return run_graphed(lambda: make(P), key_for(P), inputs,
-                           es_patience=es_patience, es_tol=es_tol)
-    outs = []
-    for s in range(0, P, max_p):
-        e = min(s + max_p, P); pc = e - s
-        sub = tuple(x[s:e].contiguous() for x in inputs)
-        outs.append(run_graphed(lambda pc=pc: make(pc), key_for(pc), sub,
-                                es_patience=es_patience, es_tol=es_tol))
-    return tuple(torch.cat([o[i] for o in outs], 0) for i in range(len(outs[0])))

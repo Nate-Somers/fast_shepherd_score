@@ -20,8 +20,6 @@ def _band_key(n: int) -> int:
 # Measured fine-loop footprint (bytes per pair) keyed by (mode, N_pad, M_pad,
 # num_seeds). Lets the sub-batcher size each bucket's chunk to the GPU.
 _PAIR_FOOTPRINT_BYTES: dict[tuple, int] = {}
-# Set env SUBBATCH_DEBUG=1 to print the chosen chunk size per bucket.
-_SUBBATCH_DEBUG = bool(os.environ.get("SUBBATCH_DEBUG"))
 
 
 def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
@@ -60,13 +58,9 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
     fp = _PAIR_FOOTPRINT_BYTES.get(key)
     need_resize = fp is None
     K_sub = max(1, min(K, int(_budget() // fp))) if fp else min(K, init_cap)
-    if _SUBBATCH_DEBUG:
-        print(f"[subbatch] key={key} K={K} init_fp={fp} K_sub0={K_sub} "
-              f"free={torch.cuda.mem_get_info()[0]//(1024*1024)}MiB", flush=True)
 
     sc_parts, q_parts, t_parts = [], [], []
     s = 0
-    _nchunks = 0; _noom = 0; _ks = []                            # diag (SUBBATCH_DEBUG)
     while s < K:
         k = min(K_sub, K - s)
         try:
@@ -86,9 +80,6 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
                 _PAIR_FOOTPRINT_BYTES[key] = max(_PAIR_FOOTPRINT_BYTES.get(key, 0), fp_meas)
             sc_parts.append(sc); q_parts.append(q); t_parts.append(t)
             s += k
-            _nchunks += 1
-            if _SUBBATCH_DEBUG:
-                _ks.append(k)
             if need_resize:   # first success -> we now know the real footprint
                 fp = _PAIR_FOOTPRINT_BYTES[key]
                 remaining = K - s
@@ -101,17 +92,9 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
                     and "out of memory" not in str(exc).lower():
                 raise
             torch.cuda.empty_cache()
-            _noom += 1
-            if _SUBBATCH_DEBUG:
-                print(f"[subbatch] OOM at k={k} (after {_nchunks} ok) "
-                      f"free={torch.cuda.mem_get_info()[0]//(1024*1024)}MiB -> K_sub={max(1, k // 2)}",
-                      flush=True)
             if k <= 1:
                 raise
             K_sub = max(1, k // 2)
-    if _SUBBATCH_DEBUG:
-        print(f"[subbatch] DONE key={key} K={K} nchunks={_nchunks} noom={_noom} "
-              f"ks={_ks} final_fp={_PAIR_FOOTPRINT_BYTES.get(key)}", flush=True)
     return torch.cat(sc_parts), torch.cat(q_parts), torch.cat(t_parts)
 
 
@@ -121,9 +104,8 @@ def _scatter_fill(out: torch.Tensor, tensors: list[torch.Tensor], sizes: list[in
 
     Bit-identical to a per-pair ``out[i, :n] = t`` loop / ``pad_sequence`` fill, but
     it copies via ONE batched ``torch.cat`` + ONE vectorized scatter instead of ``K``
-    launch-bound device copies. That fill is the dominant per-pair *host* cost at
-    large batch -- on an RTX 4050 it drops a K=10000 (ref+fit) fill from ~100 ms to
-    ~3 ms. ``out``'s padding rows are left untouched (the caller zeroes them), so the
+    launch-bound device copies -- that fill is the dominant per-pair *host* cost at large
+    batch. ``out``'s padding rows are left untouched (the caller zeroes them), so the
     result is deterministic and exactly equal to the previous fill.
     """
     K, P_pad = out.shape[0], out.shape[1]

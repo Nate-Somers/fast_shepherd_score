@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import torch, math, os
-# Kernels are dispatched per-call by tensor device (Triton on CUDA, numba on CPU) via
-# kernel_dispatch, so one process can run both -- e.g. backend="numba" runs CPU tensors
-# through the numba kernels even on a GPU box. ``_HAS_TRITON`` is kept for external /
-# diagnostic consumers; it no longer drives kernel selection (the device does).
+import torch
+# Kernels are dispatched per-call by tensor device (Triton on CUDA, numba on CPU), so one
+# process can run both -- e.g. backend="numba" runs CPU tensors through the numba kernels
+# even on a GPU box.
 from ..kernels.dispatch import (
     overlap_score_grad_se3_batch, fused_adam_qt_with_tangent_proj,
     _batch_self_overlap,
 )
 from ._common import batched_seeds_torch, _update_best
-from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
+from ._graphed import _GraphedFineBase, run_graphed, graph_cap
 from typing import Optional
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -78,40 +77,6 @@ def _self_overlap_in_chunks(P_pad, N_real, alpha=0.81):
         V_all[s:e] = _batch_self_overlap(
             P_pad[s:e], N_real[s:e], alpha)   # ← original function
     return V_all
-
-
-# ----------------------------------------------------------------------------
-# CUDA-graph fast path for the surf/vol fine loop (gaussian kernel).
-#
-# The fine loop is launch-bound at small batch (~10 kernel launches/step). We
-# capture ONE in-place fine step into a CUDA graph and replay it N times -- replay
-# carries state between steps, so N replays == N steps with ~zero per-step launch
-# overhead. Bit-identical to the eager loop (microbench-validated: max|delta|=0),
-# ~2.7x faster at batch 16, fading to ~1x by batch 256 (compute-bound). So it is
-# used ONLY for small P (where it helps and the per-shape buffers are cheap);
-# large P and any capture failure fall back to the eager loop. Disable with
-# FINE_CUDA_GRAPHS=0. The capture/replay machinery + env knobs (_FINE_GRAPHS,
-# _GRAPH_MAX_P, _GRAPH_STEPS) now live in ._graphed and are shared by all 7 modes.
-
-# Early seed-prune (H1): after _PRUNE_AFTER fine steps, keep only the top
-# _PRUNE_KEEP seeds per pair (by current best score) and finish only those. Cuts
-# pose-steps from ~num_seeds*steps to num_seeds*K + keep*(steps-K). A few steps of
-# optimisation make the score a good basin predictor (unlike the 0-step prune that
-# was removed). OFF by default (=0); accuracy-gated via benchmarks/experiments/speedlab.py.
-_PRUNE_AFTER = int(os.environ.get("FINE_PRUNE_AFTER", 0))
-_PRUNE_KEEP = int(os.environ.get("FINE_PRUNE_KEEP", 0))
-
-# Early-stop trim (H2/Lever 2): patience=5 (5 checks x 5 steps = 25 steps after the
-# best stops improving) over-runs on the fast-converging self-copy benchmark.
-# Module-level overrides (None -> use the call's params); set via speedlab.
-_ES_PATIENCE = (lambda v: int(v) if v else None)(os.environ.get("FINE_ES_PATIENCE"))
-_ES_TOL = (lambda v: float(v) if v else None)(os.environ.get("FINE_ES_TOL"))
-
-# Opt-in fully-fused CPU (numba) fine loop — a FIRST-CLASS CPU path, not the GPU eager fallback.
-# Removes torch from the hot loop (the per-step torch score/best/Adam tail AND the constant-array
-# torch->numpy re-marshalling), running the validated numba overlap kernel + an njit Adam/score
-# tail entirely in prange. Same seeds/steps as the Triton path. Disable with FSS_CPU_FUSED=0.
-_CPU_FUSED = os.environ.get("FSS_CPU_FUSED", "1") != "0"
 
 
 class _GraphedFineSurf(_GraphedFineBase):
@@ -193,14 +158,9 @@ def coarse_fine_align_many(
         num_seeds: int = 50,
         steps_fine: int = 100,
         lr: float = 0.075,
-        topk: int | None = None,        # deprecated: pruning removed (see below)
         N_real: torch.Tensor | None = None,
         M_real: torch.Tensor | None = None,
-        early_stop_patience: int = 2,   # Lever 2: surf/vol self-copies converge fast;
-                                        # patience 5 over-ran ~25 steps. =2 is paired-
-                                        # validated accuracy-safe (distinct max|Δ|=0,
-                                        # self=1.0). esp/pharm converge slower -> they
-                                        # keep 5 (patience 2 there cost ~8e-3).
+        early_stop_patience: int = 2,   # vol/surf converge fast; esp/pharm use 5
         early_stop_tol: float = 1e-5,
         seeds: tuple | None = None,
         prune_after: int = 0, prune_keep: int = 0):
@@ -212,20 +172,13 @@ def coarse_fine_align_many(
     rotations, each with a COM-aligning translation -- then fine-optimise EVERY
     seed and take the per-pair best.
 
-    Why no coarse-grid + top-k pruning anymore
-    ------------------------------------------
-    The previous implementation built a 500-pose grid (250 rotations x 2
-    translations), scored every pose with a single un-optimised overlap, kept
-    only the top-k by that raw score, and fine-tuned those. The raw overlap of an
-    un-optimised seed is a poor predictor of its post-optimisation score, so for
-    pseudo-symmetric molecules (caffeine, benzene, ...) pruning repeatedly
-    discarded the seed sitting in the true basin while keeping decoys that
-    plateau at a lower local optimum -- pulling the score ~5% below the reference
-    on real molecules (worst case ~0.4). Optimising all seeds removes the
-    fragile ranking step entirely: it is provably >= the reference (same seeds,
-    >= optimisation power, take-the-max) and -- because the fine loop is
-    launch-bound, not pose-bound -- costs only ~1.3x while restoring exact
-    parity. `topk` is accepted for call-site compatibility but ignored.
+    No coarse-grid top-k prune
+    --------------------------
+    Seeds are never ranked by their raw, un-optimised overlap: that score does
+    not predict a seed's post-optimisation result, so ranking on it discards the
+    seed sitting in the true basin for pseudo-symmetric molecules and keeps
+    decoys that plateau at a lower local optimum. Every seed therefore enters the
+    fine loop, and the per-pair max is taken.
 
     Parameters
     ----------
@@ -275,31 +228,28 @@ def coarse_fine_align_many(
     best_score = best_q = best_t = None
 
     # --- CUDA-graph fast path for the launch-bound regime --------------------
-    # Compute-aware cap: vol's light heavy-atom clouds graph far out (wins to P~1M); surf's
-    # heavy 128-point clouds cap low (eager past P~16-18k, where the graph would lose). One
-    # formula, since vol/surf share this kernel. See graph_cap.
-    if (best_score is None and _FINE_GRAPHS and A_batch.is_cuda
-            and P <= graph_cap(N_pad * M_pad) and A_batch.dtype == torch.float32):
+    # Compute-aware cap: one formula covers vol and surf, which share this kernel -- see
+    # graph_cap.
+    if (A_batch.is_cuda and P <= graph_cap(N_pad * M_pad)
+            and A_batch.dtype == torch.float32):
         try:
             best_score, best_q, best_t = _run_graphed_fine(
                 A_k.contiguous(), B_k.contiguous(), q_seed, t_seed, N_k, M_k,
                 VAA_plus_VBB, alpha, lr, steps_fine, N_pad, M_pad, P,
-                es_patience=(_ES_PATIENCE if _ES_PATIENCE is not None else early_stop_patience),
-                es_tol=(_ES_TOL if _ES_TOL is not None else early_stop_tol))
+                es_patience=early_stop_patience, es_tol=early_stop_tol)
         except Exception:
             best_score = None                              # capture failed -> eager
 
     # --- opt-in CPU (numba) fast path: fully-fused fine loop, NO torch in the hot loop ------
-    # Skipped when a seed-prune is requested (surf; handled by the eager loop) or for fp64;
-    # any failure falls through to the eager loop. Same seeds/steps as every other path.
-    if (best_score is None and _CPU_FUSED and not A_batch.is_cuda
-            and A_batch.dtype == torch.float32 and (prune_after or _PRUNE_AFTER) == 0):
+    # Skipped for fp64; any failure falls through to the eager loop. Same seeds/steps as
+    # every other path.
+    if (best_score is None and not A_batch.is_cuda
+            and A_batch.dtype == torch.float32):
         try:
             from ..kernels.cpu_fused import cpu_fused_shape
             best_score, best_q, best_t = cpu_fused_shape(
                 A_k, B_k, q_seed, t_seed, N_k, M_k, VAA_plus_VBB, alpha, lr, steps_fine,
-                _ES_PATIENCE if _ES_PATIENCE is not None else early_stop_patience,
-                _ES_TOL if _ES_TOL is not None else early_stop_tol)
+                early_stop_patience, early_stop_tol)
         except Exception:
             best_score = None                              # fused failed -> eager
 
@@ -314,15 +264,11 @@ def coarse_fine_align_many(
         best_q = q_k.clone()
         best_t = t_k.clone()
 
-        # Early stopping state (module overrides win if set -- Lever 2)
-        es_patience = _ES_PATIENCE if _ES_PATIENCE is not None else early_stop_patience
-        es_tol = _ES_TOL if _ES_TOL is not None else early_stop_tol
+        # Early stopping state
+        es_patience = early_stop_patience
+        es_tol = early_stop_tol
         prev_max_score = -float('inf')
         no_improve_count = 0
-        # Coarse-to-fine seed prune: caller (per-mode) override takes precedence over the
-        # global FINE_PRUNE_* env. surf passes (15, 24); vol passes 0 (its 16 seeds < keep).
-        _pa = prune_after or _PRUNE_AFTER
-        _pk = prune_keep or _PRUNE_KEEP
 
         for step in range(steps_fine):
             VAB, dQ, dT = _overlap_in_chunks(
@@ -334,20 +280,6 @@ def coarse_fine_align_many(
             scale = VAA_plus_VBB / (denom * denom)
 
             best_score, best_q, best_t = _update_best(score, q_k, t_k, best_score, best_q, best_t)
-
-            # --- early seed-prune (H1): keep only top-KEEP seeds/pair, finish those ---
-            if _pa and _pk and step == _pa - 1 and S > _pk:
-                topi = best_score.view(BATCH, S).topk(_pk, dim=1).indices
-                gidx = (topi + torch.arange(BATCH, device=device).unsqueeze(1) * S).reshape(-1)
-                q_k = q_k[gidx].contiguous(); t_k = t_k[gidx].contiguous()
-                m_q = m_q[gidx].contiguous(); v_q = v_q[gidx].contiguous()
-                m_t = m_t[gidx].contiguous(); v_t = v_t[gidx].contiguous()
-                best_score = best_score[gidx].contiguous()
-                best_q = best_q[gidx].contiguous(); best_t = best_t[gidx].contiguous()
-                A_k = A_k[gidx].contiguous(); B_k = B_k[gidx].contiguous()
-                N_k = N_k[gidx].contiguous(); M_k = M_k[gidx].contiguous()
-                VAA_plus_VBB = VAA_plus_VBB[gidx].contiguous()
-                S = _pk
 
             # Early stopping check, gated to every 5 steps to avoid a per-step
             # GPU->CPU sync. Gating only makes early-stop *less* aggressive.
@@ -379,16 +311,3 @@ def coarse_fine_align_many(
     return final_score.flatten()[sel], \
            best_q.view(BATCH, S, 4)[torch.arange(BATCH), best], \
            best_t.view(BATCH, S, 3)[torch.arange(BATCH), best]
-
-
-
-
-
-
-
-
-
-
-
-
-

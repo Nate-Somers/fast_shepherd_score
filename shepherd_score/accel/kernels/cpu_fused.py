@@ -1,26 +1,20 @@
-"""Opt-in CPU (numba) fine-loop driver — a first-class CPU path, NOT the GPU fallback.
+"""Fused CPU (numba) fine-loop driver — a first-class CPU path, not a GPU fallback.
 
-The GPU drivers' eager loop runs the numba overlap+grad kernel for the heavy O(K·N·M) work
-but does the per-step score/best/Adam tail in **torch** and re-marshals the constant coordinate
-blocks ``A``/``B`` torch->numpy every step. On CPU that tail is (a) serial (only the kernel
-``prange``s) so multi-core gain is Amdahl-capped, and (b) catastrophic when torch's own thread
-pool (``OMP_NUM_THREADS``) contends with numba's ``prange`` — measured ~5-8x slower at 8 threads.
+Constraints this module exists to satisfy:
 
-This module removes torch from the hot loop entirely. The constant inputs are converted to
-numpy ONCE; each step calls the existing (validated) overlap+grad njit kernel, then a small
-``@njit(parallel=True)`` TAIL that does Tanimoto score + best-pose tracking + tangent-projected
-Adam + renorm, all in ``prange`` over poses, in place. The Python loop only chains the two njit
-calls and does the every-5-steps early-stop check (a numpy ``.max()`` — no torch).
-
-PARITY: the overlap+grad kernels are reused unchanged (same dV/dq math), and the tail replicates
-``fused_adam_qt_with_tangent_proj`` exactly (β1=0.9, β2=0.999, eps=1e-8 inside the sqrt, no bias
-correction, unit-quaternion renorm) and ``_update_best`` (track the pre-Adam pose by score). The
-seed set and step count are the caller's (identical to the Triton path — same ``_MODE_SEEDS`` /
-``_MODE_STEPS``). The only intended numeric difference vs the eager path is fastmath reassociation.
+* No torch in the hot loop. torch's thread pool (``OMP_NUM_THREADS``) contends with numba's
+  ``prange``, and the per-step score/best/Adam tail would be serial. Inputs are marshalled to
+  numpy once; each step chains the overlap+grad njit kernel with an njit ``prange`` tail, and
+  the early-stop check is a numpy ``.max()``.
+* The tail must stay bit-compatible with ``fused_adam_qt_with_tangent_proj``: β1=0.9,
+  β2=0.999, eps=1e-8 *inside* the sqrt, no bias correction, unit-quaternion renorm — and with
+  ``_update_best``: the tracked best pose is the PRE-Adam pose. Seeds, step count and
+  early-stop are the caller's; this module does not define its own schedule.
+* Intended numeric differences vs the eager path: fastmath reassociation in the overlap
+  kernels (the tails are ``fastmath=False``), plus fp32 accumulation on the SoA kernels.
 """
 from __future__ import annotations
 
-import os
 import numpy as np
 from numba import njit, prange
 
@@ -29,22 +23,18 @@ _B1 = 0.9
 _B2 = 0.999
 _EPS = 1e-8
 
-# Lever 2+3: use the SoA fp32 + SVML-vectorized overlap kernels (cpu_soa.py) when this numba
-# build has SVML (numba<=0.59 + icc_rt; config.USING_SVML). They vectorize the exp-bound inner
-# loop for ~2x (atoms) to ~4.4x (200-pt surface), at fp32 gradient accuracy (~1e-4 rel). Without
-# SVML they would be no faster (scalar exp is the barrier), so fall back to the fp64 AoS kernels
-# in cpu.py. Disable with FSS_CPU_SOA=0.
+# The SoA fp32 kernels (cpu_soa.py) vectorize the exp-bound inner loop only when this numba
+# build has SVML (numba<=0.59 + icc_rt; config.USING_SVML). Without SVML the scalar exp is the
+# barrier and SoA buys nothing, so the fp64 AoS kernels in cpu.py run instead. The SoA path is
+# fp32 (gradient rel-err ~1e-4), so it is not bit-identical to the AoS path.
 try:
     import numba.core.config as _nbcfg
     _SVML = bool(_nbcfg.USING_SVML)
 except Exception:
     _SVML = False
-_USE_SOA = (os.environ.get("FSS_CPU_SOA", "1") != "0") and _SVML
+_USE_SOA = _SVML
 
-# One-time warning so nobody unknowingly runs the CPU path in the ~3-6x-slower unvectorized
-# regime: numba 0.61+ dropped the SVML-patched LLVM, so a default `numba` (>=0.61) build has
-# USING_SVML=False and the overlap kernels emit scalar exp. The fix is the SVML env
-# (environment-cpu-svml.yml: numba<=0.59 + icc_rt). Fires only when a CPU align actually runs.
+# One-time warning, raised only when a CPU align actually runs.
 _SVML_WARNED = False
 
 

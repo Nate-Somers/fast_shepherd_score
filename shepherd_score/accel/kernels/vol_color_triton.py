@@ -153,11 +153,10 @@ def _vol_color_fused_kernel(
         tl.store(dTcb + 0, dTcx); tl.store(dTcb + 1, dTcy); tl.store(dTcb + 2, dTcz)
 
 
-# Max cloud edge for which the fused kernel is a WIN. Measured (H200): fused beats the two
-# separate kernels at BLOCK<=32 (1.1-1.18x) but REGRESSES ~2x at BLOCK=64 -- the single-tile
-# fused kernel carries both channels' BLOCKxBLOCK accumulators in registers, so a 64x64 tile
-# blows occupancy (the same register-pressure failure that killed the surf fused step). So the
-# driver only uses the fused kernel when every pad <= 32; larger molecules use the two kernels.
+# Max cloud edge for which the fused kernel is used. The single-tile fused kernel carries BOTH
+# channels' BLOCKxBLOCK accumulators in registers, so tiles above 32 blow occupancy and the two
+# separate kernels are faster. The driver must only take the fused path when every pad is <= this
+# value, and fall back to the separate shape + color kernels otherwise.
 VOL_COLOR_FUSED_MAX_PAD = 32
 
 

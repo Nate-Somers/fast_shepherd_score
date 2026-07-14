@@ -12,23 +12,6 @@ from rdkit.Geometry.rdGeometry import Point3D
 import torch
 
 from shepherd_score.score.constants import COULOMB_SCALING, LAM_SCALING, ALPHA  # noqa: F401
-
-
-def _default_seeds(mode: str) -> int:
-    """Per-mode default SE(3) seed count (``MODE_SEEDS``) from the single source of truth in
-    ``accel/_modes.py``, via ``accel.batch.aligners._seeds_for`` (so ``FINE_NUM_SEEDS`` still wins).
-    Lazy-imported to keep this module importable without the accel/torch stack. Resolves
-    ``num_repeats=None`` in ``align_with_*`` so the per-pair API ships the SAME defaults as the
-    batched API -- previously it hardcoded 50/200 and could never reach the mode table."""
-    from shepherd_score.accel.batch.aligners import _seeds_for
-    return _seeds_for(mode)
-
-
-def _default_steps(mode: str) -> int:
-    """Per-mode default fine-step count (``MODE_STEPS``); see ``_default_seeds``."""
-    from shepherd_score.accel.batch.aligners import _steps_for
-    return _steps_for(mode)
-
 from shepherd_score.generate_point_cloud import get_atom_coords, get_atomic_vdw_radii, get_molecular_surface, get_molecular_surface_const_density
 from shepherd_score.score.gaussian_overlap_np import get_overlap_np
 from shepherd_score.score.gaussian_overlap import get_overlap
@@ -47,6 +30,20 @@ from shepherd_score.accel._modes import (
     CANONICAL_MODES as _CANONICAL_MODES,
     LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES,
 )
+
+
+def _default_seeds(mode: str) -> int:
+    """Per-mode default SE(3) seed count (``MODE_SEEDS``) from ``shepherd_score/accel/_modes.py``,
+    the single source of truth shared with the batched path. Resolves ``num_repeats=None`` in
+    ``align_with_*`` so the per-pair API uses the same per-mode defaults as the batched API."""
+    from shepherd_score.accel.batch.aligners import _seeds_for
+    return _seeds_for(mode)
+
+
+def _default_steps(mode: str) -> int:
+    """Per-mode default fine-step count (``MODE_STEPS``); see ``_default_seeds``."""
+    from shepherd_score.accel.batch.aligners import _steps_for
+    return _steps_for(mode)
 
 
 def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) -> Chem.Mol:
@@ -187,7 +184,6 @@ class Molecule:
         self._nonH_atoms_idx = np.array([a.GetIdx() for a in self.mol.GetAtoms() if a.GetAtomicNum() != 1])
 
         self.pharm_multi_vector = pharm_multi_vector
-        self.pharm_feature_set = feature_set
         if isinstance(pharm_types, np.ndarray) and isinstance(pharm_ancs, np.ndarray) and isinstance(pharm_vecs, np.ndarray):
             self.pharm_types, self.pharm_ancs, self.pharm_vecs = pharm_types, pharm_ancs, pharm_vecs
         else:
@@ -216,7 +212,7 @@ class Molecule:
         Gets the point cloud positions.
         """
         self.mol, centers = get_atom_coords(self.mol, MMFF_optimize=False)
-        surface_method = getattr(self, 'surface_method', 'mesh')
+        surface_method = self.surface_method
         if use_density:
             if surface_method != 'mesh':
                 raise ValueError(
@@ -378,10 +374,10 @@ class MoleculePair:
                                           dtype=torch.float32,
                                           device=device)          # (M,3)
 
-        # Result slots (transform=identity, score=None until aligned). The 7 canonical modes
-        # are driven by the registry (accel/_modes.MODE_ATTRS); adding a mode there auto-creates
-        # its slots here. The two no_H-variant slots below are legacy extras written by
-        # align_with_vol/align_with_vol_esp(no_H=False) and are intentionally not registry modes.
+        # Result slots (transform=identity, score=None until aligned). The 7 canonical modes'
+        # slots come from the registry (accel/_modes.MODE_ATTRS) -- registering a mode there
+        # auto-creates its slots here. The two extra slots below hold the WITH-hydrogen results
+        # written by align_with_vol / align_with_vol_esp(no_H=False); they are not registry modes.
         for _t, _s in _MODE_ATTRS.values():
             setattr(self, _t, np.eye(4))
             setattr(self, _s, None)
@@ -521,7 +517,7 @@ class MoleculePair:
 
 
     def align_with_vol_esp(self,
-                           lam: float,
+                           lam: float = 0.1,
                            no_H: bool = True,
                            num_repeats: int = None,
                            trans_init: bool = False,
@@ -534,7 +530,19 @@ class MoleculePair:
         Align fit_molec to ref_molec using volume similarity weighted by partial charge
         Toggle ``no_H`` parameter for scoring with or without hydrogens.
 
-        Typically ``lam=0.1`` is used.
+        ``lam`` DEFAULTS to 0.1 -- the value this library has always documented for
+        partial-charge volumetric ESP.
+
+        !! ``lam`` IS A WIDTH, NOT A WEIGHT, AND ITS UNITS DIFFER BY MODE.
+        The ESP term is ``exp(-esp_diff_sq / lam)``, so a SMALLER lam means charge
+        differences are penalised MORE sharply (a more discriminative ESP), not less.
+        Crucially, ``align_with_vol_esp`` takes lam RAW, while ``align_with_surf_esp``
+        multiplies its lam by ``LAM_SCALING`` (= COULOMB_SCALING**2, ~207) internally.
+        The two lams are therefore ~207x apart in absolute terms and are NOT
+        interchangeable. Handing this method surf_esp's 0.3 makes the ESP ~3x too
+        permissive; that mistake previously cost ~0.02 ROC-AUC on a 41-target DUDE-Z
+        screen, and it is exactly why lam is a DEFAULT here now rather than a required
+        argument the caller has to guess.
         Optimally aligned score found in ``self.sim_aligned_vol_esp`` and the optimal SE(3)
         transformation is at ``self.transform_vol_esp``. If ``no_H`` is ``True``, append '_noH' to them.
 
@@ -742,7 +750,6 @@ class MoleculePair:
                        max_num_steps: int = None,
                        use_jax: bool = False,
                        use_analytical: bool = True,
-                       use_fast: bool = False,
                        verbose: bool = False) -> np.ndarray:
         """
         Align fit_molec to ref_molec using surface-ESP similarity. ``surf_esp`` is the
@@ -816,49 +823,7 @@ class MoleculePair:
             self.transform_surf_esp = np.array(se3_transform)
             self.sim_aligned_surf_esp = np.array(score)
             return np.array(aligned_fit_points)
-        else: # Use Torch implementation (opt-in CUDA fast path via use_fast)
-            if use_fast and torch.cuda.is_available():
-                try:
-                    from shepherd_score.accel.drivers.esp import fast_optimize_ROCS_esp_overlay
-                except ImportError:
-                    fast_optimize_ROCS_esp_overlay = None
-
-                if fast_optimize_ROCS_esp_overlay is not None:
-                    # Prefer cached tensors to avoid repeated host->device transfers.
-                    if getattr(self, "_ref_surf_t", None) is None:
-                        self._ref_surf_t = torch.as_tensor(self.ref_molec.surf_pos, dtype=torch.float32, device=self.device)
-                    if getattr(self, "_fit_surf_t", None) is None:
-                        self._fit_surf_t = torch.as_tensor(self.fit_molec.surf_pos, dtype=torch.float32, device=self.device)
-                    if getattr(self, "_ref_surf_esp_t", None) is None:
-                        self._ref_surf_esp_t = torch.as_tensor(self.ref_molec.surf_esp, dtype=torch.float32, device=self.device)
-                    if getattr(self, "_fit_surf_esp_t", None) is None:
-                        self._fit_surf_esp_t = torch.as_tensor(self.fit_molec.surf_esp, dtype=torch.float32, device=self.device)
-
-                    trans_centers = None
-                    if trans_init:
-                        trans_centers = self._ref_xyz_t if hasattr(self, "_ref_xyz_t") else torch.as_tensor(
-                            self.ref_molec.atom_pos, dtype=torch.float32, device=self.device
-                        )
-
-                    aligned_fit_points_t, se3_transform_t, score_t = fast_optimize_ROCS_esp_overlay(
-                        ref_points=self._ref_surf_t,
-                        fit_points=self._fit_surf_t,
-                        ref_charges=self._ref_surf_esp_t,
-                        fit_charges=self._fit_surf_esp_t,
-                        alpha=alpha,
-                        lam=lam_scaled,
-                        num_repeats=num_repeats,
-                        trans_centers=trans_centers,
-                        num_repeats_per_trans=10,
-                        topk=30,
-                        steps_fine=max_num_steps,
-                        lr=lr,
-                    )
-
-                    self.transform_surf_esp = se3_transform_t.numpy()
-                    self.sim_aligned_surf_esp = score_t.numpy()
-                    return aligned_fit_points_t.numpy()
-
+        else: # Use Torch implementation
             _esp_fn = optimize_ROCS_esp_overlay_analytical if use_analytical else optimize_ROCS_esp_overlay
             aligned_fit_points, se3_transform, score = _esp_fn(
                 ref_points=torch.from_numpy(self.ref_molec.surf_pos).to(torch.float32).to(self.device),
@@ -889,7 +854,6 @@ class MoleculePair:
                              lr: float = 0.1,
                              max_num_steps: int = None,
                              use_jax: bool = False,
-                             use_fast: bool = False,
                              verbose: bool = False):
         """
         Align using ShaEP similarity score. ``vol_and_surf_esp`` is the canonical name
@@ -984,79 +948,6 @@ class MoleculePair:
             else:
                 ref_centers = torch.from_numpy(self.ref_molec.surf_pos).to(torch.float32).to(self.device)
                 fit_centers = torch.from_numpy(self.fit_molec.surf_pos).to(torch.float32).to(self.device)
-
-            if use_fast and torch.cuda.is_available():
-                try:
-                    from shepherd_score.accel.drivers.esp_combo import fast_optimize_esp_combo_score_overlay
-                except ImportError:
-                    fast_optimize_esp_combo_score_overlay = None
-
-                if fast_optimize_esp_combo_score_overlay is not None:
-                    # Prefer cached tensors (also used by the batch path).
-                    if getattr(self, "_ref_surf_t", None) is None:
-                        self._ref_surf_t = torch.as_tensor(self.ref_molec.surf_pos, dtype=torch.float32, device=self.device)
-                    if getattr(self, "_fit_surf_t", None) is None:
-                        self._fit_surf_t = torch.as_tensor(self.fit_molec.surf_pos, dtype=torch.float32, device=self.device)
-                    if getattr(self, "_ref_surf_esp_t", None) is None:
-                        self._ref_surf_esp_t = torch.as_tensor(self.ref_molec.surf_esp, dtype=torch.float32, device=self.device)
-                    if getattr(self, "_fit_surf_esp_t", None) is None:
-                        self._fit_surf_esp_t = torch.as_tensor(self.fit_molec.surf_esp, dtype=torch.float32, device=self.device)
-
-                    if getattr(self, "_ref_centers_w_H_t", None) is None:
-                        self._ref_centers_w_H_t = torch.as_tensor(
-                            self.ref_molec.mol.GetConformer().GetPositions(), dtype=torch.float32, device=self.device
-                        )
-                    if getattr(self, "_fit_centers_w_H_t", None) is None:
-                        self._fit_centers_w_H_t = torch.as_tensor(
-                            self.fit_molec.mol.GetConformer().GetPositions(), dtype=torch.float32, device=self.device
-                        )
-                    if getattr(self, "_ref_partial_t", None) is None:
-                        self._ref_partial_t = torch.as_tensor(self.ref_molec.partial_charges, dtype=torch.float32, device=self.device)
-                    if getattr(self, "_fit_partial_t", None) is None:
-                        self._fit_partial_t = torch.as_tensor(self.fit_molec.partial_charges, dtype=torch.float32, device=self.device)
-                    if getattr(self, "_ref_radii_t", None) is None:
-                        self._ref_radii_t = torch.as_tensor(self.ref_molec.radii, dtype=torch.float32, device=self.device)
-                    if getattr(self, "_fit_radii_t", None) is None:
-                        self._fit_radii_t = torch.as_tensor(self.fit_molec.radii, dtype=torch.float32, device=self.device)
-
-                    # Centers for shape component
-                    if alpha == 0.81:
-                        ref_centers_t = self._ref_xyz_t
-                        fit_centers_t = self._fit_xyz_t
-                    else:
-                        ref_centers_t = self._ref_surf_t
-                        fit_centers_t = self._fit_surf_t
-
-                    trans_centers = self._ref_xyz_t if trans_init else None
-
-                    aligned_fit_points_t, se3_transform_t, score_t = fast_optimize_esp_combo_score_overlay(
-                        ref_centers_w_H=self._ref_centers_w_H_t,
-                        fit_centers_w_H=self._fit_centers_w_H_t,
-                        ref_centers=ref_centers_t,
-                        fit_centers=fit_centers_t,
-                        ref_points=self._ref_surf_t,
-                        fit_points=self._fit_surf_t,
-                        ref_partial_charges=self._ref_partial_t,
-                        fit_partial_charges=self._fit_partial_t,
-                        ref_surf_esp=self._ref_surf_esp_t,
-                        fit_surf_esp=self._fit_surf_esp_t,
-                        ref_radii=self._ref_radii_t,
-                        fit_radii=self._fit_radii_t,
-                        alpha=alpha,
-                        lam=lam,
-                        probe_radius=probe_radius,
-                        esp_weight=esp_weight,
-                        num_repeats=num_repeats,
-                        trans_centers=trans_centers,
-                        num_repeats_per_trans=10,
-                        topk=30,
-                        steps_fine=max_num_steps,
-                        lr=lr,
-                    )
-
-                    self.transform_vol_and_surf_esp = se3_transform_t.numpy()
-                    self.sim_aligned_vol_and_surf_esp = score_t.numpy()
-                    return aligned_fit_points_t.numpy()
 
             aligned_fit_points, se3_transform, score = optimize_esp_combo_score_overlay(
                 ref_centers_w_H=torch.from_numpy(self.ref_molec.mol.GetConformer().GetPositions()).to(torch.float32).to(self.device),
@@ -1381,92 +1272,6 @@ class MoleculePair:
         self.transform_pharm = se3_transform.numpy()
         self.sim_aligned_pharm = score.numpy()
         return aligned_fit_anchors.numpy(), aligned_fit_vectors.numpy()
-
-
-    def score_with_vol(
-        self,
-        alpha: float,
-        *,
-        no_H: bool = True,
-        use: str = "torch",
-    ) -> np.ndarray:
-        """
-        Shape (volume) Tanimoto similarity between *ref_molec* and *fit_molec*
-        given their **current alignment**.
-
-        Parameters
-        ----------
-        alpha : float
-            Gaussian width parameter used for the overlap calculation.
-        no_H : bool (default = True)
-            When True, hydrogens are ignored for both molecules.
-        use : str (default = 'torch')
-            Pick the backend implementation:
-              'np'/'numpy'   → NumPy
-              'torch'/'pytorch' → PyTorch (recommended, fastest)
-              'jax'/'jnp'    → JAX  (if installed)
-
-        Returns
-        -------
-        score : np.ndarray shape (1,)
-            Tanimoto-style similarity score.
-        """
-        use = use.lower()
-        accepted = ("jax", "jnp", "torch", "pytorch", "np", "numpy")
-        if use not in accepted:
-            raise ValueError(f"`use` must be one of {accepted}, got {use!r}")
-
-        # Choose which atomic coordinates to feed to the overlap kernels.
-        def _coords(mol):
-            if no_H:
-                # Fast path if the class already pre-computed non-H indices
-                if hasattr(mol, "_nonH_atoms_idx"):
-                    return mol.atom_pos[mol._nonH_atoms_idx]
-            return mol.atom_pos
-
-        # -------------------------- JAX -------------------------------------
-        if use in ("jax", "jnp"):
-            try:
-                import jax.numpy as jnp
-            except ImportError:
-                raise ImportError(
-                    "JAX is not installed.  Use `use='torch'` or `use='np'`."
-                )
-            from shepherd_score.score.gaussian_overlap_jax import (
-                get_overlap_jax,
-            )
-
-            score = get_overlap_jax(
-                centers_1=jnp.array(_coords(self.ref_molec)),
-                centers_2=jnp.array(_coords(self.fit_molec)),
-                alpha=alpha,
-            )
-            return np.array(score)  # keep return type consistent
-
-        # -------------------------- PyTorch---------------------------------
-        elif use in ("torch", "pytorch"):
-            import torch
-            from shepherd_score.score.gaussian_overlap import get_overlap
-
-            score = get_overlap(
-                centers_1=torch.as_tensor(_coords(self.ref_molec), dtype=torch.float32, device=self.device),
-                centers_2=torch.as_tensor(_coords(self.fit_molec), dtype=torch.float32, device=self.device),
-                alpha=alpha,
-            )
-            return score.cpu().numpy()
-
-        # -------------------------- NumPy -----------------------------------
-        else:  # 'np' / 'numpy'
-            # NB: do NOT `import numpy as np` here — it would shadow the module-level
-            # `np` and make the jax branch's `np.array(score)` raise UnboundLocalError.
-            from shepherd_score.score.gaussian_overlap_np import get_overlap_np
-
-            score = get_overlap_np(
-                centers_1=_coords(self.ref_molec),
-                centers_2=_coords(self.fit_molec),
-                alpha=alpha,
-            )
-            return score
 
 
     def score_with_surf(self,

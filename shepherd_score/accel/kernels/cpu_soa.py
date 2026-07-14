@@ -1,12 +1,12 @@
-"""SoA + fp32 + SVML-vectorized CPU kernels (lever 2+3) — the vectorizable twins of cpu.py.
+"""SoA + fp32 + SVML-vectorized CPU kernels — the vectorizable twins of cpu.py.
 
 cpu.py's kernels store coordinates AoS (``A[k, n, :]``) and accumulate fp64; the interleaved
 xyz stride + fp64 reduction stop LLVM's auto-vectorizer, so ``math.exp`` stays scalar and the
 inner O(N·M) loop runs one lane at a time. These kernels instead take coordinates **SoA**
 (``A[k, :, n]`` — contiguous in n) and accumulate **fp32**, so with an SVML-enabled numba
 (``numba<=0.59`` + ``icc_rt``; ``config.USING_SVML==True``) LLVM vectorizes the inner loop and
-SVML supplies the vector ``exp``. Measured on the overlap+grad kernel: ~2× (30-atom vol) to
-~4.4× (200-point surf) single-core, value rel-err ~1e-6, gradient rel-err ~1e-4 (fp32).
+SVML supplies the vector ``exp``. Accuracy cost of fp32: value rel-err ~1e-6, gradient
+rel-err ~1e-4.
 
 Used ONLY by the fused CPU driver when ``USING_SVML`` is true (see cpu_fused.py); otherwise the
 fp64 AoS kernels in cpu.py run. The fp64 rotation/dQ-tail are kept (cheap, per-pose / per-m); only

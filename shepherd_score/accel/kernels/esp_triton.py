@@ -1,7 +1,8 @@
-# shepherd_score/accel/kernels/esp_triton.py
-# A fused (forward + backward) ESP-weighted Gaussian-Tanimoto kernel using Triton.
-# Extends the base volumetric kernel to include electrostatic potential weighting.
-#
+"""Fused (forward + backward) ESP-weighted Gaussian-Tanimoto kernels in Triton.
+
+Extends the base volumetric kernel (:mod:`~shepherd_score.accel.kernels.shape_triton`)
+with electrostatic-potential weighting.
+"""
 from __future__ import annotations
 
 import math
@@ -253,14 +254,13 @@ def overlap_score_grad_esp_se3_batch(
 #  falls inside that molecule's vdW+probe volume, and accumulate a Gaussian of
 #  the ESP difference:
 #      esp = sum_i  keep_i * exp( -(point_esp_i - sum_m q_m/d_im)^2 / lam )
-#  This is the fused replacement for the (B, N_surf, M_atoms) torch.cdist that
-#  the eager `_batch_esp_comparison` materialized twice per fine step. It is
-#  value-only: esp_combo steers the pose with the SHAPE gradient (the ESP term
-#  is scored / used for seed selection), so no dO/dq tail is needed.
 #
-#  The caller passes points + atoms already in the world frame (the driver
-#  applies the SE(3) transform to whichever cloud is moving), so the kernel
-#  needs no quaternion -- it is a pure pairwise reduction.
+#  VALUE-ONLY: esp_combo steers the pose with the SHAPE gradient (the ESP term
+#  is scored / used for seed selection), so this kernel emits no dO/dq tail.
+#
+#  PRECONDITION: the caller passes points + atoms already in the world frame (the
+#  driver applies the SE(3) transform to whichever cloud is moving), so the kernel
+#  takes no quaternion -- it is a pure pairwise reduction.
 # ============================================================================
 @triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit

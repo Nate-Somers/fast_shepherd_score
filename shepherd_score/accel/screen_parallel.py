@@ -1,11 +1,11 @@
 """Shard-parallel CPU screening — near-linear core scaling for query-vs-library screens.
 
 The in-process fused CPU path parallelises the fine loop over poses, but each ``align`` call has a
-single-threaded prologue (coarse seed-gen + torch->numpy marshal); by Amdahl that caps a screen at
-~3-5x on 8 cores no matter how many numba threads it gets. This driver moves the parallelism ABOVE
+single-threaded prologue (coarse seed-gen + torch->numpy marshal), so in-call thread parallelism is
+Amdahl-capped no matter how many numba threads it gets. This driver moves the parallelism ABOVE
 that prologue: it splits the library into one contiguous shard per worker process, and each worker
-runs whole, independent aligns pinned to a single thread. There is no shared serial section, so C
-workers give ~Cx — the clean way to turn 8 cores into ~8x.
+runs whole, independent aligns pinned to a single thread. There is no shared serial section, so
+throughput scales with the worker count.
 
 Zero-copy on Linux: the featurized library is stashed as a module global in the parent BEFORE the
 pool forks, so workers inherit it copy-on-write; only small index ranges are sent over the pipe.
@@ -23,17 +23,15 @@ from __future__ import annotations
 import os
 from multiprocessing import get_context
 
+# _modes is pure data (no torch), so importing it here stays fork-safe.
+from ._modes import MODE_ATTRS as _MODE_ATTRS
+
 # Parent-set globals inherited by forked workers (never pickled).
 _QUERY = None
 _LIBRARY: list = []
 _MODE = ""
 _KW: dict = {}
 
-# mode -> (align method name, aligned-similarity attribute on MoleculePair). Derived from
-# the single-source-of-truth mode registry (_modes.MODE_ATTRS) instead of a third hand-kept
-# copy: the batch method is always ``align_with_<mode>`` and the score attr is the registry's
-# score_attr. (_modes is pure data / no torch, so importing it here stays fork-safe.)
-from ._modes import MODE_ATTRS as _MODE_ATTRS
 _ALIGN_ATTR = {m: (f"align_with_{m}", score_attr) for m, (_tf, score_attr) in _MODE_ATTRS.items()}
 
 
@@ -74,10 +72,10 @@ def screen_parallel(query, library, mode, n_workers=None, **align_kwargs):
     # Cap each worker's thread pool to ONE thread BEFORE forking. numba fixes its pool size from
     # NUMBA_NUM_THREADS at IMPORT time; a forked child inherits that value and its own
     # numba.set_num_threads(1) only masks it, leaving cpu_count-1 idle threads that spin-wait -- so C
-    # workers oversubscribe C x cpu_count threads and aggregate throughput REGRESSES past ~16 workers
-    # (measured 64<16). Setting the env here works only if this process has not yet imported numba
-    # (screen_parallel's numba-clean contract holds for that); for a GUARANTEED cap, export
-    # NUMBA_NUM_THREADS=1 (+ OMP_NUM_THREADS=1) before starting the process. Restored in finally.
+    # workers oversubscribe C x cpu_count threads and aggregate throughput regresses. Setting the env
+    # here works only if this process has not yet imported numba (screen_parallel's numba-clean
+    # contract holds for that); for a GUARANTEED cap, export NUMBA_NUM_THREADS=1 (+ OMP_NUM_THREADS=1)
+    # before starting the process. Restored in finally.
     _cap = {"NUMBA_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1", "OMP_WAIT_POLICY": "passive", "KMP_BLOCKTIME": "0"}
     _saved = {k: os.environ.get(k) for k in _cap}

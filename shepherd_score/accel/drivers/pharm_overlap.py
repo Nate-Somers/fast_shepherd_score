@@ -170,7 +170,6 @@ def _batch_pharm_overlap_typed(
     # Process each pharmacophore type
     for ptype_idx in range(len(P_TYPES)):
         alpha = alphas[ptype_idx]
-        ptype_name = P_TYPES_LOWER[ptype_idx]
         use_vectors = ptype_idx in VECTOR_TYPES
         allow_antiparallel = ptype_idx in ANTIPARALLEL_TYPES
         use_extended = extended_points and (ptype_idx in EXTENDED_POINT_TYPES)

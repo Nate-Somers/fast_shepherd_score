@@ -1,34 +1,28 @@
 """Top-level data-parallel multi-GPU driver for batch alignment.
 
-WHY THIS EXISTS (see the multi-GPU scaling investigation): the alignment is
-*host-bound*, not kernel-bound, so the in-library auto-shard paths can't reach
-~Nx on N GPUs:
-  - the `thread` backend drives all GPUs from one process -> GIL-serialized host
-    work -> 1.0-2.6x;
-  - a per-call process-scatter pays the bulk data handoff every call -> 0.6-1.2x.
-
-The robust/simple/expected pattern that DOES scale (measured ~3.5-3.9x on 4xL40S
-across vol/surf/esp/pharm) is plain data parallelism: ONE OS process per GPU,
-each OWNING its shard (build + align end-to-end, data resident on its GPU), with
-CPU threads capped to cores/ndev so the N workers don't oversubscribe the cores
-(the un-capped default -- ~N x all-cores MKL/OMP threads -- was the hidden lever
-that otherwise capped scaling to <1x).
+Alignment is *host-bound*, not kernel-bound, so the in-library auto-shard cannot reach
+~Nx on N GPUs: driving every GPU from one process serializes the host work behind the
+GIL, and a per-call process-scatter re-pays the bulk data handoff on every call. The
+pattern that does scale is plain data parallelism: ONE OS process per GPU, each OWNING
+its shard (build + align end-to-end, data resident on its GPU), with CPU threads capped
+to cores/ndev. The cap is mandatory: an uncapped worker sizes an all-cores MKL/OMP pool,
+so N workers oversubscribe the machine and scaling collapses below 1x.
 
 Only lightweight `Molecule` objects cross the process boundary (once, at spawn);
 no CUDA tensors are pickled. Each worker rebuilds `MoleculePair` on its own GPU
 (passing a `Molecule` does NOT regenerate its surface, so this is cheap) and runs
 the ordinary single-GPU `MoleculePairBatch.align_with_*` path.
 
-This is a ONE-SHOT launcher: it spawns the workers, processes the whole batch in
-one shot, and returns. The fixed spawn+context-init cost (~few seconds, paid once)
-is negligible for a large screen but dominates a tiny batch -- so use it for big
-workloads. For repeated query-vs-library screening, keep the workers warm with a
-persistent pool instead (not implemented here).
+:func:`align_multi_gpu` is a ONE-SHOT launcher: it spawns the workers, processes the
+whole batch in one shot, and returns. Its fixed spawn+context-init cost is paid once,
+so it is amortized by a large screen but dominates a tiny batch -- use it for big
+workloads. For repeated query-vs-library screening, use :class:`MultiGPUAligner`, which
+keeps the workers and their shards warm.
 """
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -67,11 +61,7 @@ def _worker(rank, mode, backend, do_center, threads, align_kwargs, shard_mols, o
         import time
         import torch
         from shepherd_score.container import MoleculePair, MoleculePairBatch
-        # dispatch-local lives in _batch_align (refactored) or _core (committed).
-        try:
-            from shepherd_score.accel.batch import _DISPATCH_LOCAL
-        except Exception:
-            from shepherd_score.container._core import _DISPATCH_LOCAL
+        from shepherd_score.accel.batch import _DISPATCH_LOCAL
 
         _cap_threads(threads)
         torch.cuda.set_device(rank)
@@ -92,7 +82,7 @@ def _worker(rank, mode, backend, do_center, threads, align_kwargs, shard_mols, o
         scores = np.array([float(getattr(p, sc_attr)) for p in pairs], dtype=np.float64)
         transforms = np.stack([
             torch.as_tensor(getattr(p, tf_attr)).detach().cpu().numpy().astype(np.float64)
-            for p in pairs]) if pairs else np.zeros((0, 4, 4))
+            for p in pairs])
         out_q.put((rank, scores, transforms, t_build, t_align))
     except Exception:                            # noqa: BLE001 - relayed to parent
         import traceback
@@ -239,10 +229,7 @@ def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
         import numpy as _np
         import torch
         from shepherd_score.container import MoleculePair, MoleculePairBatch
-        try:
-            from shepherd_score.accel.batch import _DISPATCH_LOCAL
-        except Exception:
-            from shepherd_score.container._core import _DISPATCH_LOCAL
+        from shepherd_score.accel.batch import _DISPATCH_LOCAL
 
         _cap_threads(threads)
         torch.cuda.set_device(rank)          # creates THIS worker's CUDA context
@@ -267,7 +254,7 @@ def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
             scores = _np.array([float(getattr(p, sc_attr)) for p in pairs], dtype=_np.float64)
             transforms = _np.stack([
                 torch.as_tensor(getattr(p, tf_attr)).detach().cpu().numpy().astype(_np.float64)
-                for p in pairs]) if pairs else _np.zeros((0, 4, 4))
+                for p in pairs])
             out_q.put(("RES", rank, scores, transforms, t_align))
     except Exception:                            # noqa: BLE001
         import traceback

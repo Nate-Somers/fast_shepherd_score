@@ -13,11 +13,11 @@ The molecular surface is the outer boundary of the union of (vdW + probe) sphere
 
 These functions need only numpy + scipy (no Open3D), so they run anywhere and are the validation
 gate for any new surfacer: a low-leak surface spreads its shell-residual mass off zero, and a
-smooth surfacer rounds the crimps (lower curvature there). See docs/MOLECULE_CONSTRUCTION_PROBLEM.md.
+smooth surfacer rounds the crimps (lower curvature there).
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 from numpy.linalg import lstsq
@@ -46,8 +46,9 @@ def leak_metrics(points: np.ndarray,
     """How close the points lie to the atom spheres (lower residual => more leak).
 
     Returns median / mean shell residual (A) and the fraction of points within 0.05 / 0.10 A of a
-    sphere. Reference: the original mesh+Poisson surface is ~0.010 A median, 86-98% within 0.05 A;
-    an exactly-on-sphere surface (e.g. masked fibonacci, FPS) is 0.000 A / ~100%.
+    sphere. For scale: the ``method='mesh'`` (Open3D ball-pivoting + Poisson-disk) surfacer gives
+    ~0.010 A median with 86-98% within 0.05 A; a surface whose points lie exactly on the
+    (vdW + probe) spheres gives 0.000 A / ~100%.
     """
     Rs, _ = _sorted_shell_residuals(points, centers, radii, probe_radius)
     nearest = Rs[:, 0]

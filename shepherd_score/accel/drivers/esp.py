@@ -20,14 +20,8 @@ from ._common import (
     apply_se3_transform,
     quaternion_to_rotation_matrix
 )
-from ._graphed import run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
-from .shape import _GraphedFineSurf, _CPU_FUSED
-
-import os as _os
-# Opt-in: fuse surf_esp's 200-point ESP on CPU (default off = bit-faithful eager). ~8x faster via
-# the SoA+SVML kernel, at ~1-4% per-pair multi-basin divergence from eager. See the gate comment.
-_FUSE_SURF_ESP = _os.environ.get("FSS_FUSE_SURF_ESP", "0") == "1"
-
+from ._graphed import run_graphed, graph_cap
+from .shape import _GraphedFineSurf
 
 @torch.no_grad()
 def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float,
@@ -280,39 +274,33 @@ def coarse_fine_esp_align_many(
     PK = q_k.shape[0]
     best_score = best_q = best_t = None
 
-    # --- CUDA-graph fast path: capture one fine step, replay it min(steps_fine,_GRAPH_STEPS)
-    # times with ~zero per-step host launch overhead. vol_esp/surf_esp had NO graph path
-    # before -- greenfield. Gated to the launch-bound small/medium-P CUDA fp32 regime; large
-    # P / capture failure fall back to the eager loop below. See drivers/_graphed.
-    if (_FINE_GRAPHS and A_batch.is_cuda and PK <= graph_cap(N_pad * M_pad)
+    # --- CUDA-graph fast path: capture one fine step and replay it with ~zero per-step host
+    # launch overhead. Gated to the launch-bound small/medium-P CUDA fp32 regime; large P or a
+    # capture failure fall back to the eager loop below. See drivers/_graphed.
+    if (A_batch.is_cuda and PK <= graph_cap(N_pad * M_pad)
             and A_batch.dtype == torch.float32):
         try:
             best_score, best_q, best_t = _run_graphed_esp(
                 A_k.contiguous(), B_k.contiguous(), CA_k.contiguous(), CB_k.contiguous(),
                 q_k, t_k, N_k, M_k, VAA_plus_VBB, alpha, lam, lr,
                 steps_fine, N_pad, M_pad, PK,
-                es_patience=(_fc.ES_PATIENCE_OVERRIDE or early_stop_patience), es_tol=early_stop_tol)
+                es_patience=early_stop_patience, es_tol=early_stop_tol)
         except Exception:
             best_score = None                              # capture failed -> eager
 
-    # --- opt-in CPU (numba) fast path: fully-fused fine loop, NO torch in the hot loop ------
-    # vol_esp (atom-count ESP, N_pad<=100) is fused by default and bit-faithful (max|dscore|~5e-5).
-    # surf_esp (200-point surface ESP) is OPT-IN via FSS_FUSE_SURF_ESP=1: it is the most shape-
-    # degenerate mode (64 seeds), so the njit-fused trajectory settles in DIFFERENT (equally-valid)
-    # basins than torch-eager -- ~1-4% per-pair, ~1% mean, sometimes above eager. Measured to be
-    # irreducible: disabling early-stop did NOT shrink it (surf 3.7e-2 -> 4.7e-2), and even the
-    # fp64 AoS-fused path diverges, so it is the fused-vs-eager split in a multi-basin landscape,
-    # NOT an fp32 or early-stop artifact. The SoA fp32+SVML kernel makes that fused path ~8x faster
-    # than eager (43->113 a/s vs ~1x for AoS-fused), which is why opting in is now worthwhile.
-    # Default OFF keeps surf_esp bit-faithful for callers that need pose-exact agreement with eager.
-    if (best_score is None and _CPU_FUSED and not A_batch.is_cuda
+    # --- CPU (numba) fast path: fully-fused fine loop, no torch in the hot loop --------------
+    # Restricted to vol_esp (atom-count ESP, N_pad <= 100), where the fused trajectory agrees
+    # with torch-eager to max|dscore| ~5e-5. surf_esp (200-point surface ESP) is deliberately
+    # NOT fused: it is the most shape-degenerate mode, so the fused trajectory settles in
+    # different (equally valid) basins than eager, and callers rely on pose-exact agreement.
+    if (best_score is None and not A_batch.is_cuda
             and A_batch.dtype == torch.float32
-            and (A_batch.shape[1] <= 100 or _FUSE_SURF_ESP)):
+            and A_batch.shape[1] <= 100):
         try:
             from ..kernels.cpu_fused import cpu_fused_esp
             best_score, best_q, best_t = cpu_fused_esp(
                 A_k, B_k, CA_k, CB_k, q_k, t_k, N_k, M_k, VAA_plus_VBB, alpha, lam, lr, steps_fine,
-                (_fc.ES_PATIENCE_OVERRIDE or early_stop_patience), early_stop_tol)
+                early_stop_patience, early_stop_tol)
         except Exception:
             best_score = None                              # fused failed -> eager
 
@@ -349,7 +337,7 @@ def coarse_fine_esp_align_many(
                 current_max = best_score.max().item()
                 if current_max - prev_max_score < early_stop_tol:
                     no_improve_count += 1
-                    if no_improve_count >= (_fc.ES_PATIENCE_OVERRIDE or early_stop_patience):
+                    if no_improve_count >= early_stop_patience:
                         break
                 else:
                     no_improve_count = 0
@@ -536,7 +524,6 @@ def fast_optimize_ROCS_esp_overlay_batch(
     scores : torch.Tensor (B,)
         Best Tanimoto scores
     """
-    device = ref_batch.device
     BATCH = ref_batch.shape[0]
     N_pad = ref_batch.shape[1]
     M_pad = fit_batch.shape[1]

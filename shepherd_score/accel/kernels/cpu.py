@@ -1,28 +1,28 @@
-"""CPU (numba) fallbacks for the Triton overlap+grad and Adam kernels.
+"""numba CPU mirrors of the Triton overlap+grad and Adam kernels.
 
-These let the batched coarse-to-fine driver (``fast_se3.coarse_fine_align_many`` and
-``_align_batch_vol``) run on a CPU-only box with **no Triton/CUDA**. ``fast_se3`` imports
-these when ``shepherd_score.accel.kernels.shape_triton`` (which hard-requires triton)
-fails to import.
+:mod:`~shepherd_score.accel.kernels.dispatch` routes each call to the Triton kernel for
+CUDA tensors and to these numba kernels for CPU tensors, per-call and device-driven, so
+the batched coarse-to-fine drivers (``accel.drivers.shape.coarse_fine_align_many`` and the
+``accel.batch`` aligners) run with no Triton/CUDA at all.
 
 Design / correctness
 --------------------
-``overlap_score_grad_se3_batch`` replicates ``_gauss_overlap_se3_tiled`` (the Triton
-kernel) **operation-for-operation**: identical quaternion convention ``q=(w,x,y,z)``,
-the standard unit-quaternion rotation matrix, ``B`` (fit) rotated against ``A`` (ref),
+``overlap_score_grad_se3_batch`` replicates ``_gauss_overlap_se3_tiled`` (shape_triton.py)
+**operation-for-operation**: identical quaternion convention ``q=(w,x,y,z)``, the standard
+unit-quaternion rotation matrix, ``B`` (fit) rotated against ``A`` (ref),
 ``Vab = K·Σ exp(-α/2·r²)`` with ``K = π^1.5/(2α)^1.5``, and the exact analytical
 ``dVab/dq`` (4) and ``dVab/dt`` (3). It is therefore numerically **exact** (it computes
 the true overlap+gradient), though not bit-identical to the GPU (``math.exp`` ≠ Triton's
-``exp2``; see SPEED_EXPERIMENTS_CPU.md "Byte-identical exploration"). The heavy O(K·N·M)
-work is a fused single-pass ``@njit(parallel=True)`` kernel (one row per pose, prange over
-poses); the cheap O(K) quaternion/Adam bookkeeping stays in torch.
+``exp2``). The heavy O(K·N·M) work is a fused single-pass ``@njit(parallel=True)`` kernel
+(one row per pose, prange over poses); the cheap O(K) quaternion/Adam bookkeeping stays in
+torch.
 
-``fused_adam_qt_with_tangent_proj`` replicates ``_adam_qt_with_tangent_proj`` exactly
-(tangent projection ``dQ-q(dQ·q)``, Adam β1=0.9 β2=0.999 eps=1e-8 *inside* the sqrt, no
-bias correction, quaternion renormalisation), in-place, pure torch.
+``fused_adam_qt_with_tangent_proj`` must mirror the Triton ``_adam_qt_with_tangent_proj``
+exactly (tangent projection ``dQ-q(dQ·q)``, Adam β1=0.9 β2=0.999 eps=1e-8 *inside* the
+sqrt, **no** bias correction, quaternion renormalisation), in-place, pure torch.
 
-Single-core throughput is set by ``NUMBA_NUM_THREADS`` (=1 pins one core); the default
-uses all cores for aggregate throughput.
+Thread count is set by ``NUMBA_NUM_THREADS`` (=1 pins one core; the shard-parallel screen
+driver sets it to 1 to avoid oversubscription); the default uses all cores.
 """
 from __future__ import annotations
 import math
@@ -148,19 +148,12 @@ def _batch_self_overlap(P_pad: torch.Tensor, N_real: torch.Tensor, alpha: float 
     return V
 
 
-def fused_surf_step_batch(*args, **kwargs):
-    """The Triton fused surf step has no CPU analogue; the CPU driver uses the eager
-    fine loop (guarded by torch.cuda.is_available()), so this should never be called."""
-    raise NotImplementedError(
-        "fused_surf_step_batch is CUDA-only; the CPU path uses the eager fine loop.")
-
-
 # ===========================================================================
 #  ESP-weighted overlap (esp / vol_esp): shape kernel x charge weight.
 #  Replicates gaussian_overlap_esp_triton._gauss_overlap_esp_se3_tiled:
 #  V = K * sum exp(-a/2 r^2) * exp(-(Ci-Cj)^2/lam), gradient = shape grad scaled
 #  by the (SE(3)-invariant) charge weight (folded into g). The two exps are fused
-#  into one exp(-a/2 r^2 - c2/lam) (algebraically identical; the L5 lever).
+#  into one exp(-a/2 r^2 - c2/lam) (algebraically identical).
 # ===========================================================================
 @njit(parallel=True, fastmath=True, cache=True)
 def _overlap_grad_esp_kernel(A, B, CA, CB, q, t, Nr, Mr, alpha, inv_lam, need_grad):
@@ -236,10 +229,9 @@ def overlap_score_grad_esp_se3_batch(A, B, charges_A, charges_B, q, t, *,
 #  ShaEP ESP surface comparison (esp_combo), VALUE-ONLY. CPU twin of the Triton
 #  esp_triton._esp_comparison_tiled, op-for-op: for each real field point i,
 #  Coulomb ESP from the other molecule's atoms, vdW+probe volume mask, Gaussian
-#  of the ESP difference, summed over points. Replaces the (K,N_surf,M_atoms)
-#  torch.cdist the eager `_batch_esp_comparison` materialized. fp64 accumulation;
-#  math.exp vs the Triton exp2 is the only intended divergence. No gradient
-#  (esp_combo steers the pose with the shape gradient).
+#  of the ESP difference, summed over points. fp64 accumulation; math.exp vs the
+#  Triton exp2 is the only intended divergence. No gradient (esp_combo steers the
+#  pose with the shape gradient).
 # ===========================================================================
 @njit(parallel=True, fastmath=True, cache=True)
 def _esp_comparison_kernel(P, A, Q, R, PE, Nr, Mr, inv_lam, coulomb, probe):
@@ -415,7 +407,7 @@ def pharm_score_grad_se3_batch(R, t, ref_types, fit_types, ref_anchors, fit_anch
 #  q is assumed unit (the adam renormalizes it each step), matching the shape kernel.
 #  A = ref anchors, B = fit anchors (rotated by R(q),t); At/Bt = ref/fit type idx.
 #  dx = A - rot(B): identical sign convention to _overlap_grad_kernel, so the dV/dq
-#  tail below is byte-identical to the (validated) shape-kernel tail.
+#  tail below is byte-identical to the shape-kernel tail.
 # ===========================================================================
 @njit(parallel=True, fastmath=True, cache=True)
 def _pharm_color_grad_kernel(A, B, q, t, At, Bt, alphas, Ks, cats, Nr, Mr, need_grad):
@@ -501,7 +493,7 @@ def pharm_color_score_grad_se3_batch(A, B, q, t, ref_types, fit_types, alphas, K
 #  dV/dq DIRECTLY in-register, so the pharm driver drops the
 #  rotation->quaternion projection + normalization-Jacobian tail. dV/dq is the
 #  projection of grad_R = grad_R_positional + grad_R_weight onto q, computed by
-#  reusing the validated shape-kernel dR/dq tail TWICE: once with the positional
+#  reusing the shape-kernel dR/dq tail TWICE: once with the positional
 #  "force" (sum_j aKwE*(rotfit-ref)) and the body-frame fit ANCHOR, and once with
 #  the weight "force" (sum_j coeff*ref_vn) and the body-frame fit VECTOR.
 # ===========================================================================

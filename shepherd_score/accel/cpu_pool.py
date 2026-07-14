@@ -3,24 +3,25 @@
 Why this exists
 ---------------
 The ``backend="numba"`` path parallelises *one* batch across **threads** -- the
-``@njit(parallel=True)`` ``prange`` overlap kernel. On many-core CPUs that caps at
-~5-6x (measured: ``benchmarks/experiments/cpu_numba_scaling_probe.py``): ``prange``
-static-schedules the poses over a per-step barrier, so one slow core straggles every
-step, and the numba + torch thread pools oversubscribe each other.
+``@njit(parallel=True)`` ``prange`` overlap kernel. On many-core CPUs this scales
+sub-linearly: ``prange`` static-schedules the poses behind a per-step barrier, so one
+slow core straggles every step, and the numba and torch thread pools oversubscribe each
+other.
 
 This module is the alternative that scales closer to *N*: shard the **pairs** across
 *N* persistent worker **processes**, each running the unchanged batched aligner
 **single-threaded**. Alignment pairs are independent (each score is its own max over
-SE(3) seeds), so a sharded result is **bit-identical** to one big call -- it only
-removes the per-step cross-core barrier, so heterogeneous cores no longer drag each
-other and the aggregate approaches one-core-throughput x N.
+SE(3) seeds), so sharding does not change the optimization problem for any pair -- it
+only removes the per-step cross-core barrier, so heterogeneous cores no longer drag each
+other and the aggregate approaches one-core-throughput x N. Agreement with one big call
+is to convergence tolerance, not bitwise: the fine loop's early-stop tests a
+batch-GLOBAL max, so a pair's step count depends on which pairs share its batch and a
+shard may plateau a step or two apart.
 
 Design
 ------
 * **Persistent** workers (one pool per process, reused across calls): the numba
-  JIT-cache load + heavy imports are paid once, not per call. This is the missing
-  piece of the GPU ``FSS_MGPU_BACKEND=process`` path, which spawned per call and was
-  therefore too slow to be the default.
+  JIT-cache load and heavy imports are paid once, not per call.
 * Reuses :data:`shepherd_score.accel.batch._MODE_SPEC` and
   :class:`~shepherd_score.accel.batch._ProcStandIn` -- the same per-mode
   ``extract`` / ``tensors`` / ``out`` declarations the GPU process path uses -- so only
@@ -194,10 +195,12 @@ def _shutdown_pool():
 # ---------------------------------------------------------------------------
 def align_pairs(mode, pairs, num_workers, align_kwargs):
     """Align ``pairs`` (``MoleculePair``) across the persistent CPU pool, writing
-    ``sim_aligned_*`` / ``transform_*`` back in-place -- bit-identical to the
-    single-process numba path. Also caches the per-pair input tensors (``_*_t``) on
-    each pair, so the caller's ``return_aligned`` path finds them just as the
-    single-process path would. Results are in-place; returns nothing.
+    ``sim_aligned_*`` / ``transform_*`` back in-place -- equivalent to the
+    single-process numba path (pairs are independent; agreement is to convergence
+    tolerance, not bitwise -- see the module docstring). Also caches the per-pair
+    input tensors (``_*_t``) on each pair, so the caller's ``return_aligned`` path
+    finds them just as the single-process path would. Results are in-place; returns
+    nothing.
     """
     import torch
     from shepherd_score.accel import batch as bm

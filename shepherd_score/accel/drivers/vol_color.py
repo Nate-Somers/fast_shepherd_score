@@ -36,7 +36,6 @@ from typing import Optional, Tuple
 # win -- i.e. small clouds (all pads <= VOL_COLOR_FUSED_MAX_PAD=32); larger molecules fall
 # back to the two separate kernels (the fused kernel's two-channel register footprint blows
 # occupancy at BLOCK=64). Disable with FINE_VOL_COLOR_FUSED=0.
-_FINE_VOL_COLOR_FUSED = os.environ.get("FINE_VOL_COLOR_FUSED", "1") != "0"
 
 from ..kernels.dispatch import (
     fused_adam_qt_with_tangent_proj, pharm_color_score_grad_se3_batch,
@@ -49,11 +48,9 @@ from ._common import (
     apply_se3_transform,
     quaternion_to_rotation_matrix,
     _update_best,
-    ES_PATIENCE_OVERRIDE,
 )
-from ._graphed import _GraphedFineBase, run_graphed, graph_cap, _FINE_GRAPHS, _GRAPH_MAX_P, _GRAPH_STEPS
+from ._graphed import _GraphedFineBase, run_graphed, graph_cap
 from .esp_combo import _overlap_in_chunks_volumetric, _self_overlap_chunks
-from .shape import _CPU_FUSED
 from ...score.analytical_gradients._torch import build_lookup_tables
 
 # Padding type for pharmacophore slots: P_TYPES index 8 == 'Dummy' (lookup category 3 ->
@@ -86,7 +83,7 @@ def _vc_overlaps(c1, c2, a1, a2, q, t, pt1, pt2, tables, alpha, Nc, Mc, Na, Ma):
     tile; otherwise the two separate kernels (which the fused kernel beats only for small
     clouds). Drop-in for the shape + color kernel pair in the fine loop and the graph step."""
     al, Ks, cats = tables
-    if _FINE_VOL_COLOR_FUSED and c1.is_cuda:
+    if c1.is_cuda:
         from ..kernels.vol_color_triton import (
             vol_color_score_grad_se3_batch, VOL_COLOR_FUSED_MAX_PAD)
         if max(c1.shape[1], c2.shape[1], a1.shape[1], a2.shape[1]) <= VOL_COLOR_FUSED_MAX_PAD:
@@ -223,9 +220,6 @@ def coarse_fine_vol_color_align_many(
         early_stop_patience: int = 2,
         early_stop_tol: float = 1e-5) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Vectorized vol_color alignment over a batch of pairs (coarse-to-fine SE(3))."""
-    # Honor the FINE_ES_PATIENCE env override (as pharm does); default patience=2 matches the
-    # shape/surf drivers (validated bit-identical + accuracy-safe for fast-converging modes).
-    early_stop_patience = ES_PATIENCE_OVERRIDE or early_stop_patience
     device = centers_1.device
     dtype = centers_1.dtype
     BATCH = centers_1.shape[0]
@@ -332,13 +326,12 @@ def coarse_fine_vol_color_align_many(
 
     best_score = best_q = best_t = None
 
-    # --- CUDA-graph fast path: capture the 2-kernel (shape+color) step, replay it. This is
-    # the worst host-overhead mode (2 launches/step); graphing removes the per-step host gap.
-    # Gated to the launch-bound small/medium-P CUDA fp32 regime (large P / capture failure
-    # fall back to the eager loop below). See drivers/_graphed.
-    # vol_color runs a 2nd (color) kernel per step, so it crosses over sooner than vol -> an
-    # explicit work budget keeps its cap (~120k) below its ~150k crossover regardless of CEIL.
-    if (_FINE_GRAPHS and centers_1_k.is_cuda
+    # --- CUDA-graph fast path: capture the 2-kernel (shape+color) step, replay it. Gated to
+    # the launch-bound small/medium-P CUDA fp32 regime (large P / capture failure fall back to
+    # the eager loop below). See drivers/_graphed.
+    # vol_color runs a second (color) kernel per step, so it crosses over sooner than vol;
+    # hence the explicit, lower work budget on graph_cap.
+    if (centers_1_k.is_cuda
             and PK <= graph_cap(N_pad_cent * M_pad_cent, budget=30_000_000)
             and centers_1_k.dtype == torch.float32):
         try:
@@ -354,7 +347,7 @@ def coarse_fine_vol_color_align_many(
             best_score = None                              # capture failed -> eager
 
     # --- opt-in CPU (numba) fast path: fully-fused fine loop, NO torch in the hot loop ------
-    if (best_score is None and _CPU_FUSED and not centers_1_k.is_cuda
+    if (best_score is None and not centers_1_k.is_cuda
             and centers_1_k.dtype == torch.float32):
         try:
             from ..kernels.cpu_fused import cpu_fused_vol_color
@@ -443,7 +436,6 @@ def fast_optimize_vol_color_overlay_batch(
         lr: float = 0.075,
         num_seeds: int = 50) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched vol_color alignment. Returns (aligned_fit_centers, q_best, t_best, scores)."""
-    device = ref_centers_batch.device
     BATCH = ref_centers_batch.shape[0]
     if N_real_centers is None:
         N_real_centers = ref_centers_batch.new_full((BATCH,), ref_centers_batch.shape[1], dtype=torch.int32)

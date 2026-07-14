@@ -1,18 +1,15 @@
 """
 Batched, multi-GPU GPU/Triton aligners for :class:`MoleculePair`.
 
-Extracted from ``_core.py`` (which kept growing) so that file stays readable.
-Every function here is a *free function* that operates on duck-typed
-``MoleculePair`` objects -- it only reads/writes their attributes. ``MoleculePair``
-binds these as static methods, so the public seam is unchanged:
-``MoleculePair._align_batch_vol(pairs, ...)`` still works exactly as before.
+Every function here is a *free function* that operates on duck-typed ``MoleculePair``
+objects -- it only reads/writes their attributes. ``MoleculePair`` binds these as static
+methods, so ``MoleculePair._align_batch_vol(pairs, ...)`` is the public seam.
 
-There is no runtime dependency on ``_core`` (only a TYPE_CHECKING import), so this
-module imports cheaply and the spawn-based multi-GPU worker stays picklable.
+This module must keep NO runtime dependency on ``_core`` (only a TYPE_CHECKING import), so
+it imports cheaply and the worker processes stay picklable.
 """
 from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
-import os
 
 import numpy as np
 import torch
@@ -28,72 +25,46 @@ from ._bucket import plan_buckets, PadSpec
 from ._dispatch import _should_distribute, _run_distributed, _dev_idx
 
 
+from .._modes import MODE_SEEDS as _MODE_SEEDS, MODE_STEPS as _MODE_STEPS
+
 # ---- persistent, per-process caches (reused across calls) -------------------
 _ALIGN_WORKSPACES: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
 _INT_BUFFER_CACHE: dict[int, dict[str, torch.Tensor]] = {}
 
-# Override the vol/surf seed count (default 50) for speed experiments. Fewer seeds
-# = fewer poses = ~linear speedup, but coarser SO(3) coverage risks distinct-pair
-# accuracy -- gated in benchmarks/experiments/speedlab.py. None -> 50.
-_NUM_SEEDS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_SEEDS"))
-_NUM_STEPS = (lambda v: int(v) if v else None)(os.environ.get("FINE_NUM_STEPS"))
-
-# Per-mode default (seed count, fine-step count). The data + its tuning rationale now live in
-# the mode registry (``accel/_modes.py``: MODE_SEEDS / MODE_STEPS); imported here under the
-# historical names that _seeds_for/_steps_for (and external refs) use. FINE_NUM_SEEDS /
-# FINE_NUM_STEPS env vars still override every mode.
-from .._modes import MODE_SEEDS as _MODE_SEEDS, MODE_STEPS as _MODE_STEPS
-# Coarse-to-fine seed prune (after_steps, keep), wired per-mode but OFF by default. It speeds surf
-# on bandwidth-limited GPUs (L40s: ~1.46x at 99.8% of the 64-seed mean) BUT is net-NEGATIVE on
-# H200: the mid-loop seed-slice spikes memory, shrinks the _subbatched_align chunks, and the lower
-# occupancy hurts more on the higher-SM H200 (measured surf pairwise 9.5k->6.5k). So it's available
-# opt-in (set entries here, or env FINE_PRUNE_AFTER/FINE_PRUNE_KEEP) but not a default. The clean
-# large-N surf win is the bucket upfront cap (_bucket._cap_upfront), which is on by default.
-_MODE_PRUNE: dict = {}
-def _prune_for(mode): return _MODE_PRUNE.get(mode, (0, 0))
-
 
 def _seeds_for(mode: str) -> int:
-    """Per-mode default seed count (FINE_NUM_SEEDS env overrides; legacy fallback 50)."""
-    return _NUM_SEEDS if _NUM_SEEDS else _MODE_SEEDS.get(mode, 50)
+    """Per-mode default seed count from the mode registry."""
+    return _MODE_SEEDS.get(mode, 50)
 
 
 def _steps_for(mode: str) -> int:
-    """Per-mode default fine-step count (FINE_NUM_STEPS env overrides; legacy fallback 50)."""
-    return _NUM_STEPS if _NUM_STEPS else _MODE_STEPS.get(mode, 50)
+    """Per-mode default fine-step count from the mode registry."""
+    return _MODE_STEPS.get(mode, 50)
 
 
 def _batch_upload(pairs, attr, src_fn, dtype, device):
     """Set ``p.<attr>`` for every ``p`` with ONE host concat + ONE ``.to(device)``
     view-split, instead of one ``torch.as_tensor(..., device=device)`` per pair.
 
-    Bit-identical to the per-pair build it replaces: ``np.concatenate`` over a list of
-    ``(n_i, F)`` host arrays then ``.split([n_i])`` along dim 0 yields tensors whose
-    contents/dtype match per-array ``torch.as_tensor(src, dtype=...)``, and the
-    downstream ``_scatter_fill`` re-``cat``s them anyway.
+    Rules this build MUST obey to stay bit-identical to a per-pair
+    ``torch.as_tensor(src, dtype=..., device=...)``:
 
-    The dtype cast is done VIA TORCH (``from_numpy(flat).to(device=..., dtype=...)``),
-    NOT via numpy ``.astype`` -- this exactly reproduces ``torch.as_tensor(arr,
-    dtype=dtype, device=device)``, which for a CPU-numpy source + target device
-    decomposes to ``torch.from_numpy(arr).to(device, dtype)`` (verified bytewise). numpy's
-    float64->float32 rounding can differ from torch's by a ULP, so a numpy-side
-    ``.astype(float32)`` made vol_esp / vol_and_surf_esp diverge from baseline -- they are
-    the only modes with float64 RDKit sources (``partial_charges`` and
-    ``mol.GetConformer().GetPositions()``); the other 5 modes' arrays are already float32
-    so the cast was a no-op and they matched. Casting through torch is provably
-    bit-identical for every dtype (int64/float32 no-op, float64->float32 via torch).
-    ``np.concatenate`` keeps the source dtype and is fine since each ``_batch_upload``
-    call's ``src_fn`` yields one uniform-dtype attribute.
+    (1) The dtype cast goes THROUGH TORCH (``from_numpy(flat).to(device=..., dtype=...)``),
+        NEVER through numpy ``.astype``. numpy's float64->float32 rounding can differ from
+        torch's by a ULP, and vol_esp / vol_and_surf_esp are fed float64 RDKit sources
+        (``partial_charges``, ``mol.GetConformer().GetPositions()``), so a numpy-side cast
+        would move their scores.
+    (2) ``np.concatenate`` keeps the source dtype, so the concat itself never casts.
+    (3) Each per-pair view is ``.clone()``d, so the cached ``_*_t`` tensor is its OWN
+        contiguous allocation (separate storage, no shared-buffer aliasing across pairs).
+    (4) Each call's ``src_fn`` must yield a single uniform-dtype attribute; mixed dtypes
+        must be split into separate calls (as ``pharm_types``/int64 is).
 
-    Each per-pair view is ``.clone()``d so the cached ``_*_t`` tensor is its OWN
-    contiguous allocation -- exactly like the per-pair ``torch.as_tensor`` it replaces
-    (separate storage, no shared-buffer aliasing across pairs).
-
-    Only pairs whose ``<attr>`` is None (cold cache) get the batched upload; pairs
-    already holding a same-device tensor are left untouched (so the SCREEN path, which
-    pre-warms these via build_fit, stays a no-op), and a wrong-device cached tensor is
-    moved per-pair (rare warm/multi-GPU path). ``src_fn`` does any host-side numpy
-    indexing (e.g. ``_nonH_atoms_idx``) -- that stays numpy, not an ``aten::to``.
+    Only pairs whose ``<attr>`` is None (cold cache) get the batched upload; pairs already
+    holding a same-device tensor are left untouched (so the screen path, which pre-warms
+    these via build_fit, stays a no-op), and a wrong-device cached tensor is moved per-pair.
+    ``src_fn`` performs any host-side numpy indexing (e.g. ``_nonH_atoms_idx``); that
+    indexing must stay in numpy rather than becoming a device-side ``aten::to``.
     """
     cold = [p for p in pairs if getattr(p, attr, None) is None]
     if cold:
@@ -114,8 +85,6 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
     Batched alignment with workspace reuse & reduced per-pair transfers.
     """
 
-    global _ALIGN_WORKSPACES, _INT_BUFFER_CACHE
-    
     if not pairs:
         return
     if _should_distribute(pairs):
@@ -127,10 +96,9 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
 
     device = pairs[0].device
     # --- move coords once (skip if already there & right dtype) -------------
-    # _ref_xyz_t/_fit_xyz_t are set in MoleculePair.__init__, so these are never
-    # cold here -- _batch_upload's cold branch is a no-op and only the per-pair
-    # device-move (the original two lines) runs. atom_pos is the same source the
-    # constructor used, so a hypothetical cold pair stays bit-identical too.
+    # _ref_xyz_t/_fit_xyz_t are set in MoleculePair.__init__, so these are never cold here:
+    # _batch_upload's cold branch is a no-op and only the per-pair device-move runs. atom_pos
+    # is the same source the constructor uses, so a cold pair stays bit-identical too.
     _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
     _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
 
@@ -140,7 +108,7 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    # --- adaptive band bucketing (P1-4: mode-agnostic cost-model planner) ----
+    # --- adaptive band bucketing (mode-agnostic cost-model planner) ----------
     _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
                            "fit": lambda p: p._fit_xyz_t.shape[0]},
                     seeds=_seeds_for("vol"))
@@ -161,7 +129,7 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
         N_real = int_buf['N']
         M_real = int_buf['M']
 
-        # Fill once from CPU lists (one H2D each) -- was per-element GPU writes
+        # Fill once from CPU lists (one H2D each) instead of per-element GPU writes
         ref_ts = [p._ref_xyz_t for p in bucket]
         fit_ts = [p._fit_xyz_t for p in bucket]
         n_list = [t.shape[0] for t in ref_ts]
@@ -184,9 +152,8 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
         # but we do clear the padding slices for deterministic results.
         ref_pad.zero_()
         fit_pad.zero_()
-        # Batched scatter pad-fill (was K per-pair GPU copies via pad_sequence).
-        # cat+scatter into the zero-init prefix -> bit-identical, launch-count O(1)
-        # in K instead of O(K) (R3: the pad_sequence fill was the top host cost).
+        # Batched scatter pad-fill: cat+scatter into the zero-init prefix -> bit-identical
+        # to a per-pair pad_sequence fill, launch-count O(1) in K instead of O(K).
         _scatter_fill(ref_pad, ref_ts, n_list)
         _scatter_fill(fit_pad, fit_ts, m_list)
 
@@ -225,8 +192,8 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
-    scores_list = scores_cpu.tolist()                       # one C call (was K float())
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_noH = S
         p.sim_aligned_vol_noH = s
@@ -252,13 +219,9 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
     • p.sim_aligned_surf    ← best Tanimoto surface score (float)
     """
 
-    # Reuse the persistent, per-process workspace/int-buffer caches (same
-    # ref/fit scratch-buffer layout as _align_batch_vol). The previous local
-    # re-declarations here shadowed the module globals, so the surf path
-    # never reused workspaces across calls. Buffers are zeroed before use,
-    # so cross-call (and cross-modality) reuse is safe.
-    global _ALIGN_WORKSPACES, _INT_BUFFER_CACHE
-
+    # Reuses the persistent per-process workspace / int-buffer caches (same ref/fit scratch
+    # layout as _align_batch_vol; mutated in place -- accel.batch re-exports these objects --
+    # never rebound). Buffers are zeroed before use, so cross-call and cross-mode reuse is safe.
     if not pairs:
         return
     if _should_distribute(pairs):
@@ -296,7 +259,7 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    # --- adaptive band bucketing (P1-4: mode-agnostic cost-model planner) -----
+    # --- adaptive band bucketing (mode-agnostic cost-model planner) -----------
     _spec = PadSpec(merge={"ref": lambda p: p._ref_surf_t.shape[0],
                            "fit": lambda p: p._fit_surf_t.shape[0]},
                     seeds=_seeds_for("surf"))
@@ -317,8 +280,7 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
         N_real = int_buf['N']
         M_real = int_buf['M']
 
-        # Fill once from CPU lists (one H2D each) instead of per-element GPU
-        # scalar writes (which were ~8k tiny dispatches/sync per align).
+        # Fill once from CPU lists (one H2D each) instead of per-element GPU scalar writes.
         ref_ts = [p._ref_surf_t for p in bucket]
         fit_ts = [p._fit_surf_t for p in bucket]
         n_list = [t.shape[0] for t in ref_ts]
@@ -339,9 +301,8 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
         # Clear padding slices for determinism; write valid prefixes
         ref_pad.zero_()
         fit_pad.zero_()
-        # Batched scatter pad-fill (was K per-pair GPU copies via pad_sequence).
-        # cat+scatter into the zero-init prefix -> bit-identical, launch-count O(1)
-        # in K instead of O(K) (R3: the pad_sequence fill was the top host cost).
+        # Batched scatter pad-fill: cat+scatter into the zero-init prefix -> bit-identical
+        # to a per-pair pad_sequence fill, launch-count O(1) in K instead of O(K).
         _scatter_fill(ref_pad, ref_ts, n_list)
         _scatter_fill(fit_pad, fit_ts, m_list)
 
@@ -357,7 +318,6 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
         # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
         # memory-pressured chunking never re-pays the launch-bound seed-gen.
         seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds_for("surf"))
-        _pa, _pk = _prune_for("surf")
 
         # ---- coarse + fine alignment (same engine as volumetric), processed in
         # GPU-memory-safe sub-batches sized per bucket (pairs are independent)
@@ -366,7 +326,7 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
             return coarse_fine_align_many(
                 ref_pad[sl], fit_pad[sl], VAA[sl], VBB[sl],
                 N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine,
-                seeds=(seeds_q[sl], seeds_t[sl]), prune_after=_pa, prune_keep=_pk)
+                seeds=(seeds_q[sl], seeds_t[sl]))
         scores, q_batch, t_batch = _subbatched_align(
             _proc, K, key=("surf", N_pad, M_pad, _seeds_for("surf")), device=device)
 
@@ -380,8 +340,8 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
-    scores_list = scores_cpu.tolist()                       # one C call (was K float())
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_surf = S
         p.sim_aligned_surf = s
@@ -498,8 +458,8 @@ def _esp_bucketed_align(
 
     # Bucket by padded point-cloud sizes; for translation-seeded mode also PARTITION by the
     # exact number of translation centers (it fixes the legacy 10*P+5 seed count, so it must
-    # stay uniform within a bucket). Adaptive cost-model planner (P1-4); result-identical
-    # because the kernel masks padding to the real counts.
+    # stay uniform within a bucket). Result-identical because the kernel masks padding to the
+    # real counts.
     _tc_of = (lambda p: int(p._ref_xyz_t.shape[0])) if trans_init else (lambda p: 0)
     _spec = PadSpec(merge={"ref": lambda p: getattr(p, ref_pts_attr).shape[0],
                            "fit": lambda p: getattr(p, fit_pts_attr).shape[0]},
@@ -554,8 +514,8 @@ def _esp_bucketed_align(
         fit_pad.zero_()
         ref_c_pad.zero_()
         fit_c_pad.zero_()
-        # Batched scatter pad-fill (was a per-pair loop of 4*K device slice-copies).
-        # cat+scatter into the zero-init prefix -> bit-identical, O(1) launches in K.
+        # Batched scatter pad-fill: cat+scatter into the zero-init prefix -> bit-identical
+        # to a per-pair slice-copy loop, O(1) launches in K instead of 4*K.
         _scatter_fill(ref_pad, ref_pts_ts, n_list)
         _scatter_fill(fit_pad, fit_pts_ts, m_list)
         _scatter_fill(ref_c_pad, ref_chg_ts, n_list)
@@ -571,12 +531,10 @@ def _esp_bucketed_align(
                 trans_centers_batch[i] = p._ref_xyz_t
             trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
 
-        # NOTE: seed-gen is intentionally NOT hoisted out of the sub-batch loop for
-        # the ESP-family kernels. Unlike surf/vol (where hoisting cleanly helps under
-        # memory pressure), the heavier per-chunk ESP footprint meant held full-band
-        # seeds shaved enough free memory to tip the sub-batcher into OOM-retry thrash
-        # (esp-same large-batch went 1912 -> 273 mol/s). Clean-process ESP is already
-        # fast; the per-cell subprocess benchmark removes the pressure entirely.
+        # NOTE: seed-gen is intentionally NOT hoisted out of the sub-batch loop for the
+        # ESP-family kernels. Unlike surf/vol (where hoisting helps under memory pressure),
+        # the heavier per-chunk ESP footprint means held full-band seeds shave enough free
+        # memory to tip the sub-batcher into OOM-retry thrash.
         def _proc(_s, _k):
             sl = slice(_s, _s + _k)
             tcb = trans_centers_batch[sl] if trans_centers_batch is not None else None
@@ -603,8 +561,8 @@ def _esp_bucketed_align(
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
-    scores_list = scores_cpu.tolist()                       # one C call (was K float())
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         setattr(p, out_tf_attr, S)
         setattr(p, out_sc_attr, s)
@@ -646,12 +604,8 @@ def _align_batch_vol_esp(
     device = pairs[0].device
 
     # Ensure heavy-atom coords (+ heavy-atom partial charges) exist on device.
-    # Each attr here follows the clean "cold -> build, warm wrong-device -> move"
+    # Each attr here follows the "cold -> build, warm wrong-device -> move"
     # pattern, which _batch_upload reproduces exactly (one batched H2D per array).
-    # (The earlier vol_esp/esp_combo "golden mismatch" was traced to GPU cross-job
-    # Triton-kernel non-determinism, NOT this build -- the same-process test showed
-    # _batch_upload == per-pair = EXACTLY 0 diff -- so these are on the batched path
-    # like the other 5 modes.)
     for p in pairs:
         if p.ref_molec.partial_charges is None or p.fit_molec.partial_charges is None:
             raise ValueError("Partial charges are None; cannot run _align_batch_vol_esp.")
@@ -665,8 +619,8 @@ def _align_batch_vol_esp(
     # below (partial_charges[_nonH_atoms_idx]). atom_pos comes from
     # Chem.RemoveHs, which RETAINS some H (stereo/isotope/valence), so its
     # count can exceed len(_nonH_atoms_idx) -- a data-dependent off-by-a-few
-    # (DUD-E decoys hit it) that desyncs the bucketed scatter-fill (coords
-    # n_list != charge length). Index the conformer by _nonH_atoms_idx so
+    # that desyncs the bucketed scatter-fill (coords n_list != charge
+    # length). Index the conformer by _nonH_atoms_idx so
     # centers stay 1:1 with the charges (bit-identical to atom_pos when
     # RemoveHs keeps no H, since center_to transforms both together). The
     # _nonH_atoms_idx numpy indexing stays on host inside the src_fn.
@@ -735,10 +689,7 @@ def _align_batch_vol_and_surf_esp(
 
     # Ensure required tensors exist on device. Each attr is independent (cold -> build,
     # warm wrong-device -> move), the same per-attr contract _batch_upload implements,
-    # so the per-pair _ensure loop collapses to one batched H2D per array name.
-    # (The earlier vol_esp/esp_combo "golden mismatch" was traced to GPU cross-job
-    # Triton-kernel non-determinism, NOT this build -- the same-process test showed
-    # _batch_upload == per-pair = EXACTLY 0 diff -- so this is back on the batched path.)
+    # so the per-pair ensure loop collapses to one batched H2D per array name.
     for p in pairs:
         if p.ref_molec.surf_pos is None or p.fit_molec.surf_pos is None:
             raise ValueError("Surface points are None; cannot run _align_batch_vol_and_surf_esp.")
@@ -767,7 +718,7 @@ def _align_batch_vol_and_surf_esp(
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    # Adaptive cost-model planner (P1-4) over the SIX cost dims (atoms-w-H, shape centers,
+    # Cost-model planner over the SIX cost dims (atoms-w-H, shape centers,
     # surface points -- ref & fit) + the exact tc partition. "centers" are volumetric atoms
     # when alpha==0.81, else the surface points (constant for the whole call). The work model
     # is the SUM of the three channel products (shape + the two ESP comparisons) -- exactly
@@ -870,13 +821,12 @@ def _align_batch_vol_and_surf_esp(
             trans_centers_batch = torch.stack([p._ref_xyz_t for p in bucket])
             trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
 
-        # Memory-safe fine loop, GPU-adaptive: the combo driver expands the bucket by
-        # num_seeds internally, so on a large bucket its fine-loop tensors can exceed free
-        # memory (an 11.6 GB alloc OOMed a 44 GB L40S at N=1M). Route it through the same
-        # _subbatched_align vol/surf use -- it sizes each chunk from mem_get_info() free memory
-        # and HALVES-and-retries on OOM -- so the combo can never OOM and adapts to any GPU.
-        # Pairs are independent (each result is its own max over seeds), so chunking is
-        # result-identical to one big call.
+        # The fine loop MUST go through _subbatched_align: the combo driver expands the bucket
+        # by num_seeds internally, so on a large bucket its fine-loop tensors can exceed free
+        # memory. _subbatched_align sizes each chunk from mem_get_info() free memory and
+        # halves-and-retries on OOM, so the combo adapts to any GPU. Pairs are independent
+        # (each result is its own max over seeds), so chunking is result-identical to one
+        # big call.
         def _proc(_s, _k):
             sl = slice(_s, _s + _k)
             _, q, t, sc = fast_optimize_esp_combo_score_overlay_batch(
@@ -907,8 +857,8 @@ def _align_batch_vol_and_surf_esp(
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair quaternion_to_SE3)
-    scores_list = scores_cpu.tolist()                       # one C call (was K float())
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_and_surf_esp = S
         p.sim_aligned_vol_and_surf_esp = s
@@ -935,8 +885,8 @@ def _align_batch_pharm(
     if not pairs:
         return
     # Single source of truth: default the SO(3) multi-start count to the per-mode MODE_SEEDS
-    # value (FINE_NUM_SEEDS-aware) so the fast batched kernel honors it. An explicit num_repeats
-    # overrides.
+    # value (from the mode registry) so the fast batched kernel honors it. An explicit
+    # num_repeats overrides.
     if num_repeats is None:
         num_repeats = _seeds_for("pharm")
     if _should_distribute(pairs):
@@ -947,17 +897,15 @@ def _align_batch_pharm(
                                 steps_fine=steps_fine, lr=lr)
 
     # The batched pharm kernel runs on CUDA (Triton) and on CPU (numba) via device-driven
-    # dispatch. There is NO silent per-pair fallback: a throughput number labeled "numba"/"triton"
-    # must come from the batched kernel, never the ~100x-slower per-pair legacy optimizer. So on a
-    # CPU box without numba (or if the fast batched driver won't import) we RAISE rather than
-    # quietly emitting a mislabeled result. Install numba, or run this mode on CUDA.
+    # dispatch. There is no per-pair fallback, so on a CPU box without numba this raises rather
+    # than silently producing a differently-computed result.
     if pairs[0].device.type != "cuda":
         try:
             import numba  # noqa: F401
         except ImportError as e:
             raise RuntimeError(
-                "batched pharm alignment on CPU requires numba (per-pair fallback removed); "
-                "install numba or run this mode on CUDA"
+                "batched pharm alignment on CPU requires numba; "
+                "install numba (pip install numba) or run this mode on CUDA"
             ) from e
 
     from shepherd_score.accel.drivers.pharm import fast_optimize_pharm_overlay_batch
@@ -980,14 +928,14 @@ def _align_batch_pharm(
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    # Adaptive planner (P1-4): merge by padded anchor counts, partition by exact tc.
+    # Merge by padded anchor counts, partition by exact tc.
     _tc_of = (lambda p: int(p._ref_pharm_ancs_t.shape[0])) if trans_init else (lambda p: 0)
     _spec = PadSpec(merge={"ref": lambda p: p._ref_pharm_ancs_t.shape[0],
                            "fit": lambda p: p._fit_pharm_ancs_t.shape[0]},
                     seeds=_seeds_for("pharm"),
                     partition={"tc": _tc_of})
     for _bk in plan_buckets(pairs, _spec, device):
-        N_pad, M_pad, tc = _bk.pad["ref"], _bk.pad["fit"], _bk.pad["tc"]
+        N_pad, M_pad = _bk.pad["ref"], _bk.pad["fit"]
         bucket = _bk.members
         K = len(bucket)
 
@@ -1005,9 +953,9 @@ def _align_batch_pharm(
         fit_ancs_ts = [p._fit_pharm_ancs_t for p in bucket]
         n_list = [t.shape[0] for t in ref_ancs_ts]
         m_list = [t.shape[0] for t in fit_ancs_ts]
-        N_real.copy_(torch.tensor(n_list, dtype=torch.int32))   # was per-element GPU writes
+        N_real.copy_(torch.tensor(n_list, dtype=torch.int32))   # one H2D, not per-element writes
         M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
-        # Batched scatter pad-fill (was a per-pair loop of 6*K device slice-copies).
+        # Batched scatter pad-fill: O(1) launches in K instead of 6*K device slice-copies.
         _scatter_fill(ref_types, [p._ref_pharm_types_t for p in bucket], n_list)
         _scatter_fill(fit_types, [p._fit_pharm_types_t for p in bucket], m_list)
         _scatter_fill(ref_ancs, ref_ancs_ts, n_list)
@@ -1047,8 +995,8 @@ def _align_batch_pharm(
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched (was per-pair)
-    scores_list = scores_cpu.tolist()                       # one C call (was K float())
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_pharm = S
         p.sim_aligned_pharm = s
@@ -1106,13 +1054,13 @@ def _align_batch_vol_color(
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    # COLLAPSED bucket key + adaptive planner (P1-4): merge by shape-center bands only,
-    # partition by exact tc. The pharmacophore-anchor counts are deliberately NOT keyed --
-    # their pad slots are Dummy-typed (never scored) + masked by N_real_pharm, so two pairs
-    # that share a shape bucket but differ in feature count stay together and their anchors are
-    # padded to the bucket's max feature band (recomputed below). RESULT-IDENTICAL (the masked
-    # color kernel ignores the extra slots); keeps vol_color on the vol shape-bucket granularity
-    # (its old 5-tuple key split each shape bucket by two feature-count dims, starving occupancy).
+    # Collapsed bucket key: merge by shape-center bands only, partition by exact tc. The
+    # pharmacophore-anchor counts are deliberately NOT keyed -- their pad slots are Dummy-typed
+    # (never scored) and masked by N_real_pharm, so two pairs that share a shape bucket but
+    # differ in feature count stay together and their anchors are padded to the bucket's max
+    # feature band (recomputed below). RESULT-IDENTICAL (the masked color kernel ignores the
+    # extra slots), and it keeps vol_color on the vol shape-bucket granularity: keying the
+    # anchor counts splits each shape bucket by two extra dims and starves occupancy.
     _tc_of = (lambda p: int(p._ref_xyz_t.shape[0])) if trans_init else (lambda p: 0)
     _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
                            "fit": lambda p: p._fit_xyz_t.shape[0]},

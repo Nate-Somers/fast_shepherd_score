@@ -129,6 +129,17 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # unused imports in __init__
+# The accelerated kernels and their drivers use numerical-code idioms that pycodestyle flags
+# but that read better here than the alternatives: semicolon-grouped assignments so one
+# matrix/vector row occupies one line (E702), single-capital names for standard math objects
+# such as O for an overlap matrix and I for the identity (E741), and short lambdas used as
+# local buffer factories (E731). The rest of the package keeps the project's full strictness.
+"shepherd_score/accel/**" = ["E702", "E741", "E731"]
+# Kernel/backend tests build small numeric fixtures with the same dense idioms.
+"tests/test_numba_backend.py" = ["E402", "E702", "E741"]  # imports follow pytest.importorskip
+"tests/test_cpu_pool.py" = ["E702"]
+"tests/test_screen.py" = ["E702"]
+"tests/test_fast_batch_alignment.py" = ["E731"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["shepherd_score"]

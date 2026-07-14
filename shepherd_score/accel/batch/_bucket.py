@@ -1,14 +1,9 @@
-"""Mode-agnostic adaptive bucketer for the batched aligners (speed_plan.md P1-4).
+"""Mode-agnostic adaptive bucketer for the batched aligners.
 
-The batched aligners group same-size pairs into a padded workspace + one kernel launch.
-Historically every ``_align_batch_<mode>`` hand-rolled that grouping as a fixed 16-atom band
-key (see ``ADDING_A_FAST_MODE.md`` step 11). A *fixed* band over-fragments a wide size
-distribution into many under-occupied launches, and over-pads a tight one.
-
-This module replaces that hand-rolling with ONE planner that works for any mode -- the seven
-that exist today and any added later -- driven by a small declarative :class:`PadSpec` the
-driver supplies inline. A future mode gets adaptive bucketing by calling :func:`plan_buckets`
-with its own field layout; no change to this file is needed.
+The batched aligners group same-size pairs into a padded workspace + one kernel launch. A
+*fixed* band over-fragments a wide size distribution into many under-occupied launches, and
+over-pads a tight one. :func:`plan_buckets` is ONE planner for every mode, driven by the
+declarative :class:`PadSpec` each driver supplies inline.
 
 Why it is RESULT-IDENTICAL (the safety property that makes a cost model legitimate)
 ----------------------------------------------------------------------------------
@@ -33,16 +28,9 @@ Three field roles (a :class:`PadField` via the three dicts on :class:`PadSpec`)
                    count). Buckets only merge with others sharing the same partition bands.
 * ``masked``    -- cheap, padded to the bucket's max, not part of the key (e.g. vol_color
                    pharmacophore anchors, which are Dummy-typed and masked out).
-
-Env knobs (all default to preserving/raising current behaviour):
-* ``FINE_ADAPTIVE_BUCKETS=0``    -> legacy: one bucket per exact band cell (no merging).
-* ``FINE_BUCKET_MAX_PAD_WASTE``  -> opportunistic-merge cap on added padded work (default 0.15).
-* ``FINE_BUCKET_MIN_WAVE`` / ``FINE_BUCKET_CTAS_PER_SM`` -> occupancy floor (force-merge a
-  bucket whose pose count ``K*seeds`` is below one CTA wave).
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -50,51 +38,39 @@ import torch
 
 from ._pad import _band_key
 
-# --- env knobs --------------------------------------------------------------------------
-_ADAPTIVE = os.environ.get("FINE_ADAPTIVE_BUCKETS", "1") != "0"
-_MAX_PAD_WASTE = float(os.environ.get("FINE_BUCKET_MAX_PAD_WASTE", "0.15"))
-_CTAS_PER_SM = int(os.environ.get("FINE_BUCKET_CTAS_PER_SM", "16"))
-# Cap a merged bucket at this many CTA waves. Merging exists ONLY to fill under-occupied
-# buckets toward full GPU occupancy; once a bucket fills ~this many waves we stop, so we never
-# (a) merge two already-full buckets -- at compute-bound large batch that only adds masked-lane
-# padding waste (measured ~5-10% large-N regression), nor (b) grow an unbounded giant bucket
-# that wastes compute and stresses the heavy kernels' indexing/memory (an illegal-access crash
-# was observed for vol_and_surf_esp screen @100k before this cap).
-_MERGE_MAX_WAVES = float(os.environ.get("FINE_BUCKET_MAX_WAVES", "2"))
+# --- tuning constants -------------------------------------------------------------------
+_CTAS_PER_SM = 16    # CTAs per SM assumed when sizing one occupancy wave
+# Cap a merged bucket at this many CTA waves. Merging exists only to fill under-occupied
+# buckets toward full occupancy. Past this many waves it would (a) merge two already-full
+# buckets, which buys no occupancy and only adds masked-lane padding waste at compute-bound
+# batch, and (b) grow an unbounded bucket whose padded extents the heavy kernels' indexing
+# cannot safely address. Raising this cap is a correctness risk, not a tuning knob.
+_MERGE_MAX_WAVES = 2.0
 # Cap the UPFRONT held memory (padded clouds + hoisted seeds) per bucket. Occupancy merging
-# never splits a full same-size cell, so at large N one cell becomes a single giant bucket whose
-# hoisted pad+seeds -- held resident across the WHOLE fine loop -- starve _subbatched_align's
-# chunks: the held bytes inflate the measured per-pair footprint and shrink each chunk, an
-# occupancy death-spiral (measured surf 100k=11.5k/s, fp=1.6MB -> 300k=6.9k/s, fp=4.1MB -> 1M OOM).
-# Splitting an oversized bucket into <=cap-byte pieces is result-identical (pairs are independent,
-# same as the sub-batcher) and bounds the upfront so chunks stay large.
+# never splits a full same-size cell, so at large N one cell can become a single giant bucket.
+# Its hoisted pad+seeds stay resident across the WHOLE fine loop, which inflates the per-pair
+# footprint _subbatched_align measures and shrinks every chunk it takes. Splitting an oversized
+# bucket into cap-sized pieces is result-identical (pairs are independent, exactly as in the
+# sub-batcher).
 #
-# The cap is ADAPTIVE: a fraction of the device's FREE memory read at call time (mem_get_info),
-# NOT a fixed literal -- so buckets shrink on a smaller/busier GPU (or under multi-process
-# sharing) and grow on a big idle one, and the upfront always leaves the rest for the fine loop.
-# FINE_BUCKET_UPFRONT_FRAC sets the fraction (default 0.25); FINE_BUCKET_MAX_UPFRONT_GB, if set,
-# is an optional HARD CEILING on top of the adaptive value (0 disables capping entirely).
-# The fraction bounds the bucket's PEAK (upfront held + seed-gen float64 transient, see per_pair
-# below) -- both freed before the fine loop, which _subbatched_align budgets separately -- so
-# 0.25 leaves ample room and keeps the light modes' 1M in a single bucket (no over-split dip)
-# while sizing the heavy modes (surf) small enough that their seed-gen transient can't OOM.
-_UPFRONT_FRAC = float(os.environ.get("FINE_BUCKET_UPFRONT_FRAC", "0.25"))
-_UPFRONT_CEIL_GB = os.environ.get("FINE_BUCKET_MAX_UPFRONT_GB")   # None -> no fixed ceiling
+# The cap is a fraction (_UPFRONT_FRAC) of the device's FREE memory, read at call time via
+# mem_get_info -- it must NOT become a fixed byte literal: buckets have to shrink on a smaller
+# or busier GPU (and under multi-process sharing) and grow on a big idle one, so the upfront
+# always leaves the rest of the device for the fine loop. The cap must bound the bucket's PEAK:
+# upfront held bytes PLUS the batched_seeds_torch float64 seed-gen transient (the per_pair term
+# below), which runs on the WHOLE bucket and is not sub-batched. A floor keeps the split from
+# degenerating when the device is busy.
+_UPFRONT_FRAC = 0.25                                              # fraction of FREE device memory
 _UPFRONT_FLOOR_BYTES = 256 * (1024 ** 2)                          # never split below 256 MB
 
 
 def _max_upfront_bytes(device) -> float:
     """Per-bucket upfront-memory cap, derived from the device's current FREE memory."""
-    if _UPFRONT_CEIL_GB is not None and float(_UPFRONT_CEIL_GB) <= 0:
-        return float("inf")                                       # capping disabled
     try:
         free, _ = torch.cuda.mem_get_info(device)
     except Exception:
         free = 8 * (1024 ** 3)                                    # conservative if unavailable
-    cap = _UPFRONT_FRAC * float(free)
-    if _UPFRONT_CEIL_GB is not None:
-        cap = min(cap, float(_UPFRONT_CEIL_GB) * (1024 ** 3))
-    return max(_UPFRONT_FLOOR_BYTES, cap)
+    return max(_UPFRONT_FLOOR_BYTES, _UPFRONT_FRAC * float(free))
 
 
 def _cap_upfront(buckets: list, spec: "PadSpec", device) -> list:
@@ -102,18 +78,15 @@ def _cap_upfront(buckets: list, spec: "PadSpec", device) -> list:
     if getattr(device, "type", None) != "cuda":
         return buckets
     max_bytes = _max_upfront_bytes(device)
-    if max_bytes == float("inf"):
-        return buckets
     out: list = []
     for b in buckets:
         # Peak bytes/pair = UPFRONT held (padded coords 12 B/pt + seed q/t 28 B) PLUS the
-        # SEED-GEN transient. batched_seeds_torch converts the clouds to float64 and materializes
-        # a 4x fit-cloud expansion (A64 + B64 + fit4 + masks) -- a large transient run on the WHOLE
-        # bucket that is NOT sub-batched, so it must bound the bucket size too. Omitting it OOMed
-        # surf kernel_screen @1M once the adaptive cap grew past the old fixed 1.5 GB. ~176 B per
-        # point of the LARGEST cloud covers that float64 transient (24*N + 152*M, upper-bounded by
-        # the max merge pad); it scales with cloud size, so heavy modes (surf) get small buckets
-        # and light modes (vol) stay large.
+        # SEED-GEN transient. batched_seeds_torch upcasts the clouds to float64 and materializes
+        # a 4x fit-cloud expansion (A64 + B64 + fit4 + masks) over the WHOLE bucket and is NOT
+        # sub-batched, so that transient bounds the bucket size as well and must be budgeted here.
+        # ~176 B per point of the LARGEST cloud covers it (24*N + 152*M, upper-bounded by the max
+        # merge pad); it scales with cloud size, so heavy modes (surf) get small buckets and light
+        # modes (vol) stay large.
         merge_pads = [int(b.pad[n]) for n in spec.merge]
         per_pair = sum(merge_pads) * 12 + int(spec.seeds) * 28 + max(merge_pads) * 176
         max_k = max(1, int(max_bytes // max(1, per_pair)))
@@ -127,11 +100,8 @@ def _cap_upfront(buckets: list, spec: "PadSpec", device) -> list:
 
 def _min_wave(device) -> int:
     """Pose count that fills one CTA wave on ``device``. A bucket below this underfills the
-    GPU, so it is force-merged. Overridable with ``FINE_BUCKET_MIN_WAVE``; on CPU it is 1
-    (no occupancy concept), so the floor never fires and only the pad-waste cap merges."""
-    env = os.environ.get("FINE_BUCKET_MIN_WAVE")
-    if env is not None:
-        return max(1, int(env))
+    GPU, so it is force-merged; on CPU it is 1, so the floor never fires and occupancy
+    merging is disabled."""
     if getattr(device, "type", None) != "cuda":
         return 1
     try:
@@ -168,9 +138,6 @@ class PadSpec:
     work: Callable | None = None
     partition: dict = field(default_factory=dict)
     masked: dict = field(default_factory=dict)
-
-    def _all(self):
-        return (*self.merge, *self.partition, *self.masked)
 
     def sizes(self, item) -> dict:
         out = {}
@@ -255,9 +222,6 @@ def plan_buckets(items, spec: PadSpec, device) -> list[Bucket]:
             pad[xnames[i]] = _band_key(xm[i])
         return pad
 
-    if not _ADAPTIVE:                                   # legacy: one bucket per exact cell
-        return _cap_upfront([Bucket(c[0], _pad_of(c)) for c in cells.values()], spec, device)
-
     # group by partition signature (never merge across different partition values), then
     # greedy-merge within each group along the merge dims.
     groups: dict = {}
@@ -296,17 +260,16 @@ def _should_merge(a: Bucket, b: Bucket, spec: PadSpec, min_wave: int) -> bool:
     b_poses = b.K * spec.seeds
     # Merge ONLY two UNDER-occupied buckets, to fill the GPU toward a CTA wave. If EITHER is
     # already full (>= one wave), leave it: merging a full bucket gives no launch/occupancy
-    # benefit and only adds masked-lane padding waste at compute-bound (large) batch -- the
-    # ~5-10% large-N regression -- and can pad-up a saturated kernel (which crashed
-    # vol_and_surf_esp screen @100k). So full buckets fall back to legacy bucketing.
+    # benefit, only adds masked-lane padding waste at compute-bound (large) batch, and can pad
+    # up a saturated kernel past the size the heavy kernels can safely index. Full buckets
+    # therefore fall back to plain per-cell bucketing.
     if a_poses >= min_wave or b_poses >= min_wave:
         return False
     # Bound the merged size to ~_MERGE_MAX_WAVES waves: enough to fill the GPU, never an
     # unbounded giant bucket. NO pad-waste gate here -- both buckets are under-occupied, so the
-    # poses (and thus the masked-lane waste) are few, and the occupancy win dominates. A waste
-    # gate here would block exactly the size-diverse merges that fill the wave (it cost the
-    # small-batch wins when tried). The greedy sort merges size-adjacent buckets first, so the
-    # pad-up stays gradual.
+    # poses (and thus the masked-lane waste) are few and the occupancy win dominates; a waste
+    # gate would block exactly the size-diverse merges that fill the wave. The greedy sort
+    # merges size-adjacent buckets first, so the pad-up stays gradual.
     return a_poses + b_poses <= _MERGE_MAX_WAVES * min_wave
 
 

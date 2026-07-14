@@ -6,8 +6,7 @@ functions). The full prior ``accel.batch`` attribute surface is re-exported here
 so external imports (``accel.batch._align_batch_*`` / ``._MODE_SPEC`` / etc.) are
 unchanged."""
 from ._pad import (
-    _band_key, _subbatched_align, _scatter_fill, _PAIR_FOOTPRINT_BYTES,
-    _SUBBATCH_DEBUG, _BAND,
+    _band_key, _subbatched_align, _scatter_fill, _PAIR_FOOTPRINT_BYTES, _BAND,
 )
 from ._dispatch import (
     _DISPATCH_LOCAL, _dev_idx, _MIN_SHARD_PER_DEVICE, _should_distribute,
@@ -18,5 +17,5 @@ from .aligners import (
     _align_batch_vol_and_surf_esp, _align_batch_pharm, _align_batch_vol_color, _esp_bucketed_align,
     # legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp)
     _align_batch_esp, _align_batch_esp_combo,
-    _ALIGN_WORKSPACES, _INT_BUFFER_CACHE, _NUM_SEEDS,
+    _ALIGN_WORKSPACES, _INT_BUFFER_CACHE,
 )
