@@ -120,9 +120,9 @@ required; the accelerated backends add **no new hard dependency**.
 
 ```bash
 pip install shepherd-score            # unchanged: rdkit, torch, open3d, py3Dmol, numpy, pandas, scipy, molscrub, tqdm
-pip install "shepherd-score[gpu]"     # + triton   -> backend="triton"
-pip install "shepherd-score[cpu]"     # + numba    -> backend="numba"
-pip install "shepherd-score[jax]"     # + jax      -> backend="jax" (the default; unchanged)
+pip install "shepherd-score[gpu]"     # + triton>=3.6  -> backend="triton"  (needs a CUDA torch build)
+pip install "shepherd-score[cpu]"     # + numba        -> backend="numba"
+pip install "shepherd-score[jax]"     # + jax          -> backend="jax" (the default; unchanged)
 ```
 
 - **`tqdm` moved into the core dependency list.** This is a bugfix: upstream already imported
@@ -131,6 +131,16 @@ pip install "shepherd-score[jax]"     # + jax      -> backend="jax" (the default
 - **`numba` and `triton` are genuinely optional.** They are imported lazily, on first dispatch.
   The package imports cleanly with `numba`, `triton`, `jax`, and `open3d` **all absent** —
   which upstream could not do, because it imported Open3D eagerly.
+- **The `gpu` extra has two install traps** (both flagged in `pyproject.toml`):
+  - **A CUDA build of torch is required.** The default CPU torch wheel has no GPU and bundles no
+    Triton, so `pip install torch` alone will not run the GPU path — install a `+cuXXX` build
+    from the matching PyTorch index.
+  - **Triton must be ≥ 3.6.** The overlap kernels use `@triton.autotune(cache_results=…)`, an API
+    that only exists in Triton 3.6+. On older Triton (e.g. the 3.1.0 that ships with a CPU-cloned
+    env) every GPU kernel dies at compile with a missing-attribute error and there is **no CPU
+    fallback**. The `gpu` extra pins `triton>=3.6`; a known-good combination is
+    `torch==2.11.0+cu128` with `triton==3.6.0` from the cu128 index, which coexists cleanly with
+    the numpy 1.26.4 / numba 0.59.1 SVML CPU stack — so one environment serves both GPU and CPU.
 - **`triton` ships manylinux wheels only.** If you add `gpu` to an `all`-style install on
   Windows or macOS, resolution will fail. Install it explicitly on Linux instead.
 - **SVML.** The numba CPU kernels reach full speed only when numba can emit Intel SVML vector
@@ -324,7 +334,8 @@ hits = screen(query, ProfileStore.open("lib.store"), mode="surf_esp",
 ```
 
 `screen_many` streams the library **once** for a list of queries. Both accept `ndev=` to shard
-across GPUs, and `scores_out=` to write full score vectors (memmap-friendly).
+across GPUs, and `scores_out=` to write full score vectors (memmap-friendly; single-process only —
+passing it with `ndev>1` raises).
 
 Things that will bite you if you don't know them:
 
@@ -603,9 +614,10 @@ The on-disk format carries `VERSION = 1`. It should be treated as provisional.
 ### 5.3 `shepherd_score.accel`
 
 ```python
-__all__ = ["has_triton", "align_multi_gpu", "MultiGPUAligner"]
+__all__ = ["has_triton", "align_multi_gpu", "MultiGPUAligner", "clear_caches"]
 
 has_triton() -> bool
+clear_caches() -> None      # free the process-global accel caches (workspaces, footprint table, graph cache)
 
 align_multi_gpu(pairs, mode, *, ndev=None, threads=None, backend='triton', do_center=False,
                 write_back=True, return_timing=False, **align_kwargs)
@@ -628,7 +640,7 @@ PROCESS_MODES       = ('vol', 'surf', 'surf_esp', 'pharm')   # modes with a work
 MODE_ATTRS          = {mode: (transform_attr, score_attr)}
 MODE_SEEDS          = {'vol': 10, 'surf': 8, 'surf_esp': 8, 'vol_esp': 16,
                        'vol_and_surf_esp': 8, 'pharm': 32, 'vol_color': 16}
-MODE_STEPS          = {'vol': 50, 'surf': 40, 'surf_esp': 40, 'vol_esp': 50,
+MODE_STEPS          = {'vol': 30, 'surf': 40, 'surf_esp': 40, 'vol_esp': 50,
                        'vol_and_surf_esp': 60, 'pharm': 50, 'vol_color': 40}
 canonical(mode) -> str      # resolve a legacy name; unknown names pass through
 ```
@@ -814,7 +826,7 @@ max_num_steps: int = 200  ->  Optional[int] = None
 
 | mode | seeds (was → now) | steps (was → now) |
 |---|---|---|
-| `vol` | 50 → **10** | 200 → **50** |
+| `vol` | 50 → **10** | 200 → **30** |
 | `vol_esp` | 50 → **16** | 200 → **50** |
 | `surf` | 50 → **8** | 200 → **40** |
 | `surf_esp` | 50 → **8** | 200 → **40** |
@@ -958,23 +970,31 @@ not any existing caller.
   is a *quality* comparison (does each backend recover the same optimum?), not an equality test.
 - Also untested: the sparse-ESP stride, the SoA/SVML fp32 kernels, the fused CPU loop's
   basin agreement with eager, and `vol_and_surf_esp`'s shape-only gradient.
-- **~45 of the 61 new tests are skipped in CI**, which installs neither numba, nor triton, nor a
-  GPU. Adding `numba` to the CI install would activate most of them at no hardware cost.
+- Of the 61 new tests, **28 are skipped in the CI core matrix** without numba/triton/GPU: three
+  whole files — `test_screen.py` (15), `test_cpu_pool.py` (4), `test_numba_backend.py` (4) — skip at
+  collection on `importorskip("numba")`, `test_fast_batch_alignment.py` skips 4 (three CUDA, one
+  numba) and `test_vol_color.py` skips 1. **Fixed:** CI now installs `.[dev,cpu]`, so numba is
+  present and 24 of the 28 run on the existing CPU runners; only the ~4 CUDA tests still need a GPU.
 
 **Documentation**
 
 - **`accel/` and `screen.py` have no Sphinx API pages.** They are not wired into `docs/api/`, so
-  none of the API in [§5](#5-api-reference) renders on the docs site.
+  none of the API in [§5](#5-api-reference) renders on the docs site. (When adding them, set
+  `autodoc_mock_imports = ["triton", "numba"]` so the docs build without those installed.)
 - The two agent skills ([§6](#6-extensibility-the-two-agent-skills)) are **not implemented**.
 
-**Interface**
+**Interface** — the four items below were **fixed in this release**:
 
-- **The `ProfileStore` on-disk format is provisional** (`VERSION = 1`). The version is written into
-  the manifest but **never validated on open**, so a future v2 store will not fail loudly against a
-  v1 reader.
-- `screen(ndev>1)` **silently ignores `scores_out=` and `progress=`.** They work single-process only.
-- `ProfileStore.create(overwrite=True)` deletes **every** `.npz` in the target directory, not only
-  the ones it wrote.
-- The process-global caches (`_ALIGN_WORKSPACES`, `_INT_BUFFER_CACHE`, `_PAIR_FOOTPRINT_BYTES`, the
-  graph cache) never shrink. A long-lived process that sees many distinct pad shapes will hold
-  device memory until exit.
+- **`ProfileStore` on-disk format version is now validated on open.** `ProfileStore.open` reads
+  `manifest["version"]` and raises `ValueError` if it does not match the reader's `VERSION`, so a
+  future format bump fails loudly instead of misreading. (The format is still provisional at
+  `VERSION = 1`.)
+- **`screen(ndev>1)` now raises on `scores_out=`** rather than silently leaving the caller's array
+  unwritten (multi-GPU workers return top-K hits only; there is no full-vector path back). `progress`
+  is still ignored under `ndev>1`. Both work single-process.
+- **`ProfileStore.create(overwrite=True)` now deletes only this store's own files** — its manifest
+  and `shard_NNNNN.npz` sequence — instead of every `.npz` in the directory.
+- **`shepherd_score.accel.clear_caches()`** frees the process-global caches (`_ALIGN_WORKSPACES`,
+  `_INT_BUFFER_CACHE`, `_PAIR_FOOTPRINT_BYTES`, and the captured-graph LRU) so a long-lived process
+  that has seen many distinct molecule sizes can reclaim device memory between workloads. They still
+  do not shrink on their own.

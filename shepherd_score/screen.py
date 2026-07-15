@@ -50,6 +50,7 @@ import copy
 import heapq
 import json
 import os
+import re
 from collections import namedtuple
 from typing import Iterator, List, Optional, Sequence
 
@@ -388,8 +389,11 @@ class ProfileStore:
             raise FileExistsError(
                 f"{manifest_path} already exists; pass overwrite=True to replace it")
         if overwrite:
+            # Remove only THIS store's own files (its manifest + ``shard_NNNNN.npz``
+            # sequence), never every ``.npz`` in the directory -- the target may hold
+            # unrelated data the caller did not mean to lose.
             for f in os.listdir(path):
-                if f.endswith(".npz") or f == cls.MANIFEST:
+                if f == cls.MANIFEST or re.fullmatch(r"shard_\d{5}\.npz", f):
                     os.remove(os.path.join(path, f))
         manifest = dict(version=cls.VERSION, num_surf_points=int(num_surf_points),
                         modes=list(modes), schema=schema, dtype=dtype,
@@ -502,6 +506,11 @@ class ProfileStore:
     def open(cls, path) -> "ProfileStore":
         with open(os.path.join(path, cls.MANIFEST)) as fh:
             manifest = json.load(fh)
+        ver = manifest.get("version")
+        if ver != cls.VERSION:
+            raise ValueError(
+                f"ProfileStore at {path!r} has on-disk format version {ver!r}, but this "
+                f"shepherd_score reads version {cls.VERSION}. Rebuild the store.")
         return cls(path, manifest, "r")
 
     def __len__(self) -> int:
@@ -1106,6 +1115,12 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
         if not fast:
             raise ValueError("ndev>1 requires the fast path (a pre-centered store, a "
                              f"{sorted(_FAST_MODES)} mode, trans_init=False, GPU backend)")
+        if scores_out is not None:
+            # The multi-GPU workers return only per-query top-K heaps; there is no path
+            # for a full score vector back to the parent. Fail loudly rather than silently
+            # leave the caller's preallocated array unwritten.
+            raise ValueError("scores_out is not supported with ndev>1 (multi-GPU screening "
+                             "returns top-K hits only). Run single-process for full score vectors.")
         heaps = _screen_many_multigpu(qs, store.path, mode, ndev,
                                       _fast_batch_kwargs(mode, align_kwargs), top_k, progress)
         return [h.sorted() for h in heaps]

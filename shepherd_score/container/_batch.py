@@ -1118,9 +1118,10 @@ class MoleculePairBatch:
             ``"jax"`` (default) runs the per-pair torch path sequentially via
             ``MoleculePair.align_with_vol_color``. ``"triton"`` (aliases ``"cuda"``/
             ``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
-            ``MoleculePair._align_batch_vol_color`` driver — the shape channel runs on
-            the Triton (CUDA) / numba (CPU) kernel and the directionless color channel
-            on pure PyTorch, so the batched path runs on either device. The batched
+            ``MoleculePair._align_batch_vol_color`` driver — BOTH the shape channel and
+            the directionless color channel run on the device-dispatched kernels (Triton
+            on CUDA, numba on CPU; where every cloud is small they fuse into one launch),
+            so the batched path runs on either device. The batched
             path descends on the JOINT weighted gradient -- both the shape and the color
             channel steer the pose. NOTE ``backend="jax"`` is a misnomer for this mode:
             there is no JAX kernel, so it runs the per-pair PyTorch path sequentially.

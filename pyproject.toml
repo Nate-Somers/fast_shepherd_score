@@ -68,8 +68,14 @@ docs = [
 cpu = [
     "numba",
 ]
+# GPU (Triton) kernels. TWO install traps:
+#   1. Needs a CUDA build of torch. The default CPU torch wheel has no GPU and bundles no
+#      Triton, so `pip install torch` alone is not enough -- install a +cuXXX torch build.
+#   2. Needs Triton >= 3.6. The overlap kernels use `@triton.autotune(cache_results=...)`,
+#      an API that only exists in Triton 3.6+. On older Triton every GPU kernel dies at
+#      compile with a missing-attribute error and there is no CPU fallback.
 gpu = [
-    "triton",
+    "triton>=3.6",
 ]
 jax = [
     "jax>=0.4.20; python_version <'3.11'",
