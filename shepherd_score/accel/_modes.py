@@ -57,5 +57,5 @@ PROCESS_MODES = ("vol", "surf", "surf_esp", "pharm")
 # Callers who want more accuracy pass ``num_repeats`` / ``max_num_steps`` explicitly.
 MODE_SEEDS = {"vol": 10, "surf": 8, "surf_esp": 8, "vol_esp": 16, "vol_and_surf_esp": 8,
               "pharm": 32, "vol_color": 16}
-MODE_STEPS = {"vol": 50, "surf": 40, "surf_esp": 40, "vol_esp": 50, "vol_and_surf_esp": 60,
+MODE_STEPS = {"vol": 30, "surf": 40, "surf_esp": 40, "vol_esp": 50, "vol_and_surf_esp": 60,
               "pharm": 50, "vol_color": 40}
