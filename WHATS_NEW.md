@@ -524,6 +524,31 @@ unaffected.
 `align_with_pharm` returns a **3-tuple** `(scores, [None]*N, [None]*N)` where the other modes
 return a 2-tuple, so code that indexes `[1]` expecting arrays gets `None`s.
 
+### 4.12 Upstream `Molecule` refactor: `Surface` / `Pharmacophore` / `AlignmentResult`
+
+This release merges upstream `446f358`, which restructured `Molecule` around dataclasses. fss adopts
+it wholesale; the following are **new public API** a user of the merged package gets. Existing flat
+attributes are unaffected — upstream exposes them as backward-compatible properties.
+
+- **`Surface`** (`shepherd_score.container.profiles`) — holds `positions` / `esp` / `probe_radius`.
+  Backs `Molecule.surf_pos` / `surf_esp` / `probe_radius` and is reachable via `Molecule.surface`.
+- **`Pharmacophore`** — holds `types` / `positions` / `vectors`, plus `mol` / `atom_ids` / `labels`.
+  It **unpacks as the old `(types, positions, vectors)` 3-tuple**, so `X, P, V = get_pharmacophores(mol)`
+  still works. Reachable via `Molecule.pharmacophore`; backs `pharm_types` / `pharm_ancs` / `pharm_vecs`.
+- **`AlignmentResult`** — one `(score, transform)` per mode. `MoleculePair` now stores results in a
+  `_alignments` dict of these; `transform_<mode>` / `sim_aligned_<mode>` are properties over it, and
+  the legacy `transform_esp` / `transform_esp_combo` names delegate to `surf_esp` / `vol_and_surf_esp`.
+
+**Priority pharmacophores.** `get_pharmacophores` (and `Molecule.get_pharmacophore`) gained:
+- `return_atom_ids=False` → retain per-pharmacophore atom-id sets on `Pharmacophore.atom_ids`.
+- `priority_atoms=None` → compute 0/1 priority labels (ring-aware) into `Pharmacophore.labels`.
+- `min_ring_priority_atoms=3` → the ring threshold for the aromatic/hydrophobe priority rule.
+- `Pharmacophore.priority_labels(priority_atoms, ...)` computes labels lazily for any atom set.
+
+These are opt-in and do not affect the arrays the accel/kernels consume (they read only
+`types`/`positions`/`vectors`). `feature_set` and `directionless` (fss's extraction controls) sit
+alongside them on the same signature.
+
 ---
 
 ## 5. API reference
@@ -532,10 +557,13 @@ return a 2-tuple, so code that indexes `[1]` expecting arrays gets `None`s.
 
 ```python
 __all__ = ["update_mol_coordinates", "Molecule", "MoleculePair", "MoleculePairBatch",
-           "align_multi_gpu", "MultiGPUAligner"]
+           "Surface", "Pharmacophore", "AlignmentResult",   # from upstream's Molecule refactor
+           "align_multi_gpu", "MultiGPUAligner"]             # from shepherd_score.accel
 ```
 
-`align_multi_gpu` and `MultiGPUAligner` are new re-exports from `shepherd_score.accel`.
+`Surface`, `Pharmacophore` and `AlignmentResult` are the dataclasses upstream's refactor introduced
+(see [§4.12](#412-upstream-molecule-refactor-surface--pharmacophore--alignmentresult)).
+`align_multi_gpu` / `MultiGPUAligner` are re-exports from `shepherd_score.accel`.
 
 #### `Molecule.__init__`
 
@@ -550,7 +578,16 @@ Molecule(mol, num_surf_points=None, density=None, probe_radius=None, surface_poi
          surface_method='mesh')       # NEW: 'mesh' | 'smooth_sdf'
 ```
 
-`Molecule.get_pharmacophore` gains the same `feature_set` and `directionless` arguments.
+Surface and pharmacophore are now stored on `Molecule._surface` (a `Surface`) and
+`Molecule._pharmacophore` (a `Pharmacophore`), exposed through the `.surface` / `.pharmacophore`
+properties and the unchanged flat `surf_pos` / `surf_esp` / `probe_radius` / `pharm_types` /
+`pharm_ancs` / `pharm_vecs` accessors (now property+setter over those dataclasses).
+
+New read helpers: `Molecule.get_positions(no_H=True)` and `Molecule.get_charges(no_H=True)` return
+the heavy-atom (or all-atom) coordinate / partial-charge arrays.
+
+`Molecule.get_pharmacophore` gains `feature_set` and `directionless` (fss) **and** upstream's
+`return_atom_ids` / `priority_atoms` / `min_ring_priority_atoms` (see §4.12).
 
 #### `MoleculePair` — alignment methods
 
@@ -761,9 +798,12 @@ optimize_vol_color_overlay(ref_centers, fit_centers, ref_pharms, fit_pharms, ref
 get_overlap_pharm(..., directionless=False)
 get_pharm_combo_score(..., color_weight=0.5, directionless=False)
 
-# shepherd_score.pharm_utils.pharmacophore
-get_pharmacophores(mol, ..., feature_set='shepherd', directionless=False)
-get_pharmacophores_dict(...)  # same two new kwargs
+# shepherd_score.pharm_utils.pharmacophore  -> returns a Pharmacophore (unpacks as (X, P, V))
+get_pharmacophores(mol, multi_vector=True, exclude=[], check_access=False, scale=1.0,
+                   feature_set='shepherd', directionless=False,        # fss extraction controls
+                   return_atom_ids=False, priority_atoms=None, min_ring_priority_atoms=3)  # upstream
+get_pharmacophores_dict(...)  # same feature_set/directionless/return_atom_ids kwargs
+# Pharmacophore.priority_labels(priority_atoms, min_ring_priority_atoms=3) -> np.ndarray
 
 # shepherd_score.score.analytical_gradients._torch
 build_lookup_tables(..., directionless=False)
