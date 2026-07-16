@@ -1,0 +1,121 @@
+---
+name: design-scoring-mode
+description: >-
+  Turn a plain-English description of a molecular similarity objective into a correct,
+  autograd-validated Python alignment mode in shepherd_score. Use when someone wants a new
+  scoring / overlap function (a new way to compare two molecules and optimize their relative
+  pose) and has described it in words rather than code. Produces the reference implementation
+  only; hand the result to `accelerate-scoring-mode` to add the fast backend.
+---
+
+# Design a scoring mode
+
+You are given a description, in words, of how two molecules should be scored against each
+other and aligned. Your job is to turn it into a **correct, readable Python alignment mode**
+that plugs into `shepherd_score` — the *reference* implementation. Correctness first; speed is
+a separate skill (`accelerate-scoring-mode`).
+
+## The two-layer picture
+
+`shepherd_score` has two layers for every mode:
+
+1. **Reference layer** (this skill) — pure PyTorch/NumPy math and an eager autograd optimizer.
+   Slow, obviously-correct, easy to read. This is the ground truth.
+2. **Accel layer** (`accelerate-scoring-mode`) — hand-written Triton (GPU) + numba (CPU) kernels
+   that reproduce the reference at screening throughput.
+
+The single most important thing to understand: **the eager optimizer you write here is the
+parity oracle the accel skill validates against.** Everything the fast kernels do later must
+reproduce your `optimize_<mode>_overlay` to floating-point tolerance. So your reference does
+not need to be fast, but it must be *right* and *deterministic*.
+
+## The contract you must deliver
+
+By the end of this skill the mode must satisfy all of:
+
+- `MoleculePair.align_with_<mode>(...)` runs end-to-end on a pair of real molecules and writes
+  `self.transform_<mode>` / `self.sim_aligned_<mode>`.
+- A self-comparison (a molecule against a copy of itself) scores **exactly 1.000** for a
+  Tanimoto objective (the mode's built-in sanity check).
+- `optimize_<mode>_overlay(...)` is a self-contained eager function: given reference/fit inputs
+  and a seed count it returns `(aligned_fit_points, se3_transform, score)`, is deterministic
+  given the seeds, and uses only autograd — **no custom kernels**. This is the oracle.
+- The mode is registered in `accel/_modes.py` (identity only) and its public functions are
+  exported.
+- A test file exists and passes (see `template_test.py`).
+
+## Steps
+
+### 1. Pin the objective in math before touching code
+Write down `O(ref, T·fit)` — the scalar overlap after the fit molecule is moved by an SE(3)
+transform `T`. Decide explicitly:
+- **Channels**: shape (atom-centred Gaussians), electrostatics (ESP), pharmacophore ("color"),
+  or a weighted combination. Reuse an existing channel wherever the description allows.
+- **Similarity**: Tanimoto (self-overlap = 1) vs Tversky (asymmetric). Tanimoto is the default.
+- **Symmetry**: is `O(a,b) == O(b,a)`? If not, say so — it changes the tests.
+- **What moves**: only `fit` is transformed; `ref` is fixed. The optimization variable is the
+  SE(3) pose, parameterized as a unit quaternion + translation.
+
+### 2. Write the pure overlap in `score/`
+Put the channel math in the matching module — `score/gaussian_overlap.py` (shape),
+`score/electrostatic_scoring.py` (ESP), `score/pharmacophore_scoring.py` (color) — or add a new
+`score/<family>_scoring.py` if it is genuinely a new family. Provide the Torch version and keep
+the `_np` mirror in sync (add a `_jax` mirror only if you want the jax path). The function is
+pure: positions/charges/types in, scalar overlap out, no optimization. Verify by hand that a
+molecule scored against itself gives 1.000 under Tanimoto.
+
+### 3. Write the eager objective + optimizer in `alignment/_torch.py`
+Two functions, following the shape of the existing `optimize_*_overlay` functions:
+- `objective_<mode>_overlay(se3_params, ...)` — applies the SE(3) transform to the fit inputs
+  and returns the (negative) overlap for a single pose. Autograd differentiates this.
+- `optimize_<mode>_overlay(ref_..., fit_..., num_repeats, lr, max_num_steps, ...)` — generates
+  `num_repeats` SO(3) seeds, runs Adam on each, and returns the best `(aligned_points,
+  se3_transform, score)`.
+
+**Naming**: name both functions after the *canonical mode id* (e.g. `optimize_vol_color_overlay`),
+not after the physics. The oldest modes use physics names (`optimize_ROCS_overlay` is the `vol`
+mode) for historical reasons — do not follow that; the id-based name is the modern convention
+and is what the accel skill expects to find.
+
+### 4. Expose the per-pair API in `container/_core.py`
+Add `MoleculePair.align_with_<mode>(...)`. Mirror an existing `align_with_*` method:
+- Default `num_repeats` and `max_num_steps` to `None`, then resolve them via
+  `_default_seeds("<mode>")` / `_default_steps("<mode>")`.
+- Pull inputs off `self.ref_molec` / `self.fit_molec` (use the existing cached `_ref_xyz_t` /
+  `_fit_xyz_t` tensors where they fit).
+- Call your `optimize_<mode>_overlay`, write `self.transform_<mode>` and
+  `self.sim_aligned_<mode>`, and return the aligned fit coordinates as a NumPy array.
+- Validate inputs the mode requires (e.g. raise a clear `ValueError` if pharmacophores are
+  missing), matching the tone of the surrounding methods.
+
+### 5. Register the mode's identity in `accel/_modes.py`
+Add one row each to `MODE_ATTRS` (the `(transform_attr, sim_attr)` pair), `MODE_SEEDS`, and
+`MODE_STEPS`. Pick balanced seed/step defaults at the accuracy/throughput knee, as the module
+docstring describes. **Do not touch `PROCESS_MODES` or `_MODE_SPEC`** — those belong to the
+accel skill. `screen.py`, `accel/multi_gpu.py`, and `accel/cpu_pool.py` derive from this registry, so you
+do not edit them.
+
+### 6. Export the public functions
+Add your `optimize_<mode>_overlay` / scoring functions to the relevant package `__init__.py`
+(`score/`, `alignment/`, `container/`) following the existing export style.
+
+### 7. Validate
+Copy `template_test.py` to `tests/test_<mode>.py`, replace the `YOURMODE` token, and make it
+pass. The required checks: self-overlap = 1.000, autograd gradient agrees with a finite-difference
+(or analytic) gradient, the optimizer recovers a planted rotation on a self-pair, and results are
+deterministic given a fixed seed. Run `tests/test_mode_registry.py` too — it pins the registry
+invariants and will fail if your `_modes.py` edit is inconsistent.
+
+## Handoff to `accelerate-scoring-mode`
+State three things for the next skill: the exact name of your `optimize_<mode>_overlay` oracle,
+the path of your test file, and the gradient structure of the objective (which channels
+contribute, and how the SE(3) gradient decomposes). That is all it needs.
+
+## Constraints
+- **Additive and minimal.** Add functions; do not rewrite shared code. Keep the diff small.
+- **Match the surrounding code** — naming, docstring format, argument order, error style.
+- **Do not break existing modes.** Reuse channels rather than forking them; run the full test
+  suite before declaring done.
+- **One clear name per concept.** Do not add back-compat aliases for a name only this mode uses.
+
+See `seams.md` for the exact file map and name-map, and `pitfalls.md` for the recurring traps.
