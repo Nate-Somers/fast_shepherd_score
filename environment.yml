@@ -1,19 +1,39 @@
+# fast_shepherd_score — single conda environment (CPU stack + SVML numba kernels).
+#
+# numba is now a core dependency and the default CPU backend for the batched aligners, so
+# this env pins the SVML-vectorized numba build that makes those kernels fast. TWO traps this
+# env exists to handle:
+#   1. SVML requires the SVML-patched LLVM that ships ONLY in numba <= 0.59 + icc_rt on the
+#      `numba` conda channel (numba 0.61+ / llvmlite 0.44+ dropped it). numba 0.59 caps
+#      numpy < 1.27, hence numpy=1.26.
+#      Verify:  python -c "import numba.core.config as c; print(c.USING_SVML)"  -> True
+#      Without SVML the CPU kernels are correct but slower and emit a one-time RuntimeWarning.
+#      NOTE: the SVML path is fp32 SoA (values ~1e-6 rel, gradients ~1e-4), so enabling SVML
+#      changes CPU results slightly as well as speeding them up.
+#   2. GPU (Triton) kernels are NOT in this env. They need a CUDA build of torch AND Triton
+#      >= 3.6 (the overlap kernels use `@triton.autotune(cache_results=...)`, an API added in
+#      3.6). Install those on top with pip:  pip install "shepherd-score[gpu]"  plus a
+#      +cuXXX torch build (a known-good pairing is torch==2.11.0+cu128 with triton==3.6.0).
 name: shepherd_score
 channels:
+  - numba
   - conda-forge
 dependencies:
-  - python=3.8.13
-  - numpy>=1.2,<2.0
-  - torchaudio==0.12.1
-  - pytorch==1.12.1
-  - cudatoolkit==11.3.1
-  - torchvision==0.13.1
-  - xtb
-  - mkl==2024.0
+  - python=3.10
+  - numba=0.59.1        # last numba with the SVML-patched LLVM
+  - llvmlite=0.42       # pinned by numba 0.59; SVML-built
+  - icc_rt              # numba channel: provides libsvml + enables SVML in llvmlite
+  - numpy=1.26          # numba 0.59 caps numpy < 1.27
+  - pytorch=*=*cpu*     # CPU build; add a CUDA torch via pip for the GPU (triton) path
+  - rdkit               # conformer generation
+  - scipy>=1.10
+  - pandas>=2.0
+  - xtb                 # xTB partial charges / ESP
   - pip:
-    - open3d>=0.18
-    - meeko
-    - vina==1.2.5
-    - py3dmol>=2.1.0
-    - scipy>=1.10
-    - pandas>=2.0
+    - open3d>=0.18      # mesh surface generation
+    - py3Dmol>=2.1.0
+    - molscrub
+    - tqdm
+    - h5py              # ProfileStore screening
+    - meeko             # docking
+    - vina==1.2.5       # docking

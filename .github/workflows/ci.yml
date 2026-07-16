@@ -48,7 +48,7 @@ jobs:
       - name: Install core dependencies
         run: |
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-          uv pip install -e ".[dev,cpu]"
+          uv pip install -e ".[dev]"
 
       - name: Install JAX (CPU)
         if: matrix.test-type == 'jax'

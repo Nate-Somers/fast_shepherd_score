@@ -44,6 +44,12 @@ dependencies = [
     "scipy>=1.10",
     "molscrub",
     "tqdm",
+    # numba is a CORE dependency: it is the default CPU backend for the batched aligners
+    # (``backend=None`` resolves to ``numba`` on a CPU host). Unpinned here -- pip cannot
+    # deliver the SVML-patched build; for the ~2-4x SVML CPU kernels use the conda
+    # ``environment.yml`` (numba 0.59.1 + icc_rt). Without SVML the kernels are correct but
+    # slower and emit a one-time RuntimeWarning.
+    "numba",
 ]
 
 [project.urls]
@@ -65,6 +71,8 @@ docs = [
     "sphinx-copybutton>=0.5",
     "myst-nb>=1.0",
 ]
+# Retained for backwards compatibility only: numba is now a CORE dependency, so this
+# extra is redundant (installing ``.[cpu]`` is equivalent to the base install).
 cpu = [
     "numba",
 ]

@@ -109,7 +109,7 @@ pip install "shepherd-score[all]"
 The accelerated CPU backend (`MoleculePairBatch.align_with_*(backend="numba")` and
 `screen(..., backend="numba")`) reaches full speed only when numba can emit Intel SVML
 vector `exp` calls, which requires **numba ≤ 0.59 + `icc_rt`**. Build the dedicated env
-[`environment-cpu-svml.yml`](environment-cpu-svml.yml) for this (numba 0.61+ dropped SVML, so
+the conda [`environment.yml`](environment.yml) for this (numba 0.61+ dropped SVML, so
 the default GPU stack cannot vectorize the kernels). With SVML absent the overlap kernels run
 unvectorized — ~3–6× slower — and a one-time `RuntimeWarning` is emitted so the slow regime is
 never silent. Verify with `python -c "import numba.core.config as c; print(c.USING_SVML)"`.

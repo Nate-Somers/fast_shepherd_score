@@ -1,6 +1,6 @@
 """MoleculePairBatch: batch of MoleculePair objects for fast sequential JAX alignment."""
 from importlib.metadata import version as _pkg_version
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -19,6 +19,17 @@ from shepherd_score.container._batch_utils import (
     _align_esp_worker,
     _align_pharm_worker,
 )
+
+
+def _resolve_backend(backend):
+    """Resolve ``backend=None`` to the device-aware default: ``triton`` when CUDA is
+    available, else ``numba``. Explicit values (including ``"jax"``) pass through. Shares
+    the single source of truth with the screening front-end (``screen._default_backend``)
+    via a lazy import (no circular import at module load)."""
+    if backend is not None:
+        return backend
+    from shepherd_score.screen import _default_backend
+    return _default_backend()
 
 
 def _default_steps(mode: str) -> int:
@@ -126,6 +137,7 @@ class MoleculePairBatch:
         preserving the original ordering of mode-specific guards (e.g. the ``no_H``
         check).
         """
+        backend = _resolve_backend(backend)
         if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
             if backend in self._NUMBA_BACKENDS:
                 self._prepare_numba()
@@ -269,7 +281,7 @@ class MoleculePairBatch:
                        use_shmap: bool = True,
                        num_buckets: int = 1,
                        verbose: bool = False,
-                       backend: str = "jax",
+                       backend: Optional[str] = None,
                        alpha: float = 0.81,
                        return_aligned: bool = False,
                        ) -> Tuple[np.ndarray, List[np.ndarray]]:
@@ -492,7 +504,7 @@ class MoleculePairBatch:
                            use_shmap: bool = True,
                            num_buckets: int = 1,
                            verbose: bool = False,
-                           backend: str = "jax",
+                           backend: Optional[str] = None,
                            alpha: float = 0.81,
                            return_aligned: bool = False,
                            ) -> Tuple[np.ndarray, List[np.ndarray]]:
@@ -741,7 +753,7 @@ class MoleculePairBatch:
                         num_workers: int = 1,
                         use_shmap: bool = False,
                         verbose: bool = False,
-                        backend: str = "jax",
+                        backend: Optional[str] = None,
                         return_aligned: bool = False,
                         ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using surface similarity.
@@ -878,7 +890,7 @@ class MoleculePairBatch:
                        num_workers: int = 1,
                        use_shmap: bool = False,
                        verbose: bool = False,
-                       backend: str = "jax",
+                       backend: Optional[str] = None,
                        return_aligned: bool = False,
                        ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using ESP+surface similarity.
@@ -1025,7 +1037,7 @@ class MoleculePairBatch:
                              lr: float = 0.1,
                              max_num_steps: int = None,
                              verbose: bool = False,
-                             backend: str = "jax",
+                             backend: Optional[str] = None,
                              return_aligned: bool = False,
                              ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using ShaEP-style ESP-combo similarity. ``vol_and_surf_esp``
@@ -1097,7 +1109,7 @@ class MoleculePairBatch:
                              lr: float = 0.1,
                              max_num_steps: int = None,
                              verbose: bool = False,
-                             backend: str = "jax",
+                             backend: Optional[str] = None,
                              return_aligned: bool = False,
                              ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using the ROCS/ROSHAMBO-style ``vol_color`` combo
@@ -1235,7 +1247,7 @@ class MoleculePairBatch:
                          use_shmap: bool = True,
                          num_buckets: int = 1,
                          verbose: bool = False,
-                         backend: str = "jax",
+                         backend: Optional[str] = None,
                          return_aligned: bool = False,
                          ) -> Tuple[np.ndarray, List[np.ndarray], List[np.ndarray]]:
         """Align all pairs using padded masked pharmacophore similarity via JAX.
@@ -1305,6 +1317,7 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("pharm")
         if num_repeats is None:
             num_repeats = _default_seeds("pharm")
+        backend = _resolve_backend(backend)
         if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
             if backend in self._NUMBA_BACKENDS:
                 self._prepare_numba()
