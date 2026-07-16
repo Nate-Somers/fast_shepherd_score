@@ -38,30 +38,25 @@ callers are enumerated in [Behavior changes](#7-behavior-changes-read-this) — 
 
 ## 1. The diff
 
-> **Note:** the counts below are the fss delta against upstream at **`75f1b6b`** (the base the fork
-> was built on). This release *also* merges upstream's newer `446f358` (the `Molecule` refactor),
-> which brings in upstream's own new files (`container/profiles.py`, `visualize.py` rewrite, new
-> tests) on top of these. This table describes what the fork *adds*; it is not the raw
-> `git diff upstream/main` after the merge.
-
-Measured against `coleygroup/shepherd-score` at `75f1b6b`:
+Measured against `coleygroup/shepherd-score` at **`446f358`** (the current upstream, after this
+release merged it in — so these are the fork's net additions on top of the new upstream):
 
 ```
-62 files changed, 14,180 insertions(+), 253 deletions(-)
+61 files changed, 14,278 insertions(+), 253 deletions(-)
 ```
 
 (Excluding this document.)
 
-Broken down: **38 new files**, **24 modified** (15 library source, 1 test, 8 config/docs/example),
-**0 deleted**. The fork's history already contains all of upstream, so the merge applies without
-conflicts.
+Broken down: **37 new files**, **24 modified** (15 library source, 2 test, 7 config/docs/example),
+**0 deleted**. The upstream `Molecule` refactor was merged with a 3-way merge; only three files
+conflicted (`_core.py`, `pharmacophore.py`, `container/__init__.py`), all resolved.
 
-### New files (38)
+### New files (37, excluding this document)
 
 | File | Lines | Role |
 |---|---:|---|
-| **`shepherd_score/accel/`** — the acceleration subpackage | **9,458** | |
-| `accel/__init__.py` | 32 | Public surface: `has_triton`, `align_multi_gpu`, `MultiGPUAligner` |
+| **`shepherd_score/accel/`** — the acceleration subpackage | **9,498** | |
+| `accel/__init__.py` | 52 | Public surface: `has_triton`, `clear_caches`, `align_multi_gpu`, `MultiGPUAligner` |
 | `accel/_modes.py` | 61 | Mode registry. Pure data, no heavy imports |
 | `accel/kernels/__init__.py` | 8 | — |
 | `accel/kernels/dispatch.py` | 112 | Per-call device dispatch: CUDA tensor → Triton, CPU tensor → numba |
@@ -73,24 +68,24 @@ conflicts.
 | `accel/kernels/cpu_fused.py` | 338 | Torch-free fused fine loop; imports its math from `cpu.py` |
 | `accel/kernels/cpu_soa.py` | 111 | Structure-of-arrays fp32 variant, used when numba can emit SVML |
 | `accel/drivers/__init__.py` | 8 | — |
-| `accel/drivers/_common.py` | 529 | Shared seeding, coarse grid, Adam/Tanimoto tails |
+| `accel/drivers/_common.py` | 538 | Shared seeding, coarse grid, Adam/Tanimoto tails |
 | `accel/drivers/_graphed.py` | 193 | Mode-agnostic CUDA-graph fine loop |
 | `accel/drivers/shape.py` | 313 | Driver for `vol` and `surf` |
-| `accel/drivers/esp.py` | 558 | Driver for `vol_esp` and `surf_esp` |
+| `accel/drivers/esp.py` | 563 | Driver for `vol_esp` and `surf_esp` |
 | `accel/drivers/esp_combo.py` | 807 | Driver for `vol_and_surf_esp` |
-| `accel/drivers/pharm.py` | 770 | Driver for `pharm` |
+| `accel/drivers/pharm.py` | 775 | Driver for `pharm` |
 | `accel/drivers/pharm_overlap.py` | 475 | Pharmacophore overlap support for the pharm driver |
-| `accel/drivers/vol_color.py` | 516 | Driver for `vol_color` |
+| `accel/drivers/vol_color.py` | 518 | Driver for `vol_color` |
 | `accel/batch/__init__.py` | 21 | Re-exports the batch surface |
 | `accel/batch/aligners.py` | 1,146 | The seven `_align_batch_<mode>` functions `MoleculePairBatch` calls |
 | `accel/batch/_bucket.py` | 277 | Adaptive size bucketer |
-| `accel/batch/_pad.py` | 126 | Padding, GPU-memory sub-batching, scatter |
+| `accel/batch/_pad.py` | 125 | Padding, GPU-memory sub-batching, scatter |
 | `accel/batch/_dispatch.py` | 142 | Multi-GPU dispatch + the per-mode tensor spec (`_MODE_SPEC`) |
 | `accel/cpu_pool.py` | 220 | Persistent single-threaded CPU worker pool |
 | `accel/multi_gpu.py` | 424 | Process-per-GPU data parallelism |
 | `accel/screen_parallel.py` | 98 | Fork-based shard-parallel CPU screening |
 | **Top-level modules** | | |
-| `shepherd_score/screen.py` | 1,282 | Virtual-screening front-end: `ProfileStore`, `screen`, `screen_many` |
+| `shepherd_score/screen.py` | 1,297 | Virtual-screening front-end: `ProfileStore`, `screen`, `screen_many` |
 | `shepherd_score/surface_diagnostics.py` | 142 | Leak / crimp metrics for validating a surface generator |
 | **Tests** (7 new files) | **1,658** | |
 | `tests/test_fast_batch_alignment.py` | 396 | Triton/CUDA batch aligners |
@@ -100,23 +95,25 @@ conflicts.
 | `tests/test_smooth_surface.py` | 165 | Smooth-SDF surfacer + diagnostics |
 | `tests/test_numba_backend.py` | 148 | numba CPU kernels |
 | `tests/test_mode_registry.py` | 113 | Registry invariants (guards against drift) |
-| **Packaging** | | |
-| `environment.yml` (rewritten) | — | Single conda env: SVML numba stack + full runtime deps (replaces the old env and the removed `environment-cpu-svml.yml`) |
+
+(The consolidated conda `environment.yml` is a *modified* file — see below.)
 
 ### Modified files — library source (15)
 
+Numbers are the fork's net change on top of the new upstream `446f358`.
+
 | File | Change | Additive? |
 |---|---:|---|
-| `shepherd_score/container/_core.py` | +306 / −71 | Mostly. See [Behavior changes](#7-behavior-changes-read-this) |
-| `shepherd_score/container/_batch.py` | +453 / −26 | Mostly. Same |
+| `shepherd_score/container/_batch.py` | +472 / −27 | Mostly. The default-backend change is a behavior change — see [B5](#7-behavior-changes-read-this) |
+| `shepherd_score/container/_core.py` | +298 / −52 | Mostly. Merge-reconciled onto upstream's Surface/Pharmacophore Molecule; see [Behavior changes](#7-behavior-changes-read-this) |
+| `shepherd_score/alignment/_torch.py` | +255 / −0 | Yes — one appended hunk (the `vol_color` objective/optimizer) |
 | `shepherd_score/generate_point_cloud.py` | +249 / −13 | Yes — lazy Open3D + the opt-in `smooth_sdf` surfacer |
-| `shepherd_score/alignment/_torch.py` | +255 / −0 | Yes — one appended hunk, zero upstream lines touched |
-| `shepherd_score/score/pharmacophore_scoring.py` | +98 / −4 | Yes — `directionless=False` default preserves behavior |
-| `shepherd_score/pharm_utils/pharmacophore.py` | +68 / −20 | Yes |
-| `shepherd_score/score/pharmacophore_scoring_np.py` | +55 / −16 | Yes |
-| `shepherd_score/alignment/utils/se3.py` | +28 / −14 | **No** — see the `R==1` shape change |
+| `shepherd_score/score/pharmacophore_scoring.py` | +101 / −4 | Yes — the `directionless` scoring kwarg (see [B7](#7-behavior-changes-read-this)) |
+| `shepherd_score/pharm_utils/pharmacophore.py` | +78 / −26 | Yes — `feature_set`/`directionless` re-applied onto upstream's rewritten extractor |
+| `shepherd_score/score/pharmacophore_scoring_np.py` | +55 / −16 | Yes — `directionless` (numpy oracle) |
+| `shepherd_score/alignment/utils/se3.py` | +28 / −14 | **No** — see the `R==1` shape change ([B4](#7-behavior-changes-read-this)) |
 | `shepherd_score/score/analytical_gradients/_torch.py` | +17 / −6 | Yes |
-| `shepherd_score/container/__init__.py` | +7 / −1 | Yes — two new exports |
+| `shepherd_score/container/__init__.py` | +5 / −0 | Yes — union of upstream's + fork's exports |
 | `shepherd_score/evaluations/evaluate/evals.py` | +6 / −6 | Internal rename only |
 | `shepherd_score/objective.py` | +5 / −5 | Internal rename only |
 | `shepherd_score/alignment/__init__.py` | +4 / −0 | Yes — two new exports |
@@ -124,9 +121,11 @@ conflicts.
 | `shepherd_score/protonation/protonate.py` | +2 / −0 | `from __future__ import annotations` |
 
 Also modified: `tests/test_alignment_utils.py` (+12 — one appended test, no existing assertion
-changed), `pyproject.toml` (+19/−1), `pytest.ini` (+1), `.gitignore` (+3), `README.md` (+9),
-`environment.yml` (newline), `docs/usage.rst` and `docs/api/container/molecule_pair_batch.rst`
-(rename), `examples/02_scoring.ipynb` (+9/−62, rename + re-run).
+changed), `pyproject.toml` (+33/−1 — numba core, `triton>=3.6`, ruff scoping), `environment.yml`
+(+34/−14 — rewritten to the single SVML env; `environment-cpu-svml.yml` removed), `README.md`
+(+9), `.gitignore` (+3), `pytest.ini` (+1), `docs/usage.rst` (+4/−4) and
+`docs/api/container/molecule_pair_batch.rst` (rename), `examples/02_scoring.ipynb` (+9/−62,
+rename + re-run).
 
 ---
 
