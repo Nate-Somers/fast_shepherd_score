@@ -1,30 +1,41 @@
 # Reference-layer seams
 
 The files a new mode touches, bottom-up. Everything here is additive: you add functions and one
-registry row per table. You do not modify the front-end (`screen.py`, `accel/multi_gpu.py`,
-`accel/cpu_pool.py`) — those derive the mode set from `accel/_modes.py`.
+line to the `_ALIGN_KEYS` tuple. You do **not** touch `accel/_modes.py` or the front-end
+(`screen.py`, `accel/multi_gpu.py`, `accel/cpu_pool.py`) — those are the *canonical* registry and
+its consumers, which the accel skill wires up once a batched path exists.
 
 | Layer | File | What you add |
 |---|---|---|
 | Channel math | `score/<family>_scoring.py` (+ `_np`, optional `_jax`) | The pure overlap function: inputs in, scalar out, no optimization. Reuse a family (`gaussian_overlap`, `electrostatic_scoring`, `pharmacophore_scoring`) or add one. |
 | Eager optimizer | `alignment/_torch.py` | `objective_<mode>_overlay` (single-pose value) and `optimize_<mode>_overlay` (multi-seed SO(3) + Adam → best pose+score). **The oracle.** |
-| Per-pair API | `container/_core.py` | `MoleculePair.align_with_<mode>(...)`; defaults `num_repeats`/`max_num_steps` to `None` → `_default_seeds`/`_default_steps`; writes `transform_<mode>` / `sim_aligned_<mode>`. |
-| Registry (identity) | `accel/_modes.py` | One row each in `MODE_ATTRS`, `MODE_SEEDS`, `MODE_STEPS`. Nothing else. |
+| Per-pair API | `container/_core.py` | `MoleculePair.align_with_<mode>(...)`; give `num_repeats`/`max_num_steps` **literal** defaults (not `_default_seeds`/`_default_steps` — see below); writes `transform_<mode>` / `sim_aligned_<mode>`. |
+| Result slots | `container/_core.py` | Add the mode id to the `_ALIGN_KEYS` tuple — generates the `transform_<mode>` / `sim_aligned_<mode>` accessors. Do **not** add to `accel/_modes.py` (see below). |
 | Exports | `score/__init__.py`, `alignment/__init__.py`, `container/__init__.py` | Public function names, in the existing style. |
 | Tests | `tests/test_<mode>.py` | From `template_test.py`. Plus `tests/test_mode_registry.py` must still pass. |
 
-## The registry (`accel/_modes.py`)
+## Two registries: result slots vs canonical modes
 
-`accel/_modes.py` is the single source of truth for the mode set — pure data, no heavy imports,
-so every layer reads it without an import cycle. The tables you extend:
+There are two separate places a mode can be "registered", and telling them apart is the one
+non-obvious part of this skill:
 
-- `MODE_ATTRS[<mode>] = ("transform_<mode>", "sim_aligned_<mode>")` — where results are written
-  on a `MoleculePair`. Adding here is what makes the mode "exist" to the front-end.
-- `MODE_SEEDS[<mode>]` — SO(3) multi-start seed count (default for `num_repeats`).
-- `MODE_STEPS[<mode>]` — fine-optimizer step count (default for `max_num_steps`).
+- **`_ALIGN_KEYS`** (in `container/_core.py`) — the list of result slots. Adding your mode id here
+  generates its `transform_<mode>` / `sim_aligned_<mode>` accessors. **This is the only
+  registration a reference-only mode does.** Purely additive and safe.
+- **`accel/_modes.py`** (`MODE_ATTRS` / `MODE_SEEDS` / `MODE_STEPS`) — the *canonical* (screening)
+  registry. **Do not touch it in this skill.** It is not additive: `MODE_ATTRS` feeds
+  `CANONICAL_MODES`, which `@_bind_batch_aligners` walks at import time calling
+  `getattr(accel.batch, "_align_batch_<mode>")`. That aligner does not exist until the accel skill
+  builds it, so adding your mode here makes `import shepherd_score.container` raise. On top of that,
+  `tests/test_mode_registry.py` pins `len(CANONICAL_MODES) == 7`, `set(MODE_SEEDS) ==
+  set(CANONICAL_MODES)`, `set(MODE_STEPS) == set(CANONICAL_MODES)`, and a batch-bind for every
+  canonical mode — all of which fail the moment you add a mode with no aligner.
 
-Leave `PROCESS_MODES` and (in `accel/batch/_dispatch.py`) `_MODE_SPEC` alone. They are the
-accel skill's territory, and a registry test asserts `tuple(_MODE_SPEC) == PROCESS_MODES`.
+Because your mode is not in `MODE_SEEDS` / `MODE_STEPS`, you also cannot use `_default_seeds` /
+`_default_steps` for its defaults (they read those tables) — give `align_with_<mode>` literal
+defaults instead. The accel skill promotes the mode into `accel/_modes.py` and moves the defaults
+there once the batched aligner exists. `PROCESS_MODES` and (in `accel/batch/_dispatch.py`)
+`_MODE_SPEC` are likewise accel-skill territory.
 
 ## Eager-function naming: use the canonical id
 

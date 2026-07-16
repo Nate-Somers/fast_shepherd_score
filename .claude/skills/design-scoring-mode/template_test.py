@@ -49,20 +49,25 @@ def test_autograd_matches_finite_difference():
     TODO: build the objective inputs, then compare d(objective)/d(se3_params) from
     autograd against a central difference. This proves the eager objective — the oracle
     the accel kernels are validated against — is analytically correct.
+
+    NOTE: run this in float32. `get_SE3_transform` builds the rotation matrix in float32, so
+    float64 inputs raise a dtype mismatch inside the transform; float32 finite differences are
+    noisy, hence eps=1e-3 and a loose atol=2e-3 (see pitfalls.md).
     """
     pytest.skip("fill in the objective inputs for YOURMODE")
-    # se3 = torch.zeros(7, requires_grad=True); se3.data[0] = 1.0  # identity quat + zero trans
+    # se3 = torch.zeros(7, dtype=torch.float32, requires_grad=True)
+    # se3.data[0] = 1.0  # identity quat + zero trans
     # val = objective_YOURMODE_overlay(se3, ...)
     # val.backward()
     # ana = se3.grad.clone()
     # num = torch.zeros_like(ana)
-    # eps = 1e-4
+    # eps = 1e-3
     # for i in range(se3.numel()):
     #     d = torch.zeros_like(se3.data); d[i] = eps
     #     hi = objective_YOURMODE_overlay((se3.data + d).requires_grad_(False), ...)
     #     lo = objective_YOURMODE_overlay((se3.data - d).requires_grad_(False), ...)
     #     num[i] = (hi - lo) / (2 * eps)
-    # assert torch.allclose(ana, num, atol=1e-3)
+    # assert torch.allclose(ana, num, atol=2e-3)
 
 
 # --- Gate 3: the optimizer recovers a planted rotation ----------------------------------------

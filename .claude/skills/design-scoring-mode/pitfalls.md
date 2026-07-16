@@ -47,3 +47,11 @@ but not exactly 1.000.
 The reference molecule is fixed; only the fit molecule is transformed by the SE(3) pose. Keep the
 gradient flowing through the transform applied to the fit inputs only. Accidentally transforming
 both, or detaching the fit transform, produces a plausible-looking but wrong optimizer.
+
+## Finite-difference gradient checks must run in float32
+The SE(3) helpers (`get_SE3_transform`) build the rotation matrix in float32, so a gradient check
+that feeds float64 inputs raises `Input dtypes must be the same, got: input float, batch1: double`
+inside the transform. Run your autograd-vs-finite-difference check in the library-native float32,
+with a step `eps ≈ 1e-3` and a loose tolerance (`atol ≈ 2e-3`): float32 finite differences are
+noisy, and a tight float64 tolerance reports a false failure even when the gradient is correct.
+This is a test-harness gotcha, not a mode bug — do not "fix" it by changing the objective.

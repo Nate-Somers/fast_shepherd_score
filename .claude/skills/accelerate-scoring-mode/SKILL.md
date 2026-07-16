@@ -11,9 +11,11 @@ description: >-
 # Accelerate a scoring mode
 
 You are given a working reference mode: an eager `optimize_<mode>_overlay` in
-`alignment/_torch.py`, its test, and a registry entry in `accel/_modes.py`. Your job is to make
-it fast — write the GPU and CPU kernels and wire them into the batched screening path — while
-keeping the diff clean and minimal and reproducing the reference's numbers exactly.
+`alignment/_torch.py`, its test, and its result slots registered via `_ALIGN_KEYS` in
+`container/_core.py`. It is **not** yet in `accel/_modes.py` — promoting it to a canonical
+screening mode is part of your job. Make it fast — write the GPU and CPU kernels, wire them into
+the batched path, and register the mode — while keeping the diff clean and minimal and reproducing
+the reference's numbers exactly.
 
 ## What "fast" means here
 
@@ -68,7 +70,22 @@ batch tensors, call the driver, and write `transform_<mode>` / `sim_aligned_<mod
 pair. Bind it onto `MoleculePair` following the binding block at the bottom of that module, and
 export it from `accel/batch/__init__.py`.
 
-### 7. (Optional) multi-GPU / CPU-pool path
+### 7. Promote the mode to canonical (`accel/_modes.py`)
+Now that `_align_batch_<mode>` exists, register the mode in the canonical registry — this is what
+makes `screen` / `multi_gpu` / `cpu_pool` pick it up. Add one row each to `MODE_ATTRS` (the
+`(transform_<mode>, sim_aligned_<mode>)` pair), `MODE_SEEDS`, and `MODE_STEPS`, choosing balanced
+seed/step defaults at the accuracy/throughput knee. Then bump the hardcoded `len(CANONICAL_MODES)`
+count in `tests/test_mode_registry.py`; the `@_bind_batch_aligners` walk now resolves because your
+aligner exists.
+
+This is exactly the step the reference skill could not do — adding a mode to `MODE_ATTRS` before
+its aligner exists makes `import shepherd_score.container` raise (the decorator walks
+`CANONICAL_MODES` calling `getattr(accel.batch, "_align_batch_<mode>")`). Do it here, after step 6,
+and the import stays green. Now that `MODE_SEEDS` / `MODE_STEPS` carry the defaults, you may switch
+the reference `align_with_<mode>`'s literal seed/step defaults over to `_default_seeds` /
+`_default_steps` so the per-pair and batched paths share one source.
+
+### 8. (Optional) multi-GPU / CPU-pool path
 Only if the mode should run across multiple GPUs or the CPU process pool: add a `_MODE_SPEC`
 entry in `accel/batch/_dispatch.py` (declaring how to extract inputs as numpy, rebuild device
 tensors in a worker, and read results back) **and** add the mode to `PROCESS_MODES` in
@@ -76,17 +93,19 @@ tensors in a worker, and read results back) **and** add the mode to `PROCESS_MOD
 edits are a pair — never do one without the other. If the mode does not need this, skip both; it
 runs single-GPU/in-process and that is fine.
 
-### 8. Public batched API
+### 9. Public batched API
 Add `MoleculePairBatch.align_with_<mode>(backend=...)` in `container/_batch.py`. Default
 `backend=None` and resolve it device-aware (Triton on CUDA else numba) via the existing resolver
 — do not hard-default to a single backend.
 
-### 9. Do not touch the front-end
-`screen.py`, `accel/multi_gpu.py`, and `accel/cpu_pool.py` derive the mode set from `accel/_modes.py`. If you
-find yourself editing their mode logic, stop — you have missed the registry-driven path. The only
-registry edits you make are `PROCESS_MODES` (step 7, if applicable).
+### 10. Do not touch the front-end
+`screen.py`, `accel/multi_gpu.py`, and `accel/cpu_pool.py` derive the mode set from
+`accel/_modes.py`. If you find yourself editing their mode logic, stop — you have missed the
+registry-driven path. Your registry edits are confined to `accel/_modes.py` (`MODE_ATTRS` /
+`MODE_SEEDS` / `MODE_STEPS` in step 7, plus `PROCESS_MODES` in step 8 if applicable) and the pinned
+count in `tests/test_mode_registry.py`.
 
-### 10. Validate against all four parity gates
+### 11. Validate against all four parity gates
 See `parity_gates.md`. All four must pass before you declare the mode accelerated:
 numba ≡ autograd reference, Triton ≡ numba, batched ≡ per-pair, self-copy = 1.000.
 
@@ -97,8 +116,9 @@ numba ≡ autograd reference, Triton ≡ numba, batched ≡ per-pair, self-copy 
   kernels are drop-in interchangeable.
 - **Match the surrounding kernel idiom** — `tl.exp2`, autotune, the shared `dR/dq` tail, the
   `_graphed` loop. A new mode should read like the modes already there.
-- **Small diff.** You are adding one kernel pair, one driver, one aligner, one API method, and at
-  most one `_MODE_SPEC`/`PROCESS_MODES` pair. If the diff is larger than that, question it.
+- **Small diff.** You are adding one kernel pair, one driver, one aligner, the canonical registry
+  rows (`MODE_ATTRS` / `MODE_SEEDS` / `MODE_STEPS`) plus the pinned-count bump, one API method, and
+  at most one `_MODE_SPEC`/`PROCESS_MODES` pair. If the diff is larger than that, question it.
 
 See `seams.md` for the file map, `kernel_anatomy.md` for the kernel/dispatch/graph mechanics, and
 `parity_gates.md` for the validation contract.

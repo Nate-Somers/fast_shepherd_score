@@ -40,8 +40,8 @@ By the end of this skill the mode must satisfy all of:
 - `optimize_<mode>_overlay(...)` is a self-contained eager function: given reference/fit inputs
   and a seed count it returns `(aligned_fit_points, se3_transform, score)`, is deterministic
   given the seeds, and uses only autograd — **no custom kernels**. This is the oracle.
-- The mode is registered in `accel/_modes.py` (identity only) and its public functions are
-  exported.
+- The mode's result slots are registered via `_ALIGN_KEYS` in `container/_core.py` (**not**
+  `accel/_modes.py` — see step 5) and its public functions are exported.
 - A test file exists and passes (see `template_test.py`).
 
 ## Steps
@@ -79,8 +79,10 @@ and is what the accel skill expects to find.
 
 ### 4. Expose the per-pair API in `container/_core.py`
 Add `MoleculePair.align_with_<mode>(...)`. Mirror an existing `align_with_*` method:
-- Default `num_repeats` and `max_num_steps` to `None`, then resolve them via
-  `_default_seeds("<mode>")` / `_default_steps("<mode>")`.
+- Give `num_repeats` and `max_num_steps` sensible **literal** defaults (the optimizer's own
+  defaults). Do **not** resolve them via `_default_seeds` / `_default_steps` here — those read
+  `MODE_SEEDS` / `MODE_STEPS`, the *canonical* registry a reference-only mode is deliberately not
+  in yet (step 5). The accel skill moves the defaults there when it promotes the mode.
 - Pull inputs off `self.ref_molec` / `self.fit_molec` (use the existing cached `_ref_xyz_t` /
   `_fit_xyz_t` tensors where they fit).
 - Call your `optimize_<mode>_overlay`, write `self.transform_<mode>` and
@@ -88,12 +90,23 @@ Add `MoleculePair.align_with_<mode>(...)`. Mirror an existing `align_with_*` met
 - Validate inputs the mode requires (e.g. raise a clear `ValueError` if pharmacophores are
   missing), matching the tone of the surrounding methods.
 
-### 5. Register the mode's identity in `accel/_modes.py`
-Add one row each to `MODE_ATTRS` (the `(transform_attr, sim_attr)` pair), `MODE_SEEDS`, and
-`MODE_STEPS`. Pick balanced seed/step defaults at the accuracy/throughput knee, as the module
-docstring describes. **Do not touch `PROCESS_MODES` or `_MODE_SPEC`** — those belong to the
-accel skill. `screen.py`, `accel/multi_gpu.py`, and `accel/cpu_pool.py` derive from this registry, so you
-do not edit them.
+### 5. Register the mode's result slots in `container/_core.py`
+Add your mode id to the `_ALIGN_KEYS` tuple in `container/_core.py`. That is what generates the
+`transform_<mode>` / `sim_aligned_<mode>` accessors (backed by an `AlignmentResult`), giving your
+`align_with_<mode>` method somewhere to write. This edit is purely additive and safe.
+
+**Do not add the mode to `accel/_modes.py` (`MODE_ATTRS` / `MODE_SEEDS` / `MODE_STEPS`).** That
+registry is for *canonical* (screening) modes, and adding to it here **breaks the build**:
+`MODE_ATTRS` feeds `CANONICAL_MODES`, which the `@_bind_batch_aligners` decorator on `MoleculePair`
+walks *at import time*, calling `getattr(accel.batch, "_align_batch_<mode>")` — an aligner that does
+not exist until the accel skill builds it, so `import shepherd_score.container` raises
+`AttributeError`. `tests/test_mode_registry.py` also pins `len(CANONICAL_MODES) == 7`,
+`set(MODE_SEEDS) == set(CANONICAL_MODES)`, and a batch-bind for every canonical mode — all of which
+fail the instant you add a mode with no aligner. Promoting your mode to canonical is the accel
+skill's job, done once the aligner exists. Leave `accel/_modes.py`, `PROCESS_MODES`, and
+`_MODE_SPEC` untouched; `screen.py`, `accel/multi_gpu.py`, and `accel/cpu_pool.py` derive from that
+registry and so pick the mode up only after promotion — correct, since a reference-only mode has no
+batched screening path yet.
 
 ### 6. Export the public functions
 Add your `optimize_<mode>_overlay` / scoring functions to the relevant package `__init__.py`
@@ -103,13 +116,17 @@ Add your `optimize_<mode>_overlay` / scoring functions to the relevant package `
 Copy `template_test.py` to `tests/test_<mode>.py`, replace the `YOURMODE` token, and make it
 pass. The required checks: self-overlap = 1.000, autograd gradient agrees with a finite-difference
 (or analytic) gradient, the optimizer recovers a planted rotation on a self-pair, and results are
-deterministic given a fixed seed. Run `tests/test_mode_registry.py` too — it pins the registry
-invariants and will fail if your `_modes.py` edit is inconsistent.
+deterministic given a fixed seed. Run `tests/test_mode_registry.py` too — it must still pass
+**unchanged**, which confirms you kept the mode out of the canonical registry (step 5). Some suite
+tests need open3d or a GPU and may error for reasons unrelated to your change; run your own test
+and `test_mode_registry.py` specifically rather than the whole suite.
 
 ## Handoff to `accelerate-scoring-mode`
 State three things for the next skill: the exact name of your `optimize_<mode>_overlay` oracle,
 the path of your test file, and the gradient structure of the objective (which channels
-contribute, and how the SE(3) gradient decomposes). That is all it needs.
+contribute, and how the SE(3) gradient decomposes). That is all it needs. It will promote the mode
+to canonical (`accel/_modes.py`) and move the seed/step defaults into `MODE_SEEDS` / `MODE_STEPS`
+as part of building the batched path.
 
 ## Constraints
 - **Additive and minimal.** Add functions; do not rewrite shared code. Keep the diff small.
