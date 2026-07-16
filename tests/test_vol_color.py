@@ -3,7 +3,7 @@ Tests for the ROCS/ROSHAMBO-style directionless "color" scoring and the ``vol_co
 combined shape + color alignment mode.
 
 Covers:
-  * directional=False (isotropic point-Gaussian) scoring parity: torch vs NumPy oracle,
+  * directionless=True (isotropic point-Gaussian) scoring parity: torch vs NumPy oracle,
   * directionless self-overlap == 1.0,
   * the precomputed-self-overlap guard,
   * combo scorer color_weight + directional,
@@ -56,13 +56,13 @@ class TestDirectionlessScoring:
 
         result_np = get_overlap_pharm_np(
             ptype_1, ptype_2, anchors_1, anchors_2, vectors_1, vectors_2,
-            similarity=similarity, directional=False,
+            similarity=similarity, directionless=True,
         )
         result_torch = get_overlap_pharm_torch(
             torch.from_numpy(ptype_1), torch.from_numpy(ptype_2),
             torch.from_numpy(anchors_1), torch.from_numpy(anchors_2),
             torch.from_numpy(vectors_1), torch.from_numpy(vectors_2),
-            similarity=similarity, directional=False,
+            similarity=similarity, directionless=True,
         )
         assert np.allclose(result_torch.numpy(), result_np, rtol=RTOL, atol=ATOL), \
             f"torch {result_torch.numpy()} != np {result_np} (directionless, {similarity}, {sizes})"
@@ -72,9 +72,9 @@ class TestDirectionlessScoring:
         ptype_1, ptype_2, anchors_1, anchors_2, vectors_1, vectors_2 = \
             TestDataGenerator.generate_pharmacophore_data(12, 10, seed=1)
         directional = get_overlap_pharm_np(ptype_1, ptype_2, anchors_1, anchors_2,
-                                           vectors_1, vectors_2, directional=True)
+                                           vectors_1, vectors_2, directionless=False)
         directionless = get_overlap_pharm_np(ptype_1, ptype_2, anchors_1, anchors_2,
-                                             vectors_1, vectors_2, directional=False)
+                                             vectors_1, vectors_2, directionless=True)
         assert not np.isclose(directional, directionless), \
             "directionless scoring unexpectedly identical to directional"
 
@@ -88,19 +88,19 @@ class TestDirectionlessScoring:
         vectors_1 = vectors_1 / np.linalg.norm(vectors_1, axis=1, keepdims=True)
 
         res_np = get_overlap_pharm_np(ptype_1, ptype_1, anchors_1, anchors_1,
-                                      vectors_1, vectors_1, directional=False)
+                                      vectors_1, vectors_1, directionless=True)
         assert np.allclose(res_np, 1.0, rtol=1e-10, atol=1e-10)
 
         res_torch = get_overlap_pharm_torch(
             torch.from_numpy(ptype_1), torch.from_numpy(ptype_1),
             torch.from_numpy(anchors_1), torch.from_numpy(anchors_1),
             torch.from_numpy(vectors_1), torch.from_numpy(vectors_1),
-            directional=False,
+            directionless=True,
         )
         assert np.allclose(res_torch.numpy(), 1.0, rtol=1e-10, atol=1e-10)
 
     def test_directionless_precompute_guard(self):
-        """directional=False with precomputed_self_overlaps must raise (avoids the
+        """directionless=True with precomputed_self_overlaps must raise (avoids the
         directional-self vs directionless-cross Tanimoto collision)."""
         ptype_1, ptype_2, anchors_1, anchors_2, vectors_1, vectors_2 = \
             TestDataGenerator.generate_pharmacophore_data(6, 4, seed=3)
@@ -109,7 +109,7 @@ class TestDirectionlessScoring:
                 torch.from_numpy(ptype_1), torch.from_numpy(ptype_2),
                 torch.from_numpy(anchors_1), torch.from_numpy(anchors_2),
                 torch.from_numpy(vectors_1), torch.from_numpy(vectors_2),
-                directional=False,
+                directionless=True,
                 precomputed_self_overlaps=(torch.tensor(1.0), torch.tensor(1.0)),
             )
 
@@ -122,14 +122,14 @@ class TestDirectionlessScoring:
 
         res_np = get_pharm_combo_score_np(
             centers_1, centers_2, ptype_1, ptype_2, anchors_1, anchors_2,
-            vectors_1, vectors_2, color_weight=color_weight, directional=False,
+            vectors_1, vectors_2, color_weight=color_weight, directionless=True,
         )
         res_torch = get_pharm_combo_score_torch(
             torch.from_numpy(centers_1), torch.from_numpy(centers_2),
             torch.from_numpy(ptype_1), torch.from_numpy(ptype_2),
             torch.from_numpy(anchors_1), torch.from_numpy(anchors_2),
             torch.from_numpy(vectors_1), torch.from_numpy(vectors_2),
-            color_weight=color_weight, directional=False,
+            color_weight=color_weight, directionless=True,
         )
         assert np.allclose(res_torch.numpy(), res_np, rtol=RTOL, atol=ATOL)
 
@@ -138,7 +138,7 @@ class TestDirectionlessScoring:
         ptype_1, ptype_2, anchors_1, anchors_2, vectors_1, vectors_2 = \
             TestDataGenerator.generate_pharmacophore_data(8, 6, seed=11)
         centers_1, centers_2 = TestDataGenerator.generate_shape_data(13, 11)
-        # default call (color_weight=0.5, directional=True) == legacy average
+        # default call (color_weight=0.5, directionless=False) == legacy average
         res = get_pharm_combo_score_np(centers_1, centers_2, ptype_1, ptype_2,
                                        anchors_1, anchors_2, vectors_1, vectors_2)
         pharm = get_overlap_pharm_np(ptype_1, ptype_2, anchors_1, anchors_2,

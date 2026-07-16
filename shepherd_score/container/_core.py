@@ -1143,7 +1143,7 @@ class MoleculePair:
                              color_weight: float = 0.5,
                              alpha: float = 0.81,
                              similarity: _SIM_TYPE = 'tanimoto',
-                             directional: bool = False,
+                             directionless: bool = True,
                              extended_points: bool = False,
                              only_extended: bool = False,
                              num_repeats: int = None,
@@ -1158,7 +1158,7 @@ class MoleculePair:
         The optimized objective is
         ``(1 - color_weight) * shape_Tanimoto + color_weight * color_Tanimoto``. By default
         the color channel is *directionless* (isotropic point Gaussians, ROCS/ROSHAMBO
-        "color"); pass ``directional=True`` to keep fss's orientation-vector weighting. For
+        "color"); pass ``directionless=False`` to keep fss's orientation-vector weighting. For
         ROCS/ROSHAMBO feature parity, build the ``Molecule`` objects with
         ``feature_set='rdkit_base'``.
 
@@ -1174,11 +1174,12 @@ class MoleculePair:
             Gaussian width for the shape overlap. Default is 0.81 (volumetric, heavy atoms).
         similarity : str, optional
             Similarity for the color channel. Default is 'tanimoto'.
-        directional : bool, optional
-            ``False`` (default) scores color as isotropic point Gaussians; ``True`` uses the
-            orientation-vector cosine weighting.
+        directionless : bool, optional
+            ``True`` (default) scores color as isotropic point Gaussians; ``False`` uses the
+            orientation-vector cosine weighting. Same polarity as the extraction-side
+            ``directionless`` on :meth:`Molecule.get_pharmacophore`.
         extended_points, only_extended : bool, optional
-            Forwarded to the color scorer (ignored when ``directional=False``).
+            Forwarded to the color scorer (ignored when ``directionless=True``).
         num_repeats : int, optional
             Number of SE(3) initializations. Default (``None``) is ``MODE_SEEDS['vol_color']`` (16).
         trans_init : bool, optional
@@ -1220,7 +1221,7 @@ class MoleculePair:
             alpha=alpha,
             color_weight=color_weight,
             similarity=similarity,
-            directional=directional,
+            directionless=directionless,
             extended_points=extended_points,
             only_extended=only_extended,
             num_repeats=num_repeats,

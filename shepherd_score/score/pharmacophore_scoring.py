@@ -429,7 +429,7 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                       extended_points: bool = False,
                       only_extended: bool = False,
                       precomputed_self_overlaps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                      directional: bool = True,
+                      directionless: bool = False,
                       ) -> torch.Tensor:
     """
     Compute pharmacophore score.
@@ -473,11 +473,14 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
         ``extended_points`` is False), the per-type self-overlap computation is
         skipped and only the cross-overlap VAB is computed each call. Used to
         avoid redundant self-overlap recomputation in optimization loops.
-    directional : bool, optional
-        When ``True`` (default), HBA/HBD/aromatic/halogen are scored with the
-        orientation-vector cosine weighting (fss behavior). When ``False``, *all* types
+    directionless : bool, optional
+        When ``False`` (default), HBA/HBD/aromatic/halogen are scored with the
+        orientation-vector cosine weighting (fss behavior). When ``True``, *all* types
         are scored as isotropic point Gaussians (ROCS/ROSHAMBO "color"); this forces
         ``extended_points`` off and is incompatible with ``precomputed_self_overlaps``.
+        (This is the scoring-side counterpart of the extraction-side ``directionless``
+        in :func:`~shepherd_score.pharm_utils.pharmacophore.get_pharmacophores`; both use
+        the same polarity — ``True`` means orientation-blind.)
 
     Returns
     -------
@@ -513,7 +516,7 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
     # point-only Gaussian overlap. Note: zeroing the vectors is NOT equivalent -- a zero
     # vector gives cosine weight (0+2)/3 = 2/3 on cross terms but 1 on self terms, which
     # does not cancel in the Tanimoto, so the cosine path must be skipped entirely.
-    if not directional:
+    if directionless:
         # `extended_points` encodes directional geometry (anchor + vector-extended point),
         # so it is mutually exclusive with directionless scoring.
         extended_points = False
@@ -522,7 +525,7 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
         # from compute_self_overlaps_pharm) would corrupt the Tanimoto denominator.
         if precomputed_self_overlaps is not None:
             raise ValueError(
-                "Directionless pharmacophore scoring (`directional=False`) is incompatible "
+                "Directionless pharmacophore scoring (`directionless=True`) is incompatible "
                 "with `precomputed_self_overlaps`; recompute self-overlaps directionless."
             )
 
@@ -680,7 +683,7 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
                                                allow_antiparallel=True)
-        elif not directional:
+        elif directionless:
             if batched:
                 VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='aromatic',
                                                                ptype_1=ptype_1,
@@ -730,7 +733,7 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
                                                allow_antiparallel=False)
-        elif not directional:
+        elif directionless:
             if batched:
                 VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='acceptor',
                                                                ptype_1=ptype_1,
@@ -790,7 +793,7 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
                                                allow_antiparallel=False)
-        elif not directional:
+        elif directionless:
             if batched:
                 VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='donor',
                                                                ptype_1=ptype_1,
@@ -850,7 +853,7 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
                                                allow_antiparallel=False)
-        elif not directional:
+        elif directionless:
             if batched:
                 VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='halogen',
                                                                ptype_1=ptype_1,
@@ -922,13 +925,13 @@ def get_pharm_combo_score(centers_1: torch.Tensor,
                           extended_points: bool = False,
                           only_extended: bool = False,
                           color_weight: float = 0.5,
-                          directional: bool = True
+                          directionless: bool = False
                           ) -> torch.Tensor:
     """ Compute a combined shape and pharmacophore score.
 
     The combined score is ``(1 - color_weight) * shape + color_weight * pharm``.
     ``color_weight=0.5`` is the unweighted average of the two channels. Set
-    ``directional=False`` for ROCS/ROSHAMBO-style isotropic "color" scoring. """
+    ``directionless=True`` for ROCS/ROSHAMBO-style isotropic "color" scoring. """
     # Similarity scoring
     if similarity.lower() == 'tanimoto':
         similarity_func = tanimoto_func
@@ -951,7 +954,7 @@ def get_pharm_combo_score(centers_1: torch.Tensor,
                                     similarity=similarity,
                                     extended_points=extended_points,
                                     only_extended=only_extended,
-                                    directional=directional)
+                                    directionless=directionless)
 
     # Shape scoring
     VAB = VAB_2nd_order(centers_1=centers_1,

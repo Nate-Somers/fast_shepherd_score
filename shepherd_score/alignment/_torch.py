@@ -1305,7 +1305,7 @@ def objective_vol_color_overlay(se3_params: torch.Tensor,
                                 alpha: float = 0.81,
                                 color_weight: float = 0.5,
                                 similarity: _SIM_TYPE = 'tanimoto',
-                                directional: bool = False,
+                                directionless: bool = True,
                                 extended_points: bool = False,
                                 only_extended: bool = False,
                                 ) -> torch.Tensor:
@@ -1315,7 +1315,7 @@ def objective_vol_color_overlay(se3_params: torch.Tensor,
     Supports batched and non-batched inputs; for a batch the loss is the average.
 
     The combined similarity is ``(1 - color_weight) * shape + color_weight * color``. With
-    ``directional=False`` (default) the color channel is scored as isotropic point
+    ``directionless=True`` (default) the color channel is scored as isotropic point
     Gaussians (ROCS/ROSHAMBO "color"). The shape channel is always Tanimoto-scored.
 
     Parameters
@@ -1329,7 +1329,7 @@ def objective_vol_color_overlay(se3_params: torch.Tensor,
     ref_anchors, fit_anchors : torch.Tensor (P,3)/(Q,3) or batched
         Pharmacophore anchor coordinates.
     ref_vectors, fit_vectors : torch.Tensor (P,3)/(Q,3) or batched
-        Pharmacophore orientation vectors (ignored when ``directional=False``).
+        Pharmacophore orientation vectors (ignored when ``directionless=True``).
     alpha : float
         Gaussian width for the shape overlap (0.81 = volumetric).
     color_weight : float
@@ -1362,7 +1362,7 @@ def objective_vol_color_overlay(se3_params: torch.Tensor,
                                   similarity=similarity,
                                   extended_points=extended_points,
                                   only_extended=only_extended,
-                                  directional=directional)
+                                  directionless=directionless)
     combo = (1 - color_weight) * shape_sim + color_weight * color_sim
 
     # Single instance
@@ -1384,7 +1384,7 @@ def optimize_vol_color_overlay(ref_centers: torch.Tensor,
                                alpha: float = 0.81,
                                color_weight: float = 0.5,
                                similarity: _SIM_TYPE = 'tanimoto',
-                               directional: bool = False,
+                               directionless: bool = True,
                                extended_points: bool = False,
                                only_extended: bool = False,
                                num_repeats: int = 50,
@@ -1413,18 +1413,18 @@ def optimize_vol_color_overlay(ref_centers: torch.Tensor,
     ref_anchors, fit_anchors : torch.Tensor (P,3) / (Q,3)
         Pharmacophore anchor coordinates.
     ref_vectors, fit_vectors : torch.Tensor (P,3) / (Q,3)
-        Pharmacophore orientation vectors (ignored when ``directional=False``).
+        Pharmacophore orientation vectors (ignored when ``directionless=True``).
     alpha : float (default=0.81)
         Gaussian width for the shape overlap (0.81 = volumetric).
     color_weight : float (default=0.5)
         Weight of the color channel in [0, 1].
     similarity : str (default='tanimoto')
         Similarity for the color channel ('tanimoto', 'tversky', 'tversky_ref', 'tversky_fit').
-    directional : bool (default=False)
-        ``False`` scores color as isotropic point Gaussians (ROCS/ROSHAMBO); ``True`` keeps
+    directionless : bool (default=True)
+        ``True`` scores color as isotropic point Gaussians (ROCS/ROSHAMBO); ``False`` keeps
         the fss orientation-vector cosine weighting.
     extended_points, only_extended : bool
-        Forwarded to the color scorer (ignored when ``directional=False``).
+        Forwarded to the color scorer (ignored when ``directionless=True``).
     num_repeats : int (default=50)
         Number of SE(3) initializations.
     trans_centers : torch.Tensor (T,3) or None
@@ -1473,7 +1473,7 @@ def optimize_vol_color_overlay(ref_centers: torch.Tensor,
         init_color = get_overlap_pharm(ref_pharms, fit_pharms, ref_anchors, fit_anchors,
                                        ref_vectors, fit_vectors, similarity=similarity,
                                        extended_points=extended_points,
-                                       only_extended=only_extended, directional=directional)
+                                       only_extended=only_extended, directionless=directionless)
         init_score = (1 - color_weight) * init_shape + color_weight * init_color
         print(f'Initial vol_color similarity score: {float(init_score):.3f}')
 
@@ -1493,7 +1493,7 @@ def optimize_vol_color_overlay(ref_centers: torch.Tensor,
             alpha=alpha,
             color_weight=color_weight,
             similarity=similarity,
-            directional=directional,
+            directionless=directionless,
             extended_points=extended_points,
             only_extended=only_extended,
         )
@@ -1529,7 +1529,7 @@ def optimize_vol_color_overlay(ref_centers: torch.Tensor,
                                   similarity=similarity,
                                   extended_points=extended_points,
                                   only_extended=only_extended,
-                                  directional=directional)
+                                  directionless=directionless)
     scores = (1 - color_weight) * shape_sim + color_weight * color_sim
 
     if num_repeats == 1:
