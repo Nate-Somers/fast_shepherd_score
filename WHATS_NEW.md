@@ -1,13 +1,24 @@
 # What's New
 
 This document describes the accelerated-alignment update to `shepherd-score`. It covers the
-complete code diff, the organization of every new file, the full public API, every new feature,
-and — explicitly — the four places where existing behavior changes.
+code, the organization of every new file, the full public API, and every new feature.
 
-The update is **additive in structure**: no upstream file is deleted, and no upstream public
-name is removed. It is **not entirely additive in behavior**: four changes are visible to existing
-callers and are documented in [Behavior changes](#7-behavior-changes-read-this) below. Read that
-section before upgrading.
+> ## ⚠️ Read first — two changes affect existing results and installs
+>
+> 1. **The default batch backend changed, and it changes scores.** `MoleculePairBatch.align_with_*`
+>    used to default to JAX; it now defaults to the accelerated backends — **Triton on a CUDA host,
+>    numba on CPU**. Those backends use a *different SE(3) seed set* than JAX, so a default
+>    `align_with_*` call now returns **different (not worse) scores** than before. If you need the
+>    old numbers, pass `backend="jax"` explicitly. See [§4.2](#42-a-backend-argument-on-every-batch-aligner)
+>    and [Behavior changes B5](#7-behavior-changes-read-this).
+> 2. **`numba` is now a core dependency**, not an optional extra. The package no longer imports
+>    without it. See [§2](#2-installation-and-dependencies).
+
+Structurally the fork is still additive on top of upstream (no upstream file deleted, no upstream
+public name removed), and this release also **merges upstream's `Molecule` refactor** (the
+`Surface`/`Pharmacophore`/`AlignmentResult` dataclasses); fss's flat attributes still work because
+upstream exposes them as backward-compatible properties. The behavior changes visible to existing
+callers are enumerated in [Behavior changes](#7-behavior-changes-read-this) — read that before upgrading.
 
 ---
 
@@ -26,6 +37,12 @@ section before upgrading.
 ---
 
 ## 1. The diff
+
+> **Note:** the counts below are the fss delta against upstream at **`75f1b6b`** (the base the fork
+> was built on). This release *also* merges upstream's newer `446f358` (the `Molecule` refactor),
+> which brings in upstream's own new files (`container/profiles.py`, `visualize.py` rewrite, new
+> tests) on top of these. This table describes what the fork *adds*; it is not the raw
+> `git diff upstream/main` after the merge.
 
 Measured against `coleygroup/shepherd-score` at `75f1b6b`:
 
@@ -84,7 +101,7 @@ conflicts.
 | `tests/test_numba_backend.py` | 148 | numba CPU kernels |
 | `tests/test_mode_registry.py` | 113 | Registry invariants (guards against drift) |
 | **Packaging** | | |
-| `environment-cpu-svml.yml` | 26 | Conda env for the SVML-vectorized CPU kernels |
+| `environment.yml` (rewritten) | — | Single conda env: SVML numba stack + full runtime deps (replaces the old env and the removed `environment-cpu-svml.yml`) |
 
 ### Modified files — library source (15)
 
@@ -94,7 +111,7 @@ conflicts.
 | `shepherd_score/container/_batch.py` | +453 / −26 | Mostly. Same |
 | `shepherd_score/generate_point_cloud.py` | +249 / −13 | Yes — lazy Open3D + the opt-in `smooth_sdf` surfacer |
 | `shepherd_score/alignment/_torch.py` | +255 / −0 | Yes — one appended hunk, zero upstream lines touched |
-| `shepherd_score/score/pharmacophore_scoring.py` | +98 / −4 | Yes — `directional=True` default preserves behavior |
+| `shepherd_score/score/pharmacophore_scoring.py` | +98 / −4 | Yes — `directionless=False` default preserves behavior |
 | `shepherd_score/pharm_utils/pharmacophore.py` | +68 / −20 | Yes |
 | `shepherd_score/score/pharmacophore_scoring_np.py` | +55 / −16 | Yes |
 | `shepherd_score/alignment/utils/se3.py` | +28 / −14 | **No** — see the `R==1` shape change |
@@ -115,37 +132,38 @@ changed), `pyproject.toml` (+19/−1), `pytest.ini` (+1), `.gitignore` (+3), `RE
 
 ## 2. Installation and dependencies
 
-The core dependency set is unchanged except for one fix. `torch` and `open3d` were already
-required; the accelerated backends add **no new hard dependency**.
-
 ```bash
-pip install shepherd-score            # unchanged: rdkit, torch, open3d, py3Dmol, numpy, pandas, scipy, molscrub, tqdm
+pip install shepherd-score            # core: rdkit, torch, open3d, py3Dmol, numpy, pandas, scipy, molscrub, tqdm, numba
 pip install "shepherd-score[gpu]"     # + triton>=3.6  -> backend="triton"  (needs a CUDA torch build)
-pip install "shepherd-score[cpu]"     # + numba        -> backend="numba"
-pip install "shepherd-score[jax]"     # + jax          -> backend="jax" (the default; unchanged)
+pip install "shepherd-score[jax]"     # + jax          -> backend="jax"    (the OLD default; now opt-in)
 ```
 
+- **`numba` is now a CORE dependency**, no longer optional. It is the default CPU backend for the
+  batched aligners (see [§4.2](#42-a-backend-argument-on-every-batch-aligner)), so the package no
+  longer imports cleanly with numba absent. The `[cpu]` extra is retained as a redundant alias.
+  numba is unpinned in pip because the fast SVML build cannot be delivered by pip — use the conda
+  `environment.yml` for that (below).
+- **`triton` is optional** (the `[gpu]` extra) and lazily imported, so the package still imports
+  without it. `jax` is optional too — but note it is **no longer the default backend**.
 - **`tqdm` moved into the core dependency list.** This is a bugfix: upstream already imported
-  `tqdm` at module scope in `conformer_generation.py`, `objective.py`, and both `pipelines.py`
-  modules, but never declared it.
-- **`numba` and `triton` are genuinely optional.** They are imported lazily, on first dispatch.
-  The package imports cleanly with `numba`, `triton`, `jax`, and `open3d` **all absent** —
-  which upstream could not do, because it imported Open3D eagerly.
+  `tqdm` at module scope but never declared it.
 - **The `gpu` extra has two install traps** (both flagged in `pyproject.toml`):
   - **A CUDA build of torch is required.** The default CPU torch wheel has no GPU and bundles no
-    Triton, so `pip install torch` alone will not run the GPU path — install a `+cuXXX` build
-    from the matching PyTorch index.
+    Triton, so `pip install torch` alone will not run the GPU path — install a `+cuXXX` build.
   - **Triton must be ≥ 3.6.** The overlap kernels use `@triton.autotune(cache_results=…)`, an API
     that only exists in Triton 3.6+. On older Triton (e.g. the 3.1.0 that ships with a CPU-cloned
     env) every GPU kernel dies at compile with a missing-attribute error and there is **no CPU
-    fallback**. The `gpu` extra pins `triton>=3.6`; a known-good combination is
-    `torch==2.11.0+cu128` with `triton==3.6.0` from the cu128 index, which coexists cleanly with
-    the numpy 1.26.4 / numba 0.59.1 SVML CPU stack — so one environment serves both GPU and CPU.
-- **`triton` ships manylinux wheels only.** If you add `gpu` to an `all`-style install on
-  Windows or macOS, resolution will fail. Install it explicitly on Linux instead.
-- **SVML.** The numba CPU kernels reach full speed only when numba can emit Intel SVML vector
-  math. `environment-cpu-svml.yml` builds an environment that can. Without it the kernels run
-  unvectorized and a one-time `RuntimeWarning` is emitted, so the slow regime is never silent.
+    fallback**. The `gpu` extra pins `triton>=3.6`; a known-good combination is `torch==2.11.0+cu128`
+    with `triton==3.6.0` from the cu128 index.
+- **`triton` ships manylinux wheels only** — install it explicitly on Linux, not via an
+  `all`-style extra on Windows/macOS.
+- **One conda `environment.yml` now serves both CPU and GPU.** It pins the SVML-vectorized numba
+  stack (`numba 0.59.1 + llvmlite 0.42 + icc_rt + numpy 1.26`) plus the full runtime deps (open3d,
+  xtb, rdkit, …). The separate `environment-cpu-svml.yml` was folded into it and removed. SVML
+  makes the CPU kernels ~2–4× faster **and changes precision** — it switches the shape/ESP inner
+  loops to fp32 structure-of-arrays kernels (values ~1e-6 rel, gradients ~1e-4). Without SVML the
+  kernels are correct but slower and emit a one-time `RuntimeWarning`, so the slow regime is never
+  silent. For the GPU path, add a CUDA torch + `triton>=3.6` on top with pip.
 
 ---
 
@@ -216,37 +234,42 @@ weighted objective, so *both* channels steer the pose. New on both `MoleculePair
 `MoleculePairBatch`.
 
 The two `vol_color` signatures differ: `MoleculePair.align_with_vol_color` accepts `similarity`,
-`directional`, `extended_points` and `only_extended`; the batch version accepts none of them.
+`directionless`, `extended_points` and `only_extended`; the batch version accepts none of them.
 
 `pharm` also supports `similarity='tversky' | 'tversky_ref' | 'tversky_fit'` alongside the default
 `'tanimoto'`. Tversky forfeits both the CUDA-graph and the fused-CPU fast paths.
 
 ### 4.2 A `backend=` argument on every batch aligner
 
-`MoleculePairBatch.align_with_*` takes `backend="jax" | "triton" | "numba"`. Aliases are accepted:
-`"cuda"` / `"gpu"` → triton, `"cpu"` → numba.
+`MoleculePairBatch.align_with_*` takes `backend="jax" | "triton" | "numba"`, defaulting to `None`.
+Aliases are accepted: `"cuda"` / `"gpu"` → triton, `"cpu"` → numba.
 
-- `"jax"` is the **default** and runs the original, unchanged JAX path — **except on the two new
-  modes.** `align_with_vol_and_surf_esp` and `align_with_vol_color` have no JAX kernel, so
-  `backend="jax"` there falls through to the per-pair **PyTorch** path, run serially.
+- **`None` (the default) is device-aware: Triton on a CUDA host, numba on CPU.** JAX is *not* the
+  default any more — pass `backend="jax"` to select it.
 - `"triton"` runs hand-written Triton GPU kernels.
 - `"numba"` runs numba CPU kernels.
+- `"jax"` runs the original JAX path — **except on the two new modes** (`align_with_vol_and_surf_esp`,
+  `align_with_vol_color`), which have no JAX kernel and fall through to the per-pair PyTorch path.
 
 Kernel selection is per call, by tensor device, so one process can run both — a CPU batch and a
 GPU batch in the same program each get the right kernel.
 
-> #### Scores are not comparable across backends
+> #### ⚠️ The default now changes scores vs the old JAX default
 >
-> The accelerated backends use a **different SE(3) seed set** than the JAX/torch path. Both begin
-> with identity + 4 PCA-alignment quaternions, but the accelerated seeder then adds up to **six
-> structured ±90° rotations about each reference principal axis** — covering the axis *swaps* that
-> PCA alignment alone misses — before falling back to a Fibonacci fill. At the shipped per-mode
-> seed counts those structured seeds absorb most of the budget: at `vol`'s default of 10 seeds the
-> accelerated path emits **zero** Fibonacci rotations, where JAX emits five.
+> Before this release, `align_with_*` defaulted to JAX. It now defaults to the accelerated backends,
+> and **they use a different SE(3) seed set than JAX**, so *a default call returns different scores
+> than it did before*. Both begin with identity + 4 PCA-alignment quaternions, but the accelerated
+> seeder then adds up to **six structured ±90° rotations about each reference principal axis** —
+> covering the axis *swaps* PCA alignment alone misses — before falling back to a Fibonacci fill. At
+> the shipped per-mode seed counts those structured seeds absorb most of the budget: at `vol`'s
+> default of 10 seeds the accelerated path emits **zero** Fibonacci rotations, where JAX emits five.
 >
-> The two backends therefore explore different orientations and return different (not worse)
-> scores. `backend=` is **not** a pure-performance switch, and a Triton run will not reproduce a
-> JAX baseline.
+> The backends explore different orientations and return different (not worse) scores. `backend=` is
+> **not** a pure-performance switch, and Triton/numba will not reproduce a JAX baseline. If you have
+> a pinned baseline or a published score table from a previous release, **pass `backend="jax"`
+> explicitly** to reproduce it. (Changing the default this way also fixes a latent bug: the old JAX
+> default was not installable by default — `jax` is an optional extra — so a fresh install hitting
+> the default batch path raised `ImportError`.)
 
 Three backend-specific limits:
 
@@ -539,7 +562,7 @@ Molecule(mol, num_surf_points=None, density=None, probe_radius=None, surface_poi
 | `align_with_surf_esp(alpha, lam=0.3, num_repeats=None, ..., max_num_steps=None, ...)` | **renamed** from `align_with_esp` |
 | `align_with_vol_and_surf_esp(alpha, lam=0.001, probe_radius=1.0, esp_weight=0.5, ...)` | **renamed** from `align_with_esp_combo` |
 | `align_with_pharm(similarity='tanimoto', ...)` | defaults changed |
-| `align_with_vol_color(color_weight=0.5, alpha=0.81, similarity='tanimoto', directional=False, extended_points=False, only_extended=False, num_repeats=None, trans_init=False, lr=0.1, max_num_steps=None, verbose=False)` | **NEW** |
+| `align_with_vol_color(color_weight=0.5, alpha=0.81, similarity='tanimoto', directionless=True, extended_points=False, only_extended=False, num_repeats=None, trans_init=False, lr=0.1, max_num_steps=None, verbose=False)` | **NEW** |
 
 `align_with_esp` and `align_with_esp_combo` remain as aliases and are the same function objects.
 
@@ -564,7 +587,7 @@ Every method gains `backend='jax'` and `return_aligned=False`. `align_with_vol` 
 `align_with_vol_esp` additionally gain `alpha=0.81`. Two methods are new
 (`align_with_vol_and_surf_esp`, `align_with_vol_color`) and two are renamed with aliases.
 
-`MoleculePairBatch.align_with_vol_color` does **not** take `similarity`, `directional`,
+`MoleculePairBatch.align_with_vol_color` does **not** take `similarity`, `directionless`,
 `extended_points` or `only_extended` — those exist only on the `MoleculePair` version.
 
 ```python
@@ -730,13 +753,13 @@ numpy + scipy only; no Open3D.
 objective_vol_color_overlay(...)
 optimize_vol_color_overlay(ref_centers, fit_centers, ref_pharms, fit_pharms, ref_anchors,
                            fit_anchors, ref_vectors, fit_vectors, alpha=0.81, color_weight=0.5,
-                           similarity='tanimoto', directional=False, extended_points=False,
+                           similarity='tanimoto', directionless=True, extended_points=False,
                            only_extended=False, num_repeats=50, trans_centers=None, lr=0.1,
                            max_num_steps=200, verbose=False)
 
 # shepherd_score.score.pharmacophore_scoring{,_np} — new kwargs, defaults preserve behavior
-get_overlap_pharm(..., directional=True)
-get_pharm_combo_score(..., color_weight=0.5, directional=True)
+get_overlap_pharm(..., directionless=False)
+get_pharm_combo_score(..., color_weight=0.5, directionless=False)
 
 # shepherd_score.pharm_utils.pharmacophore
 get_pharmacophores(mol, ..., feature_set='shepherd', directionless=False)
@@ -810,7 +833,8 @@ the bottleneck do you need to write kernels at all.
 
 ## 7. Behavior changes (read this)
 
-Four changes are visible to code written against the previous release.
+Seven changes are visible to code written against the previous release. **B5 (the default batch
+backend) and B6 (numba required) are the ones most likely to affect you.**
 
 ### B1. `num_repeats` and `max_num_steps` defaults — the important one
 
@@ -921,15 +945,48 @@ the batched and gradient paths remain bitwise identical to before. But two cavea
 `se3.py` also gains a new public function, `quaternions_to_SE3_batch(q, t) -> (K, 4, 4)`, used by
 all the batched aligners.
 
+### B5. The default batch backend changed (scores change) — the important one
+
+`MoleculePairBatch.align_with_*` no longer defaults to JAX. The default is now device-aware —
+**Triton on a CUDA host, numba on CPU** — and those backends use a **different SE(3) seed set**
+than JAX, so **a default `align_with_*` call returns different scores than it did before**
+(different, not worse — see [§4.2](#42-a-backend-argument-on-every-batch-aligner) for the seed-set
+detail).
+
+```python
+batch.align_with_surf(alpha)                    # was JAX; now Triton/numba -> different scores
+batch.align_with_surf(alpha, backend="jax")     # explicit -> the old numbers
+```
+
+This only affects `MoleculePairBatch`. The per-pair `MoleculePair.align_with_*` methods are
+unaffected (they still default to the torch path). **If you have a pinned baseline or a published
+score table from a previous release, pass `backend="jax"`.** Changing the default also fixes a
+latent bug — the old JAX default was not installable by default (jax is an optional extra), so a
+fresh install hitting the default batch path raised `ImportError`.
+
+### B6. `numba` is now a required dependency
+
+It is the default CPU backend, so it is a core dependency and the package no longer imports without
+it. If you relied on `import shepherd_score` working in a numba-free environment, install numba (it
+is a pure-pip wheel) or pin the previous release.
+
+### B7. Pharmacophore scoring: `directional` → `directionless`
+
+The fork-only scoring kwarg `directional` (on `get_overlap_pharm` / `get_pharm_combo_score` and
+forwarded through `align_with_vol_color`) is **renamed to `directionless` with inverted meaning**,
+so extraction and scoring now share one polarity (`directionless=True` = orientation-blind). There
+is no alias — `directional=` was never in upstream and is fork-only, so update any call:
+`directional=False` → `directionless=True`, `directional=True` → `directionless=False`.
+
 ### Minor
 
 - `align_with_vol_esp(lam=...)` — `lam` was a required positional; it now defaults to `0.1`.
   Strictly widening, so no existing call breaks.
 - `MoleculePair.__init__` now eagerly allocates two torch tensors on the target device, so
   constructing a pair touches GPU memory before any `align_*` call.
-- `get_overlap_pharm(directional=False)` raises `ValueError` if combined with
+- `get_overlap_pharm(directionless=True)` raises `ValueError` if combined with
   `precomputed_self_overlaps`, and silently forces `extended_points` / `only_extended` off. The
-  numpy variant forces the flags off without raising. Neither affects the `directional=True`
+  numpy variant forces the flags off without raising. Neither affects the `directionless=False`
   default.
 - `get_pharm_combo_score`'s combination changed from `(pharm + shape) / 2` to
   `(1 − color_weight) · shape + color_weight · pharm`. At the default `color_weight=0.5` these are
@@ -951,7 +1008,8 @@ not any existing caller.
 - The 76 skips are the Triton, CUDA, and JAX tests, which need hardware or optional
   dependencies this environment lacks. Verify them on a CUDA + JAX box.
 - `ruff check shepherd_score/ tests/` passes clean.
-- The package imports with `numba`, `triton`, `jax`, and `open3d` **all absent**.
+- The package imports with `triton`, `jax`, and `open3d` absent (all optional/lazy). It now
+  **requires `numba`** (the default CPU backend), so numba is no longer in that set.
 - Behavior on the default path was checked against a 180-array golden baseline (`vol`,
   `vol_color`, `pharm` over 30 cross-pairs) captured before the final cleanup pass: **every array
   is bit-identical**.
