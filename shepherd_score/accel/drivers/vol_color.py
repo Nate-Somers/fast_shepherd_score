@@ -51,10 +51,13 @@ from ._common import (
 from ._graphed import _GraphedFineBase, run_graphed, graph_cap
 from .esp_combo import _overlap_in_chunks_volumetric, _self_overlap_chunks
 from ...score.analytical_gradients._torch import build_lookup_tables
+from ...score.constants import P_TYPES
 
-# Padding type for pharmacophore slots: P_TYPES index 8 == 'Dummy' (lookup category 3 ->
-# skipped by the kernel). Padded slots are also masked out by N_real, so padding is free.
-_PHARM_PAD_TYPE = 8
+# Padding type for pharmacophore slots: the 'Dummy' family (lookup category 3 -> skipped by the
+# kernel). Padded slots are also masked out by N_real, so padding is free. Derived by NAME from
+# P_TYPES rather than hardcoding the ordinal, so a future upstream reorder of P_TYPES stays correct.
+_PHARM_PAD_TYPE = P_TYPES.index('Dummy')
+assert P_TYPES[_PHARM_PAD_TYPE] == 'Dummy', "vol_color pad type must be the 'Dummy' pharmacophore family"
 
 
 @torch.no_grad()
