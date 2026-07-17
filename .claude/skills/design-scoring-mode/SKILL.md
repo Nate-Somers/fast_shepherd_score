@@ -77,7 +77,13 @@ and the heavy-atom slice must reuse the **same `_nonH_atoms_idx`** that position
 If it does not, the scalar desyncs from the geometry and the overlap is silently wrong — and a
 self-overlap (`ref == fit`) still reads 1.000 under a *consistently* wrong mapping, so it will not
 catch the bug; only a planted-pose test (step 8) will. Read `get_partial_charges` / `get_charges`
-and copy their structure exactly. (Most modes skip this step entirely.)
+and copy their structure exactly.
+
+Compute the attribute at construction (it only needs the RDKit mol), but call the
+`get_<feature>(no_H)` **slicer only at align time**: `_nonH_atoms_idx` is defined *later* in
+`Molecule.__init__`, so slicing during `__init__` would raise `AttributeError` (this is why
+`get_charges` is likewise only ever called at align time, not in the constructor). (Most modes skip
+this step entirely.)
 
 ### 3. Write the pure overlap in `score/`
 Put the channel math in the matching module — `score/gaussian_overlap.py` (shape),
@@ -89,10 +95,15 @@ molecule scored against itself gives 1.000 under Tanimoto.
 
 **If the mode fully reuses existing channels there is nothing to add here and nothing to export** —
 skip straight to the objective. (E.g. a shape + scalar-field combo can reuse `get_overlap` and
-`get_overlap_esp`, feeding a new per-atom scalar as `get_overlap_esp`'s "charges" argument. Note
-`get_overlap_esp` folds the shape Gaussian into its field overlap, so you get a *shape-weighted*
-field similarity — the intended ESP-style behaviour, not an independent scalar field; its `lam`
-sets the field's influence and self-overlap is `lam`-invariant, so keep the documented default.)
+`get_overlap_esp`, feeding a new per-atom scalar as `get_overlap_esp`'s "charges" argument — pass
+the `(N,)` array straight in, `get_overlap_esp` reshapes it to `(N,1)` internally and is
+batch-capable, so no manual reshaping. Note `get_overlap_esp` folds the shape Gaussian into its
+field overlap, so you get a *shape-weighted* field similarity — the intended ESP-style behaviour,
+not an independent scalar field. Its `lam` sets the field's influence; self-overlap is
+`lam`-invariant so the self-check passes for any value, but choose `lam` for your point type rather
+than the function's signature default: that default (`0.3*LAM_SCALING`) is tuned for **surface**
+point clouds, while the docstring recommends **`lam=0.1` for volumetric / atom-centred** overlap —
+pass `lam=0.1` for an atom-centred field.)
 
 ### 4. Write the eager objective + optimizer in `alignment/_torch.py`
 Two functions, following the shape of the existing `optimize_*_overlay` functions:
