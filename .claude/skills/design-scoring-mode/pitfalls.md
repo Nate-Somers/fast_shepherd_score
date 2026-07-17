@@ -48,10 +48,27 @@ The reference molecule is fixed; only the fit molecule is transformed by the SE(
 gradient flowing through the transform applied to the fit inputs only. Accidentally transforming
 both, or detaching the fit transform, produces a plausible-looking but wrong optimizer.
 
-## Finite-difference gradient checks must run in float32
-The SE(3) helpers (`get_SE3_transform`) build the rotation matrix in float32, so a gradient check
-that feeds float64 inputs raises `Input dtypes must be the same, got: input float, batch1: double`
-inside the transform. Run your autograd-vs-finite-difference check in the library-native float32,
-with a step `eps ≈ 1e-3` and a loose tolerance (`atol ≈ 2e-3`): float32 finite differences are
-noisy, and a tight float64 tolerance reports a false failure even when the gradient is correct.
-This is a test-harness gotcha, not a mode bug — do not "fix" it by changing the objective.
+## Finite-difference gradient checks: float32, and not at the identity pose
+Two gotchas make a naive autograd-vs-finite-difference test either crash or pass vacuously.
+
+- **Use float32.** The SE(3) helpers (`get_SE3_transform`) build the rotation matrix in float32, so
+  feeding float64 inputs raises `Input dtypes must be the same, got: input float, batch1: double`
+  inside the transform. Run the check in the library-native float32, with a step `eps ≈ 1e-3` and a
+  loose tolerance (`atol ≈ 2e-3`): float32 finite differences are noisy, and a tight float64
+  tolerance reports a false failure even when the gradient is correct.
+- **Evaluate at a non-identity pose.** Do the check on a fit molecule that has been rotated /
+  translated away from the reference, not at the identity SE(3) the template starts from. A
+  self-overlap objective at the identity is at its *optimum*, where the gradient is ≈0 in every
+  direction — comparing autograd-≈0 to finite-difference-≈0 passes `allclose` trivially and never
+  exercises the derivative. Plant a real pose first so the gradient is genuinely nonzero.
+
+Both are test-harness gotchas, not mode bugs — do not "fix" them by changing the objective.
+
+## Per-atom data must stay aligned with atom positions
+When a mode carries a per-atom scalar (charge, lipophilicity, any new field), that array must line
+up index-for-index with `atom_pos`, and heavy-atom slicing must reuse the **same `_nonH_atoms_idx`**
+positions use (see `seams.md`). A per-atom array built in a different atom order, or sliced
+differently, silently pairs each scalar with the wrong coordinate — the overlap is then wrong even
+though nothing errors. The dangerous part: with `ref == fit` a *consistently* wrong mapping still
+gives self-overlap 1.000, so the self-check passes. Only a **planted-pose** test (rotate the fit,
+confirm recovery to ≈1.000) catches a misalignment; include one.

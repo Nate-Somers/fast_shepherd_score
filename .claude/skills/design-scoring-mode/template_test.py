@@ -50,13 +50,16 @@ def test_autograd_matches_finite_difference():
     autograd against a central difference. This proves the eager objective — the oracle
     the accel kernels are validated against — is analytically correct.
 
-    NOTE: run this in float32. `get_SE3_transform` builds the rotation matrix in float32, so
-    float64 inputs raise a dtype mismatch inside the transform; float32 finite differences are
-    noisy, hence eps=1e-3 and a loose atol=2e-3 (see pitfalls.md).
+    NOTE (see pitfalls.md): run this in float32 (`get_SE3_transform` builds the rotation matrix in
+    float32, so float64 inputs raise a dtype mismatch; float32 finite differences are noisy, hence
+    eps=1e-3 and a loose atol=2e-3). And evaluate at a NON-IDENTITY pose — a self-overlap objective
+    at the identity is at its optimum where the gradient is ~0 in every direction, so the check
+    passes vacuously. Plant a real rotation/translation on the se3 params first.
     """
     pytest.skip("fill in the objective inputs for YOURMODE")
-    # se3 = torch.zeros(7, dtype=torch.float32, requires_grad=True)
-    # se3.data[0] = 1.0  # identity quat + zero trans
+    # # non-identity pose (small rotation quat + translation) so the gradient is genuinely nonzero
+    # se3 = torch.tensor([0.966, 0.259, 0.0, 0.0, 0.3, -0.2, 0.1],
+    #                    dtype=torch.float32, requires_grad=True)
     # val = objective_YOURMODE_overlay(se3, ...)
     # val.backward()
     # ana = se3.grad.clone()
