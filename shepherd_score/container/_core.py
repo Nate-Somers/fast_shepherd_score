@@ -23,6 +23,7 @@ from shepherd_score.score.pharmacophore_scoring import _SIM_TYPE, get_overlap_ph
 from shepherd_score.alignment import optimize_ROCS_overlay, optimize_ROCS_overlay_analytical, optimize_ROCS_esp_overlay, optimize_ROCS_esp_overlay_analytical, optimize_esp_combo_score_overlay
 from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_overlay_analytical
 from shepherd_score.alignment import optimize_vol_color_overlay
+from shepherd_score.alignment import optimize_vol_tversky_overlay
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.accel import batch as _ba
 from shepherd_score.accel._modes import (
@@ -54,7 +55,7 @@ def _default_steps(mode: str) -> int:
 # are kept as delegating properties on MoleculePair (see the class body).
 _ALIGN_KEYS = (
     'vol', 'vol_noH', 'vol_esp', 'vol_esp_noH',
-    'surf', 'surf_esp', 'vol_and_surf_esp', 'pharm', 'vol_color',
+    'surf', 'surf_esp', 'vol_and_surf_esp', 'pharm', 'vol_color', 'vol_tversky',
 )
 
 
@@ -1233,6 +1234,80 @@ class MoleculePair:
         self.transform_vol_color = se3_transform.numpy()
         self.sim_aligned_vol_color = score.numpy()
         return aligned_fit_centers.numpy()
+
+
+    def align_with_vol_tversky(self,
+                               tversky_alpha: float = 0.95,
+                               tversky_beta: float = 0.05,
+                               alpha: float = 0.81,
+                               no_H: bool = True,
+                               num_repeats: int = 50,
+                               trans_init: bool = False,
+                               lr: float = 0.1,
+                               max_num_steps: int = 200,
+                               verbose: bool = False) -> np.ndarray:
+        """
+        Align fit_molec to ref_molec using an asymmetric "fits-inside" volumetric *shape* overlay
+        scored with **Tversky** rather than Tanimoto.
+
+        The optimized objective is the Tversky shape similarity
+        ``AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))`` where ``AB`` is the
+        cross overlap of the reference with the SE(3)-transformed fit, ``AA`` the reference
+        self-overlap, and ``BB`` the fit self-overlap (atom-centred Gaussian volume integrals).
+        With the defaults (``tversky_alpha=0.95``, ``tversky_beta=0.05``) missing reference volume
+        is penalized heavily while extra fit volume is barely penalized, so the score rewards the
+        *reference* (query) being contained in the fit -- useful for scaffold hopping / finding
+        larger elaborated actives. The objective is asymmetric: swapping ref and fit changes the
+        score. Only the fit is transformed.
+
+        Optimally aligned score is stored in ``self.sim_aligned_vol_tversky`` and the optimal
+        SE(3) transformation in ``self.transform_vol_tversky``.
+
+        Parameters
+        ----------
+        tversky_alpha : float, optional
+            Weight on missing reference volume ``AA - AB``. Default is 0.95. Named to avoid
+            colliding with the Gaussian width ``alpha``.
+        tversky_beta : float, optional
+            Weight on extra fit volume ``BB - AB``. Default is 0.05.
+        alpha : float, optional
+            Gaussian width for the shape overlap. Default is 0.81 (volumetric, heavy atoms).
+        no_H : bool, optional
+            Whether to exclude hydrogens (heavy-atom overlay). Default is ``True``.
+        num_repeats : int, optional
+            Number of SE(3) initializations. Default is 50.
+        trans_init : bool, optional
+            Translation-seeded initialization from the reference atoms. Default is ``False``.
+        lr : float, optional
+            Learning rate. Default is 0.1.
+        max_num_steps : int, optional
+            Maximum optimization steps. Default is 200.
+        verbose : bool, optional
+            Print progress. Default is ``False``.
+
+        Returns
+        -------
+        aligned_fit_points : np.ndarray (M, 3)
+            Transformed fit atom (heavy-atom) coordinates.
+        """
+        ref_atom_pos = self.ref_molec.get_positions(no_H)
+        fit_atom_pos = self.fit_molec.get_positions(no_H)
+
+        aligned_fit_points, se3_transform, score = optimize_vol_tversky_overlay(
+            ref_points=self._to_tensor(ref_atom_pos),
+            fit_points=self._to_tensor(fit_atom_pos),
+            alpha=alpha,
+            tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta,
+            num_repeats=num_repeats,
+            trans_centers=self._to_tensor(self.ref_molec.atom_pos) if trans_init else None,
+            lr=lr,
+            max_num_steps=max_num_steps,
+            verbose=verbose,
+        )
+        self.transform_vol_tversky = se3_transform.numpy()
+        self.sim_aligned_vol_tversky = score.numpy()
+        return aligned_fit_points.numpy()
 
 
     def align_with_pharm(self,
