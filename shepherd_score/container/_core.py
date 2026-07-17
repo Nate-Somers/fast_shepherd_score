@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import rdkit.Chem as Chem
 from rdkit.Geometry.rdGeometry import Point3D
+from rdkit.Chem import rdMolDescriptors
 import torch
 
 from shepherd_score.score.constants import COULOMB_SCALING, LAM_SCALING, ALPHA  # noqa: F401
@@ -23,6 +24,7 @@ from shepherd_score.score.pharmacophore_scoring import _SIM_TYPE, get_overlap_ph
 from shepherd_score.alignment import optimize_ROCS_overlay, optimize_ROCS_overlay_analytical, optimize_ROCS_esp_overlay, optimize_ROCS_esp_overlay_analytical, optimize_esp_combo_score_overlay
 from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_overlay_analytical
 from shepherd_score.alignment import optimize_vol_color_overlay
+from shepherd_score.alignment import optimize_vol_lipo_overlay
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.accel import batch as _ba
 from shepherd_score.accel._modes import (
@@ -54,7 +56,7 @@ def _default_steps(mode: str) -> int:
 # are kept as delegating properties on MoleculePair (see the class body).
 _ALIGN_KEYS = (
     'vol', 'vol_noH', 'vol_esp', 'vol_esp_noH',
-    'surf', 'surf_esp', 'vol_and_surf_esp', 'pharm', 'vol_color',
+    'surf', 'surf_esp', 'vol_and_surf_esp', 'pharm', 'vol_color', 'vol_lipo',
 )
 
 
@@ -210,6 +212,9 @@ class Molecule:
             self.partial_charges = partial_charges
         else:
             self.partial_charges = self.get_partial_charges()
+        # Per-atom lipophilicity (RDKit Crippen logP contribution), all atoms in mol order,
+        # parallel to ``partial_charges``; sliced to heavy atoms via ``get_lipophilicity(no_H)``.
+        self.lipophilicity = self.get_lipophilicity_contribs()
         self.radii = get_atomic_vdw_radii(mol)
 
         self._surface = Surface(
@@ -370,6 +375,48 @@ class Molecule:
         if no_H:
             return self.partial_charges[self._nonH_atoms_idx]
         return self.partial_charges
+
+
+    def get_lipophilicity_contribs(self) -> np.ndarray:
+        """
+        Get the per-atom lipophilicity (RDKit Crippen per-atom logP contribution).
+
+        Uses ``rdMolDescriptors._CalcCrippenContribs``, which returns one ``(logp, mr)`` tuple
+        per atom (all atoms, including H, in mol order); the logp component is kept. Mirrors
+        :meth:`get_partial_charges` (computed once at construction, stored in ``lipophilicity``).
+
+        Returns
+        -------
+        np.ndarray
+            Signed per-atom lipophilicity contributions. Shape: (N,).
+        """
+        contribs = rdMolDescriptors._CalcCrippenContribs(self.mol)
+        return np.array([c[0] for c in contribs], dtype=np.float32)
+
+
+    def get_lipophilicity(self, no_H: bool = True) -> np.ndarray:
+        """
+        Get per-atom lipophilicity (Crippen logP contribution) with or without hydrogens.
+
+        This slices the already-computed ``lipophilicity``; it does not recompute it (see
+        :meth:`get_lipophilicity_contribs`). Uses the same ``_nonH_atoms_idx`` as
+        :meth:`get_charges` / :meth:`get_positions`, keeping the scalar index-aligned with
+        ``atom_pos``. Mirrors :meth:`get_charges`.
+
+        Parameters
+        ----------
+        no_H : bool, optional
+            If ``True`` (default) return lipophilicity for heavy atoms only.
+            If ``False`` return lipophilicity for all atoms (including H).
+
+        Returns
+        -------
+        np.ndarray
+            Per-atom lipophilicity. Shape: (N,).
+        """
+        if no_H:
+            return self.lipophilicity[self._nonH_atoms_idx]
+        return self.lipophilicity
 
 
     def get_pc(self, use_density=False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1232,6 +1279,76 @@ class MoleculePair:
         )
         self.transform_vol_color = se3_transform.numpy()
         self.sim_aligned_vol_color = score.numpy()
+        return aligned_fit_centers.numpy()
+
+
+    def align_with_vol_lipo(self,
+                            lipo_weight: float = 0.5,
+                            alpha: float = 0.81,
+                            lam: float = 0.1,
+                            num_repeats: int = 50,
+                            trans_init: bool = False,
+                            lr: float = 0.1,
+                            max_num_steps: int = 200,
+                            verbose: bool = False) -> np.ndarray:
+        """
+        Align fit_molec to ref_molec by a weighted combination of heavy-atom volumetric shape
+        overlap and a *lipophilicity-field* overlap (the RDKit Crippen per-atom logP
+        contributions scored through the ESP-style overlap), optimized jointly over the SE(3)
+        pose. A ROCS TanimotoCombo analogue on a lipophilicity axis.
+
+        The optimized objective is
+        ``(1 - lipo_weight) * shape_Tanimoto + lipo_weight * lipo_Tanimoto``. The optimally
+        aligned score is stored in ``self.sim_aligned_vol_lipo`` and the optimal SE(3) transform
+        in ``self.transform_vol_lipo``.
+
+        Parameters
+        ----------
+        lipo_weight : float, optional
+            Weight of the lipophilicity channel in [0, 1]; shape gets ``1 - lipo_weight``.
+            Default is 0.5.
+        alpha : float, optional
+            Gaussian width for the shape overlap. Default is 0.81 (volumetric, heavy atoms).
+        lam : float, optional
+            Field influence for the lipophilicity overlap. Default is 0.1 (the volumetric
+            convention documented for partial-charge ESP; atom-centred, not the surface value).
+        num_repeats : int, optional
+            Number of SE(3) initializations. Default is 50.
+        trans_init : bool, optional
+            Translation-seeded initialization from the reference atoms. Default is ``False``.
+        lr : float, optional
+            Learning rate. Default is 0.1.
+        max_num_steps : int, optional
+            Maximum optimization steps. Default is 200.
+        verbose : bool, optional
+            Print progress. Default is ``False``.
+
+        Returns
+        -------
+        aligned_fit_centers : np.ndarray (M, 3)
+            Transformed fit atom (heavy-atom) coordinates.
+        """
+        ref_centers = self._to_tensor(self.ref_molec.get_positions(no_H=True))
+        fit_centers = self._to_tensor(self.fit_molec.get_positions(no_H=True))
+        ref_lipo = self._to_tensor(self.ref_molec.get_lipophilicity(no_H=True))
+        fit_lipo = self._to_tensor(self.fit_molec.get_lipophilicity(no_H=True))
+
+        aligned_fit_centers, se3_transform, score = optimize_vol_lipo_overlay(
+            ref_centers=ref_centers,
+            fit_centers=fit_centers,
+            ref_lipo=ref_lipo,
+            fit_lipo=fit_lipo,
+            alpha=alpha,
+            lipo_weight=lipo_weight,
+            lam=lam,
+            num_repeats=num_repeats,
+            trans_centers=ref_centers if trans_init else None,
+            lr=lr,
+            max_num_steps=max_num_steps,
+            verbose=verbose,
+        )
+        self.transform_vol_lipo = se3_transform.numpy()
+        self.sim_aligned_vol_lipo = score.numpy()
         return aligned_fit_centers.numpy()
 
 
