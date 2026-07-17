@@ -1138,6 +1138,119 @@ def _align_batch_vol_color(
         p.sim_aligned_vol_color = s
 
 
+def _align_batch_vol_tversky(pairs: list["MoleculePair"], *, alpha: float = 0.81,
+                             tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
+                             steps_fine: int = 100):
+    """Batched asymmetric ``vol_tversky`` shape alignment.
+
+    Same heavy-atom Gaussian shape machinery as ``_align_batch_vol`` (reuses the shape
+    value+grad kernel, the shared workspace/int-buffer caches, and the CUDA-graph fine loop),
+    but scored with an asymmetric Tversky reduction
+    ``AB / (AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))`` instead of Tanimoto. ``AA``/``BB``
+    are pose-invariant and precomputed once per pair via the reused self-overlap kernel; only
+    ``AB`` flows through the fine loop. The Tversky score is NOT bounded to [0, 1] and is never
+    clamped here.
+
+    Side effects: writes ``p.transform_vol_tversky`` / ``p.sim_aligned_vol_tversky``.
+    """
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_tversky, pairs,
+                                alpha=alpha, tversky_alpha=tversky_alpha,
+                                tversky_beta=tversky_beta, steps_fine=steps_fine)
+
+    from shepherd_score.accel.drivers.vol_tversky import (
+        coarse_fine_align_many_tversky, _self_overlap_in_chunks)
+    from shepherd_score.accel.drivers._common import batched_seeds_torch
+
+    device = pairs[0].device
+    # Heavy-atom coords are the same source as _align_batch_vol (atom_pos == get_positions(no_H)),
+    # so _ref_xyz_t/_fit_xyz_t are shared (already set in MoleculePair.__init__).
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
+
+    all_pairs: list[MoleculePair] = []
+    all_scores: list[torch.Tensor] = []
+    all_q: list[torch.Tensor] = []
+    all_t: list[torch.Tensor] = []
+
+    _seeds = _seeds_for("vol_tversky")
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_t.shape[0]},
+                    seeds=_seeds)
+    for _bk in plan_buckets(pairs, _spec, device):
+        N_pad, M_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = _bk.K
+
+        ib_key = (_dev_idx(device), K)
+        int_buf = _INT_BUFFER_CACHE.get(ib_key)
+        if int_buf is None:
+            int_buf = {
+                'N': torch.empty(K, dtype=torch.int32, device=device),
+                'M': torch.empty(K, dtype=torch.int32, device=device),
+            }
+            _INT_BUFFER_CACHE[ib_key] = int_buf
+        N_real = int_buf['N']
+        M_real = int_buf['M']
+
+        ref_ts = [p._ref_xyz_t for p in bucket]
+        fit_ts = [p._fit_xyz_t for p in bucket]
+        n_list = [t.shape[0] for t in ref_ts]
+        m_list = [t.shape[0] for t in fit_ts]
+        N_real.copy_(torch.tensor(n_list, dtype=torch.int32))
+        M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
+
+        ws_key = (_dev_idx(device), N_pad, M_pad)
+        ws = _ALIGN_WORKSPACES.get(ws_key)
+        if ws is None or ws['ref'].shape[0] < K:
+            ref_pad = torch.empty(K, N_pad, 3, device=device, dtype=torch.float32)
+            fit_pad = torch.empty(K, M_pad, 3, device=device, dtype=torch.float32)
+            _ALIGN_WORKSPACES[ws_key] = {'ref': ref_pad, 'fit': fit_pad}
+        ref_pad = _ALIGN_WORKSPACES[ws_key]['ref'][:K]
+        fit_pad = _ALIGN_WORKSPACES[ws_key]['fit'][:K]
+
+        ref_pad.zero_()
+        fit_pad.zero_()
+        _scatter_fill(ref_pad, ref_ts, n_list)
+        _scatter_fill(fit_pad, fit_ts, m_list)
+
+        # Self-overlaps (reused shape kernel). AA/BB are pose-invariant Tversky inputs.
+        if K > 1 and all(p._ref_xyz_t is bucket[0]._ref_xyz_t for p in bucket):
+            VAA = _self_overlap_in_chunks(ref_pad[:1], N_real[:1], alpha).expand(K).contiguous()
+        else:
+            VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
+        VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
+
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            return coarse_fine_align_many_tversky(
+                ref_pad[sl], fit_pad[sl], VAA[sl], VBB[sl],
+                N_real=N_real[sl], M_real=M_real[sl], alpha=alpha,
+                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                steps_fine=steps_fine, seeds=(seeds_q[sl], seeds_t[sl]))
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_tversky", N_pad, M_pad, _seeds), device=device)
+
+        all_pairs.extend(bucket)
+        all_scores.append(scores)
+        all_q.append(q_batch)
+        all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    scores_list = scores_cpu.tolist()                       # one C call
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_tversky = S
+        p.sim_aligned_vol_tversky = s
+
+
 # --- legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp) ----------
 # Same function objects, so ``__name__`` stays canonical -- the multi-GPU dispatch
 # (``align_fn.__name__.replace("_align_batch_", "")``) and _MODE_SPEC lookup are

@@ -100,6 +100,48 @@ def test_kernel_dispatch_routes_by_device():
     assert ("overlap_score_grad_se3_batch", "shape") in KD._RESOLVED
 
 
+def test_numba_vol_tversky_matches_reference_and_self_copy():
+    """vol_tversky numba backend: batched driver matches the per-pair reference on DISTINCT
+    molecules (~4 decimals) and self-copy scores ~1.0. The Tversky score is NOT bounded to
+    [0, 1] and is never clamped -- only the reduction differs from vol (shape kernel reused)."""
+    from shepherd_score.conformer_generation import embed_conformer_from_smiles
+    from shepherd_score.container import Molecule, MoleculePair, MoleculePairBatch
+
+    def _embed(smi):
+        m = embed_conformer_from_smiles(smi, MMFF_optimize=True, random_seed=0)
+        if m is None:
+            pytest.skip(f"embedding returned None for {smi!r}")
+        return m
+
+    ibu = _embed("CC(C)Cc1ccc(cc1)C(C)C(=O)O")
+    caf = _embed("CN1C=NC2=C1C(=O)N(C(=O)N2C)C")
+    cpu = torch.device("cpu")
+
+    # per-pair eager reference on the two distinct asymmetric directions
+    def _ref(ref_mol, fit_mol):
+        mp = MoleculePair(Molecule(ref_mol), Molecule(fit_mol), do_center=True, device=cpu)
+        mp.align_with_vol_tversky(num_repeats=50, max_num_steps=200)
+        return float(mp.sim_aligned_vol_tversky)
+
+    ref_fwd = _ref(ibu, caf)
+    ref_rev = _ref(caf, ibu)
+
+    # batched numba backend on the same distinct pairs
+    pairs = [MoleculePair(Molecule(ibu), Molecule(caf), do_center=True, device=cpu),
+             MoleculePair(Molecule(caf), Molecule(ibu), do_center=True, device=cpu)]
+    scores, _ = MoleculePairBatch(pairs).align_with_vol_tversky(backend="numba")
+    assert abs(float(scores[0]) - ref_fwd) < 1e-3, (float(scores[0]), ref_fwd)
+    assert abs(float(scores[1]) - ref_rev) < 1e-3, (float(scores[1]), ref_rev)
+    # asymmetry: query (small ref) contained in bigger fit scores higher forward than reverse
+    assert float(scores[0]) > float(scores[1])
+
+    # self-copy == ~1.0 (Tversky(A,A)=1 for any weights) under numba
+    selfp = [MoleculePair(Molecule(ibu), Molecule(ibu), do_center=True, device=cpu),
+             MoleculePair(Molecule(caf), Molecule(caf), do_center=True, device=cpu)]
+    sscores, _ = MoleculePairBatch(selfp).align_with_vol_tversky(backend="numba")
+    assert np.allclose(np.asarray(sscores, dtype=float), 1.0, atol=1e-4), sscores
+
+
 def test_numba_pharm_self_copy():
     """The numba pharm kernel drives coarse_fine_pharm_align_many on CPU to self-copy ~1.0."""
     pytest.importorskip("rdkit.Chem.AllChem")
