@@ -1172,6 +1172,80 @@ class MoleculePairBatch:
             verbose=verbose,
         )
 
+    def align_with_vol_lipo(self,
+                            lipo_weight: float = 0.5,
+                            alpha: float = 0.81,
+                            lam: float = 0.1,
+                            num_repeats: int = None,
+                            trans_init: bool = False,
+                            lr: float = 0.1,
+                            max_num_steps: int = None,
+                            verbose: bool = False,
+                            backend: Optional[str] = None,
+                            return_aligned: bool = False,
+                            ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        """Align all pairs using the ``vol_lipo`` combo (heavy-atom Gaussian shape +
+        Crippen lipophilicity-field overlap), ``(1-lipo_weight)*shape + lipo_weight*lipo``.
+
+        Results are stored in-place on each MoleculePair:
+        - ``pair.transform_vol_lipo`` and ``pair.sim_aligned_vol_lipo``
+
+        Parameters
+        ----------
+        lipo_weight : float
+            Weight of the lipophilicity channel in [0, 1] (default 0.5).
+        alpha : float
+            Gaussian width for the shape overlap (default 0.81, volumetric heavy atoms).
+        lam : float
+            Field influence for the lipophilicity overlap. Default 0.1 (RAW, the volumetric
+            convention -- NOT scaled by ``LAM_SCALING``), matching ``align_with_vol_lipo``.
+        num_repeats, trans_init, lr, max_num_steps, verbose
+            Standard optimization controls.
+        backend : str
+            ``"jax"`` (default) runs the per-pair torch path sequentially via
+            ``MoleculePair.align_with_vol_lipo``. ``"triton"`` (aliases ``"cuda"``/``"gpu"``)
+            and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_vol_lipo`` driver -- BOTH the shape channel and the
+            lipophilicity (ESP-style) channel run on the device-dispatched kernels (Triton on
+            CUDA, numba on CPU), and BOTH steer the pose (JOINT weighted gradient). NOTE
+            ``backend="jax"`` is a misnomer for this mode: there is no JAX kernel, so it runs
+            the per-pair PyTorch path sequentially.
+        return_aligned : bool
+            For the batched backend, build the aligned-fit-atom list when ``True``.
+
+        Returns
+        -------
+        scores : np.ndarray
+            Shape: (N,).
+        aligned_list : list of np.ndarray
+            Aligned fit atom coordinates per pair (``None`` entries unless
+            ``return_aligned=True`` on the batched backend).
+        """
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_lipo")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_lipo")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_lipo,
+            dict(alpha=alpha, lam=lam, lipo_weight=lipo_weight, trans_init=trans_init,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_lipo", "transform_vol_lipo", "_fit_xyz_noH_t",
+            return_aligned)
+        if handled:
+            return _result
+
+        return self._delegate_alignment(
+            'align_with_vol_lipo', 'sim_aligned_vol_lipo',
+            lipo_weight=lipo_weight,
+            alpha=alpha,
+            lam=lam,
+            num_repeats=num_repeats,
+            trans_init=trans_init,
+            lr=lr,
+            max_num_steps=max_num_steps,
+            verbose=verbose,
+        )
+
     def _pad_and_mask_pharm(self):
         """Extract, pad, and create masks for pharmacophore alignment.
 

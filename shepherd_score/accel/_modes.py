@@ -23,9 +23,10 @@ MODE_ATTRS = {
     "vol_and_surf_esp": ("transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp"),
     "pharm":            ("transform_pharm",            "sim_aligned_pharm"),
     "vol_color":        ("transform_vol_color",        "sim_aligned_vol_color"),
+    "vol_lipo":         ("transform_vol_lipo",         "sim_aligned_vol_lipo"),
 }
 
-# The 7 canonical mode ids, in public order.
+# The 8 canonical mode ids, in public order.
 CANONICAL_MODES = tuple(MODE_ATTRS)
 
 # Legacy (pre-rename) mode names -> canonical. The old public API keeps working through this:
@@ -56,6 +57,6 @@ PROCESS_MODES = ("vol", "surf", "surf_esp", "pharm")
 # choice these cost <=0.006 ROC-AUC while recovering >=99% of the best achievable overlap.
 # Callers who want more accuracy pass ``num_repeats`` / ``max_num_steps`` explicitly.
 MODE_SEEDS = {"vol": 10, "surf": 8, "surf_esp": 8, "vol_esp": 16, "vol_and_surf_esp": 8,
-              "pharm": 32, "vol_color": 16}
+              "pharm": 32, "vol_color": 16, "vol_lipo": 16}
 MODE_STEPS = {"vol": 30, "surf": 40, "surf_esp": 40, "vol_esp": 50, "vol_and_surf_esp": 60,
-              "pharm": 50, "vol_color": 40}
+              "pharm": 50, "vol_color": 40, "vol_lipo": 50}

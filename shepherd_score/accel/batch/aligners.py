@@ -1138,6 +1138,139 @@ def _align_batch_vol_color(
         p.sim_aligned_vol_color = s
 
 
+def _align_batch_vol_lipo(
+    pairs: list["MoleculePair"],
+    *,
+    lipo_weight: float = 0.5,
+    alpha: float = 0.81,
+    lam: float = 0.1,
+    trans_init: bool = False,
+    num_repeats: int = 50,
+    num_repeats_per_trans: int = 10,
+    topk: int = 30,
+    steps_fine: int = 100,
+    lr: float = 0.075,
+) -> None:
+    """
+    Batched vol_lipo alignment: a weighted two-channel combo of heavy-atom Gaussian SHAPE
+    overlap and a LIPOPHILICITY-FIELD overlap (Crippen per-atom logP scored through the ESP
+    kernel), ``(1 - lipo_weight)*shape + lipo_weight*lipo``, with BOTH channels steering the
+    pose. Same shape+field-combo structure as ``_align_batch_vol_color``, but the field is the
+    ESP overlap of a per-atom scalar (REUSING the ESP kernel, fed lipophilicity where vol_esp
+    feeds partial charge) -- so both channels share the SAME heavy-atom centers. ``lam`` is RAW
+    (no ``LAM_SCALING``), matching the per-pair ``align_with_vol_lipo``.
+
+    Writes per-pair: ``p.transform_vol_lipo`` (4x4), ``p.sim_aligned_vol_lipo`` (float).
+    """
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_lipo, pairs,
+                                lipo_weight=lipo_weight, alpha=alpha, lam=lam,
+                                trans_init=trans_init, num_repeats=num_repeats,
+                                num_repeats_per_trans=num_repeats_per_trans,
+                                topk=topk, steps_fine=steps_fine, lr=lr)
+
+    from shepherd_score.accel.drivers.vol_lipo import fast_optimize_vol_lipo_overlay_batch
+
+    device = pairs[0].device
+
+    for p in pairs:
+        if p.ref_molec.lipophilicity is None or p.fit_molec.lipophilicity is None:
+            raise ValueError("Lipophilicity is None; cannot run _align_batch_vol_lipo.")
+
+    # Heavy-atom centers, indexed by _nonH_atoms_idx so they stay strictly 1:1 with the
+    # per-atom lipophilicity below (same rationale as vol_esp: atom_pos from Chem.RemoveHs can
+    # retain a few H). These are the SAME cached tensors vol_esp builds, reused for both channels.
+    _batch_upload(pairs, "_ref_xyz_noH_t",
+                  lambda p: p.ref_molec.mol.GetConformer().GetPositions()[p.ref_molec._nonH_atoms_idx],
+                  torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_noH_t",
+                  lambda p: p.fit_molec.mol.GetConformer().GetPositions()[p.fit_molec._nonH_atoms_idx],
+                  torch.float32, device)
+    _batch_upload(pairs, "_ref_lipo_t",
+                  lambda p: p.ref_molec.lipophilicity[p.ref_molec._nonH_atoms_idx],
+                  torch.float32, device)
+    _batch_upload(pairs, "_fit_lipo_t",
+                  lambda p: p.fit_molec.lipophilicity[p.fit_molec._nonH_atoms_idx],
+                  torch.float32, device)
+
+    if trans_init:
+        _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+
+    all_pairs: list[MoleculePair] = []
+    all_scores: list[torch.Tensor] = []
+    all_q: list[torch.Tensor] = []
+    all_t: list[torch.Tensor] = []
+
+    # Bucket by padded heavy-atom center bands (shared by both channels); partition by exact tc.
+    _tc_of = (lambda p: int(p._ref_xyz_t.shape[0])) if trans_init else (lambda p: 0)
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_noH_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_noH_t.shape[0]},
+                    seeds=_seeds_for("vol_lipo"),
+                    partition={"tc": _tc_of})
+    for _bk in plan_buckets(pairs, _spec, device):
+        N_pad, M_pad, tc = _bk.pad["ref"], _bk.pad["fit"], _bk.pad["tc"]
+        bucket = _bk.members
+        K = len(bucket)
+
+        ref_ts = [p._ref_xyz_noH_t for p in bucket]
+        fit_ts = [p._fit_xyz_noH_t for p in bucket]
+        n_list = [t.shape[0] for t in ref_ts]
+        m_list = [t.shape[0] for t in fit_ts]
+
+        ref_pad = torch.zeros(K, N_pad, 3, device=device, dtype=torch.float32)
+        fit_pad = torch.zeros(K, M_pad, 3, device=device, dtype=torch.float32)
+        ref_l_pad = torch.zeros(K, N_pad, device=device, dtype=torch.float32)
+        fit_l_pad = torch.zeros(K, M_pad, device=device, dtype=torch.float32)
+
+        N_real = torch.tensor(n_list, device=device, dtype=torch.int32)
+        M_real = torch.tensor(m_list, device=device, dtype=torch.int32)
+
+        _scatter_fill(ref_pad, ref_ts, n_list)
+        _scatter_fill(fit_pad, fit_ts, m_list)
+        _scatter_fill(ref_l_pad, [p._ref_lipo_t for p in bucket], n_list)
+        _scatter_fill(fit_l_pad, [p._fit_lipo_t for p in bucket], m_list)
+
+        trans_centers_batch = None
+        trans_centers_real = None
+        if trans_init:
+            trans_centers_batch = torch.stack([p._ref_xyz_t for p in bucket])
+            trans_centers_real = torch.full((K,), tc, device=device, dtype=torch.int32)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            tcb = trans_centers_batch[sl] if trans_centers_batch is not None else None
+            tcr = trans_centers_real[sl] if trans_centers_real is not None else None
+            _, q, t, sc = fast_optimize_vol_lipo_overlay_batch(
+                ref_pad[sl], fit_pad[sl], ref_l_pad[sl], fit_l_pad[sl],
+                alpha=alpha, lam=lam, lipo_weight=lipo_weight,
+                N_real=N_real[sl], M_real=M_real[sl],
+                trans_centers_batch=tcb, trans_centers_real=tcr,
+                num_repeats_per_trans=num_repeats_per_trans,
+                num_seeds=_seeds_for("vol_lipo"),
+                topk=topk, steps_fine=steps_fine, lr=lr,
+            )
+            return sc, q, t
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_lipo", N_pad, M_pad, _seeds_for("vol_lipo")), device=device)
+
+        all_pairs.extend(bucket)
+        all_scores.append(scores)
+        all_q.append(q_batch)
+        all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    scores_list = scores_cpu.tolist()                       # one C call
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_lipo = S
+        p.sim_aligned_vol_lipo = s
+
+
 # --- legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp) ----------
 # Same function objects, so ``__name__`` stays canonical -- the multi-GPU dispatch
 # (``align_fn.__name__.replace("_align_batch_", "")``) and _MODE_SPEC lookup are
