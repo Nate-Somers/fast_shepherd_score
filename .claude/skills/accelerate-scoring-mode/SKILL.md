@@ -40,7 +40,24 @@ which channels contribute, and for each channel what the `dO/dq` term looks like
 is a weighted sum of per-channel gradients, each in the same quaternion space. Reuse the shape
 channel's `dR/dq` tail — it is already validated and every mode's positional gradient shares it.
 
-### 2. Write the numba CPU kernel first
+**Separate the two "nearest modes".** For a *blended* mode, the existing mode whose **driver /
+combining structure** you copy is usually NOT the one whose **field physics / kernel** you reuse.
+A mode that is `(1-w)·shape + w·<scalar-field>` has the *driver* shape of a two-channel
+combined-gradient mode (e.g. `vol_color`), but its field *kernel* is the ESP kernel (a signed
+scalar field over atoms), not `vol_color`'s pharmacophore kernel. Do **not** assume "looks like
+`vol_esp`" means "reuse `vol_esp`": `vol_esp` optimizes the field **alone**, so its driver cannot
+produce a shape+field blend. Identify the driver-analog and the kernel-analog independently.
+
+**Do you even need a new kernel?** If every channel's value+gradient is already computed by an
+existing kernel — shape via `overlap_score_grad_se3_batch`, a signed scalar field via the ESP
+kernel `overlap_score_grad_esp_se3_batch`, pharmacophores via the pharm kernel (all already
+device-dispatched) — then **reuse them and write NO new kernel**: skip steps 2–4 entirely and go
+straight to the driver (step 5), which blends the per-channel `dQ`s
+(`g_q = (1-w)·(-scale_a·dQ_a) + w·(-scale_b·dQ_b)`). Feeding a new per-atom scalar (e.g.
+lipophilicity) in where the ESP kernel expects charges is a *reuse*, not a new kernel. Steps 2–4
+below are only for a mode that introduces genuinely new channel math.
+
+### 2. Write the numba CPU kernel first *(only if the mode needs new channel math — see step 1)*
 CPU is easier to debug than Triton, so start there. Add the value+grad kernel to
 `accel/kernels/cpu.py` (or `cpu_fused.py` / `cpu_soa.py` if it fits an existing fused/SoA path).
 It must return the same value the reference computes **and** the analytic `dO/dq`. Validate it

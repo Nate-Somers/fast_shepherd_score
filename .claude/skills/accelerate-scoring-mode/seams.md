@@ -44,11 +44,21 @@ diverged from the registry-driven design — find the derivation you missed inst
 
 ## Which existing mode to read
 
-Model your kernel + driver on the nearest existing family:
+For a *single-channel* mode, kernel and driver come from the same family:
 
 - shape-only → `accel/kernels/shape_triton.py` + `accel/drivers/shape.py`
-- ESP → `accel/kernels/esp_triton.py` + `accel/drivers/esp.py` / `esp_combo.py`
-- pharmacophore / combined → `accel/kernels/pharm_triton.py` (and its combined driver)
+- ESP field alone → `accel/kernels/esp_triton.py` + `accel/drivers/esp.py`
+- pharmacophore alone → `accel/kernels/pharm_triton.py` + its driver
 
-The numba twins for all of these live in `accel/kernels/cpu.py` (+ `cpu_fused.py`, `cpu_soa.py`).
-Read the twin alongside the Triton kernel to see the identical-signature contract in practice.
+For a *blended* mode, pick the **driver** and the **kernel(s)** from different modes (see SKILL.md
+step 1) — they rarely coincide:
+
+| Your objective | Driver to copy | Kernel(s) to reuse |
+|---|---|---|
+| shape + pharmacophore-color | `vol_color` driver (two-channel combined gradient) | shape kernel + pharm color kernel |
+| shape + ESP field | `esp_combo` / `vol_and_surf_esp` driver | shape kernel + ESP kernel |
+| **shape + any signed scalar field over atoms** (e.g. lipophilicity) | `vol_color` driver | shape kernel + **ESP kernel** (feed the scalar as its `charges`) |
+
+The blended driver blends the per-channel `dQ`s that the reused kernels already emit — no new
+kernel. The numba twins for all kernels live in `accel/kernels/cpu.py` (+ `cpu_fused.py`,
+`cpu_soa.py`); read the twin alongside the Triton kernel to see the identical-signature contract.

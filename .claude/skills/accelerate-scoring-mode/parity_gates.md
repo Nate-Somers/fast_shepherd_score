@@ -7,12 +7,21 @@ almost always a bug introduced at step N, not earlier.
 ## Gate 1 — numba kernel ≡ eager autograd reference
 The numba kernel's value and gradient must match the reference `optimize_<mode>_overlay`
 objective computed with autograd.
-- **What to compare**: the scalar overlap and the full `dO/dq` vector, on the same inputs and the
-  same pose, for several distinct molecule pairs (not just self-pairs).
-- **Tolerance**: ~`1e-16`–`1e-17` in double precision. This is the tightest gate — the numba
-  kernel and autograd are computing the *same math* two ways, so they should agree to machine
-  epsilon. A larger gap means the kernel's analytic gradient is wrong, not "just fp noise".
-- Run this before writing any Triton code.
+- **What to compare**: the scalar overlap and the `dO/dq` vector, on the same inputs and the same
+  pose, for several distinct molecule pairs (not just self-pairs).
+- **Compare the gradient in the tangent space of the unit quaternion, not raw.** The kernels emit
+  a **raw** `dO/dq` — they do not project out the component parallel to `q` — because the optimizer
+  (`fused_adam_qt_with_tangent_proj`) renormalizes `q` each step and discards that radial part.
+  Autograd taken through the repo's *normalizing* `quaternion→rotation` map is already
+  tangent-projected. So a naive raw-vs-autograd comparison **fails at ~0.4–0.8 even for a correct
+  kernel** — the entire mismatch is the radial component. Project both gradients onto the tangent
+  space at `q` (subtract the `q`-parallel part) before comparing, or differentiate a non-normalizing
+  map. The tangent-space component is the physical part that drives the step.
+- **Tolerance**: ~`1e-16`–`1e-17` in double precision *on the tangent-space component*. This is the
+  tightest gate — kernel and autograd compute the same math two ways. A larger tangent-space gap
+  means the analytic gradient is wrong, not "just fp noise".
+- Run this before writing any Triton code. If you **reused** existing kernels instead of writing a
+  new one (step 1), this gate validates that the blend + scaling in your driver is correct.
 
 ## Gate 2 — Triton kernel ≡ numba kernel
 The GPU twin must match the CPU kernel.
