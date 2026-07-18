@@ -1,8 +1,9 @@
 # Parity gates
 
-A mode is accelerated only when all four gates pass. Each gate isolates one link in the chain
-reference → CPU kernel → GPU kernel → batched driver. Run them in order: a failure at gate N is
-almost always a bug introduced at step N, not earlier.
+A mode is accelerated only when all four gates pass — plus gate 5 (the screen round-trip) if the
+mode is meant to screen a library. Each gate isolates one link in the chain
+reference → CPU kernel → GPU kernel → batched driver → out-of-core store. Run them in order: a
+failure at gate N is almost always a bug introduced at step N, not earlier.
 
 ## Gate 1 — numba kernel ≡ eager autograd reference
 The numba kernel's value and gradient must match the reference `optimize_<mode>_overlay`
@@ -48,10 +49,25 @@ A molecule aligned to a copy of itself scores exactly 1.000, on **both** backend
 - Run it under numba and under Triton. This is the cheap end-to-end smoke test that the whole
   path (kernel → driver → API) is wired correctly.
 
+## Gate 5 — streamed screen ≡ per-pair `MoleculePairBatch` *(only if the mode screens)*
+The out-of-core `screen` path must reproduce the in-memory result. This is the screen analog of
+gate 3, one level further out: it also exercises the store's serialization (step 10).
+- **What to compare**: `screen(query, ProfileStore, mode=<mode>)` scores vs
+  `MoleculePairBatch.align_with_<mode>()` on the *same centered molecules* (deep-copy + `center_to`
+  each library molecule to its own heavy-atom COM to match a `pre_centered` store).
+- **Tolerance**: agree to ~4 decimals (same rationale as gate 3). For a `pre_centered` store the
+  inputs are identical, so agreement is typically near-exact.
+- **Also assert the data reached disk** for a Tier-B mode: load a `shard_*.npz` and check the new
+  arrays (and the offset table for a variable-length set) are present. A mode that silently stores
+  nothing still "passes" a score comparison when every molecule's data is empty — the disk check
+  catches that.
+
 ## Running them
 The relevant suites already exist; add your mode's cases to them:
 - `tests/test_numba_backend.py` — gates 1 and 4 (CPU).
 - `tests/test_fast_batch_alignment.py` — gate 3, and gate 4 on GPU where available.
+- `tests/test_screen.py` — gate 5 (models: `test_vol_tversky_stream_matches_object`,
+  `test_esp_field_stream_matches_object`).
 - Gate 2 needs a CUDA device; guard it with a `torch.cuda.is_available()` skip so the suite still
   runs on CPU-only machines (Triton parity is then checked wherever a GPU is present).
 

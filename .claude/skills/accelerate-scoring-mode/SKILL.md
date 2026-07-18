@@ -115,27 +115,79 @@ Add `MoleculePairBatch.align_with_<mode>(backend=...)` in `container/_batch.py`.
 `backend=None` and resolve it device-aware (Triton on CUDA else numba) via the existing resolver
 — do not hard-default to a single backend.
 
-### 10. Do not touch the front-end
-`screen.py`, `accel/multi_gpu.py`, and `accel/cpu_pool.py` derive the mode set from
-`accel/_modes.py`. If you find yourself editing their mode logic, stop — you have missed the
-registry-driven path. Your registry edits are confined to `accel/_modes.py` (`MODE_ATTRS` /
-`MODE_SEEDS` / `MODE_STEPS` in step 7, plus `PROCESS_MODES` in step 8 if applicable) and the pinned
-count in `tests/test_mode_registry.py`.
+### 10. Wire the mode into `screen` (the out-of-core store) — REQUIRED, do not skip
+The registry (`accel/_modes.py`) makes `screen` / `multi_gpu` / `cpu_pool` **dispatch** your mode:
+resolve its name, result attributes, and seed/step defaults. It does **not** teach the on-disk
+store what per-molecule arrays your mode *reads*. `screen` streams a library through
+`MoleculeProfile` (an RDKit-free, arrays-only stand-in for `Molecule`) and `ProfileStore` (sharded
+`npz`). If your mode needs data the store does not persist, `screen` cannot serve it — the pairwise
+`MoleculePairBatch` API is not enough. This is the step that is easy to miss: the in-memory path
+works, the mode imports, tests pass, and yet `screen(..., mode="<yours>")` fails or feeds zeros.
+Decide your mode's tier:
+
+**Tier A — reuses data the store already holds.** A reduction over an existing channel (e.g.
+`vol_tversky` is a different reduction of the same heavy-atom shape overlap; `atom_pos` is *always*
+stored). Edit **one** function: `_store_supports(schema, mode)` in `screen.py`, returning the right
+predicate (`return True` for a shape-only mode). Nothing else — it routes through the `fast=False`
+`MoleculePairBatch` path automatically.
+
+**Tier B — needs new per-molecule DATA the store doesn't carry** (e.g. `esp_field`'s
+variable-length signed ESP field points). Wire it end to end in `screen.py`, mirroring the
+`pharm` / `field_points` plumbing already there:
+  1. **`MoleculeProfile`** — add the array(s) to `__slots__`; accept them in `__init__` (store via
+     `_f32`); shift the positional ones in `center_to` (they move rigidly with the molecule); add a
+     `get_<data>()` accessor **named exactly like the `Molecule` method the batched driver calls**
+     (`_batch_upload(pairs, ..., lambda p: p.<side>_molec.get_<data>()[k], ...)`), so a profile
+     duck-types into the aligner identically to a `Molecule`.
+  2. **`_schema_from_modes`** — add a boolean schema flag set when your mode is requested.
+  3. **`_store_supports`** — return `schema.get("<flag>", False)`.
+  4. **`_profile_from_schema`** — extract the data off the `Molecule`, pre-center it alongside
+     `atom_pos` when `pre_center`, and pass it into the returned `MoleculeProfile(...)`.
+  5. **`ProfileStore._concat`** (pack to `npz`) — fixed-width array → `np.stack`; a **variable-length**
+     set (per-molecule count differs) → write an **offset table** (`<name>_off = offsets(lens)`)
+     plus the concatenated points, mirroring the `pharm_off` block exactly.
+  6. **`ProfileStore._reconstruct`** (unpack) — read the offset table and slice each molecule's
+     segment back out, mirroring the pharm unpack.
+  7. If the data is **cached on the `Molecule`** (e.g. a lazy field), mirror the `center_to` shift in
+     `container/_core.py` too, so a query centered by `screen` never carries a stale copy.
+
+**Fast-engine registration is OPTIONAL and orthogonal.** `_FAST_MODES` in `screen.py` lists the
+modes that get the direct array→kernel fast path (build fit tensors once per shard, bypass
+`MoleculePair`). That is a **throughput** optimization, not a correctness requirement. A mode left
+out of `_FAST_MODES` still screens correctly through the `fast=False` object path. Add it (with a
+`_build_fit_fast_pairs` / `_ref_tensors_from_arrays` branch) only once the mode is proven and you
+want the streaming speed — never as part of first wiring.
+
+**Verify (screen analog of parity gate 3).** Build a `ProfileStore` for the mode, `screen()` a
+query, and assert the scores match `MoleculePairBatch.align_with_<mode>` on the same centered
+molecules. Add the test to `tests/test_screen.py` (models: `test_vol_tversky_stream_matches_object`
+for Tier A, `test_esp_field_stream_matches_object` for Tier B — the latter also asserts the
+variable-length arrays reached disk).
+
+`multi_gpu` / `cpu_pool` remain registry-driven for *routing* — never hardcode a mode-name list in
+their dispatch. The per-mode DATA plumbing above is inherently mode-specific and cannot be derived;
+that is the one place `screen.py` legitimately grows per mode.
 
 ### 11. Validate against all four parity gates
 See `parity_gates.md`. All four must pass before you declare the mode accelerated:
-numba ≡ autograd reference, Triton ≡ numba, batched ≡ per-pair, self-copy = 1.000.
+numba ≡ autograd reference, Triton ≡ numba, batched ≡ per-pair, self-copy = 1.000. Plus the
+step-10 screen round-trip (streamed ≡ `MoleculePairBatch`) if the mode is meant to screen.
 
 ## Minimality discipline
-- **Derive, never hardcode** a mode list. If you write `["vol", "surf", ...]` anywhere outside
-  `accel/_modes.py`, you are doing it wrong.
+- **Derive mode *routing*, never hardcode a mode-name list.** If you write `["vol", "surf", ...]`
+  to decide *which modes exist / dispatch where*, you are doing it wrong — that comes from
+  `accel/_modes.py`. This does **not** forbid the per-mode DATA plumbing in step 10: a mode's
+  `_store_supports` branch and its `MoleculeProfile` / serialization fields are inherently
+  mode-specific and legitimately name the mode.
 - **Two kernels, identical signatures.** The dispatch wrapper only works if the numba and Triton
   kernels are drop-in interchangeable.
 - **Match the surrounding kernel idiom** — `tl.exp2`, autotune, the shared `dR/dq` tail, the
   `_graphed` loop. A new mode should read like the modes already there.
 - **Small diff.** You are adding one kernel pair, one driver, one aligner, the canonical registry
-  rows (`MODE_ATTRS` / `MODE_SEEDS` / `MODE_STEPS`) plus the pinned-count bump, one API method, and
-  at most one `_MODE_SPEC`/`PROCESS_MODES` pair. If the diff is larger than that, question it.
+  rows (`MODE_ATTRS` / `MODE_SEEDS` / `MODE_STEPS`) plus the pinned-count bump, one API method, the
+  step-10 `screen` wiring (one `_store_supports` line for Tier A; the `MoleculeProfile` + schema +
+  serialization fields for Tier B), and at most one `_MODE_SPEC`/`PROCESS_MODES` pair. If the diff
+  is larger than that, question it.
 
 See `seams.md` for the file map, `kernel_anatomy.md` for the kernel/dispatch/graph mechanics, and
 `parity_gates.md` for the validation contract.

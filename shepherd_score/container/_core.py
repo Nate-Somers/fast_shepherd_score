@@ -590,6 +590,11 @@ class Molecule:
             self.surf_pos -= xyz_means
         if self.pharm_ancs is not None:
             self.pharm_ancs -= xyz_means
+        if self.field_point_pos is not None:
+            # Field points already cached from an earlier get_field_points(); they move
+            # rigidly with the conformer (the signs are translation-invariant), so shift
+            # them in place rather than leaving a stale copy at the old coordinates.
+            self.field_point_pos = self.field_point_pos - xyz_means
 
 
     def get_pharmacophore(self,

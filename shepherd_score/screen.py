@@ -146,11 +146,13 @@ class MoleculeProfile:
 
     __slots__ = ("atom_pos", "atom_pos_noH", "surf_pos", "surf_esp", "partial_charges", "radii",
                  "_nonH_atoms_idx", "pharm_types", "pharm_ancs", "pharm_vecs",
+                 "field_point_pos", "field_point_sign",
                  "num_surf_points", "mol", "id")
 
     def __init__(self, *, atom_pos, surf_pos=None, surf_esp=None,
                  partial_charges=None, radii=None, nonH_atoms_idx=None,
                  pharm_types=None, pharm_ancs=None, pharm_vecs=None,
+                 field_point_pos=None, field_point_sign=None,
                  centers_w_H=None, atom_pos_noH=None, id=None):
         self.atom_pos = _f32(atom_pos)
         # Strict-heavy vol_esp centers (1:1 with the heavy charges); None when identical to
@@ -171,6 +173,9 @@ class MoleculeProfile:
         self.pharm_types = None if pharm_types is None else np.asarray(pharm_types)
         self.pharm_ancs = _f32(pharm_ancs)
         self.pharm_vecs = _f32(pharm_vecs)
+        # esp_field: variable-length signed electrostatic field points (may be empty, M=0).
+        self.field_point_pos = _f32(field_point_pos)
+        self.field_point_sign = _f32(field_point_sign)
         self.num_surf_points = None if self.surf_pos is None else len(self.surf_pos)
         self.mol = _MolShim(_f32(centers_w_H)) if centers_w_H is not None else None
         self.id = id
@@ -186,8 +191,15 @@ class MoleculeProfile:
             self.surf_pos = self.surf_pos - mu
         if self.pharm_ancs is not None:
             self.pharm_ancs = self.pharm_ancs - mu
+        if self.field_point_pos is not None:
+            self.field_point_pos = self.field_point_pos - mu   # field points move with the molecule
         if self.mol is not None:
             self.mol = _MolShim(self.mol.GetConformer().GetPositions() - mu)
+
+    def get_field_points(self):
+        """(field_point_pos, field_point_sign) -- mirrors ``Molecule.get_field_points()`` so the
+        ``esp_field`` aligner reads a profile identically to a full ``Molecule``."""
+        return self.field_point_pos, self.field_point_sign
 
     @classmethod
     def from_molecule(cls, m, *, modes=_VALID_MODES, id=None) -> "MoleculeProfile":
@@ -213,6 +225,7 @@ def _schema_from_modes(modes) -> dict:
         radii=("vol_and_surf_esp" in modes),
         centers_w_H=("vol_and_surf_esp" in modes),
         pharm=bool({"pharm", "vol_color"} & modes),   # vol_color = atoms + directionless pharm
+        field_points=("esp_field" in modes),          # esp_field = atoms + ESP field points
     )
 
 
@@ -230,6 +243,10 @@ def _store_supports(schema: dict, mode: str) -> bool:
         return schema["pharm"]
     if mode == "vol_color":
         return schema["pharm"]                          # atoms (always) + pharm types/anchors
+    if mode == "vol_tversky":
+        return True                                     # asymmetric shape overlay; atom_pos always stored
+    if mode == "esp_field":
+        return schema.get("field_points", False)        # atoms (always) + ESP field points
     if mode == "vol_and_surf_esp":
         return (schema["surf"] and schema["surf_esp"] and schema["centers_w_H"]
                 and schema["radii"] and schema["charges"] and schema["with_H"])
@@ -243,6 +260,7 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
     surf = surf_esp = charges = nonH = radii = cwh = None
     atom_pos_noH = None
     ph_t = ph_a = ph_v = None
+    fp_pos = fp_sign = None
 
     if sch["surf"]:
         if m.surf_pos is None:
@@ -283,6 +301,12 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
         ph_t = np.asarray(m.pharm_types, dtype=np.int32)
         ph_a = _f32(m.pharm_ancs)
         ph_v = _f32(m.pharm_vecs)
+    if sch.get("field_points"):
+        if not hasattr(m, "get_field_points"):
+            raise ValueError("store needs ESP field points but molecule cannot provide them")
+        fp_pos, fp_sign = m.get_field_points()          # (M,3), (M,) -- may be empty (M=0)
+        fp_pos = _f32(fp_pos)
+        fp_sign = _f32(fp_sign)
 
     if pre_center:
         mu = atom_pos.mean(0)
@@ -291,6 +315,8 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
             surf = surf - mu
         if ph_a is not None:
             ph_a = ph_a - mu
+        if fp_pos is not None and len(fp_pos):
+            fp_pos = fp_pos - mu
         if cwh is not None:
             cwh = cwh - mu
         if atom_pos_noH is not None:
@@ -300,7 +326,8 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
     return MoleculeProfile(
         atom_pos=atom_pos, surf_pos=surf, surf_esp=surf_esp, partial_charges=charges,
         radii=radii, nonH_atoms_idx=nonH, pharm_types=ph_t, pharm_ancs=ph_a,
-        pharm_vecs=ph_v, centers_w_H=cwh, atom_pos_noH=atom_pos_noH, id=id,
+        pharm_vecs=ph_v, field_point_pos=fp_pos, field_point_sign=fp_sign,
+        centers_w_H=cwh, atom_pos_noH=atom_pos_noH, id=id,
     )
 
 
@@ -499,6 +526,19 @@ class ProfileStore:
             out["pharm_types"] = np.concatenate([r.pharm_types for r in recs]).astype(np.int32)
             out["pharm_ancs"] = np.concatenate([r.pharm_ancs for r in recs]).astype(dt)
             out["pharm_vecs"] = np.concatenate([r.pharm_vecs for r in recs]).astype(dt)
+        if sch.get("field_points"):
+            fp_lens = [len(r.field_point_pos) if r.field_point_pos is not None else 0 for r in recs]
+            out["fp_off"] = offsets(fp_lens)
+            if any(fp_lens):
+                out["field_point_pos"] = np.concatenate(
+                    [r.field_point_pos for r in recs
+                     if r.field_point_pos is not None and len(r.field_point_pos)]).astype(dt)
+                out["field_point_sign"] = np.concatenate(
+                    [r.field_point_sign for r in recs
+                     if r.field_point_sign is not None and len(r.field_point_sign)]).astype(dt)
+            else:                                    # every molecule in the shard had M=0
+                out["field_point_pos"] = np.zeros((0, 3), dt)
+                out["field_point_sign"] = np.zeros((0,), dt)
         return out
 
     # ---- reader ---------------------------------------------------------- #
@@ -575,6 +615,7 @@ class ProfileStore:
         surf_esp = data["surf_esp"] if sch["surf_esp"] else None
         all_off = data["all_off"] if (sch["charges"] and sch["with_H"]) else None
         pharm_off = data["pharm_off"] if sch["pharm"] else None
+        fp_off = data["fp_off"] if sch.get("field_points") else None
 
         out = []
         for i in range(n):
@@ -600,6 +641,10 @@ class ProfileStore:
                 kw["pharm_types"] = data["pharm_types"][p0:p1]
                 kw["pharm_ancs"] = data["pharm_ancs"][p0:p1]
                 kw["pharm_vecs"] = data["pharm_vecs"][p0:p1]
+            if sch.get("field_points"):
+                f0, f1 = int(fp_off[i]), int(fp_off[i + 1])
+                kw["field_point_pos"] = data["field_point_pos"][f0:f1]
+                kw["field_point_sign"] = data["field_point_sign"][f0:f1]
             out.append(MoleculeProfile(**kw))
         return out
 

@@ -14,7 +14,8 @@ step 7, which are optional.
 | Canonical promotion | `accel/_modes.py` **and** `tests/test_mode_registry.py` | Add rows to `MODE_ATTRS` / `MODE_SEEDS` / `MODE_STEPS`, and bump the hardcoded `len(CANONICAL_MODES)` count. Safe only after the aligner exists (step 6). |
 | Multi-GPU/pool (optional) | `accel/batch/_dispatch.py` **and** `accel/_modes.py` | Paired: a `_MODE_SPEC` entry **and** adding the mode to `PROCESS_MODES`. Never one without the other. |
 | Batched API | `container/_batch.py` | `MoleculePairBatch.align_with_<mode>(backend=None)`, device-aware resolve. |
-| Tests | `tests/test_<mode>.py`, `tests/test_fast_batch_alignment.py`, `tests/test_numba_backend.py` | The four parity gates. |
+| **Screen store (step 10)** | `shepherd_score/screen.py` (+ `container/_core.py` if data is cached on `Molecule`) | **Tier A** (reuses stored data, e.g. `vol_tversky`): one `_store_supports` branch. **Tier B** (new per-mol data, e.g. `esp_field`): `MoleculeProfile` slot/`__init__`/`center_to`/`get_<data>()` accessor + `_schema_from_modes` flag + `_store_supports` + `_profile_from_schema` + `ProfileStore._concat`/`_reconstruct` (offset table for variable-length). `_FAST_MODES` is a separate optional throughput opt. |
+| Tests | `tests/test_<mode>.py`, `tests/test_fast_batch_alignment.py`, `tests/test_numba_backend.py`, `tests/test_screen.py` | The four parity gates **+ the screen round-trip** (`test_{vol_tversky,esp_field}_stream_matches_object`). |
 
 ## The registry invariant
 
@@ -34,13 +35,24 @@ promoting it here is what makes `screen` / `multi_gpu` / `cpu_pool` pick it up.
 - `PROCESS_MODES` (multi-GPU / CPU-pool) must equal `tuple(_MODE_SPEC)` in
   `accel/batch/_dispatch.py` — edit both or neither.
 
-## Derive, do not hardcode
+## Derive routing; add data plumbing
 
-The whole point of the registry is that the front-end picks up a mode automatically:
-`screen.py`, `accel/multi_gpu.py`, and `accel/cpu_pool.py` build their mode tables from `accel/_modes.py`
-and the `_align_batch_*` function names. If your mode is registered and its aligner is bound and
-exported, those front-ends already support it. If you feel the need to edit them, you have
-diverged from the registry-driven design — find the derivation you missed instead.
+Two different things flow through the front-end, and they are governed by opposite rules:
+
+- **Routing is derived — never hardcode it.** `screen.py`, `accel/multi_gpu.py`, and
+  `accel/cpu_pool.py` build their mode *tables* (which modes exist, which result attributes, which
+  `_align_batch_*` to call) from `accel/_modes.py`. Register the mode + bind + export its aligner
+  and that routing lights up automatically. If you catch yourself writing a mode-name list to
+  decide dispatch, find the derivation you missed.
+- **Per-molecule DATA is not derivable — you must add it (step 10).** The out-of-core store
+  (`MoleculeProfile` + `ProfileStore` in `screen.py`) only carries the arrays it was taught to
+  carry. The registry knows your mode's *name*, not that it reads, say, ESP field points. So a mode
+  needing data beyond what's already stored *requires* a `screen.py` edit — that is by design, not a
+  divergence. `multi_gpu` / `cpu_pool` inherit the store, so wiring `screen.py` covers them too
+  (unless you also opt into the step-8 multi-GPU spec).
+
+The tell for which you're doing: editing a **mode-name list** = wrong (derive it); adding a
+**`_store_supports` branch or a `MoleculeProfile`/serialization field** = right (data plumbing).
 
 ## Which existing mode to read
 
