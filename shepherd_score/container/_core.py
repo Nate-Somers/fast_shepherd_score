@@ -239,10 +239,13 @@ class Molecule:
         self._nonH_atoms_idx = np.array([a.GetIdx() for a in self.mol.GetAtoms() if a.GetAtomicNum() != 1])
 
         # ESP field points (Cresset-style): a VARIABLE-LENGTH set of signed extrema of the
-        # softened molecular electrostatic potential. Computed once from heavy-atom positions +
-        # partial charges (no surface / open3d). ``field_point_pos`` is (M,3) float32 and
-        # ``field_point_sign`` is (M,) float32 (+1 = potential maximum, -1 = minimum). M may be 0.
-        self.field_point_pos, self.field_point_sign = self.get_field_point_contribs()
+        # softened molecular electrostatic potential, from heavy-atom positions + partial charges
+        # (no surface / open3d). Computed LAZILY on first ``get_field_points()`` and cached: the
+        # grid extremum search is expensive and only the ``esp_field`` mode needs it, so building a
+        # Molecule for any other mode must not pay for it. ``field_point_pos`` is (M,3) float32,
+        # ``field_point_sign`` is (M,) float32 (+1 = potential maximum, -1 = minimum); M may be 0.
+        self.field_point_pos = None
+        self.field_point_sign = None
 
         self.pharm_multi_vector = pharm_multi_vector
         if isinstance(pharm_types, np.ndarray) and isinstance(pharm_ancs, np.ndarray) and isinstance(pharm_vecs, np.ndarray):
@@ -519,7 +522,7 @@ class Molecule:
 
     def get_field_points(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Accessor for the precomputed ESP field points.
+        Return the ESP field points, computing them lazily on first access and caching.
 
         Returns
         -------
@@ -528,6 +531,8 @@ class Molecule:
         field_point_sign : np.ndarray (M,) float32
             +1 for a potential maximum, -1 for a minimum.
         """
+        if self.field_point_pos is None:
+            self.field_point_pos, self.field_point_sign = self.get_field_point_contribs()
         return self.field_point_pos, self.field_point_sign
 
 
