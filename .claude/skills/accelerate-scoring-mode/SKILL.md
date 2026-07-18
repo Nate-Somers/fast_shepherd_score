@@ -151,18 +151,50 @@ variable-length signed ESP field points). Wire it end to end in `screen.py`, mir
   7. If the data is **cached on the `Molecule`** (e.g. a lazy field), mirror the `center_to` shift in
      `container/_core.py` too, so a query centered by `screen` never carries a stale copy.
 
-**Fast-engine registration is OPTIONAL and orthogonal.** `_FAST_MODES` in `screen.py` lists the
-modes that get the direct array→kernel fast path (build fit tensors once per shard, bypass
-`MoleculePair`). That is a **throughput** optimization, not a correctness requirement. A mode left
-out of `_FAST_MODES` still screens correctly through the `fast=False` object path. Add it (with a
-`_build_fit_fast_pairs` / `_ref_tensors_from_arrays` branch) only once the mode is proven and you
-want the streaming speed — never as part of first wiring.
+**Fast-engine registration — optional for correctness, REQUIRED before you report screening
+throughput.** `_FAST_MODES` in `screen.py` lists the modes that get the direct array→kernel fast
+path: fit tensors built once per shard and reused across the query panel, bypassing per-shard
+`MoleculePair` construction. A mode left out still screens *correctly* through the `fast=False`
+object path — but that path rebuilds `MoleculePair` objects every shard, pure host-side Python
+overhead the fast modes do not pay. **The GPU kernel is identical; only the harness differs.** So if
+you benchmark a non-fast mode's screening throughput against the fast modes (e.g. a fig2 A/B/E
+screening panel), you measure your mode's object-path overhead against their resident-tensor path
+and **understate your mode's true throughput**. Two honest options, in order of preference:
 
-**Verify (screen analog of parity gate 3).** Build a `ProfileStore` for the mode, `screen()` a
-query, and assert the scores match `MoleculePairBatch.align_with_<mode>` on the same centered
-molecules. Add the test to `tests/test_screen.py` (models: `test_vol_tversky_stream_matches_object`
-for Tier A, `test_esp_field_stream_matches_object` for Tier B — the latter also asserts the
-variable-length arrays reached disk).
+1. **Add the mode to the fast engine** (do this for anything that will appear in a screening-speed
+   figure). It is mechanical once the driver exists — the fast path just pre-sets the tensors the
+   driver's `_batch_upload` would otherwise fill, so `_batch_upload` skips its lambdas (it only
+   fills cold `None` attrs). Six edits in `screen.py`:
+   - `_FAST_MODES` — add the mode id.
+   - `_FastPair.__slots__` — add the mode's result slots (`transform_<mode>`/`sim_aligned_<mode>`)
+     and any new fit/ref tensor slots the driver reads (e.g. `_ref_fp_pos_t`/`_fit_fp_pos_t`).
+   - `_query_ref_arrays(q, mode)` — the query's numpy arrays for the ref side.
+   - `_ref_tensors_from_arrays(ra, mode, device)` — those arrays → the pre-set `_ref_*_t` tensors
+     (no `_ArrView`/`.ref_molec` needed if you pre-set every tensor the driver uploads).
+   - `_build_fit_fast_pairs(arrs, mode, device)` — split the shard's contiguous arrays into
+     per-molecule fit tensor views (`splitT` on the offset table for a variable-length set).
+   - `_fast_batch_kwargs(mode, ak)` — translate screen kwargs to the exact `_align_batch_<mode>`
+     signature (mirror the pairwise `align_with_<mode>(backend="triton")` dispatch — pass ONLY the
+     kwargs the driver accepts; some drivers take their seed count internally).
+2. **If you deliberately keep it on the object path** (a mode you are not speed-benchmarking):
+   `log`/note in the figure that this mode uses the object path, and do NOT plot its screening
+   throughput on the same axis as the fast modes. Reporting an object-path aligns/s next to
+   resident-tensor aligns/s is the silent-cap failure from `Workflow`'s discipline, one level up.
+
+The `vol_tversky` fast path is a drop-in copy of `vol`'s (shape-only, same fit tensors); `esp_field`
+adds its four field-point tensors alongside the shape tensors. A shape-only or reduction mode is
+almost free to fast-path; a mode with new per-molecule data pre-sets that data's tensors too.
+
+**Verify (screen analog of parity gate 3 — gate 5).** Build a `ProfileStore`, `screen()` a query,
+and assert the scores match `MoleculePairBatch.align_with_<mode>` on the same centered molecules.
+Once the mode is in `_FAST_MODES` and the store is `pre_centered`, this test exercises the FAST
+path (that is the point — it proves the resident-tensor path is score-faithful). Tolerance: a
+single-channel / reduction mode is usually bit-identical (`abs=1e-4`, like `vol_tversky`); a
+basin-sensitive multi-channel mode can differ by ~1e-3 when fp-noise-level input differences flip a
+multi-start seed near a tie, so use the same `abs=1e-2` the accel test uses (`esp_field`), and lean
+on the "assert the data reached disk" check to catch a real wiring bug (which moves scores by
+`>>1e-2` or changes the point counts). Models: `test_vol_tversky_stream_matches_object` (Tier A,
+bit-identical) and `test_esp_field_stream_matches_object` (Tier B, basin tolerance + disk check).
 
 `multi_gpu` / `cpu_pool` remain registry-driven for *routing* — never hardcode a mode-name list in
 their dispatch. The per-mode DATA plumbing above is inherently mode-specific and cannot be derived;
@@ -186,8 +218,9 @@ step-10 screen round-trip (streamed ≡ `MoleculePairBatch`) if the mode is mean
 - **Small diff.** You are adding one kernel pair, one driver, one aligner, the canonical registry
   rows (`MODE_ATTRS` / `MODE_SEEDS` / `MODE_STEPS`) plus the pinned-count bump, one API method, the
   step-10 `screen` wiring (one `_store_supports` line for Tier A; the `MoleculeProfile` + schema +
-  serialization fields for Tier B), and at most one `_MODE_SPEC`/`PROCESS_MODES` pair. If the diff
-  is larger than that, question it.
+  serialization fields for Tier B), the six-point `screen` fast-engine wiring if the mode will be
+  speed-benchmarked, and at most one `_MODE_SPEC`/`PROCESS_MODES` pair. If the diff is larger than
+  that, question it.
 
 See `seams.md` for the file map, `kernel_anatomy.md` for the kernel/dispatch/graph mechanics, and
 `parity_gates.md` for the validation contract.

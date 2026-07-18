@@ -689,7 +689,8 @@ def _centered_copy(query):
 # is swapped across a panel while the fit views stay resident -> one shard build
 # serves every query.
 # --------------------------------------------------------------------------- #
-_FAST_MODES = ("vol", "surf", "surf_esp", "pharm", "vol_color", "vol_esp", "vol_and_surf_esp")
+_FAST_MODES = ("vol", "surf", "surf_esp", "pharm", "vol_color", "vol_esp", "vol_and_surf_esp",
+               "vol_tversky", "esp_field")
 
 
 class _ArrView:
@@ -727,13 +728,17 @@ class _FastPair:
                  "_ref_centers_w_H_t", "_fit_centers_w_H_t",         # esp_combo with-H centers
                  "_ref_partial_t", "_fit_partial_t",                 # esp_combo with-H charges
                  "_ref_radii_t", "_fit_radii_t",                     # esp_combo with-H radii
+                 "_ref_fp_pos_t", "_fit_fp_pos_t",                   # esp_field ESP field points
+                 "_ref_fp_sign_t", "_fit_fp_sign_t",                 # esp_field field-point signs
                  "transform_vol_noH", "sim_aligned_vol_noH",
                  "transform_surf", "sim_aligned_surf",
                  "transform_surf_esp", "sim_aligned_surf_esp",
                  "transform_pharm", "sim_aligned_pharm",
                  "transform_vol_color", "sim_aligned_vol_color",
                  "transform_vol_esp_noH", "sim_aligned_vol_esp_noH",
-                 "transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp")
+                 "transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp",
+                 "transform_vol_tversky", "sim_aligned_vol_tversky",
+                 "transform_esp_field", "sim_aligned_esp_field")
 
     def __init__(self, device):
         self.device = device
@@ -767,6 +772,13 @@ def _query_ref_arrays(q, mode: str) -> dict:
                 "partial": np.asarray(q.partial_charges, np.float32),                # with-H charges
                 "radii": np.asarray(q.radii, np.float32),                            # with-H radii
                 "xyz": np.asarray(q.atom_pos, np.float32)}                           # heavy (alpha=0.81 shape)
+    if mode == "vol_tversky":
+        return {"xyz": np.asarray(q.atom_pos, np.float32)}                           # heavy atoms (shape reuse)
+    if mode == "esp_field":
+        fp_pos, fp_sign = q.get_field_points()      # (M,3),(M,) -- may be empty (M=0)
+        return {"xyz": np.asarray(q.atom_pos, np.float32),
+                "fp_pos": np.asarray(fp_pos, np.float32).reshape(-1, 3),
+                "fp_sign": np.asarray(fp_sign, np.float32).reshape(-1)}
     raise ValueError(mode)
 
 
@@ -802,6 +814,13 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
                 "ref_molec": _ArrView(surf_pos=ra["surf"], surf_esp=ra["surf_esp"],
                                       partial_charges=ra["partial"], radii=ra["radii"],
                                       mol=_MolShim(ra["cwh"]))}
+    if mode == "vol_tversky":
+        return {"_ref_xyz_t": f(ra["xyz"])}                     # shape-only, like vol
+    if mode == "esp_field":
+        # Pre-set all three ref tensors so _align_batch_esp_field's _batch_upload skips its
+        # p.ref_molec.get_field_points() lambdas (no _ArrView needed on this array-only path).
+        return {"_ref_xyz_t": f(ra["xyz"]),
+                "_ref_fp_pos_t": f(ra["fp_pos"]), "_ref_fp_sign_t": f(ra["fp_sign"])}
     raise ValueError(mode)
 
 
@@ -888,6 +907,19 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
             p._fit_xyz_t = at                   # heavy atoms (alpha=0.81 shape channel)
             p.fit_molec = _ArrView(surf_pos=np_surf[i], surf_esp=np_se[i], partial_charges=partn,
                                    radii=radn, mol=_MolShim(cwhn))
+    elif mode == "vol_tversky":
+        for p, c in zip(pairs, splitT(f(arrs["atom_pos"]), arrs["atom_off"])):
+            p._fit_xyz_t = c                    # shape-only, identical fit tensors to vol
+    elif mode == "esp_field":
+        aoff, foff = arrs["atom_off"], arrs["fp_off"]
+        # Heavy-atom centres (shape channel) + the variable-length signed ESP field points
+        # (field channel), each split by its own offset table into per-molecule device views.
+        for p, at, fp, fs in zip(
+                pairs, splitT(f(arrs["atom_pos"]), aoff),
+                splitT(f(arrs["field_point_pos"]), foff), splitT(f(arrs["field_point_sign"]), foff)):
+            p._fit_xyz_t = at
+            p._fit_fp_pos_t = fp
+            p._fit_fp_sign_t = fs
     else:
         raise ValueError(mode)
     return ids, pairs
@@ -924,6 +956,15 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
                     probe_radius=ak.get("probe_radius", 1.0), esp_weight=ak.get("esp_weight", 0.5),
                     num_repeats=ak.get("num_repeats", _seeds_for(mode)), trans_init=False,
                     lr=ak.get("lr", 0.1), steps_fine=steps)
+    if mode == "vol_tversky":  # mirrors align_with_vol_tversky(backend="triton"); seeds are internal
+        return dict(alpha=ak.get("alpha", 0.81),
+                    tversky_alpha=ak.get("tversky_alpha", 0.95),
+                    tversky_beta=ak.get("tversky_beta", 0.05), steps_fine=steps)
+    if mode == "esp_field":    # mirrors align_with_esp_field(backend="triton") dispatch
+        return dict(field_weight=ak.get("field_weight", 0.5), alpha=ak.get("alpha", 0.81),
+                    alpha_field=ak.get("alpha_field", 0.81), lam=ak.get("lam", 0.1),
+                    num_repeats=ak.get("num_repeats", _seeds_for(mode)),
+                    lr=ak.get("lr", 0.075), steps_fine=steps)
     raise ValueError(mode)
 
 

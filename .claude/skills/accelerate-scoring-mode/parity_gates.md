@@ -51,16 +51,26 @@ A molecule aligned to a copy of itself scores exactly 1.000, on **both** backend
 
 ## Gate 5 — streamed screen ≡ per-pair `MoleculePairBatch` *(only if the mode screens)*
 The out-of-core `screen` path must reproduce the in-memory result. This is the screen analog of
-gate 3, one level further out: it also exercises the store's serialization (step 10).
+gate 3, one level further out: it exercises the store's serialization (step 10) and, once the mode
+is in `_FAST_MODES`, the resident-tensor fast engine.
 - **What to compare**: `screen(query, ProfileStore, mode=<mode>)` scores vs
   `MoleculePairBatch.align_with_<mode>()` on the *same centered molecules* (deep-copy + `center_to`
   each library molecule to its own heavy-atom COM to match a `pre_centered` store).
-- **Tolerance**: agree to ~4 decimals (same rationale as gate 3). For a `pre_centered` store the
-  inputs are identical, so agreement is typically near-exact.
+- **This test runs the FAST path** when the mode is in `_FAST_MODES` and the store is
+  `pre_centered` — which is what you want: it proves the resident-tensor path is score-faithful, not
+  just the object path. (A score gap *larger* than the tolerance below, where before it was
+  bit-identical, is the signature of the fast path engaging — confirm that, do not "fix" it by
+  reverting to the object path.)
+- **Tolerance**: a single-channel or reduction mode is typically bit-identical (`abs=1e-4`) because
+  the fast and object paths feed identical inputs to one driver. A basin-sensitive multi-channel
+  mode can differ by ~`1e-3`: the fast and object query arrays differ by fp noise (~`2e-7`, from
+  re-centering the query independently in the reference), and a rugged multi-start objective can let
+  that flip which seed wins a near-tie. Use `abs=1e-2` there (the accel test's tolerance for the
+  same mode). Do not loosen further — a real wiring bug moves scores by `>>1e-2`.
 - **Also assert the data reached disk** for a Tier-B mode: load a `shard_*.npz` and check the new
   arrays (and the offset table for a variable-length set) are present. A mode that silently stores
   nothing still "passes" a score comparison when every molecule's data is empty — the disk check
-  catches that.
+  catches that, and it is the check that survives a loose score tolerance.
 
 ## Running them
 The relevant suites already exist; add your mode's cases to them:
