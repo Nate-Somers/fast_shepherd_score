@@ -157,3 +157,58 @@ class TestPCA:
     """
     Test principal component analysis
     """
+
+    def test_rotation_axis_np_antiparallel_is_finite_perpendicular(self):
+        """rotation_axis_np on ANTIPARALLEL vectors must return a finite unit axis perpendicular
+        to v1 -- not a 0/0 NaN. The PCA seeder flips a principal axis (pmi_ref[0] = -pmi_ref[0]),
+        so a degenerate molecule hits v2 == -v1 exactly; the old code divided by the zero-norm
+        cross product and produced a NaN that later crashed np.linalg.eigh."""
+        from shepherd_score.alignment.utils.pca_np import rotation_axis_np
+        for v1 in ([1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [0.6, -0.8, 0.0]):
+            v1 = np.asarray(v1)
+            ax = rotation_axis_np(v1, -v1)                       # antiparallel
+            assert np.all(np.isfinite(ax)), f"non-finite axis for v1={v1}: {ax}"
+            assert np.isclose(np.linalg.norm(ax), 1.0, atol=1e-6)
+            assert np.isclose(np.dot(ax, v1), 0.0, atol=1e-6), "axis must be perpendicular to v1"
+
+    def test_rotation_axis_np_generic_unchanged(self):
+        """For NON-degenerate (non-parallel) vectors the result is the plain normalized cross
+        product -- the fix must not alter this path."""
+        from shepherd_score.alignment.utils.pca_np import rotation_axis_np
+        v1, v2 = np.array([1., 0., 0.]), np.array([0., 1., 0.])
+        np.testing.assert_allclose(rotation_axis_np(v1, v2), [0., 0., 1.], atol=1e-7)
+
+    def test_degenerate_molecules_align_without_eigh_crash(self):
+        """Linear / single-heavy-atom / symmetric-top molecules used to crash the per-pair torch
+        seeder with LinAlgError 'Eigenvalues did not converge' (NaN PCA axis -> NaN coords -> eigh).
+        They must now self-align to ~1.0 on the per-pair path."""
+        pytest.importorskip("rdkit")
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from shepherd_score.container import Molecule, MoleculePair
+
+        def build(smi):
+            m = Chem.AddHs(Chem.MolFromSmiles(smi))
+            p = AllChem.ETKDGv3(); p.randomSeed = 0
+            assert AllChem.EmbedMolecule(m, p) == 0
+            return Molecule(m)
+
+        for smi in ("N#N", "O", "C1CCCCC1", "CC(C)(C)C", "C#C"):   # N2, water, cyclohexane, neopentane, acetylene
+            mol = build(smi)
+            mp = MoleculePair(mol, mol, do_center=True)
+            torch.manual_seed(0)
+            mp.align_with_vol()                                    # must not raise
+            assert float(np.asarray(mp.sim_aligned_vol_noH)) > 0.99, f"self-overlap too low for {smi}"
+
+    def test_mmff_unparameterizable_raises_clear_error(self):
+        """A molecule MMFF cannot parameterize (H2) must raise a clear ValueError from
+        get_partial_charges, not the cryptic ``'NoneType' has no attribute 'GetMMFFPartialCharge'``."""
+        pytest.importorskip("rdkit")
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from shepherd_score.container import Molecule
+
+        m = Chem.AddHs(Chem.MolFromSmiles("[H][H]"))
+        AllChem.EmbedMolecule(m, randomSeed=0)
+        with pytest.raises(ValueError, match="MMFF94 could not parameterize"):
+            Molecule(m)

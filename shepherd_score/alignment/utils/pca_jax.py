@@ -62,7 +62,16 @@ def rotation_axis_jax(v1: Array, v2: Array) -> Array:
         if jnp.allclose(v1, v2):
             return jnp.array([1., 0., 0.])
         v3 = jnp.cross(v1, v2)
-        v3 = v3 / jnp.linalg.norm(v3)
+        norm = jnp.linalg.norm(v3)
+        if norm < 1e-12:
+            # v1, v2 (anti)parallel -> undefined axis; any perpendicular to v1 works. Without this
+            # the 0/0 yields NaN, which cascades into an eigh "Eigenvalues did not converge" crash
+            # for linear / single-atom / symmetric-top molecules (mirrors the pca_np fix; this
+            # single-instance branch is the one the jax PCA seeder uses).
+            ref = jnp.array([1., 0., 0.]) if abs(float(v1[0])) < 0.9 else jnp.array([0., 1., 0.])
+            v3 = jnp.cross(v1, ref)
+            norm = jnp.linalg.norm(v3)
+        v3 = v3 / norm
     return v3
 
 def quaternion_from_axis_angle_jax(axis: Array, angle: Array) -> Array:

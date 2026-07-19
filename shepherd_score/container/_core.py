@@ -343,6 +343,16 @@ class Molecule:
         """
         mol_copy = deepcopy(self.mol)
         molec_props = Chem.AllChem.MMFFGetMoleculeProperties(mol_copy)
+        if molec_props is None:
+            # MMFF94 cannot parameterize this molecule (e.g. H2, a lone noble-gas atom, or elements
+            # outside MMFF's coverage), so GetMMFFPartialCharge would raise a cryptic
+            # ``'NoneType' object has no attribute 'GetMMFFPartialCharge'``. Fail with an actionable
+            # message instead; such inputs should supply ``partial_charges`` explicitly.
+            raise ValueError(
+                "MMFF94 could not parameterize this molecule, so partial charges cannot be "
+                "computed (this happens for inputs MMFF does not cover, e.g. H2 or a single "
+                "noble-gas atom). Pass partial_charges=... explicitly if you need to score it."
+            )
         charges = np.array([molec_props.GetMMFFPartialCharge(i) for i, _ in enumerate(mol_copy.GetAtoms())])
         return charges.astype(np.float32)
 
