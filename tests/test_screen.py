@@ -378,6 +378,45 @@ def test_esp_field_stream_matches_object(tmp_path, molecules):
         assert by_id[p.id] == pytest.approx(float(rs), abs=1e-2)
 
 
+def test_vol_lipo_stream_matches_object(tmp_path, molecules):
+    """vol_lipo carries a NEW per-molecule data set (the TRUE-heavy lipo centres + per-atom
+    Crippen logP) through the store's variable-length serialization, then screens through the
+    resident-tensor FAST path. The streamed scores must match the per-pair object path, and the
+    store must actually persist the lipo arrays (offset table + centres + scalar)."""
+    import copy, glob
+    store_path = os.path.join(tmp_path, "lib.fss")
+    with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_lipo",),
+                             dtype="float32", pre_centered=True) as store:
+        for i, m in enumerate(molecules):
+            store.add(m, id=i)
+    store = ProfileStore.open(store_path)
+    assert store.supports("vol_lipo") and store.supports("vol")
+    assert store.schema["lipophilicity"]
+    # the variable-length lipo set made it to disk (offset table + centres + scalar arrays)
+    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
+        assert {"lipo_off", "lipo_pos", "lipophilicity"} <= set(d.files)
+
+    query = molecules[1]
+    hits = screen(query, store, mode="vol_lipo", backend="numba",
+                  num_repeats=16, max_num_steps=50, top_k=len(molecules))
+    by_id = {h.id: h.score for h in hits}
+    assert by_id[1] == pytest.approx(1.0, abs=1e-2)        # self-overlay optimum (shape+lipo)
+
+    cq = copy.deepcopy(query); cq.center_to(cq.atom_pos.mean(0))
+    profiles = [p for shard in store.iter_shards() for p in shard]
+    pairs = [MoleculePair(cq, p, do_center=False) for p in profiles]
+    ref, _ = MoleculePairBatch(pairs).align_with_vol_lipo(
+        backend="numba", num_repeats=16, max_num_steps=50)
+    # pre_centered store -> screen() takes the resident-tensor FAST path (mode in _FAST_MODES).
+    # The fit lipo data is bit-identical to the object path and the query differs only by fp noise
+    # (~2e-7 from re-centering it independently). The two-channel objective is basin-sensitive, so
+    # that tickle can flip a near-tie multi-start seed, moving a score by ~1e-3. Same abs=1e-2 the
+    # accel vol_lipo test uses -- loose enough for the flip, tight enough that wrong/empty lipo data
+    # (which would move scores >>1e-2 or change the heavy counts) is still caught.
+    for p, rs in zip(profiles, ref):
+        assert by_id[p.id] == pytest.approx(float(rs), abs=1e-2)
+
+
 def test_screen_many_equals_per_query_and_streams_once(tmp_path_factory, molecules):
     """A panel screen (one read per shard, all queries) equals per-query screens,
     across multiple shards."""
@@ -460,3 +499,48 @@ def test_vol_esp_stream_retained_h(tmp_path):
         backend="numba", lam=0.1, num_repeats=5, max_num_steps=50)
     for i, rs in enumerate(ref):                     # incl. the retained-H molecule
         assert fast_by_id[i] == pytest.approx(float(rs), abs=1e-4)
+
+
+def test_vol_lipo_stream_retained_h(tmp_path):
+    """vol_lipo's two channels live on DIFFERENT bases: shape on ``atom_pos`` (RemoveHs) and
+    lipophilicity on the TRUE-heavy centres. When Chem.RemoveHs RETAINS an H (deuterium), the
+    RemoveHs set is longer than the heavy lipo set, so the two per-molecule offset tables
+    (``atom_off`` vs ``lipo_off``) legitimately diverge. The store must persist both bases
+    self-consistently and the streamed scores must match the in-memory MoleculePairBatch path."""
+    import copy, glob
+
+    # [2H]OC(=O)c1ccccc1 keeps its deuterium after RemoveHs -> atom_pos (10) != heavy (9).
+    smis = ["CC(=O)Oc1ccccc1C(=O)O", "c1ccccc1O", "[2H]OC(=O)c1ccccc1",
+            "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"]
+    mols = [_build_molecule(s, seed=i) for i, s in enumerate(smis)]
+    retained = [m for m in mols if len(m.atom_pos) != len(m._nonH_atoms_idx)]
+    assert retained, "test premise broken: no molecule retains an H after RemoveHs"
+
+    store_path = os.path.join(tmp_path, "lib.fss")
+    with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_lipo",),
+                             dtype="float32", pre_centered=True) as store:
+        for i, m in enumerate(mols):
+            store.add(m, id=i)
+
+    # The lipo set reached disk, and its offset table diverges from atom_off on the retained-H
+    # molecule (proving the two bases are stored independently, not desynced).
+    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
+        assert {"lipo_off", "lipo_pos", "lipophilicity"} <= set(d.files)
+        atom_lens = np.diff(d["atom_off"])
+        lipo_lens = np.diff(d["lipo_off"])
+        assert (atom_lens != lipo_lens).any(), "retained-H molecule should diverge atom_off vs lipo_off"
+
+    query = mols[0]                                  # clean query
+    hits = screen(query, ProfileStore.open(store_path), mode="vol_lipo", backend="numba",
+                  num_repeats=16, max_num_steps=50, top_k=len(mols))
+    assert len(hits) == len(mols)
+    fast_by_id = {h.id: h.score for h in hits}
+
+    cq = copy.deepcopy(query); cq.center_to(cq.atom_pos.mean(0))
+    def _c(m):
+        c = copy.deepcopy(m); c.center_to(c.atom_pos.mean(0)); return c
+    pairs = [MoleculePair(cq, _c(m), do_center=False) for m in mols]
+    ref, _ = MoleculePairBatch(pairs).align_with_vol_lipo(
+        backend="numba", num_repeats=16, max_num_steps=50)
+    for i, rs in enumerate(ref):                     # incl. the retained-H molecule
+        assert fast_by_id[i] == pytest.approx(float(rs), abs=1e-2)

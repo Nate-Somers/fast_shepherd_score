@@ -1377,6 +1377,141 @@ def _align_batch_esp_field(
         p.sim_aligned_esp_field = s
 
 
+def _align_batch_vol_lipo(
+    pairs: list["MoleculePair"],
+    *,
+    lipo_weight: float = 0.5,
+    alpha: float = 0.81,
+    lam: float = 0.1,
+    num_repeats: int = 50,
+    topk: int = 30,
+    steps_fine: int = 100,
+    lr: float = 0.075,
+) -> None:
+    """Batched ``vol_lipo`` alignment: atom-centred Gaussian *shape* (volume) + per-atom
+    *lipophilicity* overlap, blended ``(1-lipo_weight)*shape + lipo_weight*lipo``.
+
+    Two INDEPENDENT point sets are padded per bucket, exactly as the reference passes
+    ``ref_centers``/``fit_centers`` apart from ``ref_lipo_pos``/``fit_lipo_pos``:
+      * the SHAPE centres -- ``atom_pos`` (the RemoveHs coordinate set, own N_real, the
+        bucket merge key, reusing the shape kernel), and
+      * the LIPO centres -- the TRUE-heavy atom coordinates
+        ``mol.GetConformer().GetPositions()[_nonH_atoms_idx]`` (own M_real, reusing the fused
+        ESP kernel with the per-atom Crippen logP as its charges, matched by value).
+    The two sets CAN DIFFER IN LENGTH on isotope-labelled molecules (RemoveHs retains e.g.
+    deuterium, so ``atom_pos`` is longer than the strict-heavy lipo set) -- the separate
+    paddings keep them from desyncing. Both fit sets transform under the same pose; the driver
+    descends on the JOINT weighted gradient. ``lam`` is RAW (atom-centred, no LAM_SCALING),
+    matching the per-pair ``align_with_vol_lipo``.
+
+    Side effects: writes ``p.transform_vol_lipo`` / ``p.sim_aligned_vol_lipo``.
+    """
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_lipo, pairs,
+                                lipo_weight=lipo_weight, alpha=alpha, lam=lam,
+                                num_repeats=num_repeats, topk=topk,
+                                steps_fine=steps_fine, lr=lr)
+
+    from shepherd_score.accel.drivers.vol_lipo import fast_optimize_vol_lipo_overlay_batch
+
+    device = pairs[0].device
+
+    # Shape centres (shape channel) -- same source as _align_batch_vol (RemoveHs atom_pos).
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
+    # Lipo centres + per-atom logP (lipo channel). TRUE-heavy basis (get_lipo_positions()),
+    # NOT atom_pos -- indexes the with-H conformer by _nonH_atoms_idx so positions stay 1:1 with
+    # the logP even when RemoveHs retained an H (the retained-H trap). Both Molecule and the
+    # RDKit-free MoleculeProfile expose get_lipo_positions() / get_lipophilicity(no_H=True), so
+    # this duck-types identically on either input.
+    _batch_upload(pairs, "_ref_lipo_pos_t", lambda p: p.ref_molec.get_lipo_positions(), torch.float32, device)
+    _batch_upload(pairs, "_fit_lipo_pos_t", lambda p: p.fit_molec.get_lipo_positions(), torch.float32, device)
+    _batch_upload(pairs, "_ref_lipo_t", lambda p: p.ref_molec.get_lipophilicity(no_H=True), torch.float32, device)
+    _batch_upload(pairs, "_fit_lipo_t", lambda p: p.fit_molec.get_lipophilicity(no_H=True), torch.float32, device)
+
+    all_pairs: list[MoleculePair] = []
+    all_scores: list[torch.Tensor] = []
+    all_q: list[torch.Tensor] = []
+    all_t: list[torch.Tensor] = []
+
+    # Merge by shape-centre bands only (like esp_field / vol_color). Lipo-centre counts are NOT
+    # keyed -- the ESP kernel masks padded lipo slots by the real count, so two pairs sharing a
+    # shape bucket but differing in lipo-centre count stay together and their lipo centres are
+    # padded to the bucket's max lipo band (recomputed below). Result-identical.
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_t.shape[0]},
+                    seeds=_seeds_for("vol_lipo"))
+    for _bk in plan_buckets(pairs, _spec, device):
+        n_cent_pad, m_cent_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = len(bucket)
+
+        ref_cent_ts = [p._ref_xyz_t for p in bucket]
+        fit_cent_ts = [p._fit_xyz_t for p in bucket]
+        n_cent_list = [t.shape[0] for t in ref_cent_ts]
+        m_cent_list = [t.shape[0] for t in fit_cent_ts]
+        ref_lipo_ts = [p._ref_lipo_pos_t for p in bucket]
+        fit_lipo_ts = [p._fit_lipo_pos_t for p in bucket]
+        n_lipo_list = [t.shape[0] for t in ref_lipo_ts]
+        m_lipo_list = [t.shape[0] for t in fit_lipo_ts]
+        # Lipo centres not keyed -> pad to this bucket's max lipo band (>= 1 slot so the kernel
+        # always sees a well-formed tensor; zeroed slots are masked by the real count).
+        n_lipo_pad = _band_key(max(n_lipo_list)) or _BAND
+        m_lipo_pad = _band_key(max(m_lipo_list)) or _BAND
+
+        centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
+        lipo_pos_1 = torch.zeros(K, n_lipo_pad, 3, device=device, dtype=torch.float32)
+        lipo_pos_2 = torch.zeros(K, m_lipo_pad, 3, device=device, dtype=torch.float32)
+        lipo_1 = torch.zeros(K, n_lipo_pad, device=device, dtype=torch.float32)
+        lipo_2 = torch.zeros(K, m_lipo_pad, device=device, dtype=torch.float32)
+
+        N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
+        M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))
+        N_real_lipo = torch.tensor(n_lipo_list, device=device, dtype=torch.int32)
+        M_real_lipo = torch.tensor(m_lipo_list, device=device, dtype=torch.int32)
+
+        _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
+        _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
+        _scatter_fill(lipo_pos_1, ref_lipo_ts, n_lipo_list)
+        _scatter_fill(lipo_pos_2, fit_lipo_ts, m_lipo_list)
+        _scatter_fill(lipo_1, [p._ref_lipo_t for p in bucket], n_lipo_list)
+        _scatter_fill(lipo_2, [p._fit_lipo_t for p in bucket], m_lipo_list)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_vol_lipo_overlay_batch(
+                centers_1[sl], centers_2[sl], lipo_pos_1[sl], lipo_pos_2[sl],
+                lipo_1[sl], lipo_2[sl],
+                alpha=alpha, lam=lam, lipo_weight=lipo_weight,
+                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
+                N_real_lipo=N_real_lipo[sl], M_real_lipo=M_real_lipo[sl],
+                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("vol_lipo"))
+            return sc, q, t
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_lipo", n_cent_pad, m_cent_pad, n_lipo_pad, m_lipo_pad,
+                           _seeds_for("vol_lipo")), device=device)
+
+        all_pairs.extend(bucket)
+        all_scores.append(scores)
+        all_q.append(q_batch)
+        all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    scores_list = scores_cpu.tolist()                       # one C call
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_lipo = S
+        p.sim_aligned_vol_lipo = s
+
+
 # --- legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp) ----------
 # Same function objects, so ``__name__`` stays canonical -- the multi-GPU dispatch
 # (``align_fn.__name__.replace("_align_batch_", "")``) and _MODE_SPEC lookup are

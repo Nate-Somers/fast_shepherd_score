@@ -1328,6 +1328,88 @@ class MoleculePairBatch:
             verbose=verbose,
         )
 
+    def align_with_vol_lipo(self,
+                            lipo_weight: float = 0.5,
+                            alpha: float = 0.81,
+                            lam: float = 0.1,
+                            num_repeats: int = None,
+                            lr: float = 0.1,
+                            max_num_steps: int = None,
+                            verbose: bool = False,
+                            backend: Optional[str] = None,
+                            return_aligned: bool = False,
+                            ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        """Align all pairs using the ``vol_lipo`` overlay: atom-centred Gaussian *shape*
+        (volume) + per-atom *lipophilicity* overlap, blended
+        ``(1-lipo_weight)*shape_Tanimoto + lipo_weight*lipo_Tanimoto``.
+
+        The shape channel is the heavy-atom Gaussian volume overlap (identical to ``vol``); the
+        lipophilicity channel overlays the per-atom Crippen atomic logP contributions -- placed
+        at the TRUE-heavy atom centres -- like an ESP/partial-charge field (matched by value so
+        hydrophobic overlaps hydrophobic), with the atom-centred ``lam=0.1`` (raw). Both the fit
+        shape centres AND the fit lipophilicity centres move rigidly under the same SE(3) pose,
+        and BOTH channels steer the pose (joint weighted gradient). Each channel self-normalises
+        to a Tanimoto, so a self-copy scores 1.000.
+
+        Results are stored in-place on each MoleculePair:
+        - ``pair.transform_vol_lipo`` and ``pair.sim_aligned_vol_lipo``
+
+        Parameters
+        ----------
+        lipo_weight : float
+            Weight of the lipophilicity channel in [0, 1]; shape gets ``1 - lipo_weight``
+            (default 0.5).
+        alpha : float
+            Gaussian width for the shape AND lipophilicity overlaps (default 0.81, volumetric
+            heavy atoms).
+        lam : float
+            Value ("charge") weighting for the lipophilicity ESP overlap (default 0.1, raw /
+            atom-centred, NOT LAM_SCALING-scaled).
+        num_repeats, lr, max_num_steps, verbose
+            Standard optimization controls. ``num_repeats`` / ``max_num_steps`` default
+            (``None``) to the per-mode ``MODE_SEEDS`` / ``MODE_STEPS`` in ``accel/_modes.py``.
+        backend : str
+            ``None`` (default) resolves device-aware (Triton on CUDA else numba). ``"triton"``
+            (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_vol_lipo`` driver, which reuses the shape kernel (shape
+            channel) and the fused ESP kernel (lipophilicity channel, logP as charges).
+            ``"jax"`` falls back to the per-pair PyTorch path (there is no JAX kernel for this
+            mode).
+        return_aligned : bool
+            For the batched backend, build the aligned-fit-atom list when ``True``.
+
+        Returns
+        -------
+        scores : np.ndarray
+            Shape: (N,).
+        aligned_list : list of np.ndarray
+            Aligned fit atom coordinates per pair (``None`` entries unless
+            ``return_aligned=True`` on the batched backend).
+        """
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_lipo")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_lipo")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_lipo,
+            dict(lipo_weight=lipo_weight, alpha=alpha, lam=lam,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_lipo", "transform_vol_lipo", "_fit_xyz_t",
+            return_aligned)
+        if handled:
+            return _result
+
+        return self._delegate_alignment(
+            'align_with_vol_lipo', 'sim_aligned_vol_lipo',
+            lipo_weight=lipo_weight,
+            alpha=alpha,
+            lam=lam,
+            num_repeats=num_repeats,
+            lr=lr,
+            max_num_steps=max_num_steps,
+            verbose=verbose,
+        )
+
     def _pad_and_mask_pharm(self):
         """Extract, pad, and create masks for pharmacophore alignment.
 

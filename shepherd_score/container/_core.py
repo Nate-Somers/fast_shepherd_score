@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import rdkit.Chem as Chem
+from rdkit.Chem import rdMolDescriptors
 from rdkit.Geometry.rdGeometry import Point3D
 import torch
 
@@ -25,6 +26,7 @@ from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_over
 from shepherd_score.alignment import optimize_vol_color_overlay
 from shepherd_score.alignment import optimize_vol_tversky_overlay
 from shepherd_score.alignment import optimize_esp_field_overlay
+from shepherd_score.alignment import optimize_vol_lipo_overlay
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.accel import batch as _ba
 from shepherd_score.accel._modes import (
@@ -57,7 +59,7 @@ def _default_steps(mode: str) -> int:
 _ALIGN_KEYS = (
     'vol', 'vol_noH', 'vol_esp', 'vol_esp_noH',
     'surf', 'surf_esp', 'vol_and_surf_esp', 'pharm', 'vol_color', 'vol_tversky',
-    'esp_field',
+    'esp_field', 'vol_lipo',
 )
 
 
@@ -213,6 +215,10 @@ class Molecule:
             self.partial_charges = partial_charges
         else:
             self.partial_charges = self.get_partial_charges()
+        # Per-atom Crippen atomic logP contributions (the ``vol_lipo`` lipophilicity channel).
+        # A full ``(N,)`` array over ALL atoms in RDKit-mol (with-H) order -- the same order and
+        # basis as ``partial_charges`` -- so its heavy slice reuses the SAME ``_nonH_atoms_idx``.
+        self.lipophilicity = self.get_lipophilicity_contribs()
         self.radii = get_atomic_vdw_radii(mol)
 
         self._surface = Surface(
@@ -382,6 +388,68 @@ class Molecule:
         if no_H:
             return self.partial_charges[self._nonH_atoms_idx]
         return self.partial_charges
+
+
+    def get_lipophilicity_contribs(self) -> np.ndarray:
+        """
+        Get the per-atom Crippen atomic logP contribution for each atom.
+
+        Uses RDKit's ``rdMolDescriptors._CalcCrippenContribs``, which returns one
+        ``(logP, MR)`` tuple per atom in RDKit-mol (with-H) order; the per-atom scalar taken
+        here is the ``logP`` element. The result is a full ``(N,)`` array over ALL atoms in the
+        same order/basis as :attr:`partial_charges` (heavy atoms are sliced out later via
+        :meth:`get_lipophilicity`, reusing the same ``_nonH_atoms_idx`` the charges use).
+
+        Returns
+        -------
+        np.ndarray
+            Per-atom Crippen logP contributions. Shape: (N,).
+        """
+        contribs = rdMolDescriptors._CalcCrippenContribs(self.mol)
+        return np.array([c[0] for c in contribs], dtype=np.float32)
+
+
+    def get_lipophilicity(self, no_H: bool = True) -> np.ndarray:
+        """
+        Get per-atom Crippen logP contributions with or without hydrogens.
+
+        This slices the already-computed ``lipophilicity``; it does not recompute it
+        (see :meth:`get_lipophilicity_contribs`). Mirrors :meth:`get_charges`.
+
+        Parameters
+        ----------
+        no_H : bool, optional
+            If ``True`` (default) return contributions for heavy atoms only.
+            If ``False`` return contributions for all atoms (including H).
+
+        Returns
+        -------
+        np.ndarray
+            Per-atom Crippen logP contributions. Shape: (N,).
+        """
+        if no_H:
+            return self.lipophilicity[self._nonH_atoms_idx]
+        return self.lipophilicity
+
+
+    def get_lipo_positions(self) -> np.ndarray:
+        """Get the TRUE-heavy atom coordinates that carry the per-atom Crippen logP -- the
+        lipophilicity channel's centres for the ``vol_lipo`` mode.
+
+        Reads the with-H conformer and selects the strict-heavy atoms via ``_nonH_atoms_idx``,
+        so the positions stay 1:1 with :meth:`get_lipophilicity`. This is NOT ``atom_pos``:
+        ``atom_pos`` is the ``Chem.RemoveHs`` coordinate set, which RETAINS isotope-labelled H
+        (e.g. deuterium), so it can be longer than and misaligned with the heavy logP -- the
+        retained-H trap. Mirrors the strict-heavy centres the ``vol_esp`` mode uses, and lets a
+        ``Molecule`` and the RDKit-free ``MoleculeProfile`` feed the ``vol_lipo`` aligner
+        identically (both expose ``get_lipo_positions()``).
+
+        Returns
+        -------
+        np.ndarray
+            TRUE-heavy atom coordinates. Shape: (N_heavy, 3).
+        """
+        return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
 
 
     def get_field_point_contribs(self,
@@ -1486,6 +1554,94 @@ class MoleculePair:
         )
         self.transform_esp_field = se3_transform.numpy()
         self.sim_aligned_esp_field = score.numpy()
+        return aligned_fit_centers.numpy()
+
+
+    def align_with_vol_lipo(self,
+                            lipo_weight: float = 0.5,
+                            alpha: float = 0.81,
+                            lam: float = 0.1,
+                            num_repeats: Optional[int] = None,
+                            trans_init: bool = False,
+                            lr: float = 0.1,
+                            max_num_steps: Optional[int] = None,
+                            verbose: bool = False) -> np.ndarray:
+        """
+        Align using a combined atom-centred Gaussian *shape* (volume) + *lipophilicity* overlay.
+
+        The optimized objective is
+        ``(1 - lipo_weight) * shape_Tanimoto + lipo_weight * lipo_Tanimoto``. The shape channel is
+        the heavy-atom Gaussian volume overlap (identical to the ``vol`` mode, ``alpha=0.81``). The
+        lipophilicity channel overlays the per-atom Crippen atomic logP contributions -- placed at
+        the TRUE-heavy atom centres -- like an ESP/partial-charge field (``get_overlap_esp`` with
+        the logP as the "charge", matched by value so hydrophobic overlaps hydrophobic and
+        hydrophilic overlaps hydrophilic), with the atom-centred ``lam=0.1``. Each channel is its
+        own self-normalised Tanimoto, so a molecule aligned to a copy of itself scores 1.000. Only
+        the fit molecule is transformed; its shape centres and lipophilicity centres move rigidly
+        under the same SE(3) pose.
+
+        Optimally aligned score is stored in ``self.sim_aligned_vol_lipo`` and the optimal SE(3)
+        transformation in ``self.transform_vol_lipo``.
+
+        Parameters
+        ----------
+        lipo_weight : float, optional
+            Weight of the lipophilicity channel in [0, 1]; shape gets ``1 - lipo_weight``.
+            Default is 0.5.
+        alpha : float, optional
+            Gaussian width for the shape and lipophilicity overlaps. Default is 0.81 (volumetric,
+            heavy atoms).
+        lam : float, optional
+            Value ("charge") weighting for the lipophilicity ESP overlap. Default is 0.1 (the
+            atom-centred convention, NOT the surface-tuned default).
+        num_repeats : int, optional
+            Number of SE(3) initializations. Default (``None``) is ``MODE_SEEDS['vol_lipo']``.
+        trans_init : bool, optional
+            Translation-seeded initialization from the reference atoms. Default is ``False``.
+        lr : float, optional
+            Learning rate. Default is 0.1.
+        max_num_steps : int, optional
+            Maximum optimization steps. Default (``None``) is ``MODE_STEPS['vol_lipo']``.
+        verbose : bool, optional
+            Print progress. Default is ``False``.
+
+        Returns
+        -------
+        aligned_fit_centers : np.ndarray (M, 3)
+            Transformed fit atom (heavy-atom, shape-channel) coordinates.
+        """
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_lipo")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_lipo")
+        # TRUE-heavy centres that MATCH the heavy Crippen logP. NOT ``atom_pos``: atom_pos is the
+        # RemoveHs coordinate set, which RETAINS isotope-labelled H (e.g. deuterium), whereas
+        # ``_nonH_atoms_idx`` selects atomic-number != 1 and so drops it -- they desync (N vs N-1)
+        # whenever an H is retained. Index the with-H conformer by the SAME ``_nonH_atoms_idx`` the
+        # lipophilicity slice uses so positions and logP stay 1:1 (the retained-H trap).
+        ref_lipo_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
+        fit_lipo_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
+        ref_lipo = self.ref_molec.get_lipophilicity(no_H=True)
+        fit_lipo = self.fit_molec.get_lipophilicity(no_H=True)
+
+        aligned_fit_centers, se3_transform, score = optimize_vol_lipo_overlay(
+            ref_centers=self._ref_xyz_t,
+            fit_centers=self._fit_xyz_t,
+            ref_lipo_pos=self._to_tensor(np.ascontiguousarray(ref_lipo_pos)),
+            fit_lipo_pos=self._to_tensor(np.ascontiguousarray(fit_lipo_pos)),
+            ref_lipo=self._to_tensor(ref_lipo),
+            fit_lipo=self._to_tensor(fit_lipo),
+            alpha=alpha,
+            lam=lam,
+            lipo_weight=lipo_weight,
+            num_repeats=num_repeats,
+            trans_centers=self._ref_xyz_t if trans_init else None,
+            lr=lr,
+            max_num_steps=max_num_steps,
+            verbose=verbose,
+        )
+        self.transform_vol_lipo = se3_transform.numpy()
+        self.sim_aligned_vol_lipo = score.numpy()
         return aligned_fit_centers.numpy()
 
 

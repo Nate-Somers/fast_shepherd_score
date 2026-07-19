@@ -39,6 +39,7 @@ def mols():
 MODES = [
     ("vol_tversky", "sim_aligned_vol_tversky"),
     ("esp_field", "sim_aligned_esp_field"),
+    ("vol_lipo", "sim_aligned_vol_lipo"),
 ]
 
 
@@ -73,3 +74,22 @@ def test_numba_batched_matches_per_pair(mode, attr, mols):
     bat = float(scores[0])
 
     assert abs(ref - bat) < 1e-2, f"{mode}: per-pair {ref:.5f} vs batched-numba {bat:.5f}"
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not (TORCH and torch.cuda.is_available()), reason="CUDA required")
+@pytest.mark.parametrize("mode,attr", MODES)
+def test_triton_matches_numba(mode, attr, mols):
+    """Gate 2 (Triton == numba): the GPU (Triton) batched driver agrees with the CPU (numba)
+    one on the same pair. These modes REUSE the shape + ESP kernels, whose Triton twins are
+    already parity-validated; this end-to-end check confirms the driver's blend dispatches
+    device-consistently. CPU-only boxes skip it (the rest of the gates still run)."""
+    from shepherd_score.container import MoleculePair, MoleculePairBatch
+    bn = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,
+                                         device=torch.device("cpu"))])
+    sc_n, _ = getattr(bn, f"align_with_{mode}")(backend="numba")
+    bt = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,
+                                         device=torch.device("cuda"))])
+    sc_t, _ = getattr(bt, f"align_with_{mode}")(backend="triton")
+    assert abs(float(sc_n[0]) - float(sc_t[0])) < 1e-2, (
+        f"{mode}: numba {float(sc_n[0]):.5f} vs triton {float(sc_t[0]):.5f}")

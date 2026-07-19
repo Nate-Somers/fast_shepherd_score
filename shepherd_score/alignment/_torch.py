@@ -1809,6 +1809,264 @@ def optimize_esp_field_overlay(ref_centers: torch.Tensor,
     return best_alignment, best_transform, best_score
 
 
+def _vol_lipo_overlap(ref_centers: torch.Tensor,
+                      fit_centers: torch.Tensor,
+                      ref_lipo_pos: torch.Tensor,
+                      fit_lipo_pos: torch.Tensor,
+                      ref_lipo: torch.Tensor,
+                      fit_lipo: torch.Tensor,
+                      alpha: float,
+                      lam: float,
+                      lipo_weight: float) -> torch.Tensor:
+    """Combined shape + lipophilicity similarity (helper shared by the objective/optimizer).
+
+    ``shape`` is the atom-centred Gaussian volume Tanimoto over the shape centres (the vol-mode
+    RemoveHs coordinates); ``lipo`` is the ESP-style shape-weighted overlap of the per-atom Crippen
+    logP placed at the TRUE-heavy centres, matched by value (``get_overlap_esp`` with the logP as
+    the "charge"). Each channel self-normalises to a Tanimoto, so a self-copy scores 1.000. If
+    either lipophilicity point set is empty the lipo channel is 0 (shape-only). ``fit_*`` are
+    assumed already SE(3)-transformed. Returns the combined similarity with shape matching
+    ``get_overlap(ref_centers, fit_centers)``.
+    """
+    shape_sim = get_overlap(ref_centers, fit_centers, alpha)
+    n_ref = ref_lipo_pos.shape[-2]
+    n_fit = fit_lipo_pos.shape[-2]
+    if n_ref == 0 or n_fit == 0:
+        lipo_sim = torch.zeros_like(shape_sim)
+    else:
+        lipo_sim = get_overlap_esp(centers_1=ref_lipo_pos,
+                                   centers_2=fit_lipo_pos,
+                                   charges_1=ref_lipo,
+                                   charges_2=fit_lipo,
+                                   alpha=alpha,
+                                   lam=lam).reshape(shape_sim.shape)
+    return (1 - lipo_weight) * shape_sim + lipo_weight * lipo_sim
+
+
+def objective_vol_lipo_overlay(se3_params: torch.Tensor,
+                               ref_centers: torch.Tensor,
+                               fit_centers: torch.Tensor,
+                               ref_lipo_pos: torch.Tensor,
+                               fit_lipo_pos: torch.Tensor,
+                               ref_lipo: torch.Tensor,
+                               fit_lipo: torch.Tensor,
+                               alpha: float = 0.81,
+                               lam: float = 0.1,
+                               lipo_weight: float = 0.5,
+                               ) -> torch.Tensor:
+    """
+    Objective for the ``vol_lipo`` overlay: a weighted combination of atom-centred Gaussian
+    *shape* (volume) Tanimoto and *lipophilicity* Tanimoto (Crippen atomic logP overlaid like an
+    ESP/partial-charge field, matched by value so hydrophobic overlaps hydrophobic).
+
+    The combined similarity is ``(1 - lipo_weight) * shape + lipo_weight * lipo``. Only the fit
+    inputs are transformed; both the fit shape centres AND the fit lipophilicity centres move
+    rigidly under the same SE(3) pose. Supports batched and non-batched inputs; for a batch the
+    loss is the average.
+
+    Parameters
+    ----------
+    se3_params : torch.Tensor (7,) or (B, 7)
+        SE(3) parameters (quaternion (r,i,j,k) followed by translation (x,y,z)).
+    ref_centers, fit_centers : torch.Tensor (N,3)/(M,3) or batched (B,N,3)/(B,M,3)
+        Shape-channel centres (RemoveHs coordinates, identical to the ``vol`` mode).
+    ref_lipo_pos, fit_lipo_pos : torch.Tensor (P,3)/(Q,3) or batched
+        TRUE-heavy centres that carry the per-atom Crippen logP (may be empty, P=0 or Q=0).
+    ref_lipo, fit_lipo : torch.Tensor (P,)/(Q,) or batched
+        Per-atom Crippen logP contributions, used as the ESP "charge".
+    alpha : float
+        Gaussian width for both the shape overlap and the lipophilicity positional overlap
+        (0.81 = volumetric, heavy atoms).
+    lam : float
+        Value ("charge") weighting for the lipophilicity ESP overlap (0.1 = atom-centred
+        convention, NOT the surface-tuned default).
+    lipo_weight : float
+        Weight of the lipophilicity channel in [0, 1]; shape gets ``1 - lipo_weight``.
+
+    Returns
+    -------
+    loss : torch.Tensor
+        ``1 - combined_similarity`` (mean over the batch if batched).
+    """
+    if len(fit_centers.shape) - 1 != len(se3_params.shape):
+        err_mssg = f'Instead these shapes were given: fit_centers {fit_centers.shape} and se3_params {se3_params.shape}'
+        if len(fit_centers.shape) == 2:  # expect single instance
+            raise ValueError(f'Since "fit_centers" is a single point cloud, there should only be one set of "se3_params". {err_mssg}')
+        elif len(fit_centers.shape) == 3:  # expect batch
+            raise ValueError(f'Since "fit_centers" is batched, there should be a row of "se3_params" for each batch. {err_mssg}')
+
+    se3_matrix = get_SE3_transform(se3_params)
+    fit_centers = apply_SE3_transform(fit_centers, se3_matrix)
+    if fit_lipo_pos.shape[-2] != 0:
+        fit_lipo_pos = apply_SE3_transform(fit_lipo_pos, se3_matrix)
+
+    combo = _vol_lipo_overlap(ref_centers, fit_centers,
+                              ref_lipo_pos, fit_lipo_pos,
+                              ref_lipo, fit_lipo,
+                              alpha, lam, lipo_weight)
+
+    # Single instance
+    if len(se3_params.shape) == 1:
+        return 1 - combo
+    # Batch
+    elif len(se3_params.shape) == 2:
+        return 1 - combo.mean()
+
+
+def optimize_vol_lipo_overlay(ref_centers: torch.Tensor,
+                              fit_centers: torch.Tensor,
+                              ref_lipo_pos: torch.Tensor,
+                              fit_lipo_pos: torch.Tensor,
+                              ref_lipo: torch.Tensor,
+                              fit_lipo: torch.Tensor,
+                              alpha: float = 0.81,
+                              lam: float = 0.1,
+                              lipo_weight: float = 0.5,
+                              num_repeats: int = 50,
+                              trans_centers: Union[torch.Tensor, None] = None,
+                              lr: float = 0.1,
+                              max_num_steps: int = 200,
+                              verbose: bool = False
+                              ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Optimize a combined shape (atom-centred Gaussian volume) + lipophilicity (Crippen logP)
+    overlay over SE(3), maximizing
+    ``(1 - lipo_weight) * shape_Tanimoto + lipo_weight * lipo_Tanimoto``.
+
+    Multi-start (identity + 4 principal-component + Fibonacci rotations, all COM-aligned) with
+    Adam; the best-scoring pose by the combined similarity is returned. The SE(3) seed comes from
+    the shape point clouds (``ref_centers``/``fit_centers``), matching the ``vol``/``vol_color``
+    optimizers. Both the fit shape centres and the fit lipophilicity centres are transformed by the
+    pose. Self-overlaps are recomputed every step (both channels self-normalise), so a self-copy
+    scores 1.000.
+
+    Parameters
+    ----------
+    ref_centers, fit_centers : torch.Tensor (N,3) / (M,3)
+        Shape-channel centres (RemoveHs coordinates, identical to the ``vol`` mode).
+    ref_lipo_pos, fit_lipo_pos : torch.Tensor (P,3) / (Q,3)
+        TRUE-heavy centres carrying the per-atom Crippen logP (may be empty, P=0 or Q=0).
+    ref_lipo, fit_lipo : torch.Tensor (P,) / (Q,)
+        Per-atom Crippen logP contributions, used as the ESP "charge".
+    alpha : float (default=0.81)
+        Gaussian width for the shape and lipophilicity overlaps.
+    lam : float (default=0.1)
+        Value weighting for the lipophilicity ESP overlap (atom-centred convention).
+    lipo_weight : float (default=0.5)
+        Weight of the lipophilicity channel in [0, 1].
+    num_repeats : int (default=50)
+        Number of SE(3) initializations.
+    trans_centers : torch.Tensor (T,3) or None
+        Optional translation seed centers (10 rotations per center); otherwise COM-aligned.
+    lr : float (default=0.1)
+        Adam learning rate.
+    max_num_steps : int (default=200)
+        Maximum optimization steps.
+    verbose : bool (default=False)
+        Print progress.
+
+    Returns
+    -------
+    aligned_fit_centers : torch.Tensor (M,3)
+        Transformed fit shape centres under the best SE(3).
+    SE3_transform : torch.Tensor (4,4)
+        Best SE(3) transformation.
+    score : torch.Tensor
+        Best combined (shape + lipophilicity) similarity.
+    """
+    # Seed SE(3) from the shape point clouds (consistent with the vol/vol_color optimizers).
+    if trans_centers is None:
+        se3_params = _initialize_se3_params(ref_points=ref_centers, fit_points=fit_centers, num_repeats=num_repeats)
+    else:
+        se3_params = _initialize_se3_params_with_translations(
+            ref_points=ref_centers,
+            fit_points=fit_centers,
+            trans_centers=trans_centers,
+            num_repeats_per_trans=10)
+    num_repeats = len(se3_params) if len(se3_params.shape) == 2 else 1
+
+    optimizer = optim.Adam([se3_params], lr=lr)
+
+    has_lipo = ref_lipo_pos.shape[-2] != 0 and fit_lipo_pos.shape[-2] != 0
+
+    # Repeat per-molecule tensors across the seed batch (squeeze(0) -> single instance).
+    ref_centers_rep = ref_centers.repeat((num_repeats, 1, 1)).squeeze(0)
+    fit_centers_rep = fit_centers.repeat((num_repeats, 1, 1)).squeeze(0)
+    if has_lipo:
+        ref_lipo_pos_rep = ref_lipo_pos.repeat((num_repeats, 1, 1)).squeeze(0)
+        fit_lipo_pos_rep = fit_lipo_pos.repeat((num_repeats, 1, 1)).squeeze(0)
+        ref_lipo_rep = ref_lipo.repeat((num_repeats, 1)).squeeze(0)
+        fit_lipo_rep = fit_lipo.repeat((num_repeats, 1)).squeeze(0)
+    else:
+        # Empty point sets: keep an (…,0,3)/(…,0) shape so the objective's guard triggers.
+        ref_lipo_pos_rep, fit_lipo_pos_rep = ref_lipo_pos, fit_lipo_pos
+        ref_lipo_rep, fit_lipo_rep = ref_lipo, fit_lipo
+
+    if verbose:
+        init_score = _vol_lipo_overlap(ref_centers, fit_centers, ref_lipo_pos, fit_lipo_pos,
+                                       ref_lipo, fit_lipo, alpha, lam, lipo_weight)
+        print(f'Initial vol_lipo similarity score: {float(init_score):.3f}')
+
+    last_loss = 1
+    counter = 0
+    for step in range(max_num_steps):
+        loss = objective_vol_lipo_overlay(
+            se3_params=se3_params,
+            ref_centers=ref_centers_rep,
+            fit_centers=fit_centers_rep,
+            ref_lipo_pos=ref_lipo_pos_rep,
+            fit_lipo_pos=fit_lipo_pos_rep,
+            ref_lipo=ref_lipo_rep,
+            fit_lipo=fit_lipo_rep,
+            alpha=alpha,
+            lam=lam,
+            lipo_weight=lipo_weight,
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if verbose and step % 100 == 0:
+            print(f"Step {step}, Score: {1 - loss.item()}")
+
+        # early stopping
+        if abs(loss - last_loss) > 1e-5:
+            counter = 0
+        else:
+            counter += 1
+        last_loss = loss
+        if counter > 10:
+            break
+
+    optimized_se3_params = se3_params.detach()
+    SE3_transform = get_SE3_transform(optimized_se3_params)
+    aligned_fit_centers = apply_SE3_transform(fit_centers_rep, SE3_transform)
+    if has_lipo:
+        aligned_fit_lipo_pos = apply_SE3_transform(fit_lipo_pos_rep, SE3_transform)
+    else:
+        aligned_fit_lipo_pos = fit_lipo_pos_rep
+
+    scores = _vol_lipo_overlap(ref_centers_rep, aligned_fit_centers,
+                               ref_lipo_pos_rep, aligned_fit_lipo_pos,
+                               ref_lipo_rep, fit_lipo_rep,
+                               alpha, lam, lipo_weight)
+
+    if num_repeats == 1:
+        if verbose:
+            print(f'Optimized vol_lipo similarity score: {float(scores):.3f}')
+        best_alignment = aligned_fit_centers.cpu()
+        best_transform = SE3_transform.cpu()
+        best_score = scores.detach().cpu()
+    else:
+        if verbose:
+            print(f'Optimized vol_lipo similarity -- max: {scores.max():.3f} | mean: {scores.mean():.3f} | min: {scores.min():.3f}')
+        best_idx = torch.argmax(scores.detach().cpu())
+        best_alignment = aligned_fit_centers.cpu()[best_idx]
+        best_transform = SE3_transform.cpu()[best_idx]
+        best_score = scores.detach().cpu()[best_idx]
+    return best_alignment, best_transform, best_score
+
+
 def objective_vol_tversky_overlay(se3_params: torch.Tensor,
                                   ref_points: torch.Tensor,
                                   fit_points: torch.Tensor,
