@@ -72,12 +72,22 @@ following the established `partial_charges` "trio":
 - a **heavy-atom slicer** `get_<feature>(no_H=True)` returning `self.<feature>[self._nonH_atoms_idx]`
   (mirror `get_charges`).
 
-**The invariant that matters:** the per-atom array must be in the same atom order as `atom_pos`,
-and the heavy-atom slice must reuse the **same `_nonH_atoms_idx`** that positions and charges use.
-If it does not, the scalar desyncs from the geometry and the overlap is silently wrong — and a
-self-overlap (`ref == fit`) still reads 1.000 under a *consistently* wrong mapping, so it will not
-catch the bug; only a planted-pose test (step 8) will. Read `get_partial_charges` / `get_charges`
-and copy their structure exactly.
+**The invariant that matters:** the per-atom array is a full `(N_full,)` array in RDKit-mol (with-H)
+order — the same order as `partial_charges` — and its heavy slice reuses the **same
+`_nonH_atoms_idx`** the charges use. If it does not, the scalar desyncs from the geometry and the
+overlap is silently wrong — and a self-overlap (`ref == fit`) still reads 1.000 under a
+*consistently* wrong mapping, so it will not catch the bug; only a planted-pose test (step 8) will.
+Read `get_partial_charges` / `get_charges` and copy their structure exactly.
+
+**Trap: `self.atom_pos` is NOT the heavy set `_nonH_atoms_idx` selects.** To pair positions with the
+heavy scalar (a Coulomb sum, a distance matrix, an overlap), use
+`mol.GetConformer().GetPositions()[self._nonH_atoms_idx]` — **never** `self.atom_pos`. `atom_pos` is
+the RemoveHs coordinate set, and `Chem.RemoveHs` retains isotope-labelled H (deuterium), so on such
+a molecule `atom_pos` is *longer* than `partial_charges[self._nonH_atoms_idx]` and any elementwise
+pairing broadcasts `(…, N)` against `(…, N-1)` and crashes. This is the retained-H case `vol_esp`
+handles with its separate heavy centres; replicate it, and add the retained-H gate (gate 5 in
+`template_test.py`, SMILES `[2H]OC(=O)c1ccccc1`) — a plain heavy-atom molecule exercises none of it.
+See `pitfalls.md` "retained-H basis".
 
 Compute the attribute at construction (it only needs the RDKit mol), but call the
 `get_<feature>(no_H)` **slicer only at align time**: `_nonH_atoms_idx` is defined *later* in
@@ -159,7 +169,10 @@ existing channels and added no new `score/` function, there is nothing to export
 Copy `template_test.py` to `tests/test_<mode>.py`, replace the `YOURMODE` token, and make it
 pass. The required checks: self-overlap = 1.000, autograd gradient (evaluated at a **non-identity**
 pose — see `pitfalls.md`) agrees with a finite-difference gradient, the optimizer recovers a planted
-rotation on a self-pair, and results are deterministic given a fixed seed. Run
+rotation on a self-pair, and results are deterministic given a fixed seed. **If your mode reads
+per-atom charges/fields (step 2), also keep gate 5 — the retained-H molecule** (`[2H]OC(=O)c1ccccc1`):
+it is the only gate that catches the `atom_pos`-vs-heavy-charge desync, because every plain
+heavy-atom molecule has `atom_pos` equal to the heavy set and sails through the other four. Run
 `tests/test_mode_registry.py` too — it must still pass **unchanged**, which confirms you kept the
 mode out of the canonical registry (step 6). Some suite tests need open3d or a GPU and may error for
 reasons unrelated to your change; run your own test and `test_mode_registry.py` specifically rather

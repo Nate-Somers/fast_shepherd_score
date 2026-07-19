@@ -55,6 +55,32 @@ def test_field_points_are_reasonable():
     assert nn.min() >= 1.5 - 1e-4 and nn.max() <= 4.5 + 1e-4
 
 
+# --- Gate 0b: retained-H molecules (atom_pos longer than the true-heavy charges) --------------
+def test_field_points_retained_h():
+    """A molecule whose Chem.RemoveHs RETAINS an H (isotope-labelled, e.g. deuterium) has
+    ``atom_pos`` one longer than ``partial_charges[_nonH_atoms_idx]`` (the true-heavy set,
+    atomic-number != 1). The field-point contribs must index the with-H conformer by the SAME
+    _nonH_atoms_idx as the charges -- pairing atom_pos with the heavy charges desyncs (N vs N-1)
+    and crashes with a broadcast error. Same retained-H trap vol_esp handles for its centers."""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    m = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))     # deuterium survives RemoveHs
+    params = AllChem.ETKDGv3(); params.randomSeed = 0
+    assert AllChem.EmbedMolecule(m, params) == 0
+    mol = Molecule(m)
+    assert mol.atom_pos.shape[0] != len(mol._nonH_atoms_idx), \
+        "test premise broken: this molecule no longer retains an H after RemoveHs"
+    pos, sign = mol.get_field_points()                          # must not raise
+    assert pos.dtype == np.float32 and pos.ndim == 2 and pos.shape[1] == 3
+    assert sign.shape == (pos.shape[0],)
+    assert set(np.unique(sign).tolist()).issubset({-1.0, 1.0}) if pos.shape[0] else True
+    # field points are measured from the TRUE-heavy atoms (the ones that carry charge)
+    heavy = mol.mol.GetConformer().GetPositions()[mol._nonH_atoms_idx]
+    if pos.shape[0]:
+        nn = np.sqrt(((pos[:, None, :] - heavy[None, :, :]) ** 2).sum(-1)).min(1)
+        assert nn.min() >= 1.5 - 1e-4 and nn.max() <= 4.5 + 1e-4
+
+
 # --- Gate 1: self-overlap is exactly 1.000 ----------------------------------------------------
 def test_self_overlap_is_one():
     pair = _make_pair()

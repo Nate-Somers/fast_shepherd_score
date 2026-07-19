@@ -30,12 +30,16 @@ copy their structure exactly:
 - **slicer** — `get_<feature>(no_H=True)` returns `self.<feature>[self._nonH_atoms_idx]`. Mirrors
   `get_charges`; the per-pair method reads the mode's inputs through this.
 
-**Invariant:** the per-atom array must be in the same atom order as `atom_pos`, and the heavy-atom
-slice must reuse the **same `_nonH_atoms_idx`** positions and charges use. A misaligned field
-silently mis-scores, and a self-overlap still reads 1.000 under a consistently-wrong mapping — only
-a planted-pose test exposes it (see `pitfalls.md`). Compute the attribute at construction, but call
-the `get_<feature>(no_H)` slicer only at align time — `_nonH_atoms_idx` is set later in
-`Molecule.__init__`, so slicing in the constructor raises `AttributeError`. If a mode reuses
+**Invariant:** the per-atom array is a full `(N_full,)` array in RDKit-mol (with-H) order — the same
+order as `partial_charges` — and its heavy slice reuses the **same `_nonH_atoms_idx`** the charges
+use. A misaligned field silently mis-scores, and a self-overlap still reads 1.000 under a
+consistently-wrong mapping — only a planted-pose test exposes it (see `pitfalls.md`). Compute the
+attribute at construction, but call the `get_<feature>(no_H)` slicer only at align time —
+`_nonH_atoms_idx` is set later in `Molecule.__init__`, so slicing in the constructor raises
+`AttributeError`. **Do not pair the heavy slice with `self.atom_pos`.** `atom_pos` is the RemoveHs
+coordinate set, which retains isotope-labelled H (deuterium) and so desyncs from the true-heavy
+`X[_nonH_atoms_idx]` set — positions that must match heavy charges/fields come from
+`mol.GetConformer().GetPositions()[self._nonH_atoms_idx]` (see `pitfalls.md` "retained-H basis"). If a mode reuses
 `get_overlap_esp` for the field channel, pass the `(N,)` scalar straight in (it reshapes internally)
 and set `lam=0.1` for an atom-centred field — the function's `0.3*LAM_SCALING` signature default is
 surface-tuned. If the accel skill later builds a batched path, this new per-atom scalar must also be

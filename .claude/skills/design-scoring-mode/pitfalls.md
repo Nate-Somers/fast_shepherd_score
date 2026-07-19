@@ -64,11 +64,33 @@ Two gotchas make a naive autograd-vs-finite-difference test either crash or pass
 
 Both are test-harness gotchas, not mode bugs — do not "fix" them by changing the objective.
 
-## Per-atom data must stay aligned with atom positions
-When a mode carries a per-atom scalar (charge, lipophilicity, any new field), that array must line
-up index-for-index with `atom_pos`, and heavy-atom slicing must reuse the **same `_nonH_atoms_idx`**
-positions use (see `seams.md`). A per-atom array built in a different atom order, or sliced
-differently, silently pairs each scalar with the wrong coordinate — the overlap is then wrong even
-though nothing errors. The dangerous part: with `ref == fit` a *consistently* wrong mapping still
-gives self-overlap 1.000, so the self-check passes. Only a **planted-pose** test (rotate the fit,
-confirm recovery to ≈1.000) catches a misalignment; include one.
+## Per-atom data must stay aligned with atom positions — and mind the retained-H basis
+Two distinct traps live here.
+
+**(a) Atom order.** A per-atom scalar (charge, lipophilicity, any new field) is a full array in
+RDKit-mol (with-H) order, exactly like `partial_charges`. Build it in that order and slice heavy
+atoms with the **same `_nonH_atoms_idx`** the charges use. An array built in a different order
+silently pairs each scalar with the wrong atom — the overlap is wrong though nothing errors. With
+`ref == fit` a *consistently* wrong mapping still gives self-overlap 1.000, so the self-check
+passes; only a **planted-pose** test (rotate the fit, confirm recovery to ≈1.000) catches it.
+Include one.
+
+**(b) `self.atom_pos` is NOT the heavy set `_nonH_atoms_idx` selects.** A `Molecule` has *three*
+atom bases and they are not interchangeable:
+- **with-H** — `self.mol`, `partial_charges`, `mol.GetConformer().GetPositions()`: length `N_full`.
+- **true-heavy** — `X[self._nonH_atoms_idx]` (atomic number != 1): the atoms that carry
+  `partial_charges[self._nonH_atoms_idx]`.
+- **RemoveHs** — `self.atom_pos`, the shape channel's coordinates. Usually equals the true-heavy
+  set, **but `Chem.RemoveHs` retains isotope-labelled H (deuterium)**, so `atom_pos` can be *one
+  (or more) longer* than the true-heavy set.
+
+To pair positions with the heavy charges, use `mol.GetConformer().GetPositions()[self._nonH_atoms_idx]`
+(true-heavy) — **never** `self.atom_pos`. Reaching for `atom_pos` because "it is already the heavy
+coordinates" is the trap: on a deuterated molecule `atom_pos` has `N` rows while
+`partial_charges[self._nonH_atoms_idx]` has `N-1`, and any elementwise pairing (a Coulomb sum, an
+overlap, a distance matrix) broadcasts `(…, N)` against `(…, N-1)` and crashes — or silently
+mis-pairs if the counts happen to divide. This is exactly the retained-H case `vol_esp` handles by
+keeping a separate heavy-centre array (`atom_pos_noH`); a new charge-like or field channel must do
+the same. **Always add a retained-H test** with a SMILES whose deuterium survives RemoveHs, e.g.
+`[2H]OC(=O)c1ccccc1`, and assert `atom_pos.shape[0] != len(_nonH_atoms_idx)` so the test premise
+can't silently rot — a plain heavy-atom molecule exercises none of this.

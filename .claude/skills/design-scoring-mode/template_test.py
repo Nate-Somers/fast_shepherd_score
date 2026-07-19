@@ -1,8 +1,9 @@
 """Reference-mode test template.
 
 Copy this to ``tests/test_<mode>.py`` and replace the token ``YOURMODE`` (find/replace)
-with your canonical mode id, then fill in the ``# TODO`` markers. The four checks below are
-the correctness gate for a reference mode; all must pass before handing off to
+with your canonical mode id, then fill in the ``# TODO`` markers. Gates 1-4 below are the
+correctness gate for every reference mode; gate 5 (retained-H) is required only if the mode reads
+per-atom charges/fields (delete it otherwise). All applicable gates must pass before handing off to
 ``accelerate-scoring-mode``.
 
 This file is a template: it is valid Python (so it byte-compiles) but is not meant to run until
@@ -98,3 +99,27 @@ def test_deterministic_given_seed():
         float(getattr(pair_b, f"sim_aligned_{MODE}")),
         atol=0.0,
     )
+
+
+# --- Gate 5: retained-H molecule -- ONLY if your mode reads per-atom charges/fields -----------
+def test_retained_h_molecule():
+    """A molecule whose Chem.RemoveHs RETAINS an H (isotope-labelled, e.g. deuterium) has
+    ``atom_pos`` longer than the true-heavy set ``_nonH_atoms_idx`` selects (atomic number != 1),
+    which is what ``partial_charges[_nonH_atoms_idx]`` and any per-atom field are sliced to. If your
+    mode pairs positions with heavy charges/fields, pairing them with ``atom_pos`` (the RemoveHs
+    set) desyncs (N vs N-1) and crashes with a broadcast error. See pitfalls.md "retained-H basis":
+    positions that match heavy charges come from ``mol.GetConformer().GetPositions()[_nonH_atoms_idx]``,
+    never ``atom_pos``. Delete this gate if your mode reads no per-atom charge/field data.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from shepherd_score.container import Molecule
+    m = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))     # deuterium survives RemoveHs
+    params = AllChem.ETKDGv3(); params.randomSeed = 0
+    assert AllChem.EmbedMolecule(m, params) == 0
+    mol = Molecule(m)                                            # TODO: pass whatever your mode reads
+    assert mol.atom_pos.shape[0] != len(mol._nonH_atoms_idx), \
+        "test premise broken: this molecule no longer retains an H after RemoveHs"
+    # TODO: exercise your mode's per-atom-data path on `mol` and assert it does not raise
+    # (e.g. mol.get_<feature>(), or align a MoleculePair(mol, mol) with your mode).
+    pytest.skip("fill in the per-atom-data call for YOURMODE, or delete this gate if N/A")

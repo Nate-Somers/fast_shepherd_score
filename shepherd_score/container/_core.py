@@ -443,7 +443,13 @@ class Molecule:
         empty_pos = np.zeros((0, 3), dtype=np.float32)
         empty_sign = np.zeros((0,), dtype=np.float32)
 
-        pos = np.asarray(self.atom_pos, dtype=np.float64)  # heavy-atom coordinates (N,3)
+        # True-heavy positions that MATCH the heavy charges. NOT self.atom_pos: atom_pos is the
+        # RemoveHs set, which RETAINS isotope-labelled H (e.g. deuterium), whereas _nonH_atoms_idx
+        # selects atomic-number != 1 and so drops it -- they desync (N vs N-1) whenever an H is
+        # retained, which broadcasts (G,N) against (1,N-1) below and crashes. Index the with-H
+        # conformer by the SAME _nonH_atoms_idx the charges use so pos and charges stay 1:1. This is
+        # the retained-H trap vol_esp already avoids via its separate heavy centers.
+        pos = self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx].astype(np.float64)  # (N,3)
         charges = self.partial_charges[self._nonH_atoms_idx].astype(np.float64)  # (N,)
         if pos.shape[0] == 0 or not np.any(charges != 0.0):
             return empty_pos, empty_sign
