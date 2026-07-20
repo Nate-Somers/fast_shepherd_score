@@ -39,6 +39,7 @@ def mols():
 MODES = [
     ("vol_tversky", "sim_aligned_vol_tversky"),
     ("vol_lipo", "sim_aligned_vol_lipo"),
+    ("vol_esp_tversky", "sim_aligned_vol_esp_tversky"),
 ]
 
 

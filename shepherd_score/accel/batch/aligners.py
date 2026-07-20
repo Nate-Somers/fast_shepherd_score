@@ -1386,6 +1386,133 @@ def _align_batch_vol_lipo(
         p.sim_aligned_vol_lipo = s
 
 
+def _align_batch_vol_esp_tversky(pairs: list["MoleculePair"], *, lam: float = 0.1,
+                                 alpha: float = 0.81, tversky_alpha: float = 0.95,
+                                 tversky_beta: float = 0.05, steps_fine: int = 100):
+    """Batched asymmetric ``vol_esp_tversky`` alignment.
+
+    Same electrostatic-weighted heavy-atom Gaussian overlap as ``_align_batch_vol_esp`` (reuses
+    the fused shape+ESP value+grad kernel and the ESP self-overlap kernel), but scored with the
+    asymmetric Tversky reduction ``AB / (AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))``
+    instead of Tanimoto -- i.e. exactly what ``_align_batch_vol_tversky`` is to ``_align_batch_vol``.
+    ``AA``/``BB`` are the pose-invariant ESP self-overlaps, precomputed once per pair; only ``AB``
+    flows through the fine loop. ``lam`` is RAW (no ``LAM_SCALING``), matching per-pair
+    ``align_with_vol_esp``/``align_with_vol_esp_tversky``. The Tversky score is NOT bounded to
+    [0, 1] and is never clamped.
+
+    Side effects: writes ``p.transform_vol_esp_tversky`` / ``p.sim_aligned_vol_esp_tversky``.
+    """
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_esp_tversky, pairs,
+                                lam=lam, alpha=alpha, tversky_alpha=tversky_alpha,
+                                tversky_beta=tversky_beta, steps_fine=steps_fine)
+
+    from shepherd_score.accel.drivers.vol_esp_tversky import (
+        coarse_fine_esp_tversky_align_many, _self_overlap_esp_chunks)
+    from shepherd_score.accel.drivers._common import batched_seeds_torch
+
+    device = pairs[0].device
+    for p in pairs:
+        if p.ref_molec.partial_charges is None or p.fit_molec.partial_charges is None:
+            raise ValueError("Partial charges are None; cannot run _align_batch_vol_esp_tversky.")
+
+    # Strict-heavy Gaussian centres (with-H conformer indexed by _nonH_atoms_idx) stay 1:1 with the
+    # heavy charges -- NOT atom_pos, which is the Chem.RemoveHs set and RETAINS some H (isotope), so
+    # its count can exceed len(_nonH_atoms_idx). Same sourcing as _align_batch_vol_esp. On the fast
+    # screen path these _*_t tensors are pre-set, so _batch_upload skips its .mol lambdas (it only
+    # fills cold None attrs), and the _nonH_atoms_idx numpy indexing stays on host inside src_fn.
+    _batch_upload(pairs, "_ref_xyz_noH_t",
+                  lambda p: p.ref_molec.mol.GetConformer().GetPositions()[p.ref_molec._nonH_atoms_idx],
+                  torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_noH_t",
+                  lambda p: p.fit_molec.mol.GetConformer().GetPositions()[p.fit_molec._nonH_atoms_idx],
+                  torch.float32, device)
+    _batch_upload(pairs, "_ref_xyz_esp_t",
+                  lambda p: p.ref_molec.partial_charges[p.ref_molec._nonH_atoms_idx],
+                  torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_esp_t",
+                  lambda p: p.fit_molec.partial_charges[p.fit_molec._nonH_atoms_idx],
+                  torch.float32, device)
+
+    all_pairs: list[MoleculePair] = []
+    all_scores: list[torch.Tensor] = []
+    all_q: list[torch.Tensor] = []
+    all_t: list[torch.Tensor] = []
+
+    _seeds = _seeds_for("vol_esp_tversky")
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_noH_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_noH_t.shape[0]},
+                    seeds=_seeds)
+    for _bk in plan_buckets(pairs, _spec, device):
+        N_pad, M_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = _bk.K
+
+        ib_key = (_dev_idx(device), K)
+        int_buf = _INT_BUFFER_CACHE.get(ib_key)
+        if int_buf is None:
+            int_buf = {
+                'N': torch.empty(K, dtype=torch.int32, device=device),
+                'M': torch.empty(K, dtype=torch.int32, device=device),
+            }
+            _INT_BUFFER_CACHE[ib_key] = int_buf
+        N_real = int_buf['N']
+        M_real = int_buf['M']
+
+        ref_ts = [p._ref_xyz_noH_t for p in bucket]
+        fit_ts = [p._fit_xyz_noH_t for p in bucket]
+        ref_c_ts = [p._ref_xyz_esp_t for p in bucket]
+        fit_c_ts = [p._fit_xyz_esp_t for p in bucket]
+        n_list = [t.shape[0] for t in ref_ts]
+        m_list = [t.shape[0] for t in fit_ts]
+        N_real.copy_(torch.tensor(n_list, dtype=torch.int32))
+        M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
+
+        # Coord + charge pads (mirrors _esp_bucketed_align's ref/fit + ref_c/fit_c pads). Zeroed
+        # padding is masked by the real counts inside the kernel.
+        ref_pad = torch.zeros(K, N_pad, 3, device=device, dtype=torch.float32)
+        fit_pad = torch.zeros(K, M_pad, 3, device=device, dtype=torch.float32)
+        ref_c_pad = torch.zeros(K, N_pad, device=device, dtype=torch.float32)
+        fit_c_pad = torch.zeros(K, M_pad, device=device, dtype=torch.float32)
+        _scatter_fill(ref_pad, ref_ts, n_list)
+        _scatter_fill(fit_pad, fit_ts, m_list)
+        _scatter_fill(ref_c_pad, ref_c_ts, n_list)
+        _scatter_fill(fit_c_pad, fit_c_ts, m_list)
+
+        # ESP self-overlaps (reused ESP kernel). AA/BB are pose-invariant Tversky inputs.
+        VAA = _self_overlap_esp_chunks(ref_pad, ref_c_pad, N_real, alpha, lam)
+        VBB = _self_overlap_esp_chunks(fit_pad, fit_c_pad, M_real, alpha, lam)
+
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            return coarse_fine_esp_tversky_align_many(
+                ref_pad[sl], fit_pad[sl], ref_c_pad[sl], fit_c_pad[sl], VAA[sl], VBB[sl],
+                N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, lam=lam,
+                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                steps_fine=steps_fine, seeds=(seeds_q[sl], seeds_t[sl]))
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_esp_tversky", N_pad, M_pad, _seeds), device=device)
+
+        all_pairs.extend(bucket)
+        all_scores.append(scores)
+        all_q.append(q_batch)
+        all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    scores_list = scores_cpu.tolist()                       # one C call
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_esp_tversky = S
+        p.sim_aligned_vol_esp_tversky = s
+
+
 # --- legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp) ----------
 # Same function objects, so ``__name__`` stays canonical -- the multi-GPU dispatch
 # (``align_fn.__name__.replace("_align_batch_", "")``) and _MODE_SPEC lookup are

@@ -2016,3 +2016,259 @@ def optimize_vol_tversky_overlay(ref_points: torch.Tensor,
         best_transform = SE3_transform.cpu()[best_idx]
         best_score = scores.detach().cpu()[best_idx]
     return best_alignment, best_transform, best_score
+
+
+def objective_vol_esp_tversky_overlay(se3_params: torch.Tensor,
+                                      ref_points: torch.Tensor,
+                                      fit_points: torch.Tensor,
+                                      ref_charges: torch.Tensor,
+                                      fit_charges: torch.Tensor,
+                                      alpha: float = 0.81,
+                                      lam: float = 0.1,
+                                      tversky_alpha: float = 0.95,
+                                      tversky_beta: float = 0.05,
+                                      precomputed_AA: Optional[torch.Tensor] = None,
+                                      precomputed_BB: Optional[torch.Tensor] = None,
+                                      ) -> torch.Tensor:
+    """
+    Objective for the asymmetric "fits-inside" ``vol_esp_tversky`` overlay.
+
+    Identical electrostatic-weighted atom-centred Gaussian overlap channel as
+    ``objective_ROCS_esp_overlay`` (the ``vol_esp`` reference -- only the fit is transformed and
+    the overlap ``VAB_2nd_order_esp`` weights each Gaussian pair-term by ``exp(-|q_i-q_j|^2/lam)``),
+    but the similarity *reduction* is Tversky rather than Tanimoto::
+
+        T = AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))
+
+    where ``AB`` is the cross ESP overlap of the reference with the SE(3)-transformed fit, ``AA``
+    is the reference ESP self-overlap, and ``BB`` is the fit ESP self-overlap (all raw
+    ``VAB_2nd_order_esp`` integrals). This is EXACTLY what ``objective_vol_tversky_overlay`` is to
+    ``objective_ROCS_overlay``, with the shape overlap ``VAB_2nd_order`` swapped for the ESP
+    overlap ``VAB_2nd_order_esp``. With the defaults (``tversky_alpha=0.95``,
+    ``tversky_beta=0.05``) missing reference volume is penalized heavily while extra fit volume is
+    barely penalized, so the score rewards the *reference* being contained in the fit. Supports
+    batched and non-batched inputs; for a batch the loss is the average.
+
+    ``AA`` and ``BB`` are both invariant to the SE(3) pose (a rigid transform preserves a
+    self-overlap and the charges are unchanged), so they may be precomputed and passed in for
+    speed; the gradient flows only through ``AB`` (via the transformed fit). Tversky(A, A) =
+    AA / (AA + 0 + 0) = 1 for any ``tversky_alpha``/``tversky_beta``, so the self-overlap gate
+    holds regardless of the weights.
+
+    Parameters
+    ----------
+    se3_params : torch.Tensor (7,) or (B, 7)
+        SE(3) parameters (quaternion (r,i,j,k) followed by translation (x,y,z)).
+    ref_points : torch.Tensor (N,3) or (B,N,3)
+        Reference (query) heavy-atom coordinates. Fixed.
+    fit_points : torch.Tensor (M,3) or (B,M,3)
+        Fit heavy-atom coordinates. Transformed by the SE(3) pose.
+    ref_charges : torch.Tensor (N,) or (B,N)
+        Partial charge at each reference atom.
+    fit_charges : torch.Tensor (M,) or (B,M)
+        Partial charge at each fit atom.
+    alpha : float (default=0.81)
+        Gaussian width for the overlap (0.81 = volumetric, heavy atoms).
+    lam : float (default=0.1)
+        RAW charge-scaling term for the ESP exponential kernel (atom-centred convention; NOT
+        surface-tuned -- do NOT pass ``LAM_SCALING``-scaled values here).
+    tversky_alpha : float (default=0.95)
+        Weight on missing reference volume ``AA - AB``. Named to avoid colliding with the
+        Gaussian width ``alpha``.
+    tversky_beta : float (default=0.05)
+        Weight on extra fit volume ``BB - AB``.
+    precomputed_AA, precomputed_BB : torch.Tensor, optional
+        Pose-invariant reference / fit ESP self-overlaps. Computed inside when ``None``.
+
+    Returns
+    -------
+    loss : torch.Tensor
+        ``1 - Tversky`` (mean over the batch if batched).
+    """
+    if len(fit_points.shape) - 1 != len(se3_params.shape):
+        err_mssg = f'Instead these shapes were given: fit_points {fit_points.shape} and se3_params {se3_params.shape}'
+        if len(fit_points.shape) == 2:  # expect single instance
+            raise ValueError(f'Since "fit_points" is a single point cloud, there should only be one set of "se3_params" for each batch. {err_mssg}')
+        elif len(fit_points.shape) == 3:  # expect batch
+            raise ValueError(f'Since "fit_points" is batched, there should be a row of "se3_params" for each batch. {err_mssg}')
+
+    # Validate correspondence of points and charges dimensions (mirrors objective_ROCS_esp_overlay).
+    if len(fit_points.shape) - 1 != len(fit_charges.shape) and not (fit_points.shape[:-1] == fit_charges.shape):
+        raise ValueError(f'fit_charges should correspond to fit_points point-wise. Instead these shapes were given: fit_points {fit_points.shape} and fit_charges {fit_charges.shape}')
+    if len(ref_points.shape) - 1 != len(ref_charges.shape) and not (ref_points.shape[:-1] == ref_charges.shape):
+        raise ValueError(f'ref_charges should correspond to ref_points point-wise. Instead these shapes were given: ref_points {ref_points.shape} and ref_charges {ref_charges.shape}')
+
+    se3_matrix = get_SE3_transform(se3_params)
+    fit_points = apply_SE3_transform(fit_points, se3_matrix)
+
+    # Same 1-D charge reshaping objective_ROCS_esp_overlay applies before calling VAB_2nd_order_esp.
+    _rc = ref_charges.reshape((-1, 1)) if ref_charges.dim() == 1 else ref_charges.unsqueeze(2)
+    _fc = fit_charges.reshape((-1, 1)) if fit_charges.dim() == 1 else fit_charges.unsqueeze(2)
+
+    AB = VAB_2nd_order_esp(ref_points, fit_points, _rc, _fc, alpha, lam)
+    AA = precomputed_AA if precomputed_AA is not None else VAB_2nd_order_esp(ref_points, ref_points, _rc, _rc, alpha, lam)
+    BB = precomputed_BB if precomputed_BB is not None else VAB_2nd_order_esp(fit_points, fit_points, _fc, _fc, alpha, lam)
+    score = AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))
+
+    # Single instance
+    if len(se3_params.shape) == 1:
+        return 1 - score  # maximize overlap
+    # Batch
+    elif len(se3_params.shape) == 2:
+        return 1 - score.mean()
+    else:
+        raise ValueError(f"Unexpected shape {se3_params.shape}")
+
+
+def optimize_vol_esp_tversky_overlay(ref_points: torch.Tensor,
+                                     fit_points: torch.Tensor,
+                                     ref_charges: torch.Tensor,
+                                     fit_charges: torch.Tensor,
+                                     alpha: float = 0.81,
+                                     lam: float = 0.1,
+                                     tversky_alpha: float = 0.95,
+                                     tversky_beta: float = 0.05,
+                                     num_repeats: int = 50,
+                                     trans_centers: Union[torch.Tensor, None] = None,
+                                     lr: float = 0.1,
+                                     max_num_steps: int = 200,
+                                     verbose: bool = False
+                                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Optimize the asymmetric "fits-inside" ``vol_esp_tversky`` overlay over SE(3), maximizing the
+    Tversky ESP similarity ``AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))``.
+
+    Same electrostatic-weighted Gaussian overlap machinery and multi-start scheme (identity + 4
+    principal-component + Fibonacci rotations, all COM-aligned) with Adam as the ``vol_esp``/ESP
+    optimizer, but scored with an asymmetric Tversky reduction instead of Tanimoto -- i.e. exactly
+    what ``optimize_vol_tversky_overlay`` is to ``optimize_ROCS_overlay``, with the shape overlap
+    swapped for the ESP overlap. With the defaults the objective rewards the *reference* being
+    contained in the fit. The pose-invariant ESP self-overlaps ``AA``/``BB`` are precomputed once
+    before the loop.
+
+    Parameters
+    ----------
+    ref_points : torch.Tensor (N,3)
+        Reference (query) heavy-atom coordinates. Fixed.
+    fit_points : torch.Tensor (M,3)
+        Fit heavy-atom coordinates to transform.
+    ref_charges : torch.Tensor (N,)
+        Partial charge at each reference atom.
+    fit_charges : torch.Tensor (M,)
+        Partial charge at each fit atom.
+    alpha : float (default=0.81)
+        Gaussian width for the overlap (0.81 = volumetric, heavy atoms).
+    lam : float (default=0.1)
+        RAW charge-scaling term for the ESP exponential kernel (atom-centred convention).
+    tversky_alpha : float (default=0.95)
+        Weight on missing reference volume ``AA - AB`` (named to avoid the Gaussian width ``alpha``).
+    tversky_beta : float (default=0.05)
+        Weight on extra fit volume ``BB - AB``.
+    num_repeats : int (default=50)
+        Number of SE(3) initializations.
+    trans_centers : torch.Tensor (T,3) or None
+        Optional translation seed centers (10 rotations per center); otherwise COM-aligned.
+    lr : float (default=0.1)
+        Adam learning rate.
+    max_num_steps : int (default=200)
+        Maximum optimization steps.
+    verbose : bool (default=False)
+        Print progress.
+
+    Returns
+    -------
+    aligned_fit_points : torch.Tensor (M,3)
+        Transformed fit atom coordinates under the best SE(3).
+    SE3_transform : torch.Tensor (4,4)
+        Best SE(3) transformation.
+    score : torch.Tensor
+        Best Tversky ESP similarity.
+    """
+    # Seed SE(3) from the shape point clouds (consistent with the vol_esp / vol_tversky optimizers).
+    if trans_centers is None:
+        se3_params = _initialize_se3_params(ref_points=ref_points, fit_points=fit_points, num_repeats=num_repeats)
+    else:
+        se3_params = _initialize_se3_params_with_translations(
+            ref_points=ref_points,
+            fit_points=fit_points,
+            trans_centers=trans_centers,
+            num_repeats_per_trans=10)
+    num_repeats = len(se3_params) if len(se3_params.shape) == 2 else 1
+
+    optimizer = optim.Adam([se3_params], lr=lr)
+
+    if num_repeats == 1:
+        fit_points_to_transform = fit_points
+        fit_charges_for_objective = fit_charges
+    else:
+        fit_points_to_transform = fit_points.repeat((num_repeats, 1, 1))
+        # fit_charges is a single molecule's (M,) charge vector -> repeat to (num_repeats, M).
+        fit_charges_for_objective = fit_charges.repeat((num_repeats, 1))
+
+    # Pre-compute SE(3)-invariant ESP self-overlaps once before the loop (charge reshaping matches
+    # objective_ROCS_esp_overlay / VAB_2nd_order_esp).
+    with torch.no_grad():
+        _rc = ref_charges.reshape((-1, 1)) if ref_charges.dim() == 1 else ref_charges.unsqueeze(2)
+        _fc0 = fit_charges.reshape((-1, 1)) if fit_charges.dim() == 1 else fit_charges.unsqueeze(2)
+        _AA = VAB_2nd_order_esp(ref_points, ref_points, _rc, _rc, alpha, lam)
+        _BB = VAB_2nd_order_esp(fit_points, fit_points, _fc0, _fc0, alpha, lam)
+
+    if verbose:
+        with torch.no_grad():
+            _init_AB = VAB_2nd_order_esp(ref_points, fit_points, _rc, _fc0, alpha, lam)
+            _init = _init_AB / (_init_AB + tversky_alpha * (_AA - _init_AB) + tversky_beta * (_BB - _init_AB))
+        print(f'Initial vol_esp_tversky similarity score: {float(_init):.3f}')
+
+    last_loss = 1
+    counter = 0
+    for step in range(max_num_steps):
+        loss = objective_vol_esp_tversky_overlay(se3_params=se3_params,
+                                                 ref_points=ref_points,
+                                                 fit_points=fit_points_to_transform,
+                                                 ref_charges=ref_charges,
+                                                 fit_charges=fit_charges_for_objective,
+                                                 alpha=alpha,
+                                                 lam=lam,
+                                                 tversky_alpha=tversky_alpha,
+                                                 tversky_beta=tversky_beta,
+                                                 precomputed_AA=_AA,
+                                                 precomputed_BB=_BB)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if verbose and step % 100 == 0:
+            print(f"Step {step}, Score: {1 - loss.item()}")
+
+        # early stopping
+        if abs(loss - last_loss) > 1e-5:
+            counter = 0
+        else:
+            counter += 1
+        last_loss = loss
+        if counter > 10:
+            break
+
+    optimized_se3_params = se3_params.detach()
+    SE3_transform = get_SE3_transform(optimized_se3_params)
+    aligned_points = apply_SE3_transform(fit_points_to_transform, SE3_transform)
+
+    _rc_f = ref_charges.reshape((-1, 1)) if ref_charges.dim() == 1 else ref_charges.unsqueeze(2)
+    _fc_f = fit_charges_for_objective.reshape((-1, 1)) if fit_charges_for_objective.dim() == 1 else fit_charges_for_objective.unsqueeze(2)
+    AB = VAB_2nd_order_esp(ref_points, aligned_points, _rc_f, _fc_f, alpha, lam)
+    scores = AB / (AB + tversky_alpha * (_AA - AB) + tversky_beta * (_BB - AB))
+
+    if num_repeats == 1:
+        if verbose:
+            print(f'Optimized vol_esp_tversky similarity score: {float(scores):.3f}')
+        best_alignment = aligned_points.cpu()
+        best_transform = SE3_transform.cpu()
+        best_score = scores.detach().cpu()
+    else:
+        if verbose:
+            print(f'Optimized vol_esp_tversky similarity -- max: {scores.max():.3f} | mean: {scores.mean():.3f} | min: {scores.min():.3f}')
+        best_idx = torch.argmax(scores.detach().cpu())
+        best_alignment = aligned_points.cpu()[best_idx]
+        best_transform = SE3_transform.cpu()[best_idx]
+        best_score = scores.detach().cpu()[best_idx]
+    return best_alignment, best_transform, best_score

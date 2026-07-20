@@ -13,7 +13,7 @@ To add a new mode, register it here (attrs + seeds + steps, and PROCESS_MODES if
 """
 
 # Canonical mode id -> (transform_attr, score_attr) written in-place on a MoleculePair by
-# ``MoleculePairBatch.align_with_<mode>``. This is the full set of the 7 canonical modes; the
+# ``MoleculePairBatch.align_with_<mode>``. This is the full set of the 10 canonical modes; the
 # tuple order is the public mode order (preserved from screen.py's historical _VALID_MODES).
 MODE_ATTRS = {
     "vol":              ("transform_vol_noH",          "sim_aligned_vol_noH"),
@@ -25,9 +25,10 @@ MODE_ATTRS = {
     "vol_color":        ("transform_vol_color",        "sim_aligned_vol_color"),
     "vol_tversky":      ("transform_vol_tversky",      "sim_aligned_vol_tversky"),
     "vol_lipo":         ("transform_vol_lipo",         "sim_aligned_vol_lipo"),
+    "vol_esp_tversky":  ("transform_vol_esp_tversky",  "sim_aligned_vol_esp_tversky"),
 }
 
-# The 9 canonical mode ids, in public order.
+# The 10 canonical mode ids, in public order.
 CANONICAL_MODES = tuple(MODE_ATTRS)
 
 # Legacy (pre-rename) mode names -> canonical. The old public API keeps working through this:
@@ -58,6 +59,8 @@ PROCESS_MODES = ("vol", "surf", "surf_esp", "pharm")
 # choice these cost <=0.006 ROC-AUC while recovering >=99% of the best achievable overlap.
 # Callers who want more accuracy pass ``num_repeats`` / ``max_num_steps`` explicitly.
 MODE_SEEDS = {"vol": 10, "surf": 8, "surf_esp": 8, "vol_esp": 16, "vol_and_surf_esp": 8,
-              "pharm": 32, "vol_color": 16, "vol_tversky": 10, "vol_lipo": 16}
+              "pharm": 32, "vol_color": 16, "vol_tversky": 10, "vol_lipo": 16,
+              "vol_esp_tversky": 16}
 MODE_STEPS = {"vol": 30, "surf": 40, "surf_esp": 40, "vol_esp": 50, "vol_and_surf_esp": 60,
-              "pharm": 50, "vol_color": 40, "vol_tversky": 40, "vol_lipo": 50}
+              "pharm": 50, "vol_color": 40, "vol_tversky": 40, "vol_lipo": 50,
+              "vol_esp_tversky": 50}

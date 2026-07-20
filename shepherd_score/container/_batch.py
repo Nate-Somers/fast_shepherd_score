@@ -1249,6 +1249,87 @@ class MoleculePairBatch:
             verbose=verbose,
         )
 
+    def align_with_vol_esp_tversky(self,
+                                   tversky_alpha: float = 0.95,
+                                   tversky_beta: float = 0.05,
+                                   alpha: float = 0.81,
+                                   lam: float = 0.1,
+                                   num_repeats: int = None,
+                                   lr: float = 0.1,
+                                   max_num_steps: int = None,
+                                   verbose: bool = False,
+                                   backend: Optional[str] = None,
+                                   return_aligned: bool = False,
+                                   ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        """Align all pairs using the asymmetric "fits-inside" ``vol_esp_tversky`` overlay.
+
+        The ``vol_esp`` electrostatic-weighted heavy-atom Gaussian overlap (``VAB_2nd_order_esp``,
+        ``lam`` RAW/atom-centred), scored with a **Tversky** reduction
+        ``AB / (AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))`` instead of Tanimoto. It is to
+        ``vol_esp`` EXACTLY what ``vol_tversky`` is to ``vol``. With the defaults
+        (``tversky_alpha=0.95``, ``tversky_beta=0.05``) missing reference volume is penalized
+        heavily and extra fit volume barely, so the score rewards the *reference* (query) being
+        contained in the fit. The score is NOT bounded to [0, 1] and is never clamped.
+
+        Results are stored in-place on each MoleculePair:
+        - ``pair.transform_vol_esp_tversky`` and ``pair.sim_aligned_vol_esp_tversky``
+
+        Parameters
+        ----------
+        tversky_alpha : float
+            Weight on missing reference volume ``AA - AB`` (default 0.95). Named to avoid the
+            Gaussian width ``alpha``.
+        tversky_beta : float
+            Weight on extra fit volume ``BB - AB`` (default 0.05).
+        alpha : float
+            Gaussian width for the overlap (default 0.81, volumetric heavy atoms).
+        lam : float
+            RAW partial-charge weighting for the ESP kernel (default 0.1; NOT ``LAM_SCALING``-scaled).
+        num_repeats, lr, max_num_steps, verbose
+            Standard optimization controls. ``num_repeats`` / ``max_num_steps`` default
+            (``None``) to the per-mode ``MODE_SEEDS`` / ``MODE_STEPS`` in ``accel/_modes.py``.
+        backend : str
+            ``None`` (default) resolves device-aware (Triton on CUDA else numba). ``"triton"``
+            (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_vol_esp_tversky`` driver, which reuses the fused shape+ESP
+            kernel and applies the Tversky reduction on the host. ``"jax"`` falls back to the
+            per-pair PyTorch path (there is no JAX kernel for this mode).
+        return_aligned : bool
+            For the batched backend, build the aligned-fit-atom list when ``True``.
+
+        Returns
+        -------
+        scores : np.ndarray
+            Shape: (N,). NOT clipped to [0, 1].
+        aligned_list : list of np.ndarray
+            Aligned fit atom coordinates per pair (``None`` entries unless
+            ``return_aligned=True`` on the batched backend).
+        """
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_esp_tversky")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_esp_tversky")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_esp_tversky,
+            dict(alpha=alpha, lam=lam, tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                 steps_fine=max_num_steps),
+            "sim_aligned_vol_esp_tversky", "transform_vol_esp_tversky", "_fit_xyz_noH_t",
+            return_aligned)
+        if handled:
+            return _result
+
+        return self._delegate_alignment(
+            'align_with_vol_esp_tversky', 'sim_aligned_vol_esp_tversky',
+            tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta,
+            alpha=alpha,
+            lam=lam,
+            num_repeats=num_repeats,
+            lr=lr,
+            max_num_steps=max_num_steps,
+            verbose=verbose,
+        )
+
     def align_with_vol_lipo(self,
                             lipo_weight: float = 0.5,
                             alpha: float = 0.81,

@@ -70,7 +70,15 @@ class _GraphedFineTversky(_GraphedFineBase):
     def _step(self):
         VAB, dQ, dT = overlap_score_grad_se3_batch(
             self.A, self.B, self.q, self.t, alpha=self.alpha, N_real=self.Nr, M_real=self.Mr)
-        # Tversky: denom = k*VAB + C ; T = VAB/denom ; dT/dVAB = C/denom^2. NOT clamped to [0,1].
+        self._tversky_adam_tail(VAB, dQ, dT)
+
+    def _tversky_adam_tail(self, VAB, dQ, dT):
+        """Asymmetric Tversky score + best-pose tracking + tangent-projected Adam, all in-place
+        into persistent buffers. denom = k*VAB + C ; T = VAB/denom ; dT/dVAB = C/denom^2 (NOT
+        clamped to [0,1]). Shared by vol_tversky (shape kernel) and the ESP-weighted
+        vol_esp_tversky subclass (whose only difference is the fused shape+ESP overlap kernel
+        that produces VAB/dQ/dT) -- mirrors how _GraphedFineSurf._tanimoto_adam_tail is shared
+        by surf/vol and the vol_esp/surf_esp ESP subclass."""
         torch.add(self.C, VAB, alpha=self.k, out=self.denom)
         torch.div(VAB, self.denom, out=self.score)
         torch.mul(self.denom, self.denom, out=self.d2)

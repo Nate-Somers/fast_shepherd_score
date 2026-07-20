@@ -25,6 +25,7 @@ from shepherd_score.alignment import optimize_ROCS_overlay, optimize_ROCS_overla
 from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_overlay_analytical
 from shepherd_score.alignment import optimize_vol_color_overlay
 from shepherd_score.alignment import optimize_vol_tversky_overlay
+from shepherd_score.alignment import optimize_vol_esp_tversky_overlay
 from shepherd_score.alignment import optimize_vol_lipo_overlay
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.accel import batch as _ba
@@ -58,7 +59,7 @@ def _default_steps(mode: str) -> int:
 _ALIGN_KEYS = (
     'vol', 'vol_noH', 'vol_esp', 'vol_esp_noH',
     'surf', 'surf_esp', 'vol_and_surf_esp', 'pharm', 'vol_color', 'vol_tversky',
-    'vol_lipo',
+    'vol_lipo', 'vol_esp_tversky',
 )
 
 
@@ -1474,6 +1475,108 @@ class MoleculePair:
         )
         self.transform_vol_tversky = se3_transform.numpy()
         self.sim_aligned_vol_tversky = score.numpy()
+        return aligned_fit_points.numpy()
+
+
+    def align_with_vol_esp_tversky(self,
+                                   tversky_alpha: float = 0.95,
+                                   tversky_beta: float = 0.05,
+                                   alpha: float = 0.81,
+                                   lam: float = 0.1,
+                                   no_H: bool = True,
+                                   num_repeats: int = None,
+                                   trans_init: bool = False,
+                                   lr: float = 0.1,
+                                   max_num_steps: int = None,
+                                   verbose: bool = False) -> np.ndarray:
+        """
+        Align fit_molec to ref_molec using the asymmetric "fits-inside" ``vol_esp_tversky``
+        overlay: the ``vol_esp`` electrostatic-weighted volumetric overlap scored with **Tversky**
+        rather than Tanimoto. It is to ``vol_esp`` EXACTLY what ``vol_tversky`` is to ``vol``.
+
+        The optimized objective is the Tversky ESP similarity
+        ``AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))`` where ``AB`` is the
+        cross electrostatic-weighted Gaussian overlap (``VAB_2nd_order_esp``) of the reference with
+        the SE(3)-transformed fit, ``AA`` the reference ESP self-overlap, and ``BB`` the fit ESP
+        self-overlap. With the defaults (``tversky_alpha=0.95``, ``tversky_beta=0.05``) missing
+        reference volume is penalized heavily while extra fit volume is barely penalized, so the
+        score rewards the *reference* (query) being contained in the fit. The objective is
+        asymmetric: swapping ref and fit changes the score. Only the fit is transformed.
+
+        ``lam`` DEFAULTS to 0.1 -- the value this library documents for partial-charge volumetric
+        ESP -- and, like ``align_with_vol_esp``, is taken RAW (NOT ``LAM_SCALING``-scaled; that
+        scaling is only for the surface ESP modes). Reads the strict-heavy atom centres from the
+        with-H conformer indexed by ``_nonH_atoms_idx`` (1:1 with the heavy partial charges), NOT
+        ``atom_pos`` -- the same retained-H-safe heavy-charge handling the ``vol_esp`` accel path
+        uses.
+
+        Optimally aligned score is stored in ``self.sim_aligned_vol_esp_tversky`` and the optimal
+        SE(3) transformation in ``self.transform_vol_esp_tversky``.
+
+        Parameters
+        ----------
+        tversky_alpha : float, optional
+            Weight on missing reference volume ``AA - AB``. Default is 0.95. Named to avoid
+            colliding with the Gaussian width ``alpha``.
+        tversky_beta : float, optional
+            Weight on extra fit volume ``BB - AB``. Default is 0.05.
+        alpha : float, optional
+            Gaussian width for the overlap. Default is 0.81 (volumetric, heavy atoms).
+        lam : float, optional
+            RAW partial-charge weighting parameter for the ESP kernel. Default is 0.1.
+        no_H : bool, optional
+            Whether to exclude hydrogens (heavy-atom overlay). Default is ``True``.
+        num_repeats : int, optional
+            Number of SE(3) initializations.
+            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
+        trans_init : bool, optional
+            Translation-seeded initialization from the reference atoms. Default is ``False``.
+        lr : float, optional
+            Learning rate. Default is 0.1.
+        max_num_steps : int, optional
+            Maximum optimization steps.
+            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
+        verbose : bool, optional
+            Print progress. Default is ``False``.
+
+        Returns
+        -------
+        aligned_fit_points : np.ndarray (M, 3)
+            Transformed fit atom (heavy-atom) coordinates.
+        """
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_esp_tversky")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_esp_tversky")
+        # Heavy centres come from the with-H conformer indexed by ``_nonH_atoms_idx`` (strict-heavy,
+        # 1:1 with ``get_charges(no_H=True)``) -- NOT ``atom_pos``, which is the ``Chem.RemoveHs``
+        # set and RETAINS isotope-labelled H (deuterium), desyncing from the heavy charges.
+        if no_H:
+            ref_atom_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
+            fit_atom_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
+        else:
+            ref_atom_pos = self.ref_molec.mol.GetConformer().GetPositions()
+            fit_atom_pos = self.fit_molec.mol.GetConformer().GetPositions()
+        ref_charges = self.ref_molec.get_charges(no_H)
+        fit_charges = self.fit_molec.get_charges(no_H)
+
+        aligned_fit_points, se3_transform, score = optimize_vol_esp_tversky_overlay(
+            ref_points=self._to_tensor(ref_atom_pos),
+            fit_points=self._to_tensor(fit_atom_pos),
+            ref_charges=self._to_tensor(ref_charges),
+            fit_charges=self._to_tensor(fit_charges),
+            alpha=alpha,
+            lam=lam,
+            tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta,
+            num_repeats=num_repeats,
+            trans_centers=self._to_tensor(self.ref_molec.atom_pos) if trans_init else None,
+            lr=lr,
+            max_num_steps=max_num_steps,
+            verbose=verbose,
+        )
+        self.transform_vol_esp_tversky = se3_transform.numpy()
+        self.sim_aligned_vol_esp_tversky = score.numpy()
         return aligned_fit_points.numpy()
 
 

@@ -227,7 +227,7 @@ def _schema_from_modes(modes) -> dict:
     return dict(
         surf=bool({"surf", "surf_esp", "vol_and_surf_esp"} & modes),
         surf_esp=bool({"surf_esp", "vol_and_surf_esp"} & modes),
-        charges=bool({"vol_esp", "vol_and_surf_esp"} & modes),
+        charges=bool({"vol_esp", "vol_esp_tversky", "vol_and_surf_esp"} & modes),
         with_H=("vol_and_surf_esp" in modes),
         radii=("vol_and_surf_esp" in modes),
         centers_w_H=("vol_and_surf_esp" in modes),
@@ -242,6 +242,8 @@ def _store_supports(schema: dict, mode: str) -> bool:
         return True                                   # atom_pos is always stored
     if mode == "vol_esp":
         return schema["charges"]
+    if mode == "vol_esp_tversky":
+        return schema["charges"]                        # same heavy centres + charges as vol_esp
     if mode == "surf":
         return schema["surf"]
     if mode == "surf_esp":
@@ -697,7 +699,7 @@ def _centered_copy(query):
 # serves every query.
 # --------------------------------------------------------------------------- #
 _FAST_MODES = ("vol", "surf", "surf_esp", "pharm", "vol_color", "vol_esp", "vol_and_surf_esp",
-               "vol_tversky", "vol_lipo")
+               "vol_tversky", "vol_lipo", "vol_esp_tversky")
 
 
 class _ArrView:
@@ -745,7 +747,8 @@ class _FastPair:
                  "transform_vol_esp_noH", "sim_aligned_vol_esp_noH",
                  "transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp",
                  "transform_vol_tversky", "sim_aligned_vol_tversky",
-                 "transform_vol_lipo", "sim_aligned_vol_lipo")
+                 "transform_vol_lipo", "sim_aligned_vol_lipo",
+                 "transform_vol_esp_tversky", "sim_aligned_vol_esp_tversky")
 
     def __init__(self, device):
         self.device = device
@@ -767,9 +770,10 @@ def _query_ref_arrays(q, mode: str) -> dict:
     if mode == "vol_color":
         return {"xyz": np.asarray(q.atom_pos, np.float32),
                 "ptypes": np.asarray(q.pharm_types), "pancs": np.asarray(q.pharm_ancs, np.float32)}
-    if mode == "vol_esp":
+    if mode in ("vol_esp", "vol_esp_tversky"):
         # Strict-heavy centers (from the with-H conformer) 1:1 with the heavy charges -- NOT
-        # atom_pos, which is the RemoveHs set and longer when an H was retained.
+        # atom_pos, which is the RemoveHs set and longer when an H was retained. vol_esp_tversky
+        # reads the SAME data as vol_esp (only the host-side reduction differs).
         return {"xyz": np.asarray(_heavy_positions(q), np.float32),
                 "charges": np.asarray(np.asarray(q.partial_charges)[q._nonH_atoms_idx], np.float32)}
     if mode == "vol_and_surf_esp":
@@ -809,10 +813,10 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
                 "_ref_pharm_types_t": torch.as_tensor(ra["ptypes"], dtype=torch.int64, device=device),
                 "_ref_pharm_ancs_t": f(ra["pancs"]),
                 "ref_molec": _ArrView(ra["xyz"], ra["ptypes"], ra["pancs"])}
-    if mode == "vol_esp":
+    if mode in ("vol_esp", "vol_esp_tversky"):
         # ra["xyz"] is the strict-heavy centers (1:1 with the heavy charges; see
         # _query_ref_arrays). Pre-set _ref_xyz_noH_t so the aligner reads it instead of
-        # dereferencing .mol (absent on this array-only path).
+        # dereferencing .mol (absent on this array-only path). vol_esp_tversky reuses this verbatim.
         xyz = f(ra["xyz"])
         return {"_ref_xyz_t": xyz, "_ref_xyz_noH_t": xyz, "_ref_xyz_esp_t": f(ra["charges"]),
                 "ref_molec": _ArrView(atom_pos=ra["xyz"], partial_charges=ra["charges"])}
@@ -880,7 +884,7 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
             p._fit_pharm_types_t = pt
             p._fit_pharm_ancs_t = pa
             p.fit_molec = _ArrView(an, ptn, pan)        # numpy holder for the aligner's eager reads
-    elif mode == "vol_esp":
+    elif mode in ("vol_esp", "vol_esp_tversky"):        # identical fit tensors (see _query_ref_arrays)
         aoff = arrs["atom_off"]
         # heavy_off + xyz_noH exist only when some molecule's RemoveHs retained an H; else
         # atom_off/atom_pos already are the heavy set (no-op for the common case / legacy stores).
@@ -968,6 +972,10 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
                     lr=ak.get("lr", 0.1), steps_fine=steps)
     if mode == "vol_tversky":  # mirrors align_with_vol_tversky(backend="triton"); seeds are internal
         return dict(alpha=ak.get("alpha", 0.81),
+                    tversky_alpha=ak.get("tversky_alpha", 0.95),
+                    tversky_beta=ak.get("tversky_beta", 0.05), steps_fine=steps)
+    if mode == "vol_esp_tversky":  # mirrors align_with_vol_esp_tversky(backend="triton"); seeds internal
+        return dict(alpha=ak.get("alpha", 0.81), lam=ak.get("lam", 0.1),
                     tversky_alpha=ak.get("tversky_alpha", 0.95),
                     tversky_beta=ak.get("tversky_beta", 0.05), steps_fine=steps)
     if mode == "vol_lipo":     # mirrors align_with_vol_lipo(backend="triton") dispatch

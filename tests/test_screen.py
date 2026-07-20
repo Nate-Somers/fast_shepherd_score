@@ -337,6 +337,46 @@ def test_vol_tversky_stream_matches_object(tmp_path, molecules):
         assert by_id[p.id] == pytest.approx(float(rs), abs=1e-4)
 
 
+def test_vol_esp_tversky_stream_matches_object(tmp_path, molecules):
+    """vol_esp_tversky screens from a vol_esp-style store (heavy centres + partial charges) -- it
+    reads the SAME per-molecule data as vol_esp, only the host-side reduction is Tversky -- and its
+    streamed scores (the resident-tensor FAST path, since it is in _FAST_MODES + the store is
+    pre_centered) match the per-pair object path on identical centered molecules."""
+    import copy, glob
+    store_path = os.path.join(tmp_path, "lib.fss")
+    with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_esp_tversky",),
+                             dtype="float32", pre_centered=True) as store:
+        for i, m in enumerate(molecules):
+            store.add(m, id=i)
+    store = ProfileStore.open(store_path)
+    # Reuses vol_esp's store schema (heavy centres + charges); no new per-molecule data.
+    assert store.supports("vol_esp_tversky") and store.supports("vol_esp")
+    assert store.schema["charges"]
+    # the heavy partial charges actually reached disk (a mode that stored nothing would still
+    # "pass" a score compare when every molecule's charges are empty -- this catches that).
+    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
+        assert "charges" in d.files
+
+    query = molecules[1]                                 # also stored at id=1
+    hits = screen(query, store, mode="vol_esp_tversky", backend="numba", lam=0.1,
+                  num_repeats=16, max_num_steps=50, top_k=len(molecules))
+    by_id = {h.id: h.score for h in hits}
+    assert by_id[1] == pytest.approx(1.0, abs=1e-2)      # self fits perfectly inside self (Tversky(A,A)=1)
+
+    cq = copy.deepcopy(query); cq.center_to(cq.atom_pos.mean(0))
+    def _c(m):
+        c = copy.deepcopy(m); c.center_to(c.atom_pos.mean(0)); return c
+    pairs = [MoleculePair(cq, _c(m), do_center=False) for m in molecules]
+    ref, _ = MoleculePairBatch(pairs).align_with_vol_esp_tversky(
+        backend="numba", lam=0.1, num_repeats=16, max_num_steps=50)
+    # reduction over a single ESP channel: fast and object paths feed identical inputs to one
+    # driver, so the streamed scores are effectively bit-identical to the per-pair path (measured
+    # max |fast-object| ~6e-8; abs=1e-4 like vol_esp's own store round-trip). NB the Tversky score
+    # is NOT clamped to [0, 1] -- a small dense query inside a bigger molecule legitimately >1.0.
+    for i, rs in enumerate(ref):
+        assert by_id[i] == pytest.approx(float(rs), abs=1e-4)
+
+
 def test_vol_lipo_stream_matches_object(tmp_path, molecules):
     """vol_lipo carries a NEW per-molecule data set (the TRUE-heavy lipo centres + per-atom
     Crippen logP) through the store's variable-length serialization, then screens through the
