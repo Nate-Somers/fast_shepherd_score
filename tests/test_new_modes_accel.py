@@ -1,4 +1,4 @@
-"""Batched (numba) accel regression tests for the vol_tversky and esp_field modes.
+"""Batched (numba) accel regression tests for the vol_tversky and vol_lipo modes.
 
 Covers the fast-path gates that survive without a GPU: self-copy overlap == 1.0 under the
 numba backend, and batched-numba vs the per-pair torch reference on a distinct pair (matched
@@ -38,7 +38,6 @@ def mols():
 # per mode: (align kwarg name for repeats, steps) come from MODE_SEEDS/MODE_STEPS
 MODES = [
     ("vol_tversky", "sim_aligned_vol_tversky"),
-    ("esp_field", "sim_aligned_esp_field"),
     ("vol_lipo", "sim_aligned_vol_lipo"),
 ]
 

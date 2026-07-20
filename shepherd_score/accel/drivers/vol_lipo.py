@@ -2,16 +2,16 @@
 # Fast batched ``vol_lipo`` alignment:
 #   atom-centred Gaussian SHAPE (volume) overlap  +  per-atom LIPOPHILICITY overlap.
 #
-# This is a two-channel JOINT-gradient mode (driver modeled on esp_field / vol_color): BOTH
+# This is a two-channel JOINT-gradient mode (driver modeled on vol_color): BOTH
 # channels steer the SE(3) pose, and the score is the weighted sum of the two Tanimotos
 #   score = (1-w)*shape_Tanimoto + w*lipo_Tanimoto        (w = lipo_weight)
 # matching the per-pair reference alignment._torch.optimize_vol_lipo_overlay.
 #
-# KERNEL REUSE -- NO new kernel is written here (identical to esp_field's construction):
+# KERNEL REUSE -- NO new kernel is written here:
 #   * SHAPE  -> overlap_score_grad_se3_batch (the same Gaussian-volume kernel as vol/vol_esp),
 #              scored on the RemoveHs shape centres. Emits dO_s/dq directly.
 #   * LIPO   -> overlap_score_grad_esp_se3_batch (the SAME fused ESP kernel used by
-#              vol_esp/surf_esp/esp_field), fed the TRUE-heavy atom centres as its coordinates
+#              vol_esp/surf_esp), fed the TRUE-heavy atom centres as its coordinates
 #              and the per-atom Crippen atomic logP as its "charges", matched by value
 #              (get_overlap_esp with the logP where the ESP kernel expects charges, lam=0.1 RAW
 #              / atom-centred, NOT LAM_SCALING-scaled). Emits dO_l/dq directly.
@@ -193,8 +193,8 @@ def coarse_fine_vol_lipo_align_many(
     """Vectorized vol_lipo alignment over a batch of pairs (coarse-to-fine SE(3)).
 
     Seeds from the SHAPE atom clouds (identity + PCA + Fibonacci, COM-aligned), fine-optimises
-    ALL seeds and takes the per-pair max -- NO coarse-grid + top-k pruning (matching the vol /
-    esp_field drivers). ``VAA`` / ``VBB`` are the shape self-overlaps; lipo self-overlaps are
+    ALL seeds and takes the per-pair max -- NO coarse-grid + top-k pruning (matching the vol
+    driver). ``VAA`` / ``VBB`` are the shape self-overlaps; lipo self-overlaps are
     recomputed here from the lipo centres + logP."""
     device = centers_1.device
     BATCH = centers_1.shape[0]

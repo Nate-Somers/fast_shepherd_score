@@ -131,9 +131,9 @@ stored). Edit **one** function: `_store_supports(schema, mode)` in `screen.py`, 
 predicate (`return True` for a shape-only mode). Nothing else — it routes through the `fast=False`
 `MoleculePairBatch` path automatically.
 
-**Tier B — needs new per-molecule DATA the store doesn't carry** (e.g. `esp_field`'s
-variable-length signed ESP field points). Wire it end to end in `screen.py`, mirroring the
-`pharm` / `field_points` plumbing already there:
+**Tier B — needs new per-molecule DATA the store doesn't carry** (e.g. `vol_lipo`'s
+variable-length per-heavy-atom lipophilicity centres and per-atom Crippen logP). Wire it end to end in `screen.py`, mirroring the
+`pharm` / `lipo` plumbing already there:
   1. **`MoleculeProfile`** — add the array(s) to `__slots__`; accept them in `__init__` (store via
      `_f32`); shift the positional ones in `center_to` (they move rigidly with the molecule); add a
      `get_<data>()` accessor **named exactly like the `Molecule` method the batched driver calls**
@@ -167,7 +167,7 @@ and **understate your mode's true throughput**. Two honest options, in order of 
    fills cold `None` attrs). Six edits in `screen.py`:
    - `_FAST_MODES` — add the mode id.
    - `_FastPair.__slots__` — add the mode's result slots (`transform_<mode>`/`sim_aligned_<mode>`)
-     and any new fit/ref tensor slots the driver reads (e.g. `_ref_fp_pos_t`/`_fit_fp_pos_t`).
+     and any new fit/ref tensor slots the driver reads (e.g. `_ref_lipo_pos_t`/`_fit_lipo_pos_t`).
    - `_query_ref_arrays(q, mode)` — the query's numpy arrays for the ref side.
    - `_ref_tensors_from_arrays(ra, mode, device)` — those arrays → the pre-set `_ref_*_t` tensors
      (no `_ArrView`/`.ref_molec` needed if you pre-set every tensor the driver uploads).
@@ -181,8 +181,8 @@ and **understate your mode's true throughput**. Two honest options, in order of 
    throughput on the same axis as the fast modes. Reporting an object-path aligns/s next to
    resident-tensor aligns/s is the silent-cap failure from `Workflow`'s discipline, one level up.
 
-The `vol_tversky` fast path is a drop-in copy of `vol`'s (shape-only, same fit tensors); `esp_field`
-adds its four field-point tensors alongside the shape tensors. A shape-only or reduction mode is
+The `vol_tversky` fast path is a drop-in copy of `vol`'s (shape-only, same fit tensors); `vol_lipo`
+adds its four lipophilicity tensors alongside the shape tensors. A shape-only or reduction mode is
 almost free to fast-path; a mode with new per-molecule data pre-sets that data's tensors too.
 
 **Verify (screen analog of parity gate 3 — gate 5).** Build a `ProfileStore`, `screen()` a query,
@@ -191,10 +191,10 @@ Once the mode is in `_FAST_MODES` and the store is `pre_centered`, this test exe
 path (that is the point — it proves the resident-tensor path is score-faithful). Tolerance: a
 single-channel / reduction mode is usually bit-identical (`abs=1e-4`, like `vol_tversky`); a
 basin-sensitive multi-channel mode can differ by ~1e-3 when fp-noise-level input differences flip a
-multi-start seed near a tie, so use the same `abs=1e-2` the accel test uses (`esp_field`), and lean
+multi-start seed near a tie, so use the same `abs=1e-2` the accel test uses (`vol_lipo`), and lean
 on the "assert the data reached disk" check to catch a real wiring bug (which moves scores by
 `>>1e-2` or changes the point counts). Models: `test_vol_tversky_stream_matches_object` (Tier A,
-bit-identical) and `test_esp_field_stream_matches_object` (Tier B, basin tolerance + disk check).
+bit-identical) and `test_vol_lipo_stream_matches_object` (Tier B, basin tolerance + disk check).
 
 `multi_gpu` / `cpu_pool` remain registry-driven for *routing* — never hardcode a mode-name list in
 their dispatch. The per-mode DATA plumbing above is inherently mode-specific and cannot be derived;

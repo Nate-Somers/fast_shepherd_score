@@ -77,7 +77,7 @@ The relevant suites already exist; add your mode's cases to them:
 - `tests/test_numba_backend.py` — gates 1 and 4 (CPU).
 - `tests/test_fast_batch_alignment.py` — gate 3, and gate 4 on GPU where available.
 - `tests/test_screen.py` — gate 5 (models: `test_vol_tversky_stream_matches_object`,
-  `test_esp_field_stream_matches_object`).
+  `test_vol_lipo_stream_matches_object`).
 - Gate 2 needs a CUDA device; guard it with a `torch.cuda.is_available()` skip so the suite still
   runs on CPU-only machines (Triton parity is then checked wherever a GPU is present).
 

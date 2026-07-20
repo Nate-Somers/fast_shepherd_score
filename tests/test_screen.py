@@ -321,7 +321,6 @@ def test_vol_tversky_stream_matches_object(tmp_path, molecules):
             store.add(m, id=i)
     store = ProfileStore.open(store_path)
     assert store.supports("vol_tversky") and store.supports("vol")
-    assert not store.schema["field_points"]                # no per-mol extra data needed
 
     query = molecules[1]
     hits = screen(query, store, mode="vol_tversky", backend="numba",
@@ -336,46 +335,6 @@ def test_vol_tversky_stream_matches_object(tmp_path, molecules):
         backend="numba", num_repeats=5, max_num_steps=50)
     for p, rs in zip(profiles, ref):
         assert by_id[p.id] == pytest.approx(float(rs), abs=1e-4)
-
-
-def test_esp_field_stream_matches_object(tmp_path, molecules):
-    """esp_field carries a NEW per-molecule derived point set (variable-length signed ESP
-    field points) through the store's variable-length serialization, then screens through
-    the fast=False object path. The streamed scores must match the per-pair object path,
-    and the store must actually persist the field points."""
-    import copy, glob
-    store_path = os.path.join(tmp_path, "lib.fss")
-    with ProfileStore.create(store_path, num_surf_points=64, modes=("esp_field",),
-                             dtype="float32", pre_centered=True) as store:
-        for i, m in enumerate(molecules):
-            store.add(m, id=i)
-    store = ProfileStore.open(store_path)
-    assert store.supports("esp_field")
-    assert store.schema["field_points"]
-    # the variable-length field points made it to disk (offset table + point/sign arrays)
-    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
-        assert {"fp_off", "field_point_pos", "field_point_sign"} <= set(d.files)
-
-    query = molecules[1]
-    hits = screen(query, store, mode="esp_field", backend="numba",
-                  num_repeats=8, max_num_steps=50, top_k=len(molecules))
-    by_id = {h.id: h.score for h in hits}
-    assert by_id[1] == pytest.approx(1.0, abs=1e-2)        # self-overlay optimum (shape+field)
-
-    cq = copy.deepcopy(query); cq.center_to(cq.atom_pos.mean(0))
-    profiles = [p for shard in store.iter_shards() for p in shard]
-    pairs = [MoleculePair(cq, p, do_center=False) for p in profiles]
-    ref, _ = MoleculePairBatch(pairs).align_with_esp_field(
-        backend="numba", num_repeats=8, max_num_steps=50)
-    # esp_field is a pre_centered store -> screen() takes the resident-tensor FAST path (mode is
-    # in _FAST_MODES). Its fit field points are bit-identical to the object path and the query
-    # differs only by fp noise (~2e-7, from independently re-centering the query here). But the
-    # two-channel objective is basin-sensitive: that fp-noise tickle can flip which multi-start
-    # seed wins a near-tie, moving a score by ~1e-3. Same tolerance the accel esp_field test uses
-    # (test_new_modes_accel) -- loose enough for the basin flip, tight enough to catch a real
-    # wiring bug (wrong/empty field points would move scores by >>1e-2 or change the M counts).
-    for p, rs in zip(profiles, ref):
-        assert by_id[p.id] == pytest.approx(float(rs), abs=1e-2)
 
 
 def test_vol_lipo_stream_matches_object(tmp_path, molecules):

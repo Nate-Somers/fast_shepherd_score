@@ -1251,132 +1251,6 @@ def _align_batch_vol_tversky(pairs: list["MoleculePair"], *, alpha: float = 0.81
         p.sim_aligned_vol_tversky = s
 
 
-def _align_batch_esp_field(
-    pairs: list["MoleculePair"],
-    *,
-    field_weight: float = 0.5,
-    alpha: float = 0.81,
-    alpha_field: float = 0.81,
-    lam: float = 0.1,
-    num_repeats: int = 50,
-    topk: int = 30,
-    steps_fine: int = 100,
-    lr: float = 0.075,
-) -> None:
-    """Batched Cresset-style ``esp_field`` alignment: atom-centred Gaussian *shape* +
-    signed ESP *field-point* overlap, blended ``(1-field_weight)*shape + field_weight*field``.
-
-    Two INDEPENDENT point sets are padded per bucket: the heavy-atom centres (own N_real, the
-    bucket merge key, reusing the shape kernel) and the derived ESP field points (own M_real,
-    variable length possibly 0, padded to the bucket's max field-point band and masked by the
-    real count -- reusing the fused ESP kernel with the field-point SIGNS as its charges). Both
-    fit sets transform under the same pose; the driver descends on the JOINT weighted gradient.
-
-    Side effects: writes ``p.transform_esp_field`` / ``p.sim_aligned_esp_field``.
-    """
-    if not pairs:
-        return
-    if _should_distribute(pairs):
-        return _run_distributed(_align_batch_esp_field, pairs,
-                                field_weight=field_weight, alpha=alpha,
-                                alpha_field=alpha_field, lam=lam, num_repeats=num_repeats,
-                                topk=topk, steps_fine=steps_fine, lr=lr)
-
-    from shepherd_score.accel.drivers.esp_field import fast_optimize_esp_field_overlay_batch
-
-    device = pairs[0].device
-
-    # Heavy-atom centres (shape channel) -- same source as _align_batch_vol.
-    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
-    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
-    # ESP field points + signs (field channel). Derived point set (variable M, possibly 0);
-    # get_field_points() returns (pos (M,3) float32, sign (M,) float32).
-    _batch_upload(pairs, "_ref_fp_pos_t", lambda p: p.ref_molec.get_field_points()[0], torch.float32, device)
-    _batch_upload(pairs, "_fit_fp_pos_t", lambda p: p.fit_molec.get_field_points()[0], torch.float32, device)
-    _batch_upload(pairs, "_ref_fp_sign_t", lambda p: p.ref_molec.get_field_points()[1], torch.float32, device)
-    _batch_upload(pairs, "_fit_fp_sign_t", lambda p: p.fit_molec.get_field_points()[1], torch.float32, device)
-
-    all_pairs: list[MoleculePair] = []
-    all_scores: list[torch.Tensor] = []
-    all_q: list[torch.Tensor] = []
-    all_t: list[torch.Tensor] = []
-
-    # Merge by shape-center bands only (like vol_color). Field-point counts are NOT keyed -- the
-    # ESP kernel masks padded field slots by the real count, so two pairs sharing a shape bucket
-    # but differing in field-point count stay together and their field points are padded to the
-    # bucket's max field band (recomputed below). Result-identical.
-    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
-                           "fit": lambda p: p._fit_xyz_t.shape[0]},
-                    seeds=_seeds_for("esp_field"))
-    for _bk in plan_buckets(pairs, _spec, device):
-        n_cent_pad, m_cent_pad = _bk.pad["ref"], _bk.pad["fit"]
-        bucket = _bk.members
-        K = len(bucket)
-
-        ref_cent_ts = [p._ref_xyz_t for p in bucket]
-        fit_cent_ts = [p._fit_xyz_t for p in bucket]
-        n_cent_list = [t.shape[0] for t in ref_cent_ts]
-        m_cent_list = [t.shape[0] for t in fit_cent_ts]
-        ref_fp_ts = [p._ref_fp_pos_t for p in bucket]
-        fit_fp_ts = [p._fit_fp_pos_t for p in bucket]
-        n_fp_list = [t.shape[0] for t in ref_fp_ts]
-        m_fp_list = [t.shape[0] for t in fit_fp_ts]
-        # Field points not keyed -> pad to this bucket's max field band (>= 1 slot so the
-        # kernel always sees a well-formed tensor; zeroed slots are masked by the real count).
-        n_fp_pad = _band_key(max(n_fp_list)) or _BAND
-        m_fp_pad = _band_key(max(m_fp_list)) or _BAND
-
-        centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
-        centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
-        fp_pos_1 = torch.zeros(K, n_fp_pad, 3, device=device, dtype=torch.float32)
-        fp_pos_2 = torch.zeros(K, m_fp_pad, 3, device=device, dtype=torch.float32)
-        fp_sign_1 = torch.zeros(K, n_fp_pad, device=device, dtype=torch.float32)
-        fp_sign_2 = torch.zeros(K, m_fp_pad, device=device, dtype=torch.float32)
-
-        N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
-        M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
-        N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
-        M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))
-        N_real_fp = torch.tensor(n_fp_list, device=device, dtype=torch.int32)
-        M_real_fp = torch.tensor(m_fp_list, device=device, dtype=torch.int32)
-
-        _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
-        _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
-        _scatter_fill(fp_pos_1, ref_fp_ts, n_fp_list)
-        _scatter_fill(fp_pos_2, fit_fp_ts, m_fp_list)
-        _scatter_fill(fp_sign_1, [p._ref_fp_sign_t for p in bucket], n_fp_list)
-        _scatter_fill(fp_sign_2, [p._fit_fp_sign_t for p in bucket], m_fp_list)
-
-        def _proc(_s, _k):
-            sl = slice(_s, _s + _k)
-            _, q, t, sc = fast_optimize_esp_field_overlay_batch(
-                centers_1[sl], centers_2[sl], fp_pos_1[sl], fp_pos_2[sl],
-                fp_sign_1[sl], fp_sign_2[sl],
-                alpha=alpha, alpha_field=alpha_field, lam=lam, field_weight=field_weight,
-                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
-                N_real_fp=N_real_fp[sl], M_real_fp=M_real_fp[sl],
-                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("esp_field"))
-            return sc, q, t
-        scores, q_batch, t_batch = _subbatched_align(
-            _proc, K, key=("esp_field", n_cent_pad, m_cent_pad, n_fp_pad, m_fp_pad,
-                           _seeds_for("esp_field")), device=device)
-
-        all_pairs.extend(bucket)
-        all_scores.append(scores)
-        all_q.append(q_batch)
-        all_t.append(t_batch)
-
-    scores_cpu = torch.cat(all_scores).cpu()
-    q_cpu = torch.cat(all_q).cpu()
-    t_cpu = torch.cat(all_t).cpu()
-
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
-    scores_list = scores_cpu.tolist()                       # one C call
-    for p, s, S in zip(all_pairs, scores_list, SE3_all):
-        p.transform_esp_field = S
-        p.sim_aligned_esp_field = s
-
-
 def _align_batch_vol_lipo(
     pairs: list["MoleculePair"],
     *,
@@ -1436,7 +1310,7 @@ def _align_batch_vol_lipo(
     all_q: list[torch.Tensor] = []
     all_t: list[torch.Tensor] = []
 
-    # Merge by shape-centre bands only (like esp_field / vol_color). Lipo-centre counts are NOT
+    # Merge by shape-centre bands only (like vol_color). Lipo-centre counts are NOT
     # keyed -- the ESP kernel masks padded lipo slots by the real count, so two pairs sharing a
     # shape bucket but differing in lipo-centre count stay together and their lipo centres are
     # padded to the bucket's max lipo band (recomputed below). Result-identical.

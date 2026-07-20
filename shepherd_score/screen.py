@@ -146,14 +146,12 @@ class MoleculeProfile:
 
     __slots__ = ("atom_pos", "atom_pos_noH", "surf_pos", "surf_esp", "partial_charges", "radii",
                  "_nonH_atoms_idx", "pharm_types", "pharm_ancs", "pharm_vecs",
-                 "field_point_pos", "field_point_sign",
                  "lipo_pos", "lipophilicity",
                  "num_surf_points", "mol", "id")
 
     def __init__(self, *, atom_pos, surf_pos=None, surf_esp=None,
                  partial_charges=None, radii=None, nonH_atoms_idx=None,
                  pharm_types=None, pharm_ancs=None, pharm_vecs=None,
-                 field_point_pos=None, field_point_sign=None,
                  lipo_pos=None, lipophilicity=None,
                  centers_w_H=None, atom_pos_noH=None, id=None):
         self.atom_pos = _f32(atom_pos)
@@ -175,9 +173,6 @@ class MoleculeProfile:
         self.pharm_types = None if pharm_types is None else np.asarray(pharm_types)
         self.pharm_ancs = _f32(pharm_ancs)
         self.pharm_vecs = _f32(pharm_vecs)
-        # esp_field: variable-length signed electrostatic field points (may be empty, M=0).
-        self.field_point_pos = _f32(field_point_pos)
-        self.field_point_sign = _f32(field_point_sign)
         # vol_lipo: the TRUE-heavy atom centres (own count, may differ from atom_pos when
         # RemoveHs retained an H) + the per-atom Crippen logP placed at them (already heavy-sliced).
         self.lipo_pos = _f32(lipo_pos)
@@ -197,17 +192,10 @@ class MoleculeProfile:
             self.surf_pos = self.surf_pos - mu
         if self.pharm_ancs is not None:
             self.pharm_ancs = self.pharm_ancs - mu
-        if self.field_point_pos is not None:
-            self.field_point_pos = self.field_point_pos - mu   # field points move with the molecule
         if self.lipo_pos is not None:
             self.lipo_pos = self.lipo_pos - mu                 # lipo centres move with the molecule
         if self.mol is not None:
             self.mol = _MolShim(self.mol.GetConformer().GetPositions() - mu)
-
-    def get_field_points(self):
-        """(field_point_pos, field_point_sign) -- mirrors ``Molecule.get_field_points()`` so the
-        ``esp_field`` aligner reads a profile identically to a full ``Molecule``."""
-        return self.field_point_pos, self.field_point_sign
 
     def get_lipo_positions(self):
         """TRUE-heavy lipophilicity centres -- mirrors ``Molecule.get_lipo_positions()`` so the
@@ -244,7 +232,6 @@ def _schema_from_modes(modes) -> dict:
         radii=("vol_and_surf_esp" in modes),
         centers_w_H=("vol_and_surf_esp" in modes),
         pharm=bool({"pharm", "vol_color"} & modes),   # vol_color = atoms + directionless pharm
-        field_points=("esp_field" in modes),          # esp_field = atoms + ESP field points
         lipophilicity=("vol_lipo" in modes),          # vol_lipo = atoms + heavy logP centres
     )
 
@@ -265,8 +252,6 @@ def _store_supports(schema: dict, mode: str) -> bool:
         return schema["pharm"]                          # atoms (always) + pharm types/anchors
     if mode == "vol_tversky":
         return True                                     # asymmetric shape overlay; atom_pos always stored
-    if mode == "esp_field":
-        return schema.get("field_points", False)        # atoms (always) + ESP field points
     if mode == "vol_lipo":
         return schema.get("lipophilicity", False)       # atoms (always) + heavy logP centres
     if mode == "vol_and_surf_esp":
@@ -282,7 +267,6 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
     surf = surf_esp = charges = nonH = radii = cwh = None
     atom_pos_noH = None
     ph_t = ph_a = ph_v = None
-    fp_pos = fp_sign = None
     lipo_pos = lipo_val = None
 
     if sch["surf"]:
@@ -324,12 +308,6 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
         ph_t = np.asarray(m.pharm_types, dtype=np.int32)
         ph_a = _f32(m.pharm_ancs)
         ph_v = _f32(m.pharm_vecs)
-    if sch.get("field_points"):
-        if not hasattr(m, "get_field_points"):
-            raise ValueError("store needs ESP field points but molecule cannot provide them")
-        fp_pos, fp_sign = m.get_field_points()          # (M,3), (M,) -- may be empty (M=0)
-        fp_pos = _f32(fp_pos)
-        fp_sign = _f32(fp_sign)
     if sch.get("lipophilicity"):
         if not hasattr(m, "get_lipo_positions") or not hasattr(m, "get_lipophilicity"):
             raise ValueError("store needs lipophilicity but molecule cannot provide it")
@@ -346,8 +324,6 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
             surf = surf - mu
         if ph_a is not None:
             ph_a = ph_a - mu
-        if fp_pos is not None and len(fp_pos):
-            fp_pos = fp_pos - mu
         if lipo_pos is not None and len(lipo_pos):
             lipo_pos = lipo_pos - mu           # shift by the atom_pos COM (matches the in-memory
                                                # conformer transform, not its own COM)
@@ -360,7 +336,7 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
     return MoleculeProfile(
         atom_pos=atom_pos, surf_pos=surf, surf_esp=surf_esp, partial_charges=charges,
         radii=radii, nonH_atoms_idx=nonH, pharm_types=ph_t, pharm_ancs=ph_a,
-        pharm_vecs=ph_v, field_point_pos=fp_pos, field_point_sign=fp_sign,
+        pharm_vecs=ph_v,
         lipo_pos=lipo_pos, lipophilicity=lipo_val,
         centers_w_H=cwh, atom_pos_noH=atom_pos_noH, id=id,
     )
@@ -561,19 +537,6 @@ class ProfileStore:
             out["pharm_types"] = np.concatenate([r.pharm_types for r in recs]).astype(np.int32)
             out["pharm_ancs"] = np.concatenate([r.pharm_ancs for r in recs]).astype(dt)
             out["pharm_vecs"] = np.concatenate([r.pharm_vecs for r in recs]).astype(dt)
-        if sch.get("field_points"):
-            fp_lens = [len(r.field_point_pos) if r.field_point_pos is not None else 0 for r in recs]
-            out["fp_off"] = offsets(fp_lens)
-            if any(fp_lens):
-                out["field_point_pos"] = np.concatenate(
-                    [r.field_point_pos for r in recs
-                     if r.field_point_pos is not None and len(r.field_point_pos)]).astype(dt)
-                out["field_point_sign"] = np.concatenate(
-                    [r.field_point_sign for r in recs
-                     if r.field_point_sign is not None and len(r.field_point_sign)]).astype(dt)
-            else:                                    # every molecule in the shard had M=0
-                out["field_point_pos"] = np.zeros((0, 3), dt)
-                out["field_point_sign"] = np.zeros((0,), dt)
         if sch.get("lipophilicity"):
             # vol_lipo carries the TRUE-heavy centres + per-atom logP as their OWN variable-length
             # set (one offset table, positions + scalar share the heavy-atom count). Independent of
@@ -659,7 +622,6 @@ class ProfileStore:
         surf_esp = data["surf_esp"] if sch["surf_esp"] else None
         all_off = data["all_off"] if (sch["charges"] and sch["with_H"]) else None
         pharm_off = data["pharm_off"] if sch["pharm"] else None
-        fp_off = data["fp_off"] if sch.get("field_points") else None
         lipo_off = data["lipo_off"] if sch.get("lipophilicity") else None
 
         out = []
@@ -686,10 +648,6 @@ class ProfileStore:
                 kw["pharm_types"] = data["pharm_types"][p0:p1]
                 kw["pharm_ancs"] = data["pharm_ancs"][p0:p1]
                 kw["pharm_vecs"] = data["pharm_vecs"][p0:p1]
-            if sch.get("field_points"):
-                f0, f1 = int(fp_off[i]), int(fp_off[i + 1])
-                kw["field_point_pos"] = data["field_point_pos"][f0:f1]
-                kw["field_point_sign"] = data["field_point_sign"][f0:f1]
             if sch.get("lipophilicity"):
                 l0, l1 = int(lipo_off[i]), int(lipo_off[i + 1])
                 kw["lipo_pos"] = data["lipo_pos"][l0:l1]
@@ -739,7 +697,7 @@ def _centered_copy(query):
 # serves every query.
 # --------------------------------------------------------------------------- #
 _FAST_MODES = ("vol", "surf", "surf_esp", "pharm", "vol_color", "vol_esp", "vol_and_surf_esp",
-               "vol_tversky", "esp_field", "vol_lipo")
+               "vol_tversky", "vol_lipo")
 
 
 class _ArrView:
@@ -777,8 +735,6 @@ class _FastPair:
                  "_ref_centers_w_H_t", "_fit_centers_w_H_t",         # esp_combo with-H centers
                  "_ref_partial_t", "_fit_partial_t",                 # esp_combo with-H charges
                  "_ref_radii_t", "_fit_radii_t",                     # esp_combo with-H radii
-                 "_ref_fp_pos_t", "_fit_fp_pos_t",                   # esp_field ESP field points
-                 "_ref_fp_sign_t", "_fit_fp_sign_t",                 # esp_field field-point signs
                  "_ref_lipo_pos_t", "_fit_lipo_pos_t",               # vol_lipo heavy logP centres
                  "_ref_lipo_t", "_fit_lipo_t",                       # vol_lipo per-atom logP
                  "transform_vol_noH", "sim_aligned_vol_noH",
@@ -789,7 +745,6 @@ class _FastPair:
                  "transform_vol_esp_noH", "sim_aligned_vol_esp_noH",
                  "transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp",
                  "transform_vol_tversky", "sim_aligned_vol_tversky",
-                 "transform_esp_field", "sim_aligned_esp_field",
                  "transform_vol_lipo", "sim_aligned_vol_lipo")
 
     def __init__(self, device):
@@ -826,11 +781,6 @@ def _query_ref_arrays(q, mode: str) -> dict:
                 "xyz": np.asarray(q.atom_pos, np.float32)}                           # heavy (alpha=0.81 shape)
     if mode == "vol_tversky":
         return {"xyz": np.asarray(q.atom_pos, np.float32)}                           # heavy atoms (shape reuse)
-    if mode == "esp_field":
-        fp_pos, fp_sign = q.get_field_points()      # (M,3),(M,) -- may be empty (M=0)
-        return {"xyz": np.asarray(q.atom_pos, np.float32),
-                "fp_pos": np.asarray(fp_pos, np.float32).reshape(-1, 3),
-                "fp_sign": np.asarray(fp_sign, np.float32).reshape(-1)}
     if mode == "vol_lipo":
         # Shape centres = atom_pos (RemoveHs); lipo centres = the TRUE-heavy positions (own count)
         # via the accessor (Molecule reads its conformer; a MoleculeProfile returns its lipo_pos),
@@ -875,11 +825,6 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
                                       mol=_MolShim(ra["cwh"]))}
     if mode == "vol_tversky":
         return {"_ref_xyz_t": f(ra["xyz"])}                     # shape-only, like vol
-    if mode == "esp_field":
-        # Pre-set all three ref tensors so _align_batch_esp_field's _batch_upload skips its
-        # p.ref_molec.get_field_points() lambdas (no _ArrView needed on this array-only path).
-        return {"_ref_xyz_t": f(ra["xyz"]),
-                "_ref_fp_pos_t": f(ra["fp_pos"]), "_ref_fp_sign_t": f(ra["fp_sign"])}
     if mode == "vol_lipo":
         # Pre-set all three ref tensors so _align_batch_vol_lipo's _batch_upload skips its
         # p.ref_molec.get_lipo_positions()/get_lipophilicity() lambdas (no _ArrView needed).
@@ -974,16 +919,6 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
     elif mode == "vol_tversky":
         for p, c in zip(pairs, splitT(f(arrs["atom_pos"]), arrs["atom_off"])):
             p._fit_xyz_t = c                    # shape-only, identical fit tensors to vol
-    elif mode == "esp_field":
-        aoff, foff = arrs["atom_off"], arrs["fp_off"]
-        # Heavy-atom centres (shape channel) + the variable-length signed ESP field points
-        # (field channel), each split by its own offset table into per-molecule device views.
-        for p, at, fp, fs in zip(
-                pairs, splitT(f(arrs["atom_pos"]), aoff),
-                splitT(f(arrs["field_point_pos"]), foff), splitT(f(arrs["field_point_sign"]), foff)):
-            p._fit_xyz_t = at
-            p._fit_fp_pos_t = fp
-            p._fit_fp_sign_t = fs
     elif mode == "vol_lipo":
         aoff, loff = arrs["atom_off"], arrs["lipo_off"]
         # RemoveHs shape centres (own atom_off) + the TRUE-heavy lipo centres and per-atom logP
@@ -1035,11 +970,6 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
         return dict(alpha=ak.get("alpha", 0.81),
                     tversky_alpha=ak.get("tversky_alpha", 0.95),
                     tversky_beta=ak.get("tversky_beta", 0.05), steps_fine=steps)
-    if mode == "esp_field":    # mirrors align_with_esp_field(backend="triton") dispatch
-        return dict(field_weight=ak.get("field_weight", 0.5), alpha=ak.get("alpha", 0.81),
-                    alpha_field=ak.get("alpha_field", 0.81), lam=ak.get("lam", 0.1),
-                    num_repeats=ak.get("num_repeats", _seeds_for(mode)),
-                    lr=ak.get("lr", 0.075), steps_fine=steps)
     if mode == "vol_lipo":     # mirrors align_with_vol_lipo(backend="triton") dispatch
         return dict(lipo_weight=ak.get("lipo_weight", 0.5), alpha=ak.get("alpha", 0.81),
                     lam=ak.get("lam", 0.1),

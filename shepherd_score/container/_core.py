@@ -25,7 +25,6 @@ from shepherd_score.alignment import optimize_ROCS_overlay, optimize_ROCS_overla
 from shepherd_score.alignment import optimize_pharm_overlay, optimize_pharm_overlay_analytical
 from shepherd_score.alignment import optimize_vol_color_overlay
 from shepherd_score.alignment import optimize_vol_tversky_overlay
-from shepherd_score.alignment import optimize_esp_field_overlay
 from shepherd_score.alignment import optimize_vol_lipo_overlay
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.accel import batch as _ba
@@ -59,7 +58,7 @@ def _default_steps(mode: str) -> int:
 _ALIGN_KEYS = (
     'vol', 'vol_noH', 'vol_esp', 'vol_esp_noH',
     'surf', 'surf_esp', 'vol_and_surf_esp', 'pharm', 'vol_color', 'vol_tversky',
-    'esp_field', 'vol_lipo',
+    'vol_lipo',
 )
 
 
@@ -243,15 +242,6 @@ class Molecule:
 
         # Indices for atoms that aren't hydrogens
         self._nonH_atoms_idx = np.array([a.GetIdx() for a in self.mol.GetAtoms() if a.GetAtomicNum() != 1])
-
-        # ESP field points (Cresset-style): a VARIABLE-LENGTH set of signed extrema of the
-        # softened molecular electrostatic potential, from heavy-atom positions + partial charges
-        # (no surface / open3d). Computed LAZILY on first ``get_field_points()`` and cached: the
-        # grid extremum search is expensive and only the ``esp_field`` mode needs it, so building a
-        # Molecule for any other mode must not pay for it. ``field_point_pos`` is (M,3) float32,
-        # ``field_point_sign`` is (M,) float32 (+1 = potential maximum, -1 = minimum); M may be 0.
-        self.field_point_pos = None
-        self.field_point_sign = None
 
         self.pharm_multi_vector = pharm_multi_vector
         if isinstance(pharm_types, np.ndarray) and isinstance(pharm_ancs, np.ndarray) and isinstance(pharm_vecs, np.ndarray):
@@ -462,164 +452,6 @@ class Molecule:
         return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
 
 
-    def get_field_point_contribs(self,
-                                 eps: float = 1.0,
-                                 spacing: float = 0.75,
-                                 margin: float = 4.0,
-                                 rel_thresh: float = 0.15,
-                                 shell_min: float = 1.5,
-                                 shell_max: float = 4.5,
-                                 merge_radius: float = 1.5,
-                                 ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute Cresset-style electrostatic-potential (ESP) *field points*: a variable-length set
-        of signed extrema of the molecular ESP around the molecule.
-
-        Unlike the per-atom ``partial_charges`` trio, this is a *derived point set* (like the
-        pharmacophore) whose length ``M`` depends on the ESP topology, not on the atom count.
-        Everything is computed from heavy-atom positions (``atom_pos``) and their MMFF partial
-        charges (``partial_charges[_nonH_atoms_idx]``) -- no surface / mesh is required.
-
-        Method
-        ------
-        1. Softened Coulomb potential ``phi(r) = sum_i q_i / sqrt(|r - r_i|^2 + eps^2)`` over
-           heavy atoms (``eps=1.0`` A avoids the singularity at the nuclei).
-        2. Evaluate ``phi`` on a regular grid: heavy-atom bounding box + ``margin`` (4.0 A),
-           ``spacing`` 0.75 A.
-        3. Restrict to the *probe shell* -- grid points whose nearest heavy atom lies in
-           ``[shell_min, shell_max]`` (around, not inside, the molecule) -- and keep shell cells
-           that are a strict local max or min of ``phi`` among their in-shell 26 neighbours, with
-           ``|phi| > rel_thresh * max|phi|``. (The extremum test is restricted to the shell because
-           the unrestricted extrema of a superposed softened-Coulomb potential sit *on* the atoms;
-           searching within the shell places field points out in space where the potential is
-           extremal along the accessible surface -- the Cresset field-point concept.)
-        4. Merge extrema within ``merge_radius`` (1.5 A), keeping the strongest by ``|phi|``.
-
-        Parameters
-        ----------
-        eps : float
-            Softening length (A) for the Coulomb potential. Default 1.0.
-        spacing : float
-            Grid spacing (A). Default 0.75.
-        margin : float
-            Bounding-box margin (A) around the heavy atoms. Default 4.0.
-        rel_thresh : float
-            Keep extrema with ``|phi|`` above this fraction of ``max|phi|``. Default 0.15.
-        shell_min, shell_max : float
-            Retain extrema whose nearest heavy atom lies in ``[shell_min, shell_max]`` A.
-            Defaults 1.5 and 4.5.
-        merge_radius : float
-            Merge extrema closer than this (A), keeping the strongest. Default 1.5.
-
-        Returns
-        -------
-        field_point_pos : np.ndarray (M, 3) float32
-            Coordinates of the field points.
-        field_point_sign : np.ndarray (M,) float32
-            +1 for a potential maximum, -1 for a minimum. Empty (M=0) if no extrema qualify.
-        """
-        empty_pos = np.zeros((0, 3), dtype=np.float32)
-        empty_sign = np.zeros((0,), dtype=np.float32)
-
-        # True-heavy positions that MATCH the heavy charges. NOT self.atom_pos: atom_pos is the
-        # RemoveHs set, which RETAINS isotope-labelled H (e.g. deuterium), whereas _nonH_atoms_idx
-        # selects atomic-number != 1 and so drops it -- they desync (N vs N-1) whenever an H is
-        # retained, which broadcasts (G,N) against (1,N-1) below and crashes. Index the with-H
-        # conformer by the SAME _nonH_atoms_idx the charges use so pos and charges stay 1:1. This is
-        # the retained-H trap vol_esp already avoids via its separate heavy centers.
-        pos = self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx].astype(np.float64)  # (N,3)
-        charges = self.partial_charges[self._nonH_atoms_idx].astype(np.float64)  # (N,)
-        if pos.shape[0] == 0 or not np.any(charges != 0.0):
-            return empty_pos, empty_sign
-
-        # --- grid over the heavy-atom bounding box + margin ---
-        lo = pos.min(axis=0) - margin
-        hi = pos.max(axis=0) + margin
-        axes = [np.arange(lo[d], hi[d] + spacing, spacing) for d in range(3)]
-        nx, ny, nz = (len(a) for a in axes)
-        if nx < 3 or ny < 3 or nz < 3:
-            return empty_pos, empty_sign
-        gx, gy, gz = np.meshgrid(axes[0], axes[1], axes[2], indexing='ij')
-        grid = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)  # (G,3)
-
-        # --- softened Coulomb potential + nearest-atom distance at every grid point ---
-        d2 = np.sum((grid[:, None, :] - pos[None, :, :]) ** 2, axis=2)  # (G,N)
-        phi = np.sum(charges[None, :] / np.sqrt(d2 + eps ** 2), axis=1)  # (G,)
-        phi3 = phi.reshape(nx, ny, nz)
-        nn3 = np.sqrt(d2).min(axis=1).reshape(nx, ny, nz)  # nearest heavy-atom distance
-
-        max_abs = np.abs(phi).max()
-        if max_abs == 0.0:
-            return empty_pos, empty_sign
-
-        # --- probe shell: grid cells whose nearest atom is in [shell_min, shell_max] ---
-        shell = (nn3 >= shell_min) & (nn3 <= shell_max)
-        if not np.any(shell):
-            return empty_pos, empty_sign
-
-        # --- strict local extrema restricted to the shell (compare only in-shell neighbours) ---
-        # Pad by 1 so out-of-grid neighbours are treated as "not in shell" (ignored).
-        phi_pad = np.pad(phi3, 1, constant_values=0.0)
-        shell_pad = np.pad(shell, 1, constant_values=False)
-        is_max = np.ones_like(shell, dtype=bool)
-        is_min = np.ones_like(shell, dtype=bool)
-        n_neigh = np.zeros_like(shell, dtype=np.int32)  # in-shell neighbour count
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for dz in (-1, 0, 1):
-                    if dx == 0 and dy == 0 and dz == 0:
-                        continue
-                    neigh_shell = shell_pad[1 + dx:1 + dx + nx, 1 + dy:1 + dy + ny, 1 + dz:1 + dz + nz]
-                    neigh_phi = phi_pad[1 + dx:1 + dx + nx, 1 + dy:1 + dy + ny, 1 + dz:1 + dz + nz]
-                    n_neigh += neigh_shell.astype(np.int32)
-                    # A candidate stays a strict max only if no in-shell neighbour is >= it.
-                    is_max &= ~(neigh_shell & (neigh_phi >= phi3))
-                    is_min &= ~(neigh_shell & (neigh_phi <= phi3))
-        # Require a few in-shell neighbours so isolated cells are not trivially extremal.
-        valid = shell & (n_neigh >= 3)
-        extrema = valid & (is_max | is_min) & (np.abs(phi3) > rel_thresh * max_abs)
-        if not np.any(extrema):
-            return empty_pos, empty_sign
-
-        ex_pos = grid.reshape(nx, ny, nz, 3)[extrema]           # (E,3)
-        ex_phi = phi3[extrema]                                  # (E,)
-        ex_sign = np.where(is_max[extrema], 1.0, -1.0).astype(np.float64)
-
-        # --- merge extrema within merge_radius, keeping the strongest |phi| ---
-        order = np.argsort(-np.abs(ex_phi))
-        accepted_pos = []
-        accepted_sign = []
-        for idx in order:
-            p = ex_pos[idx]
-            if accepted_pos:
-                dists = np.sqrt(np.sum((np.asarray(accepted_pos) - p) ** 2, axis=1))
-                if np.any(dists < merge_radius):
-                    continue
-            accepted_pos.append(p)
-            accepted_sign.append(ex_sign[idx])
-
-        if not accepted_pos:
-            return empty_pos, empty_sign
-        return (np.asarray(accepted_pos, dtype=np.float32),
-                np.asarray(accepted_sign, dtype=np.float32))
-
-
-    def get_field_points(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Return the ESP field points, computing them lazily on first access and caching.
-
-        Returns
-        -------
-        field_point_pos : np.ndarray (M, 3) float32
-            Field-point coordinates (empty if the molecule has no qualifying extrema).
-        field_point_sign : np.ndarray (M,) float32
-            +1 for a potential maximum, -1 for a minimum.
-        """
-        if self.field_point_pos is None:
-            self.field_point_pos, self.field_point_sign = self.get_field_point_contribs()
-        return self.field_point_pos, self.field_point_sign
-
-
     def get_pc(self, use_density=False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Gets the point cloud positions.
@@ -674,11 +506,6 @@ class Molecule:
             self.surf_pos -= xyz_means
         if self.pharm_ancs is not None:
             self.pharm_ancs -= xyz_means
-        if self.field_point_pos is not None:
-            # Field points already cached from an earlier get_field_points(); they move
-            # rigidly with the conformer (the signs are translation-invariant), so shift
-            # them in place rather than leaving a stale copy at the old coordinates.
-            self.field_point_pos = self.field_point_pos - xyz_means
 
 
     def get_pharmacophore(self,
@@ -1485,85 +1312,6 @@ class MoleculePair:
         )
         self.transform_vol_color = se3_transform.numpy()
         self.sim_aligned_vol_color = score.numpy()
-        return aligned_fit_centers.numpy()
-
-
-    def align_with_esp_field(self,
-                             field_weight: float = 0.5,
-                             alpha: float = 0.81,
-                             alpha_field: float = 0.81,
-                             lam: float = 0.1,
-                             num_repeats: int = 50,
-                             trans_init: bool = False,
-                             lr: float = 0.1,
-                             max_num_steps: int = 200,
-                             verbose: bool = False) -> np.ndarray:
-        """
-        Align using a Cresset-style electrostatic *field-point* overlay: a weighted combination of
-        atom-centred Gaussian *shape* (volume) Tanimoto and the overlap of the molecular ESP
-        *field points* (signed extrema of the softened electrostatic potential), matched by sign.
-
-        The optimized objective is
-        ``(1 - field_weight) * shape_Tanimoto + field_weight * field_Tanimoto`` where the field
-        channel scores the field points as signed points via the ESP overlap (same-sign extrema
-        reward, opposite-sign penalize). Only the fit molecule is transformed; both its heavy-atom
-        centres and its field points move rigidly under the same SE(3) pose. If either molecule has
-        no field points the field channel is 0 (shape-only) and the alignment still runs.
-
-        Optimally aligned score is stored in ``self.sim_aligned_esp_field`` and the optimal SE(3)
-        transformation in ``self.transform_esp_field``.
-
-        Parameters
-        ----------
-        field_weight : float, optional
-            Weight of the field-point channel in [0, 1]; shape gets ``1 - field_weight``.
-            Default is 0.5.
-        alpha : float, optional
-            Gaussian width for the shape overlap. Default is 0.81 (volumetric, heavy atoms).
-        alpha_field : float, optional
-            Gaussian width for the field-point positional overlap. Default is 0.81.
-        lam : float, optional
-            Sign ("charge") weighting for the field-point ESP overlap. Default is 0.1
-            (atom-centred/volumetric convention).
-        num_repeats : int, optional
-            Number of SE(3) initializations. Default is 50.
-        trans_init : bool, optional
-            Translation-seeded initialization from the reference atoms. Default is ``False``.
-        lr : float, optional
-            Learning rate. Default is 0.1.
-        max_num_steps : int, optional
-            Maximum optimization steps. Default is 200.
-        verbose : bool, optional
-            Print progress. Default is ``False``.
-
-        Returns
-        -------
-        aligned_fit_centers : np.ndarray (M, 3)
-            Transformed fit atom (heavy-atom) coordinates.
-        """
-        dev = self.device
-        ref_fp_pos, ref_fp_sign = self.ref_molec.get_field_points()
-        fit_fp_pos, fit_fp_sign = self.fit_molec.get_field_points()
-
-        aligned_fit_centers, se3_transform, score = optimize_esp_field_overlay(
-            ref_centers=self._ref_xyz_t,
-            fit_centers=self._fit_xyz_t,
-            ref_fp_pos=self._to_tensor(ref_fp_pos),
-            fit_fp_pos=self._to_tensor(fit_fp_pos),
-            ref_fp_sign=self._to_tensor(ref_fp_sign),
-            fit_fp_sign=self._to_tensor(fit_fp_sign),
-            alpha=alpha,
-            alpha_field=alpha_field,
-            lam=lam,
-            field_weight=field_weight,
-            num_repeats=num_repeats,
-            trans_centers=self._ref_xyz_t if trans_init else None,
-            lr=lr,
-            max_num_steps=max_num_steps,
-            verbose=verbose,
-        )
-        self.transform_esp_field = se3_transform.numpy()
-        self.sim_aligned_esp_field = score.numpy()
         return aligned_fit_centers.numpy()
 
 
