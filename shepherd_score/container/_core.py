@@ -136,6 +136,7 @@ class Molecule:
                  probe_radius: Optional[float] = None,
                  surface_points: Optional[np.ndarray] = None,
                  partial_charges : Optional[np.ndarray] = None,
+                 charge_model: str = "xtb",
                  electrostatics: Optional[np.ndarray] = None,
                  pharm_multi_vector: Optional[bool] = None,
                  pharm_types: Optional[np.ndarray] = None,
@@ -148,8 +149,8 @@ class Molecule:
         """
         Molecule constructor to extract interaction profiles.
 
-        If `partial_charges` are not provided, they will be generated using MMFF94 which may
-        result in subpar performance.
+        If `partial_charges` are not provided, they are generated lazily (only when first needed)
+        using `charge_model` -- gfn2-xTB by default, MMFF94 as a fallback.
 
         Parameters
         ----------
@@ -168,7 +169,14 @@ class Molecule:
             Default is 1.2 if ``None`` is passed.
         partial_charges : Optional[np.ndarray]
             Partial charges for each atom. Shape: (N,).
-            If ``None`` is passed and ESP surface is generated, it will default to MMFF94 partial charges.
+            If ``None``, charges are generated lazily from ``charge_model`` the first time they are
+            needed (an ESP mode, or the surface ESP built when a surface is generated).
+        charge_model : str
+            Charge model used when ``partial_charges`` is ``None``. ``'xtb'`` (default) uses gfn2-xTB
+            partial charges (an external per-molecule subprocess), falling back to MMFF94 with a
+            warning if ``xtb`` is unavailable; ``'mmff'`` uses MMFF94 directly (free by-product of the
+            MMFF optimisation, no subprocess). Charges are computed lazily either way, so pure-shape
+            modes that never read them incur no cost.
         electrostatics : Optional[np.ndarray]
             Electrostatic potential if they were previously generated. Shape: (M,).
         pharm_multi_vector : Optional[bool]
@@ -211,10 +219,16 @@ class Molecule:
         if isinstance(partial_charges, list):
             partial_charges = np.array(partial_charges)
 
+        # Charges are generated LAZILY (see the ``partial_charges`` property): a molecule that is
+        # never asked for its charges -- e.g. pure volumetric-shape / colour / pharmacophore screening
+        # -- never pays to compute them. When they ARE needed (an ESP mode, or a surface whose ESP is
+        # built below), they come from ``charge_model`` (default ``'xtb'`` = gfn2-xTB, with an MMFF94
+        # fallback). Explicit ``partial_charges`` short-circuit generation entirely.
+        self._charge_model = str(charge_model).lower()
         if isinstance(partial_charges, np.ndarray):
-            self.partial_charges = partial_charges
+            self._partial_charges = partial_charges
         else:
-            self.partial_charges = self.get_partial_charges()
+            self._partial_charges = None                       # deferred
         # Per-atom Crippen atomic logP contributions (the ``vol_lipo`` lipophilicity channel).
         # A full ``(N,)`` array over ALL atoms in RDKit-mol (with-H) order -- the same order and
         # basis as ``partial_charges`` -- so its heavy slice reuses the SAME ``_nonH_atoms_idx``.
@@ -327,6 +341,40 @@ class Molecule:
     @pharm_vecs.setter
     def pharm_vecs(self, value: Optional[np.ndarray]) -> None:
         self._ensure_pharm_container().vectors = value
+
+    @property
+    def partial_charges(self) -> np.ndarray:
+        """Per-atom partial charges (all atoms, with-H order), computed lazily on first access.
+
+        The default charge model is **gfn2-xTB** (``charge_model='xtb'``). It is generated the first
+        time the charges are read -- so pure-shape modes that never touch charges never pay for the
+        xTB subprocess -- and cached thereafter. If the ``xtb`` binary is unavailable or fails on a
+        molecule, it falls back to MMFF94 with a warning. Pass ``charge_model='mmff'`` (or explicit
+        ``partial_charges=...``) to skip xTB entirely.
+        """
+        if self._partial_charges is None:
+            self._partial_charges = self._generate_partial_charges()
+        return self._partial_charges
+
+    @partial_charges.setter
+    def partial_charges(self, value) -> None:
+        self._partial_charges = value
+
+    def _generate_partial_charges(self) -> np.ndarray:
+        """Generate charges per ``self._charge_model`` (default 'xtb'); MMFF94 fallback on failure."""
+        if self._charge_model == "xtb":
+            try:
+                from shepherd_score.conformer_generation import (
+                    charges_from_single_point_conformer_with_xtb)
+                return np.asarray(
+                    charges_from_single_point_conformer_with_xtb(self.mol), dtype=np.float32)
+            except Exception as e:
+                import warnings
+                warnings.warn(
+                    f"xTB partial charges unavailable ({type(e).__name__}: {e}); falling back to "
+                    "MMFF94. Install xtb or pass charge_model='mmff' to silence this.",
+                    RuntimeWarning)
+        return self.get_partial_charges()
 
     def get_partial_charges(self) -> np.ndarray:
         """

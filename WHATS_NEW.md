@@ -3,7 +3,7 @@
 This document describes the accelerated-alignment update to `shepherd-score`. It covers the
 code, the organization of every new file, the full public API, and every new feature.
 
-> ## ⚠️ Read first — two changes affect existing results and installs
+> ## ⚠️ Read first — three changes affect existing results and installs
 >
 > 1. **The default batch backend changed, and it changes scores.** `MoleculePairBatch.align_with_*`
 >    used to default to JAX; it now defaults to the accelerated backends — **Triton on a CUDA host,
@@ -13,6 +13,15 @@ code, the organization of every new file, the full public API, and every new fea
 >    and [Behavior changes B5](#7-behavior-changes-read-this).
 > 2. **`numba` is now a core dependency**, not an optional extra. The package no longer imports
 >    without it. See [§2](#2-installation-and-dependencies).
+> 3. **The default charge model for the ESP modes is now gfn2-xTB, not MMFF94, and it changes ESP
+>    scores.** `Molecule(...)` with no `partial_charges` now defaults to `charge_model="xtb"`. Charges
+>    are generated **lazily** — only when something actually reads them (an ESP mode, or the surface
+>    ESP built when a surface is generated) — so pure volumetric-shape / colour / pharmacophore work
+>    never pays the xTB subprocess. If the `xtb` binary is missing or fails on a molecule, it falls
+>    back to MMFF94 with a warning. Pass `charge_model="mmff"` (or explicit `partial_charges=`) for the
+>    old behavior. xTB is **not uniformly better**: on the DUDE-Z enrichment benchmark it helps the
+>    surface-ESP modes (`vol_and_surf_esp` +0.036 ROC-AUC) but *hurts* atom-centred `vol_esp`
+>    (−0.041); pick the charge model to match the representation. See [Behavior changes B6](#7-behavior-changes-read-this).
 
 Structurally the fork is still additive on top of upstream (no upstream file deleted, no upstream
 public name removed), and this release also **merges upstream's `Molecule` refactor** (the
@@ -1016,6 +1025,39 @@ forwarded through `align_with_vol_color`) is **renamed to `directionless` with i
 so extraction and scoring now share one polarity (`directionless=True` = orientation-blind). There
 is no alias — `directional=` was never in upstream and is fork-only, so update any call:
 `directional=False` → `directionless=True`, `directional=True` → `directionless=False`.
+
+### B8. Default charge model for ESP is now gfn2-xTB (ESP scores change), computed lazily
+
+`Molecule(...)` with no `partial_charges` used to fall back to MMFF94. It now takes a
+`charge_model` argument that **defaults to `"xtb"`** (gfn2-xTB), so a default-constructed molecule's
+ESP modes score on xTB charges instead of MMFF94 — **different ESP scores**. Shape, colour, and
+pharmacophore modes are unaffected (they never read charges).
+
+```python
+Molecule(rd, num_surf_points=200)                      # ESP now uses gfn2-xTB charges (new default)
+Molecule(rd, num_surf_points=200, charge_model="mmff") # the old MMFF94 behaviour
+Molecule(rd, num_surf_points=200, partial_charges=q)   # explicit charges (unchanged; skips generation)
+```
+
+Two things make this safe rather than a performance cliff:
+
+- **Lazy.** Charges are generated the first time they are actually read (an ESP mode, or the surface
+  ESP that is built when a surface is generated), then cached. A molecule used only for volumetric
+  shape / colour / pharmacophore never invokes the xTB subprocess — so screening throughput for the
+  non-ESP modes is unchanged. (Constructing *with a surface* does build its surface ESP eagerly, as
+  before, and so does pay the charge cost; pass `charge_model="mmff"` for a fast pure-surface-shape
+  prep.)
+- **Graceful fallback.** If the `xtb` binary is missing or fails to converge on a molecule, it falls
+  back to MMFF94 and emits a `RuntimeWarning` rather than crashing. `xtb` is therefore *recommended*
+  but not a hard import dependency.
+
+**Why xTB, and a caveat.** gfn2-xTB gives quantum-derived charges that are more transferable than
+MMFF94's atom-typed empirical charges, and it is what the paper's ESP benchmark uses. But on the
+DUDE-Z retrospective-enrichment benchmark the effect is **mode-dependent, not uniformly positive**:
+xTB helps the surface-ESP modes (`vol_and_surf_esp` +0.036 ROC-AUC, `surf_esp` ~flat) but *hurts*
+the atom-centred `vol_esp` (−0.041), which does better on MMFF94. The representation and the charge
+model interact — surface ESP rewards a faithful field, atom-centred ESP suits atom-centred charges —
+so choose `charge_model` per mode rather than assuming xTB is always best.
 
 ### Minor
 
