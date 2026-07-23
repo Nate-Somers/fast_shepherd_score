@@ -1475,6 +1475,207 @@ class MoleculePairBatch:
 
         return entries, max_ref_len, max_fit_len
 
+    # ---- SI experimental modes (reuse existing drivers) ------------------------------------
+    def align_with_vol_mr(self, mr_weight: float = 0.5, alpha: float = 0.81, lam: float = 0.1,
+                          num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                          verbose: bool = False, backend: Optional[str] = None,
+                          return_aligned: bool = False):
+        """Batched shape + molar-refractivity alignment (reuses the vol_lipo driver)."""
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_mr")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_mr")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_mr,
+            dict(mr_weight=mr_weight, alpha=alpha, lam=lam,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_mr", "transform_vol_mr", "_fit_xyz_t", return_aligned)
+        if handled:
+            return _result
+        return self._delegate_alignment(
+            'align_with_vol_mr', 'sim_aligned_vol_mr', mr_weight=mr_weight, alpha=alpha, lam=lam,
+            num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
+
+    def align_with_surf_tversky(self, tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
+                                alpha: float = 0.81, num_repeats: int = None, lr: float = 0.1,
+                                max_num_steps: int = None, verbose: bool = False,
+                                backend: Optional[str] = None, return_aligned: bool = False):
+        """Batched surface-shape Tversky alignment (reuses the vol_tversky driver)."""
+        if max_num_steps is None:
+            max_num_steps = _default_steps("surf_tversky")
+        if num_repeats is None:
+            num_repeats = _default_seeds("surf_tversky")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_surf_tversky,
+            dict(alpha=alpha, tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                 steps_fine=max_num_steps),
+            "sim_aligned_surf_tversky", "transform_surf_tversky", "_fit_surf_t", return_aligned)
+        if handled:
+            return _result
+        return self._delegate_alignment(
+            'align_with_surf_tversky', 'sim_aligned_surf_tversky',
+            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta, alpha=alpha,
+            num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
+
+    def align_with_surf_esp_tversky(self, tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
+                                    alpha: float = 0.81, lam: float = 0.3, num_repeats: int = None,
+                                    lr: float = 0.1, max_num_steps: int = None, verbose: bool = False,
+                                    backend: Optional[str] = None, return_aligned: bool = False):
+        """Batched surface-ESP Tversky alignment (reuses the vol_esp_tversky driver)."""
+        if max_num_steps is None:
+            max_num_steps = _default_steps("surf_esp_tversky")
+        if num_repeats is None:
+            num_repeats = _default_seeds("surf_esp_tversky")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_surf_esp_tversky,
+            dict(lam=lam, alpha=alpha, tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                 steps_fine=max_num_steps),
+            "sim_aligned_surf_esp_tversky", "transform_surf_esp_tversky", "_fit_surf_t", return_aligned)
+        if handled:
+            return _result
+        return self._delegate_alignment(
+            'align_with_surf_esp_tversky', 'sim_aligned_surf_esp_tversky',
+            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta, alpha=alpha, lam=lam,
+            num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
+
+    def align_with_vol_lipo_tversky(self, lipo_weight: float = 0.5, alpha: float = 0.81,
+                                    lam: float = 0.1, tversky_alpha: float = 0.95,
+                                    tversky_beta: float = 0.05, num_repeats: int = None,
+                                    lr: float = 0.1, max_num_steps: int = None,
+                                    verbose: bool = False, backend: Optional[str] = None,
+                                    return_aligned: bool = False):
+        """Batched vol_lipo scored with Tversky on both channels (new vol_lipo_tversky driver)."""
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_lipo_tversky")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_lipo_tversky")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_lipo_tversky,
+            dict(lipo_weight=lipo_weight, alpha=alpha, lam=lam,
+                 tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_lipo_tversky", "transform_vol_lipo_tversky", "_fit_xyz_t", return_aligned)
+        if handled:
+            return _result
+        return self._delegate_alignment(
+            'align_with_vol_lipo_tversky', 'sim_aligned_vol_lipo_tversky',
+            lipo_weight=lipo_weight, alpha=alpha, lam=lam, tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta, num_repeats=num_repeats, lr=lr,
+            max_num_steps=max_num_steps, verbose=verbose)
+
+    def align_with_vol_color_tversky(self, color_weight: float = 0.5, alpha: float = 0.81,
+                                     tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
+                                     num_repeats: int = None, lr: float = 0.1,
+                                     max_num_steps: int = None, verbose: bool = False,
+                                     backend: Optional[str] = None, return_aligned: bool = False):
+        """Batched vol_color scored with Tversky on both channels (new vol_color_tversky driver)."""
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_color_tversky")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_color_tversky")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_color_tversky,
+            dict(color_weight=color_weight, alpha=alpha, tversky_alpha=tversky_alpha,
+                 tversky_beta=tversky_beta, num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_color_tversky", "transform_vol_color_tversky", "_fit_xyz_t", return_aligned)
+        if handled:
+            return _result
+        return self._delegate_alignment(
+            'align_with_vol_color_tversky', 'sim_aligned_vol_color_tversky',
+            color_weight=color_weight, alpha=alpha, tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta, num_repeats=num_repeats, lr=lr,
+            max_num_steps=max_num_steps, verbose=verbose)
+
+    def align_with_vol_atomtype(self, atomtype_weight: float = 0.5, alpha: float = 0.81,
+                                num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                                verbose: bool = False, backend: Optional[str] = None,
+                                return_aligned: bool = False):
+        """Batched shape + element-identity alignment (element-table + directionless color kernel)."""
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_atomtype")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_atomtype")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_atomtype,
+            dict(atomtype_weight=atomtype_weight, alpha=alpha,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_atomtype", "transform_vol_atomtype", "_fit_xyz_t", return_aligned)
+        if handled:
+            return _result
+        return self._delegate_alignment(
+            'align_with_vol_atomtype', 'sim_aligned_vol_atomtype',
+            atomtype_weight=atomtype_weight, alpha=alpha, num_repeats=num_repeats, lr=lr,
+            max_num_steps=max_num_steps, verbose=verbose)
+
+    def align_with_vol_pharm(self, color_weight: float = 0.5, alpha: float = 0.81,
+                             num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                             verbose: bool = False, backend: Optional[str] = None,
+                             return_aligned: bool = False):
+        """Batched shape + directional-pharmacophore alignment (new vol_pharm driver)."""
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_pharm")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_pharm")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_pharm,
+            dict(color_weight=color_weight, alpha=alpha,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_pharm", "transform_vol_pharm", "_fit_xyz_t", return_aligned)
+        if handled:
+            return _result
+        return self._delegate_alignment(
+            'align_with_vol_pharm', 'sim_aligned_vol_pharm',
+            color_weight=color_weight, alpha=alpha, num_repeats=num_repeats, lr=lr,
+            max_num_steps=max_num_steps, verbose=verbose)
+
+    def align_with_pharm_tversky(self, extended_points: bool = False, only_extended: bool = False,
+                                 num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                                 verbose: bool = False, backend: Optional[str] = None,
+                                 return_aligned: bool = False):
+        """Batched pharmacophore alignment scored with Tversky (reuses the pharm driver)."""
+        if max_num_steps is None:
+            max_num_steps = _default_steps("pharm_tversky")
+        if num_repeats is None:
+            num_repeats = _default_seeds("pharm_tversky")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_pharm_tversky,
+            dict(extended_points=extended_points, only_extended=only_extended,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_pharm_tversky", "transform_pharm_tversky", "_fit_pharm_ancs_t", return_aligned)
+        if handled:
+            return _result
+        return self._delegate_alignment(
+            'align_with_pharm_tversky', 'sim_aligned_pharm_tversky',
+            extended_points=extended_points, only_extended=only_extended,
+            num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
+
+    def align_with_vol_and_surf_esp_tversky(self, tversky_alpha: float = 0.95,
+                                            tversky_beta: float = 0.05, alpha: float = 0.81,
+                                            lam: float = 0.001, probe_radius: float = 1.0,
+                                            esp_weight: float = 0.5, num_repeats: int = None,
+                                            lr: float = 0.1, max_num_steps: int = None,
+                                            verbose: bool = False, backend: Optional[str] = None,
+                                            return_aligned: bool = False):
+        """Batched ShaEP-style vol_and_surf_esp with a Tversky shape channel."""
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_and_surf_esp_tversky")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_and_surf_esp_tversky")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_and_surf_esp_tversky,
+            dict(alpha=alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight,
+                 tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_and_surf_esp_tversky", "transform_vol_and_surf_esp_tversky",
+            "_fit_surf_t", return_aligned)
+        if handled:
+            return _result
+        return self._delegate_alignment(
+            'align_with_vol_and_surf_esp_tversky', 'sim_aligned_vol_and_surf_esp_tversky',
+            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta, alpha=alpha, lam=lam,
+            probe_radius=probe_radius, esp_weight=esp_weight, num_repeats=num_repeats, lr=lr,
+            max_num_steps=max_num_steps, verbose=verbose)
+
     def align_with_pharm(self,
                          similarity: str = 'tanimoto',
                          extended_points: bool = False,

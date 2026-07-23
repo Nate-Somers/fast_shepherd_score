@@ -26,6 +26,16 @@ MODE_ATTRS = {
     "vol_tversky":      ("transform_vol_tversky",      "sim_aligned_vol_tversky"),
     "vol_lipo":         ("transform_vol_lipo",         "sim_aligned_vol_lipo"),
     "vol_esp_tversky":  ("transform_vol_esp_tversky",  "sim_aligned_vol_esp_tversky"),
+    # SI experimental modes (accelerated; reuse existing kernels/drivers or a small new one).
+    "vol_mr":                   ("transform_vol_mr",                   "sim_aligned_vol_mr"),
+    "surf_tversky":             ("transform_surf_tversky",             "sim_aligned_surf_tversky"),
+    "surf_esp_tversky":         ("transform_surf_esp_tversky",         "sim_aligned_surf_esp_tversky"),
+    "vol_lipo_tversky":         ("transform_vol_lipo_tversky",         "sim_aligned_vol_lipo_tversky"),
+    "vol_color_tversky":        ("transform_vol_color_tversky",        "sim_aligned_vol_color_tversky"),
+    "vol_atomtype":             ("transform_vol_atomtype",             "sim_aligned_vol_atomtype"),
+    "vol_pharm":                ("transform_vol_pharm",                "sim_aligned_vol_pharm"),
+    "pharm_tversky":            ("transform_pharm_tversky",            "sim_aligned_pharm_tversky"),
+    "vol_and_surf_esp_tversky": ("transform_vol_and_surf_esp_tversky", "sim_aligned_vol_and_surf_esp_tversky"),
 }
 
 # The 10 canonical mode ids, in public order.
@@ -60,7 +70,13 @@ PROCESS_MODES = ("vol", "surf", "surf_esp", "pharm")
 # Callers who want more accuracy pass ``num_repeats`` / ``max_num_steps`` explicitly.
 MODE_SEEDS = {"vol": 10, "surf": 8, "surf_esp": 8, "vol_esp": 16, "vol_and_surf_esp": 8,
               "pharm": 32, "vol_color": 16, "vol_tversky": 10, "vol_lipo": 16,
-              "vol_esp_tversky": 16}
+              "vol_esp_tversky": 16,
+              "vol_mr": 16, "surf_tversky": 8, "surf_esp_tversky": 8, "vol_lipo_tversky": 16,
+              "vol_color_tversky": 16, "vol_atomtype": 16, "vol_pharm": 32, "pharm_tversky": 32,
+              "vol_and_surf_esp_tversky": 8}
 MODE_STEPS = {"vol": 30, "surf": 40, "surf_esp": 40, "vol_esp": 50, "vol_and_surf_esp": 60,
               "pharm": 50, "vol_color": 40, "vol_tversky": 40, "vol_lipo": 50,
-              "vol_esp_tversky": 50}
+              "vol_esp_tversky": 50,
+              "vol_mr": 50, "surf_tversky": 40, "surf_esp_tversky": 40, "vol_lipo_tversky": 50,
+              "vol_color_tversky": 40, "vol_atomtype": 40, "vol_pharm": 50, "pharm_tversky": 50,
+              "vol_and_surf_esp_tversky": 60}

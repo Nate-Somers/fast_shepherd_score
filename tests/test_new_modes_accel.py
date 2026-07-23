@@ -27,7 +27,9 @@ def _mol(smiles):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         rd = embed_conformer_from_smiles(smiles, MMFF_optimize=True, random_seed=0)
-    return Molecule(rd)
+    # pharm_multi_vector=False builds pharmacophores (needed by the pharm/colour SI modes;
+    # harmless for the shape/ESP/lipophilicity modes, which ignore them).
+    return Molecule(rd, pharm_multi_vector=False)
 
 
 @pytest.fixture(scope="module")
@@ -40,6 +42,15 @@ MODES = [
     ("vol_tversky", "sim_aligned_vol_tversky"),
     ("vol_lipo", "sim_aligned_vol_lipo"),
     ("vol_esp_tversky", "sim_aligned_vol_esp_tversky"),
+    # SI experimental modes that need NO molecular surface (validatable on a CPU-only box).
+    # The surface modes (surf_tversky, surf_esp_tversky, vol_and_surf_esp_tversky) require Open3D
+    # and are validated on the GPU cluster.
+    ("vol_mr", "sim_aligned_vol_mr"),
+    ("vol_lipo_tversky", "sim_aligned_vol_lipo_tversky"),
+    ("vol_color_tversky", "sim_aligned_vol_color_tversky"),
+    ("vol_atomtype", "sim_aligned_vol_atomtype"),
+    ("vol_pharm", "sim_aligned_vol_pharm"),
+    ("pharm_tversky", "sim_aligned_pharm_tversky"),
 ]
 
 

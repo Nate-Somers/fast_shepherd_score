@@ -1513,6 +1513,852 @@ def _align_batch_vol_esp_tversky(pairs: list["MoleculePair"], *, lam: float = 0.
         p.sim_aligned_vol_esp_tversky = s
 
 
+# =====================================================================================
+# SI experimental modes -- accel aligners that REUSE an existing driver (no new kernel/driver).
+#   vol_mr           -> the vol_lipo driver (molar refractivity as the per-atom scalar field)
+#   surf_tversky     -> the vol_tversky driver (surface points instead of atom centres)
+#   surf_esp_tversky -> the vol_esp_tversky driver (surface points + surface ESP, surface lam)
+# =====================================================================================
+def _align_batch_vol_mr(
+    pairs: list["MoleculePair"],
+    *,
+    mr_weight: float = 0.5,
+    alpha: float = 0.81,
+    lam: float = 0.1,
+    num_repeats: int = 50,
+    topk: int = 30,
+    steps_fine: int = 100,
+    lr: float = 0.075,
+) -> None:
+    """Molar-refractivity blend -- identical to ``_align_batch_vol_lipo`` but feeds the per-atom
+    Crippen MR (``get_mr_positions``/``get_molar_refractivity``) into the shared vol_lipo driver."""
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_mr, pairs,
+                                mr_weight=mr_weight, alpha=alpha, lam=lam,
+                                num_repeats=num_repeats, topk=topk, steps_fine=steps_fine, lr=lr)
+
+    from shepherd_score.accel.drivers.vol_lipo import fast_optimize_vol_lipo_overlay_batch
+
+    device = pairs[0].device
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_ref_mr_pos_t", lambda p: p.ref_molec.get_mr_positions(), torch.float32, device)
+    _batch_upload(pairs, "_fit_mr_pos_t", lambda p: p.fit_molec.get_mr_positions(), torch.float32, device)
+    _batch_upload(pairs, "_ref_mr_t", lambda p: p.ref_molec.get_molar_refractivity(no_H=True), torch.float32, device)
+    _batch_upload(pairs, "_fit_mr_t", lambda p: p.fit_molec.get_molar_refractivity(no_H=True), torch.float32, device)
+
+    all_pairs, all_scores, all_q, all_t = [], [], [], []
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_t.shape[0]},
+                    seeds=_seeds_for("vol_mr"))
+    for _bk in plan_buckets(pairs, _spec, device):
+        n_cent_pad, m_cent_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = len(bucket)
+
+        ref_cent_ts = [p._ref_xyz_t for p in bucket]
+        fit_cent_ts = [p._fit_xyz_t for p in bucket]
+        n_cent_list = [t.shape[0] for t in ref_cent_ts]
+        m_cent_list = [t.shape[0] for t in fit_cent_ts]
+        ref_mr_ts = [p._ref_mr_pos_t for p in bucket]
+        fit_mr_ts = [p._fit_mr_pos_t for p in bucket]
+        n_mr_list = [t.shape[0] for t in ref_mr_ts]
+        m_mr_list = [t.shape[0] for t in fit_mr_ts]
+        n_mr_pad = _band_key(max(n_mr_list)) or _BAND
+        m_mr_pad = _band_key(max(m_mr_list)) or _BAND
+
+        centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
+        mr_pos_1 = torch.zeros(K, n_mr_pad, 3, device=device, dtype=torch.float32)
+        mr_pos_2 = torch.zeros(K, m_mr_pad, 3, device=device, dtype=torch.float32)
+        mr_1 = torch.zeros(K, n_mr_pad, device=device, dtype=torch.float32)
+        mr_2 = torch.zeros(K, m_mr_pad, device=device, dtype=torch.float32)
+
+        N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
+        M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))
+        N_real_mr = torch.tensor(n_mr_list, device=device, dtype=torch.int32)
+        M_real_mr = torch.tensor(m_mr_list, device=device, dtype=torch.int32)
+
+        _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
+        _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
+        _scatter_fill(mr_pos_1, ref_mr_ts, n_mr_list)
+        _scatter_fill(mr_pos_2, fit_mr_ts, m_mr_list)
+        _scatter_fill(mr_1, [p._ref_mr_t for p in bucket], n_mr_list)
+        _scatter_fill(mr_2, [p._fit_mr_t for p in bucket], m_mr_list)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_vol_lipo_overlay_batch(
+                centers_1[sl], centers_2[sl], mr_pos_1[sl], mr_pos_2[sl],
+                mr_1[sl], mr_2[sl],
+                alpha=alpha, lam=lam, lipo_weight=mr_weight,
+                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
+                N_real_lipo=N_real_mr[sl], M_real_lipo=M_real_mr[sl],
+                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("vol_mr"))
+            return sc, q, t
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_mr", n_cent_pad, m_cent_pad, n_mr_pad, m_mr_pad,
+                           _seeds_for("vol_mr")), device=device)
+
+        all_pairs.extend(bucket); all_scores.append(scores); all_q.append(q_batch); all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    scores_list = scores_cpu.tolist()
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_mr = S
+        p.sim_aligned_vol_mr = s
+
+
+def _align_batch_surf_tversky(pairs: list["MoleculePair"], *, alpha: float = 0.81,
+                              tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
+                              steps_fine: int = 100):
+    """Surface-shape Tversky -- identical to ``_align_batch_vol_tversky`` but over ``surf_pos``."""
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_surf_tversky, pairs,
+                                alpha=alpha, tversky_alpha=tversky_alpha,
+                                tversky_beta=tversky_beta, steps_fine=steps_fine)
+
+    from shepherd_score.accel.drivers.vol_tversky import (
+        coarse_fine_align_many_tversky, _self_overlap_in_chunks)
+    from shepherd_score.accel.drivers._common import batched_seeds_torch
+
+    device = pairs[0].device
+    _batch_upload(pairs, "_ref_surf_t", lambda p: p.ref_molec.surf_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_surf_t", lambda p: p.fit_molec.surf_pos, torch.float32, device)
+
+    all_pairs, all_scores, all_q, all_t = [], [], [], []
+    _seeds = _seeds_for("surf_tversky")
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_surf_t.shape[0],
+                           "fit": lambda p: p._fit_surf_t.shape[0]},
+                    seeds=_seeds)
+    for _bk in plan_buckets(pairs, _spec, device):
+        N_pad, M_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = _bk.K
+
+        N_real = torch.empty(K, dtype=torch.int32, device=device)
+        M_real = torch.empty(K, dtype=torch.int32, device=device)
+        ref_ts = [p._ref_surf_t for p in bucket]
+        fit_ts = [p._fit_surf_t for p in bucket]
+        n_list = [t.shape[0] for t in ref_ts]
+        m_list = [t.shape[0] for t in fit_ts]
+        N_real.copy_(torch.tensor(n_list, dtype=torch.int32))
+        M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
+
+        ref_pad = torch.zeros(K, N_pad, 3, device=device, dtype=torch.float32)
+        fit_pad = torch.zeros(K, M_pad, 3, device=device, dtype=torch.float32)
+        _scatter_fill(ref_pad, ref_ts, n_list)
+        _scatter_fill(fit_pad, fit_ts, m_list)
+
+        VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
+        VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            return coarse_fine_align_many_tversky(
+                ref_pad[sl], fit_pad[sl], VAA[sl], VBB[sl],
+                N_real=N_real[sl], M_real=M_real[sl], alpha=alpha,
+                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                steps_fine=steps_fine, seeds=(seeds_q[sl], seeds_t[sl]))
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("surf_tversky", N_pad, M_pad, _seeds), device=device)
+
+        all_pairs.extend(bucket); all_scores.append(scores); all_q.append(q_batch); all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    scores_list = scores_cpu.tolist()
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_surf_tversky = S
+        p.sim_aligned_surf_tversky = s
+
+
+def _align_batch_surf_esp_tversky(pairs: list["MoleculePair"], *, lam: float = 0.3,
+                                  alpha: float = 0.81, tversky_alpha: float = 0.95,
+                                  tversky_beta: float = 0.05, steps_fine: int = 100):
+    """Surface-ESP Tversky -- identical to ``_align_batch_vol_esp_tversky`` but over ``surf_pos`` +
+    ``surf_esp``, with ``lam`` scaled by ``LAM_SCALING`` (the surface convention, matching surf_esp)."""
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_surf_esp_tversky, pairs,
+                                lam=lam, alpha=alpha, tversky_alpha=tversky_alpha,
+                                tversky_beta=tversky_beta, steps_fine=steps_fine)
+
+    from shepherd_score.accel.drivers.vol_esp_tversky import (
+        coarse_fine_esp_tversky_align_many, _self_overlap_esp_chunks)
+    from shepherd_score.accel.drivers._common import batched_seeds_torch
+    from shepherd_score.score.constants import LAM_SCALING
+
+    lam_scaled = LAM_SCALING * lam
+    device = pairs[0].device
+    _batch_upload(pairs, "_ref_surf_t", lambda p: p.ref_molec.surf_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_surf_t", lambda p: p.fit_molec.surf_pos, torch.float32, device)
+    _batch_upload(pairs, "_ref_surf_esp_t", lambda p: p.ref_molec.surf_esp, torch.float32, device)
+    _batch_upload(pairs, "_fit_surf_esp_t", lambda p: p.fit_molec.surf_esp, torch.float32, device)
+
+    all_pairs, all_scores, all_q, all_t = [], [], [], []
+    _seeds = _seeds_for("surf_esp_tversky")
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_surf_t.shape[0],
+                           "fit": lambda p: p._fit_surf_t.shape[0]},
+                    seeds=_seeds)
+    for _bk in plan_buckets(pairs, _spec, device):
+        N_pad, M_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = _bk.K
+
+        N_real = torch.empty(K, dtype=torch.int32, device=device)
+        M_real = torch.empty(K, dtype=torch.int32, device=device)
+        ref_ts = [p._ref_surf_t for p in bucket]
+        fit_ts = [p._fit_surf_t for p in bucket]
+        ref_c_ts = [p._ref_surf_esp_t for p in bucket]
+        fit_c_ts = [p._fit_surf_esp_t for p in bucket]
+        n_list = [t.shape[0] for t in ref_ts]
+        m_list = [t.shape[0] for t in fit_ts]
+        N_real.copy_(torch.tensor(n_list, dtype=torch.int32))
+        M_real.copy_(torch.tensor(m_list, dtype=torch.int32))
+
+        ref_pad = torch.zeros(K, N_pad, 3, device=device, dtype=torch.float32)
+        fit_pad = torch.zeros(K, M_pad, 3, device=device, dtype=torch.float32)
+        ref_c_pad = torch.zeros(K, N_pad, device=device, dtype=torch.float32)
+        fit_c_pad = torch.zeros(K, M_pad, device=device, dtype=torch.float32)
+        _scatter_fill(ref_pad, ref_ts, n_list)
+        _scatter_fill(fit_pad, fit_ts, m_list)
+        _scatter_fill(ref_c_pad, ref_c_ts, n_list)
+        _scatter_fill(fit_c_pad, fit_c_ts, m_list)
+
+        VAA = _self_overlap_esp_chunks(ref_pad, ref_c_pad, N_real, alpha, lam_scaled)
+        VBB = _self_overlap_esp_chunks(fit_pad, fit_c_pad, M_real, alpha, lam_scaled)
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            return coarse_fine_esp_tversky_align_many(
+                ref_pad[sl], fit_pad[sl], ref_c_pad[sl], fit_c_pad[sl], VAA[sl], VBB[sl],
+                N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, lam=lam_scaled,
+                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                steps_fine=steps_fine, seeds=(seeds_q[sl], seeds_t[sl]))
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("surf_esp_tversky", N_pad, M_pad, _seeds), device=device)
+
+        all_pairs.extend(bucket); all_scores.append(scores); all_q.append(q_batch); all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    scores_list = scores_cpu.tolist()
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_surf_esp_tversky = S
+        p.sim_aligned_surf_esp_tversky = s
+
+
+def _align_batch_vol_lipo_tversky(
+    pairs: list["MoleculePair"],
+    *,
+    lipo_weight: float = 0.5,
+    alpha: float = 0.81,
+    lam: float = 0.1,
+    tversky_alpha: float = 0.95,
+    tversky_beta: float = 0.05,
+    num_repeats: int = 50,
+    topk: int = 30,
+    steps_fine: int = 100,
+    lr: float = 0.075,
+) -> None:
+    """vol_lipo scored with Tversky on both channels -- identical plumbing to ``_align_batch_vol_lipo``
+    (same lipophilicity data), routed through the vol_lipo_tversky driver."""
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_lipo_tversky, pairs,
+                                lipo_weight=lipo_weight, alpha=alpha, lam=lam,
+                                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                                num_repeats=num_repeats, topk=topk, steps_fine=steps_fine, lr=lr)
+
+    from shepherd_score.accel.drivers.vol_lipo_tversky import fast_optimize_vol_lipo_tversky_overlay_batch
+
+    device = pairs[0].device
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_ref_lipo_pos_t", lambda p: p.ref_molec.get_lipo_positions(), torch.float32, device)
+    _batch_upload(pairs, "_fit_lipo_pos_t", lambda p: p.fit_molec.get_lipo_positions(), torch.float32, device)
+    _batch_upload(pairs, "_ref_lipo_t", lambda p: p.ref_molec.get_lipophilicity(no_H=True), torch.float32, device)
+    _batch_upload(pairs, "_fit_lipo_t", lambda p: p.fit_molec.get_lipophilicity(no_H=True), torch.float32, device)
+
+    all_pairs, all_scores, all_q, all_t = [], [], [], []
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_t.shape[0]},
+                    seeds=_seeds_for("vol_lipo_tversky"))
+    for _bk in plan_buckets(pairs, _spec, device):
+        n_cent_pad, m_cent_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = len(bucket)
+
+        ref_cent_ts = [p._ref_xyz_t for p in bucket]
+        fit_cent_ts = [p._fit_xyz_t for p in bucket]
+        n_cent_list = [t.shape[0] for t in ref_cent_ts]
+        m_cent_list = [t.shape[0] for t in fit_cent_ts]
+        ref_lipo_ts = [p._ref_lipo_pos_t for p in bucket]
+        fit_lipo_ts = [p._fit_lipo_pos_t for p in bucket]
+        n_lipo_list = [t.shape[0] for t in ref_lipo_ts]
+        m_lipo_list = [t.shape[0] for t in fit_lipo_ts]
+        n_lipo_pad = _band_key(max(n_lipo_list)) or _BAND
+        m_lipo_pad = _band_key(max(m_lipo_list)) or _BAND
+
+        centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
+        lipo_pos_1 = torch.zeros(K, n_lipo_pad, 3, device=device, dtype=torch.float32)
+        lipo_pos_2 = torch.zeros(K, m_lipo_pad, 3, device=device, dtype=torch.float32)
+        lipo_1 = torch.zeros(K, n_lipo_pad, device=device, dtype=torch.float32)
+        lipo_2 = torch.zeros(K, m_lipo_pad, device=device, dtype=torch.float32)
+
+        N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
+        M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))
+        N_real_lipo = torch.tensor(n_lipo_list, device=device, dtype=torch.int32)
+        M_real_lipo = torch.tensor(m_lipo_list, device=device, dtype=torch.int32)
+
+        _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
+        _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
+        _scatter_fill(lipo_pos_1, ref_lipo_ts, n_lipo_list)
+        _scatter_fill(lipo_pos_2, fit_lipo_ts, m_lipo_list)
+        _scatter_fill(lipo_1, [p._ref_lipo_t for p in bucket], n_lipo_list)
+        _scatter_fill(lipo_2, [p._fit_lipo_t for p in bucket], m_lipo_list)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_vol_lipo_tversky_overlay_batch(
+                centers_1[sl], centers_2[sl], lipo_pos_1[sl], lipo_pos_2[sl],
+                lipo_1[sl], lipo_2[sl],
+                alpha=alpha, lam=lam, lipo_weight=lipo_weight,
+                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
+                N_real_lipo=N_real_lipo[sl], M_real_lipo=M_real_lipo[sl],
+                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("vol_lipo_tversky"))
+            return sc, q, t
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_lipo_tversky", n_cent_pad, m_cent_pad, n_lipo_pad, m_lipo_pad,
+                           _seeds_for("vol_lipo_tversky")), device=device)
+
+        all_pairs.extend(bucket); all_scores.append(scores); all_q.append(q_batch); all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    scores_list = scores_cpu.tolist()
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_lipo_tversky = S
+        p.sim_aligned_vol_lipo_tversky = s
+
+
+def _align_batch_vol_color_tversky(
+    pairs: list["MoleculePair"],
+    *,
+    color_weight: float = 0.5,
+    alpha: float = 0.81,
+    tversky_alpha: float = 0.95,
+    tversky_beta: float = 0.05,
+    num_repeats: int = 50,
+    topk: int = 30,
+    steps_fine: int = 100,
+    lr: float = 0.075,
+) -> None:
+    """vol_color scored with Tversky on both channels -- same directionless pharm data plumbing as
+    ``_align_batch_vol_color``, routed through the vol_color_tversky driver."""
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_color_tversky, pairs,
+                                color_weight=color_weight, alpha=alpha,
+                                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                                num_repeats=num_repeats, topk=topk, steps_fine=steps_fine, lr=lr)
+    for p in pairs:
+        if p.ref_molec.pharm_types is None or p.fit_molec.pharm_types is None:
+            raise ValueError("Pharmacophores are None; cannot run _align_batch_vol_color_tversky.")
+
+    from shepherd_score.accel.drivers.vol_color_tversky import (
+        fast_optimize_vol_color_tversky_overlay_batch)
+    from shepherd_score.accel.drivers.vol_color import _PHARM_PAD_TYPE
+
+    device = pairs[0].device
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_ref_pharm_types_t", lambda p: p.ref_molec.pharm_types, torch.int64, device)
+    _batch_upload(pairs, "_fit_pharm_types_t", lambda p: p.fit_molec.pharm_types, torch.int64, device)
+    _batch_upload(pairs, "_ref_pharm_ancs_t", lambda p: p.ref_molec.pharm_ancs, torch.float32, device)
+    _batch_upload(pairs, "_fit_pharm_ancs_t", lambda p: p.fit_molec.pharm_ancs, torch.float32, device)
+
+    all_pairs, all_scores, all_q, all_t = [], [], [], []
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_t.shape[0]},
+                    seeds=_seeds_for("vol_color_tversky"))
+    for _bk in plan_buckets(pairs, _spec, device):
+        n_cent_pad, m_cent_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = len(bucket)
+
+        ref_cent_ts = [p._ref_xyz_t for p in bucket]
+        fit_cent_ts = [p._fit_xyz_t for p in bucket]
+        n_cent_list = [t.shape[0] for t in ref_cent_ts]
+        m_cent_list = [t.shape[0] for t in fit_cent_ts]
+        ref_anc_ts = [p._ref_pharm_ancs_t for p in bucket]
+        fit_anc_ts = [p._fit_pharm_ancs_t for p in bucket]
+        n_ph_list = [t.shape[0] for t in ref_anc_ts]
+        m_ph_list = [t.shape[0] for t in fit_anc_ts]
+        n_ph_pad = _band_key(max(n_ph_list))
+        m_ph_pad = _band_key(max(m_ph_list))
+
+        centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
+        ref_types = torch.full((K, n_ph_pad), _PHARM_PAD_TYPE, device=device, dtype=torch.int64)
+        fit_types = torch.full((K, m_ph_pad), _PHARM_PAD_TYPE, device=device, dtype=torch.int64)
+        ref_ancs = torch.zeros(K, n_ph_pad, 3, device=device, dtype=torch.float32)
+        fit_ancs = torch.zeros(K, m_ph_pad, 3, device=device, dtype=torch.float32)
+
+        N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
+        M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))
+        N_real_pharm = torch.tensor(n_ph_list, device=device, dtype=torch.int32)
+        M_real_pharm = torch.tensor(m_ph_list, device=device, dtype=torch.int32)
+
+        _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
+        _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
+        _scatter_fill(ref_types, [p._ref_pharm_types_t for p in bucket], n_ph_list)
+        _scatter_fill(fit_types, [p._fit_pharm_types_t for p in bucket], m_ph_list)
+        _scatter_fill(ref_ancs, ref_anc_ts, n_ph_list)
+        _scatter_fill(fit_ancs, fit_anc_ts, m_ph_list)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_vol_color_tversky_overlay_batch(
+                centers_1[sl], centers_2[sl], ref_types[sl], fit_types[sl],
+                ref_ancs[sl], fit_ancs[sl],
+                alpha=alpha, color_weight=color_weight,
+                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
+                N_real_pharm=N_real_pharm[sl], M_real_pharm=M_real_pharm[sl],
+                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("vol_color_tversky"))
+            return sc, q, t
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_color_tversky", n_cent_pad, m_cent_pad, n_ph_pad, m_ph_pad,
+                           _seeds_for("vol_color_tversky")), device=device)
+
+        all_pairs.extend(bucket); all_scores.append(scores); all_q.append(q_batch); all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    scores_list = scores_cpu.tolist()
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_color_tversky = S
+        p.sim_aligned_vol_color_tversky = s
+
+
+def _align_batch_vol_atomtype(
+    pairs: list["MoleculePair"],
+    *,
+    atomtype_weight: float = 0.5,
+    alpha: float = 0.81,
+    num_repeats: int = 50,
+    topk: int = 30,
+    steps_fine: int = 100,
+    lr: float = 0.075,
+) -> None:
+    """Shape + element-identity categorical overlay (reuses the directionless colour kernel with
+    element tables). Two independent point sets like vol_lipo (shape on atom_pos; identity on the
+    true-heavy centres with atomic-number labels)."""
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_atomtype, pairs,
+                                atomtype_weight=atomtype_weight, alpha=alpha,
+                                num_repeats=num_repeats, topk=topk, steps_fine=steps_fine, lr=lr)
+
+    from shepherd_score.accel.drivers.vol_atomtype import (
+        fast_optimize_vol_atomtype_overlay_batch, _ATOMTYPE_PAD)
+
+    device = pairs[0].device
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_ref_type_pos_t", lambda p: p.ref_molec.get_atomtype_positions(), torch.float32, device)
+    _batch_upload(pairs, "_fit_type_pos_t", lambda p: p.fit_molec.get_atomtype_positions(), torch.float32, device)
+    _batch_upload(pairs, "_ref_atomlabels_t", lambda p: p.ref_molec.get_atomic_numbers(no_H=True), torch.int64, device)
+    _batch_upload(pairs, "_fit_atomlabels_t", lambda p: p.fit_molec.get_atomic_numbers(no_H=True), torch.int64, device)
+
+    all_pairs, all_scores, all_q, all_t = [], [], [], []
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_t.shape[0]},
+                    seeds=_seeds_for("vol_atomtype"))
+    for _bk in plan_buckets(pairs, _spec, device):
+        n_cent_pad, m_cent_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = len(bucket)
+
+        ref_cent_ts = [p._ref_xyz_t for p in bucket]
+        fit_cent_ts = [p._fit_xyz_t for p in bucket]
+        n_cent_list = [t.shape[0] for t in ref_cent_ts]
+        m_cent_list = [t.shape[0] for t in fit_cent_ts]
+        ref_tp_ts = [p._ref_type_pos_t for p in bucket]
+        fit_tp_ts = [p._fit_type_pos_t for p in bucket]
+        n_tp_list = [t.shape[0] for t in ref_tp_ts]
+        m_tp_list = [t.shape[0] for t in fit_tp_ts]
+        n_tp_pad = _band_key(max(n_tp_list)) or _BAND
+        m_tp_pad = _band_key(max(m_tp_list)) or _BAND
+
+        centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
+        type_pos_1 = torch.zeros(K, n_tp_pad, 3, device=device, dtype=torch.float32)
+        type_pos_2 = torch.zeros(K, m_tp_pad, 3, device=device, dtype=torch.float32)
+        labels_1 = torch.full((K, n_tp_pad), _ATOMTYPE_PAD, device=device, dtype=torch.int64)
+        labels_2 = torch.full((K, m_tp_pad), _ATOMTYPE_PAD, device=device, dtype=torch.int64)
+
+        N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
+        M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))
+        N_real_type = torch.tensor(n_tp_list, device=device, dtype=torch.int32)
+        M_real_type = torch.tensor(m_tp_list, device=device, dtype=torch.int32)
+
+        _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
+        _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
+        _scatter_fill(type_pos_1, ref_tp_ts, n_tp_list)
+        _scatter_fill(type_pos_2, fit_tp_ts, m_tp_list)
+        _scatter_fill(labels_1, [p._ref_atomlabels_t for p in bucket], n_tp_list)
+        _scatter_fill(labels_2, [p._fit_atomlabels_t for p in bucket], m_tp_list)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_vol_atomtype_overlay_batch(
+                centers_1[sl], centers_2[sl], type_pos_1[sl], type_pos_2[sl],
+                labels_1[sl], labels_2[sl],
+                alpha=alpha, atomtype_weight=atomtype_weight,
+                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
+                N_real_type=N_real_type[sl], M_real_type=M_real_type[sl],
+                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("vol_atomtype"))
+            return sc, q, t
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_atomtype", n_cent_pad, m_cent_pad, n_tp_pad, m_tp_pad,
+                           _seeds_for("vol_atomtype")), device=device)
+
+        all_pairs.extend(bucket); all_scores.append(scores); all_q.append(q_batch); all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    scores_list = scores_cpu.tolist()
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_atomtype = S
+        p.sim_aligned_vol_atomtype = s
+
+
+def _align_batch_vol_pharm(
+    pairs: list["MoleculePair"],
+    *,
+    color_weight: float = 0.5,
+    alpha: float = 0.81,
+    num_repeats: int = 50,
+    topk: int = 30,
+    steps_fine: int = 100,
+    lr: float = 0.075,
+) -> None:
+    """Shape + DIRECTIONAL pharmacophore overlay -- like ``_align_batch_vol_color`` but also uploads
+    the orientation VECTORS and routes through the directional vol_pharm driver."""
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_pharm, pairs,
+                                color_weight=color_weight, alpha=alpha,
+                                num_repeats=num_repeats, topk=topk, steps_fine=steps_fine, lr=lr)
+    for p in pairs:
+        if p.ref_molec.pharm_types is None or p.fit_molec.pharm_types is None:
+            raise ValueError("Pharmacophores are None; cannot run _align_batch_vol_pharm.")
+
+    from shepherd_score.accel.drivers.vol_pharm import fast_optimize_vol_pharm_overlay_batch
+    from shepherd_score.accel.drivers.vol_color import _PHARM_PAD_TYPE
+
+    device = pairs[0].device
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_ref_pharm_types_t", lambda p: p.ref_molec.pharm_types, torch.int64, device)
+    _batch_upload(pairs, "_fit_pharm_types_t", lambda p: p.fit_molec.pharm_types, torch.int64, device)
+    _batch_upload(pairs, "_ref_pharm_ancs_t", lambda p: p.ref_molec.pharm_ancs, torch.float32, device)
+    _batch_upload(pairs, "_fit_pharm_ancs_t", lambda p: p.fit_molec.pharm_ancs, torch.float32, device)
+    _batch_upload(pairs, "_ref_pharm_vecs_t", lambda p: p.ref_molec.pharm_vecs, torch.float32, device)
+    _batch_upload(pairs, "_fit_pharm_vecs_t", lambda p: p.fit_molec.pharm_vecs, torch.float32, device)
+
+    all_pairs, all_scores, all_q, all_t = [], [], [], []
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_t.shape[0]},
+                    seeds=_seeds_for("vol_pharm"))
+    for _bk in plan_buckets(pairs, _spec, device):
+        n_cent_pad, m_cent_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = len(bucket)
+
+        ref_cent_ts = [p._ref_xyz_t for p in bucket]
+        fit_cent_ts = [p._fit_xyz_t for p in bucket]
+        n_cent_list = [t.shape[0] for t in ref_cent_ts]
+        m_cent_list = [t.shape[0] for t in fit_cent_ts]
+        ref_anc_ts = [p._ref_pharm_ancs_t for p in bucket]
+        fit_anc_ts = [p._fit_pharm_ancs_t for p in bucket]
+        n_ph_list = [t.shape[0] for t in ref_anc_ts]
+        m_ph_list = [t.shape[0] for t in fit_anc_ts]
+        n_ph_pad = _band_key(max(n_ph_list))
+        m_ph_pad = _band_key(max(m_ph_list))
+
+        centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
+        ref_types = torch.full((K, n_ph_pad), _PHARM_PAD_TYPE, device=device, dtype=torch.int64)
+        fit_types = torch.full((K, m_ph_pad), _PHARM_PAD_TYPE, device=device, dtype=torch.int64)
+        ref_ancs = torch.zeros(K, n_ph_pad, 3, device=device, dtype=torch.float32)
+        fit_ancs = torch.zeros(K, m_ph_pad, 3, device=device, dtype=torch.float32)
+        ref_vecs = torch.zeros(K, n_ph_pad, 3, device=device, dtype=torch.float32)
+        fit_vecs = torch.zeros(K, m_ph_pad, 3, device=device, dtype=torch.float32)
+
+        N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
+        M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))
+        N_real_pharm = torch.tensor(n_ph_list, device=device, dtype=torch.int32)
+        M_real_pharm = torch.tensor(m_ph_list, device=device, dtype=torch.int32)
+
+        _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
+        _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
+        _scatter_fill(ref_types, [p._ref_pharm_types_t for p in bucket], n_ph_list)
+        _scatter_fill(fit_types, [p._fit_pharm_types_t for p in bucket], m_ph_list)
+        _scatter_fill(ref_ancs, ref_anc_ts, n_ph_list)
+        _scatter_fill(fit_ancs, fit_anc_ts, m_ph_list)
+        _scatter_fill(ref_vecs, [p._ref_pharm_vecs_t for p in bucket], n_ph_list)
+        _scatter_fill(fit_vecs, [p._fit_pharm_vecs_t for p in bucket], m_ph_list)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_vol_pharm_overlay_batch(
+                centers_1[sl], centers_2[sl], ref_types[sl], fit_types[sl],
+                ref_ancs[sl], fit_ancs[sl], ref_vecs[sl], fit_vecs[sl],
+                alpha=alpha, color_weight=color_weight,
+                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
+                N_real_pharm=N_real_pharm[sl], M_real_pharm=M_real_pharm[sl],
+                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("vol_pharm"))
+            return sc, q, t
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_pharm", n_cent_pad, m_cent_pad, n_ph_pad, m_ph_pad,
+                           _seeds_for("vol_pharm")), device=device)
+
+        all_pairs.extend(bucket); all_scores.append(scores); all_q.append(q_batch); all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    scores_list = scores_cpu.tolist()
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_pharm = S
+        p.sim_aligned_vol_pharm = s
+
+
+def _align_batch_vol_and_surf_esp_tversky(
+    pairs: list["MoleculePair"],
+    *,
+    alpha: float = 0.81,
+    lam: float = 0.001,
+    probe_radius: float = 1.0,
+    esp_weight: float = 0.5,
+    tversky_alpha: float = 0.95,
+    tversky_beta: float = 0.05,
+    num_repeats: int = 50,
+    topk: int = 30,
+    steps_fine: int = 100,
+    lr: float = 0.075,
+) -> None:
+    """ShaEP-style vol_and_surf_esp with a Tversky SHAPE channel. Identical plumbing to
+    ``_align_batch_vol_and_surf_esp`` (surfaces + ESP + radii + with-H centres), routed through the
+    vol_and_surf_esp_tversky driver."""
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_and_surf_esp_tversky, pairs,
+                                alpha=alpha, lam=lam, probe_radius=probe_radius,
+                                esp_weight=esp_weight, tversky_alpha=tversky_alpha,
+                                tversky_beta=tversky_beta, num_repeats=num_repeats,
+                                topk=topk, steps_fine=steps_fine, lr=lr)
+
+    from shepherd_score.accel.drivers.vol_and_surf_esp_tversky import (
+        fast_optimize_vol_and_surf_esp_tversky_overlay_batch)
+
+    device = pairs[0].device
+    for p in pairs:
+        if p.ref_molec.surf_pos is None or p.fit_molec.surf_pos is None:
+            raise ValueError("Surface points are None; cannot run _align_batch_vol_and_surf_esp_tversky.")
+        if p.ref_molec.surf_esp is None or p.fit_molec.surf_esp is None:
+            raise ValueError("Surface ESP is None; cannot run _align_batch_vol_and_surf_esp_tversky.")
+
+    _batch_upload(pairs, "_ref_surf_t", lambda p: p.ref_molec.surf_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_surf_t", lambda p: p.fit_molec.surf_pos, torch.float32, device)
+    _batch_upload(pairs, "_ref_surf_esp_t", lambda p: p.ref_molec.surf_esp, torch.float32, device)
+    _batch_upload(pairs, "_fit_surf_esp_t", lambda p: p.fit_molec.surf_esp, torch.float32, device)
+    _batch_upload(pairs, "_ref_centers_w_H_t",
+                  lambda p: p.ref_molec.mol.GetConformer().GetPositions(), torch.float32, device)
+    _batch_upload(pairs, "_fit_centers_w_H_t",
+                  lambda p: p.fit_molec.mol.GetConformer().GetPositions(), torch.float32, device)
+    _batch_upload(pairs, "_ref_partial_t", lambda p: p.ref_molec.partial_charges, torch.float32, device)
+    _batch_upload(pairs, "_fit_partial_t", lambda p: p.fit_molec.partial_charges, torch.float32, device)
+    _batch_upload(pairs, "_ref_radii_t", lambda p: p.ref_molec.radii, torch.float32, device)
+    _batch_upload(pairs, "_fit_radii_t", lambda p: p.fit_molec.radii, torch.float32, device)
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
+
+    all_pairs, all_scores, all_q, all_t = [], [], [], []
+    _a0 = (alpha == 0.81)
+    _spec = PadSpec(
+        merge={
+            "n_wH":   lambda p: p._ref_centers_w_H_t.shape[0],
+            "m_wH":   lambda p: p._fit_centers_w_H_t.shape[0],
+            "n_surf": lambda p: p._ref_surf_t.shape[0],
+            "m_surf": lambda p: p._fit_surf_t.shape[0],
+            "n_cent": (lambda p: p._ref_xyz_t.shape[0]) if _a0 else (lambda p: p._ref_surf_t.shape[0]),
+            "m_cent": (lambda p: p._fit_xyz_t.shape[0]) if _a0 else (lambda p: p._fit_surf_t.shape[0]),
+        },
+        seeds=_seeds_for("vol_and_surf_esp_tversky"),
+        work=lambda pad: (pad["n_cent"] * pad["m_cent"]
+                          + pad["n_surf"] * pad["m_wH"]
+                          + pad["m_surf"] * pad["n_wH"]),
+    )
+    for _bk in plan_buckets(pairs, _spec, device):
+        n_wH_pad, m_wH_pad = _bk.pad["n_wH"], _bk.pad["m_wH"]
+        n_cent_pad, m_cent_pad = _bk.pad["n_cent"], _bk.pad["m_cent"]
+        n_surf_pad, m_surf_pad = _bk.pad["n_surf"], _bk.pad["m_surf"]
+        bucket = _bk.members
+        K = len(bucket)
+
+        centers_w_H_1 = torch.zeros(K, n_wH_pad, 3, device=device, dtype=torch.float32)
+        centers_w_H_2 = torch.zeros(K, m_wH_pad, 3, device=device, dtype=torch.float32)
+        partial_1 = torch.zeros(K, n_wH_pad, device=device, dtype=torch.float32)
+        partial_2 = torch.zeros(K, m_wH_pad, device=device, dtype=torch.float32)
+        radii_1 = torch.zeros(K, n_wH_pad, device=device, dtype=torch.float32)
+        radii_2 = torch.zeros(K, m_wH_pad, device=device, dtype=torch.float32)
+        centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
+        points_1 = torch.zeros(K, n_surf_pad, 3, device=device, dtype=torch.float32)
+        points_2 = torch.zeros(K, m_surf_pad, 3, device=device, dtype=torch.float32)
+        point_charges_1 = torch.zeros(K, n_surf_pad, device=device, dtype=torch.float32)
+        point_charges_2 = torch.zeros(K, m_surf_pad, device=device, dtype=torch.float32)
+
+        N_real_atoms_w_H_1 = torch.empty(K, device=device, dtype=torch.int32)
+        M_real_atoms_w_H_2 = torch.empty(K, device=device, dtype=torch.int32)
+        N_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        M_real_centers = torch.empty(K, device=device, dtype=torch.int32)
+        N_real_surf_1 = torch.empty(K, device=device, dtype=torch.int32)
+        M_real_surf_2 = torch.empty(K, device=device, dtype=torch.int32)
+
+        ref_wH_ts = [p._ref_centers_w_H_t for p in bucket]
+        fit_wH_ts = [p._fit_centers_w_H_t for p in bucket]
+        ref_surf_ts = [p._ref_surf_t for p in bucket]
+        fit_surf_ts = [p._fit_surf_t for p in bucket]
+        n_wH_list = [t.shape[0] for t in ref_wH_ts]
+        m_wH_list = [t.shape[0] for t in fit_wH_ts]
+        n_surf_list = [t.shape[0] for t in ref_surf_ts]
+        m_surf_list = [t.shape[0] for t in fit_surf_ts]
+
+        N_real_atoms_w_H_1.copy_(torch.tensor(n_wH_list, dtype=torch.int32))
+        M_real_atoms_w_H_2.copy_(torch.tensor(m_wH_list, dtype=torch.int32))
+        N_real_surf_1.copy_(torch.tensor(n_surf_list, dtype=torch.int32))
+        M_real_surf_2.copy_(torch.tensor(m_surf_list, dtype=torch.int32))
+
+        _scatter_fill(centers_w_H_1, ref_wH_ts, n_wH_list)
+        _scatter_fill(centers_w_H_2, fit_wH_ts, m_wH_list)
+        _scatter_fill(partial_1, [p._ref_partial_t for p in bucket], n_wH_list)
+        _scatter_fill(partial_2, [p._fit_partial_t for p in bucket], m_wH_list)
+        _scatter_fill(radii_1, [p._ref_radii_t for p in bucket], n_wH_list)
+        _scatter_fill(radii_2, [p._fit_radii_t for p in bucket], m_wH_list)
+        _scatter_fill(points_1, ref_surf_ts, n_surf_list)
+        _scatter_fill(points_2, fit_surf_ts, m_surf_list)
+        _scatter_fill(point_charges_1, [p._ref_surf_esp_t for p in bucket], n_surf_list)
+        _scatter_fill(point_charges_2, [p._fit_surf_esp_t for p in bucket], m_surf_list)
+
+        if alpha == 0.81:
+            ref_cent_ts = [p._ref_xyz_t for p in bucket]
+            fit_cent_ts = [p._fit_xyz_t for p in bucket]
+            n_cent_list = [t.shape[0] for t in ref_cent_ts]
+            m_cent_list = [t.shape[0] for t in fit_cent_ts]
+        else:
+            ref_cent_ts, fit_cent_ts = ref_surf_ts, fit_surf_ts
+            n_cent_list, m_cent_list = n_surf_list, m_surf_list
+        _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
+        _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
+        N_real_centers.copy_(torch.tensor(n_cent_list, dtype=torch.int32))
+        M_real_centers.copy_(torch.tensor(m_cent_list, dtype=torch.int32))
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_vol_and_surf_esp_tversky_overlay_batch(
+                centers_w_H_1[sl], centers_w_H_2[sl], centers_1[sl], centers_2[sl],
+                points_1[sl], points_2[sl], partial_1[sl], partial_2[sl],
+                point_charges_1[sl], point_charges_2[sl], radii_1[sl], radii_2[sl],
+                alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight,
+                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                N_real_atoms_w_H_1=N_real_atoms_w_H_1[sl], M_real_atoms_w_H_2=M_real_atoms_w_H_2[sl],
+                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
+                N_real_surf_1=N_real_surf_1[sl], M_real_surf_2=M_real_surf_2[sl],
+                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("vol_and_surf_esp_tversky"))
+            return sc, q, t
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_and_surf_esp_tversky", n_wH_pad, m_wH_pad, n_cent_pad,
+                           m_cent_pad, n_surf_pad, m_surf_pad, _seeds_for("vol_and_surf_esp_tversky")),
+            device=device)
+
+        all_pairs.extend(bucket); all_scores.append(scores); all_q.append(q_batch); all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    scores_list = scores_cpu.tolist()
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_and_surf_esp_tversky = S
+        p.sim_aligned_vol_and_surf_esp_tversky = s
+
+
+def _align_batch_pharm_tversky(pairs: list["MoleculePair"], *, extended_points: bool = False,
+                               only_extended: bool = False, trans_init: bool = False,
+                               num_repeats: Optional[int] = None, topk: int = 30,
+                               steps_fine: int = 100, lr: float = 0.075):
+    """Pharmacophore alignment scored with Tversky. Reuses the pharm driver (which already accepts
+    ``similarity='tversky'``) verbatim, then moves the result into the ``pharm_tversky`` slots
+    (preserving any existing ``pharm`` slot values so both modes can run on the same objects)."""
+    if not pairs:
+        return
+    if num_repeats is None:
+        num_repeats = _seeds_for("pharm_tversky")
+    saved = [(p.transform_pharm, p.sim_aligned_pharm) for p in pairs]
+    _align_batch_pharm(pairs, similarity="tversky", extended_points=extended_points,
+                       only_extended=only_extended, trans_init=trans_init,
+                       num_repeats=num_repeats, topk=topk, steps_fine=steps_fine, lr=lr)
+    for p, (tf, sc) in zip(pairs, saved):
+        p.transform_pharm_tversky = p.transform_pharm
+        p.sim_aligned_pharm_tversky = p.sim_aligned_pharm
+        p.transform_pharm = tf
+        p.sim_aligned_pharm = sc
+
+
 # --- legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp) ----------
 # Same function objects, so ``__name__`` stays canonical -- the multi-GPU dispatch
 # (``align_fn.__name__.replace("_align_batch_", "")``) and _MODE_SPEC lookup are

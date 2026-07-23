@@ -16,6 +16,10 @@ from .aligners import (
     _align_batch_vol, _align_batch_surf, _align_batch_surf_esp, _align_batch_vol_esp,
     _align_batch_vol_and_surf_esp, _align_batch_pharm, _align_batch_vol_color,
     _align_batch_vol_tversky, _align_batch_vol_lipo, _align_batch_vol_esp_tversky,
+    # SI experimental modes
+    _align_batch_vol_mr, _align_batch_surf_tversky, _align_batch_surf_esp_tversky,
+    _align_batch_vol_lipo_tversky, _align_batch_vol_color_tversky, _align_batch_vol_atomtype,
+    _align_batch_vol_pharm, _align_batch_pharm_tversky, _align_batch_vol_and_surf_esp_tversky,
     _esp_bucketed_align,
     # legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp)
     _align_batch_esp, _align_batch_esp_combo,

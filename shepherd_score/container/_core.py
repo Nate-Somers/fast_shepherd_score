@@ -27,6 +27,10 @@ from shepherd_score.alignment import optimize_vol_color_overlay
 from shepherd_score.alignment import optimize_vol_tversky_overlay
 from shepherd_score.alignment import optimize_vol_esp_tversky_overlay
 from shepherd_score.alignment import optimize_vol_lipo_overlay
+from shepherd_score.alignment import optimize_vol_atomtype_overlay
+from shepherd_score.alignment import optimize_vol_color_tversky_overlay
+from shepherd_score.alignment import optimize_vol_lipo_tversky_overlay
+from shepherd_score.alignment import optimize_vol_and_surf_esp_tversky_overlay
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.accel import batch as _ba
 from shepherd_score.accel._modes import (
@@ -60,6 +64,11 @@ _ALIGN_KEYS = (
     'vol', 'vol_noH', 'vol_esp', 'vol_esp_noH',
     'surf', 'surf_esp', 'vol_and_surf_esp', 'pharm', 'vol_color', 'vol_tversky',
     'vol_lipo', 'vol_esp_tversky',
+    # SI experimental modes (reference layer): directional-pharmacophore / atom-identity /
+    # molar-refractivity blends, and the Tversky variants of the remaining canonical modes.
+    'vol_pharm', 'vol_atomtype', 'vol_mr',
+    'surf_tversky', 'surf_esp_tversky', 'vol_and_surf_esp_tversky',
+    'vol_color_tversky', 'vol_lipo_tversky', 'pharm_tversky',
 )
 
 
@@ -233,6 +242,11 @@ class Molecule:
         # A full ``(N,)`` array over ALL atoms in RDKit-mol (with-H) order -- the same order and
         # basis as ``partial_charges`` -- so its heavy slice reuses the SAME ``_nonH_atoms_idx``.
         self.lipophilicity = self.get_lipophilicity_contribs()
+        # Per-atom Crippen atomic molar-refractivity (polarizability) contributions -- the ``vol_mr``
+        # channel. Same ``(N,)`` with-H order/basis as ``lipophilicity``: ``_CalcCrippenContribs``
+        # returns one ``(logP, MR)`` tuple per atom, and this takes the ``MR`` element (index 1)
+        # exactly where ``lipophilicity`` takes ``logP`` (index 0).
+        self.molar_refractivity = self.get_molar_refractivity_contribs()
         self.radii = get_atomic_vdw_radii(mol)
 
         self._surface = Surface(
@@ -499,6 +513,96 @@ class Molecule:
             TRUE-heavy atom coordinates. Shape: (N_heavy, 3).
         """
         return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
+
+
+    def get_molar_refractivity_contribs(self) -> np.ndarray:
+        """
+        Get the per-atom Crippen atomic molar-refractivity (MR) contribution for each atom.
+
+        Uses RDKit's ``rdMolDescriptors._CalcCrippenContribs``, which returns one ``(logP, MR)``
+        tuple per atom in RDKit-mol (with-H) order; the per-atom scalar taken here is the ``MR``
+        element (index 1), exactly where :meth:`get_lipophilicity_contribs` takes ``logP`` (index
+        0). Atomic MR is a size/polarizability descriptor (larger for heavy, polarizable atoms such
+        as S/Cl/Br/I and aromatic carbons). The result is a full ``(N,)`` array over ALL atoms in
+        the same order/basis as :attr:`partial_charges` (heavy atoms are sliced out later via
+        :meth:`get_molar_refractivity`, reusing the same ``_nonH_atoms_idx`` the charges use).
+
+        Returns
+        -------
+        np.ndarray
+            Per-atom Crippen molar-refractivity contributions. Shape: (N,).
+        """
+        contribs = rdMolDescriptors._CalcCrippenContribs(self.mol)
+        return np.array([c[1] for c in contribs], dtype=np.float32)
+
+
+    def get_molar_refractivity(self, no_H: bool = True) -> np.ndarray:
+        """
+        Get per-atom Crippen molar-refractivity contributions with or without hydrogens.
+
+        This slices the already-computed ``molar_refractivity``; it does not recompute it
+        (see :meth:`get_molar_refractivity_contribs`). Mirrors :meth:`get_lipophilicity`.
+
+        Parameters
+        ----------
+        no_H : bool, optional
+            If ``True`` (default) return contributions for heavy atoms only.
+            If ``False`` return contributions for all atoms (including H).
+
+        Returns
+        -------
+        np.ndarray
+            Per-atom Crippen molar-refractivity contributions. Shape: (N,).
+        """
+        if no_H:
+            return self.molar_refractivity[self._nonH_atoms_idx]
+        return self.molar_refractivity
+
+
+    def get_mr_positions(self) -> np.ndarray:
+        """Get the TRUE-heavy atom coordinates that carry the per-atom Crippen molar refractivity --
+        the ``vol_mr`` channel's centres. Identical basis to :meth:`get_lipo_positions` (strict-heavy
+        via ``_nonH_atoms_idx``, from the with-H conformer, NOT ``atom_pos`` -- the retained-H trap);
+        a separate accessor so a ``Molecule`` and the RDKit-free ``MoleculeProfile`` feed the
+        ``vol_mr`` aligner identically."""
+        return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
+
+
+    def get_atomtype_positions(self) -> np.ndarray:
+        """Get the TRUE-heavy atom coordinates that carry the per-atom element labels -- the
+        ``vol_atomtype`` categorical channel's centres. Strict-heavy via ``_nonH_atoms_idx`` (1:1 with
+        :meth:`get_atomic_numbers`), from the with-H conformer, NOT ``atom_pos`` (the retained-H
+        trap)."""
+        return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
+
+
+    def get_atomic_numbers(self, no_H: bool = True) -> np.ndarray:
+        """
+        Get per-atom atomic numbers (element identity) as a float32 array -- the categorical label
+        the ``vol_atomtype`` (atom-identity) channel matches on.
+
+        A full ``(N,)`` array over ALL atoms in RDKit-mol (with-H) order, sliced to the strict-heavy
+        set with the SAME ``_nonH_atoms_idx`` the charges/lipophilicity use, so the labels stay 1:1
+        with the true-heavy centres ``mol.GetConformer().GetPositions()[_nonH_atoms_idx]`` (NOT
+        ``atom_pos`` -- the retained-H trap). Returned as float32 to sit alongside the other per-atom
+        channels in a batch tensor; equality of the (integer-valued) labels is what the categorical
+        overlap tests.
+
+        Parameters
+        ----------
+        no_H : bool, optional
+            If ``True`` (default) return atomic numbers for heavy atoms only.
+            If ``False`` return atomic numbers for all atoms (including H).
+
+        Returns
+        -------
+        np.ndarray
+            Per-atom atomic numbers. Shape: (N,).
+        """
+        Z = np.array([a.GetAtomicNum() for a in self.mol.GetAtoms()], dtype=np.float32)
+        if no_H:
+            return Z[self._nonH_atoms_idx]
+        return Z
 
 
     def get_pc(self, use_density=False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1746,6 +1850,347 @@ class MoleculePair:
 
         self.transform_pharm = se3_transform.numpy()
         self.sim_aligned_pharm = score.numpy()
+        return aligned_fit_anchors.numpy(), aligned_fit_vectors.numpy()
+
+
+    # =====================================================================================
+    # SI experimental modes (reference layer). Each reuses an existing eager optimizer or one
+    # of the new SI optimizers in ``alignment/_torch.py``; seed/step defaults are LITERAL (50/200)
+    # because these modes are not yet in the canonical ``MODE_SEEDS``/``MODE_STEPS`` registry (the
+    # accelerate-scoring-mode pass promotes them and moves the defaults there).
+    # =====================================================================================
+    def align_with_vol_pharm(self,
+                             color_weight: float = 0.5,
+                             alpha: float = 0.81,
+                             similarity: _SIM_TYPE = 'tanimoto',
+                             extended_points: bool = False,
+                             only_extended: bool = False,
+                             num_repeats: int = 50,
+                             trans_init: bool = False,
+                             lr: float = 0.1,
+                             max_num_steps: int = 200,
+                             verbose: bool = False) -> np.ndarray:
+        """Align using a combined atom-centred Gaussian *shape* (volume) + *directional
+        pharmacophore* overlay. This is the ``vol_color`` combo with the orientation-vector cosine
+        weighting KEPT (``directionless=False``) -- a full ROCS ColorTanimoto analogue where the
+        HBA/HBD/aromatic/halogen features must also point the same way, rather than the
+        directionless ``vol_color`` "color". Score/transform stored in
+        ``self.sim_aligned_vol_pharm`` / ``self.transform_vol_pharm``."""
+        if self.ref_molec.pharm_types is None or self.fit_molec.pharm_types is None:
+            raise ValueError(
+                'Both Molecule objects must have pharmacophores to use align_with_vol_pharm. '
+                "Build them with `pharm_multi_vector` set."
+            )
+        dev = self.device
+        aligned_fit_centers, se3_transform, score = optimize_vol_color_overlay(
+            ref_centers=self._ref_xyz_t,
+            fit_centers=self._fit_xyz_t,
+            ref_pharms=torch.from_numpy(self.ref_molec.pharm_types).to(dev),
+            fit_pharms=torch.from_numpy(self.fit_molec.pharm_types).to(dev),
+            ref_anchors=torch.from_numpy(self.ref_molec.pharm_ancs).to(torch.float32).to(dev),
+            fit_anchors=torch.from_numpy(self.fit_molec.pharm_ancs).to(torch.float32).to(dev),
+            ref_vectors=torch.from_numpy(self.ref_molec.pharm_vecs).to(torch.float32).to(dev),
+            fit_vectors=torch.from_numpy(self.fit_molec.pharm_vecs).to(torch.float32).to(dev),
+            alpha=alpha, color_weight=color_weight, similarity=similarity,
+            directionless=False,
+            extended_points=extended_points, only_extended=only_extended,
+            num_repeats=num_repeats, trans_centers=self._ref_xyz_t if trans_init else None,
+            lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+        )
+        self.transform_vol_pharm = se3_transform.numpy()
+        self.sim_aligned_vol_pharm = score.numpy()
+        return aligned_fit_centers.numpy()
+
+
+    def align_with_vol_atomtype(self,
+                                atomtype_weight: float = 0.5,
+                                alpha: float = 0.81,
+                                similarity: _SIM_TYPE = 'tanimoto',
+                                num_repeats: int = 50,
+                                trans_init: bool = False,
+                                lr: float = 0.1,
+                                max_num_steps: int = 200,
+                                verbose: bool = False) -> np.ndarray:
+        """Align using a combined atom-centred Gaussian *shape* (volume) + *atom-identity* overlay.
+        The identity channel is a categorical Gaussian overlap keyed by element (atomic number) --
+        only same-element atoms contribute, so the pose is rewarded for placing carbon-on-carbon,
+        oxygen-on-oxygen, etc. (a cheap, feature-detection-free "colour" that prioritises atom
+        identity). ``(1 - atomtype_weight) * shape + atomtype_weight * identity``. Identity labels /
+        centres are the strict-heavy set (``_nonH_atoms_idx``), retained-H-safe (NOT ``atom_pos``).
+        Score/transform stored in ``self.sim_aligned_vol_atomtype`` / ``self.transform_vol_atomtype``."""
+        ref_type_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
+        fit_type_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
+        aligned_fit_centers, se3_transform, score = optimize_vol_atomtype_overlay(
+            ref_centers=self._ref_xyz_t,
+            fit_centers=self._fit_xyz_t,
+            ref_type_pos=self._to_tensor(np.ascontiguousarray(ref_type_pos)),
+            fit_type_pos=self._to_tensor(np.ascontiguousarray(fit_type_pos)),
+            ref_labels=self._to_tensor(self.ref_molec.get_atomic_numbers(no_H=True)),
+            fit_labels=self._to_tensor(self.fit_molec.get_atomic_numbers(no_H=True)),
+            alpha=alpha, atomtype_weight=atomtype_weight, similarity=similarity,
+            num_repeats=num_repeats, trans_centers=self._ref_xyz_t if trans_init else None,
+            lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+        )
+        self.transform_vol_atomtype = se3_transform.numpy()
+        self.sim_aligned_vol_atomtype = score.numpy()
+        return aligned_fit_centers.numpy()
+
+
+    def align_with_vol_mr(self,
+                          mr_weight: float = 0.5,
+                          alpha: float = 0.81,
+                          lam: float = 0.1,
+                          num_repeats: int = 50,
+                          trans_init: bool = False,
+                          lr: float = 0.1,
+                          max_num_steps: int = 200,
+                          verbose: bool = False) -> np.ndarray:
+        """Align using a combined atom-centred Gaussian *shape* (volume) + *molar-refractivity*
+        (polarizability) overlay. Structurally identical to ``vol_lipo`` -- the per-atom Crippen
+        atomic MR is overlaid like an ESP/partial-charge field (matched by value, so polarizable
+        overlaps polarizable) at the TRUE-heavy centres -- but the scalar is the Crippen MR
+        contribution instead of logP. Molar refractivity tracks atomic size/polarizability
+        (large for S/Cl/Br/I and aromatic systems), a physicochemical channel distinct from shape,
+        electrostatics and lipophilicity. ``(1 - mr_weight) * shape + mr_weight * mr``.
+        Score/transform stored in ``self.sim_aligned_vol_mr`` / ``self.transform_vol_mr``."""
+        ref_mr_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
+        fit_mr_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
+        aligned_fit_centers, se3_transform, score = optimize_vol_lipo_overlay(
+            ref_centers=self._ref_xyz_t,
+            fit_centers=self._fit_xyz_t,
+            ref_lipo_pos=self._to_tensor(np.ascontiguousarray(ref_mr_pos)),
+            fit_lipo_pos=self._to_tensor(np.ascontiguousarray(fit_mr_pos)),
+            ref_lipo=self._to_tensor(self.ref_molec.get_molar_refractivity(no_H=True)),
+            fit_lipo=self._to_tensor(self.fit_molec.get_molar_refractivity(no_H=True)),
+            alpha=alpha, lam=lam, lipo_weight=mr_weight,
+            num_repeats=num_repeats, trans_centers=self._ref_xyz_t if trans_init else None,
+            lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+        )
+        self.transform_vol_mr = se3_transform.numpy()
+        self.sim_aligned_vol_mr = score.numpy()
+        return aligned_fit_centers.numpy()
+
+
+    def align_with_surf_tversky(self,
+                                tversky_alpha: float = 0.95,
+                                tversky_beta: float = 0.05,
+                                alpha: float = 0.81,
+                                num_repeats: int = 50,
+                                trans_init: bool = False,
+                                lr: float = 0.1,
+                                max_num_steps: int = 200,
+                                verbose: bool = False) -> np.ndarray:
+        """Align using the *surface* shape overlay scored with **Tversky** rather than Tanimoto -- it
+        is to ``surf`` exactly what ``vol_tversky`` is to ``vol`` (the same asymmetric "fits-inside"
+        Tversky reduction, over the surface point cloud instead of atom centres). Reuses the
+        ``vol_tversky`` optimizer with the molecules' surface points. Requires surfaces.
+        Score/transform stored in ``self.sim_aligned_surf_tversky`` / ``self.transform_surf_tversky``."""
+        if self.num_surf_points is None:
+            raise ValueError('The Molecule objects were initialized with no surface points so '
+                             'align_with_surf_tversky cannot be used.')
+        aligned_fit_points, se3_transform, score = optimize_vol_tversky_overlay(
+            ref_points=self._to_tensor(self.ref_molec.surf_pos),
+            fit_points=self._to_tensor(self.fit_molec.surf_pos),
+            alpha=alpha, tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+            num_repeats=num_repeats,
+            trans_centers=self._to_tensor(self.ref_molec.atom_pos) if trans_init else None,
+            lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+        )
+        self.transform_surf_tversky = se3_transform.numpy()
+        self.sim_aligned_surf_tversky = score.numpy()
+        return aligned_fit_points.numpy()
+
+
+    def align_with_surf_esp_tversky(self,
+                                    tversky_alpha: float = 0.95,
+                                    tversky_beta: float = 0.05,
+                                    alpha: float = 0.81,
+                                    lam: float = 0.3,
+                                    num_repeats: int = 50,
+                                    trans_init: bool = False,
+                                    lr: float = 0.1,
+                                    max_num_steps: int = 200,
+                                    verbose: bool = False) -> np.ndarray:
+        """Align using the *surface ESP* overlay scored with **Tversky** rather than Tanimoto -- it
+        is to ``surf_esp`` exactly what ``vol_esp_tversky`` is to ``vol_esp``. Reuses the
+        ``vol_esp_tversky`` optimizer with the molecules' surface points + surface ESP, and (like
+        ``surf_esp``) scales ``lam`` by ``LAM_SCALING`` for the surface convention. Requires surfaces.
+        Score/transform stored in ``self.sim_aligned_surf_esp_tversky`` / ``self.transform_surf_esp_tversky``."""
+        if self.num_surf_points is None:
+            raise ValueError('The Molecule objects were initialized with no surface points so '
+                             'align_with_surf_esp_tversky cannot be used.')
+        lam_scaled = LAM_SCALING * lam
+        aligned_fit_points, se3_transform, score = optimize_vol_esp_tversky_overlay(
+            ref_points=self._to_tensor(self.ref_molec.surf_pos),
+            fit_points=self._to_tensor(self.fit_molec.surf_pos),
+            ref_charges=self._to_tensor(self.ref_molec.surf_esp),
+            fit_charges=self._to_tensor(self.fit_molec.surf_esp),
+            alpha=alpha, lam=lam_scaled, tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+            num_repeats=num_repeats,
+            trans_centers=self._to_tensor(self.ref_molec.atom_pos) if trans_init else None,
+            lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+        )
+        self.transform_surf_esp_tversky = se3_transform.numpy()
+        self.sim_aligned_surf_esp_tversky = score.numpy()
+        return aligned_fit_points.numpy()
+
+
+    def align_with_vol_color_tversky(self,
+                                     color_weight: float = 0.5,
+                                     alpha: float = 0.81,
+                                     tversky_alpha: float = 0.95,
+                                     tversky_beta: float = 0.05,
+                                     directionless: bool = True,
+                                     extended_points: bool = False,
+                                     only_extended: bool = False,
+                                     num_repeats: int = 50,
+                                     trans_init: bool = False,
+                                     lr: float = 0.1,
+                                     max_num_steps: int = 200,
+                                     verbose: bool = False) -> np.ndarray:
+        """Align using the ``vol_color`` shape+colour combo scored with an asymmetric **Tversky**
+        reduction on both channels (shape via ``tversky_alpha``/``tversky_beta``; colour via the
+        OpenEye 0.95 Tversky). Requires pharmacophores. Score/transform stored in
+        ``self.sim_aligned_vol_color_tversky`` / ``self.transform_vol_color_tversky``."""
+        if self.ref_molec.pharm_types is None or self.fit_molec.pharm_types is None:
+            raise ValueError(
+                'Both Molecule objects must have pharmacophores to use align_with_vol_color_tversky.'
+            )
+        dev = self.device
+        aligned_fit_centers, se3_transform, score = optimize_vol_color_tversky_overlay(
+            ref_centers=self._ref_xyz_t,
+            fit_centers=self._fit_xyz_t,
+            ref_pharms=torch.from_numpy(self.ref_molec.pharm_types).to(dev),
+            fit_pharms=torch.from_numpy(self.fit_molec.pharm_types).to(dev),
+            ref_anchors=torch.from_numpy(self.ref_molec.pharm_ancs).to(torch.float32).to(dev),
+            fit_anchors=torch.from_numpy(self.fit_molec.pharm_ancs).to(torch.float32).to(dev),
+            ref_vectors=torch.from_numpy(self.ref_molec.pharm_vecs).to(torch.float32).to(dev),
+            fit_vectors=torch.from_numpy(self.fit_molec.pharm_vecs).to(torch.float32).to(dev),
+            alpha=alpha, color_weight=color_weight,
+            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+            directionless=directionless, extended_points=extended_points, only_extended=only_extended,
+            num_repeats=num_repeats, trans_centers=self._ref_xyz_t if trans_init else None,
+            lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+        )
+        self.transform_vol_color_tversky = se3_transform.numpy()
+        self.sim_aligned_vol_color_tversky = score.numpy()
+        return aligned_fit_centers.numpy()
+
+
+    def align_with_vol_lipo_tversky(self,
+                                    lipo_weight: float = 0.5,
+                                    alpha: float = 0.81,
+                                    lam: float = 0.1,
+                                    tversky_alpha: float = 0.95,
+                                    tversky_beta: float = 0.05,
+                                    num_repeats: int = 50,
+                                    trans_init: bool = False,
+                                    lr: float = 0.1,
+                                    max_num_steps: int = 200,
+                                    verbose: bool = False) -> np.ndarray:
+        """Align using the ``vol_lipo`` shape+lipophilicity combo scored with an asymmetric
+        **Tversky** reduction per channel (shape and the Crippen-logP ESP channel). Score/transform
+        stored in ``self.sim_aligned_vol_lipo_tversky`` / ``self.transform_vol_lipo_tversky``."""
+        ref_lipo_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
+        fit_lipo_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
+        aligned_fit_centers, se3_transform, score = optimize_vol_lipo_tversky_overlay(
+            ref_centers=self._ref_xyz_t,
+            fit_centers=self._fit_xyz_t,
+            ref_lipo_pos=self._to_tensor(np.ascontiguousarray(ref_lipo_pos)),
+            fit_lipo_pos=self._to_tensor(np.ascontiguousarray(fit_lipo_pos)),
+            ref_lipo=self._to_tensor(self.ref_molec.get_lipophilicity(no_H=True)),
+            fit_lipo=self._to_tensor(self.fit_molec.get_lipophilicity(no_H=True)),
+            alpha=alpha, lam=lam, lipo_weight=lipo_weight,
+            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+            num_repeats=num_repeats, trans_centers=self._ref_xyz_t if trans_init else None,
+            lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+        )
+        self.transform_vol_lipo_tversky = se3_transform.numpy()
+        self.sim_aligned_vol_lipo_tversky = score.numpy()
+        return aligned_fit_centers.numpy()
+
+
+    def align_with_vol_and_surf_esp_tversky(self,
+                                            tversky_alpha: float = 0.95,
+                                            tversky_beta: float = 0.05,
+                                            alpha: float = 0.81,
+                                            lam: float = 0.001,
+                                            probe_radius: float = 1.0,
+                                            esp_weight: float = 0.5,
+                                            num_repeats: int = 50,
+                                            trans_init: bool = False,
+                                            lr: float = 0.1,
+                                            max_num_steps: int = 200,
+                                            verbose: bool = False) -> np.ndarray:
+        """Align using the ShaEP-style ``vol_and_surf_esp`` score with the SHAPE channel scored by
+        **Tversky** rather than Tanimoto (the surface-ESP agreement channel is a point-to-point
+        potential average, not an overlap ratio, so Tversky is not applied to it). Requires surfaces.
+        Score/transform stored in ``self.sim_aligned_vol_and_surf_esp_tversky`` /
+        ``self.transform_vol_and_surf_esp_tversky``."""
+        if self.num_surf_points is None:
+            raise ValueError('The Molecule objects were initialized with no surface points so '
+                             'align_with_vol_and_surf_esp_tversky cannot be used.')
+        if alpha == 0.81:
+            ref_centers = self._to_tensor(self.ref_molec.atom_pos)
+            fit_centers = self._to_tensor(self.fit_molec.atom_pos)
+        else:
+            ref_centers = self._to_tensor(self.ref_molec.surf_pos)
+            fit_centers = self._to_tensor(self.fit_molec.surf_pos)
+        aligned_fit_points, se3_transform, score = optimize_vol_and_surf_esp_tversky_overlay(
+            ref_centers_w_H=self._to_tensor(self.ref_molec.mol.GetConformer().GetPositions()),
+            fit_centers_w_H=self._to_tensor(self.fit_molec.mol.GetConformer().GetPositions()),
+            ref_centers=ref_centers, fit_centers=fit_centers,
+            ref_points=self._to_tensor(self.ref_molec.surf_pos),
+            fit_points=self._to_tensor(self.fit_molec.surf_pos),
+            ref_partial_charges=self._to_tensor(self.ref_molec.partial_charges),
+            fit_partial_charges=self._to_tensor(self.fit_molec.partial_charges),
+            ref_surf_esp=self._to_tensor(self.ref_molec.surf_esp),
+            fit_surf_esp=self._to_tensor(self.fit_molec.surf_esp),
+            ref_radii=self._to_tensor(self.ref_molec.radii),
+            fit_radii=self._to_tensor(self.fit_molec.radii),
+            alpha=alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight,
+            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+            num_repeats=num_repeats,
+            trans_centers=self._to_tensor(self.ref_molec.atom_pos) if trans_init else None,
+            lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+        )
+        self.transform_vol_and_surf_esp_tversky = se3_transform.numpy()
+        self.sim_aligned_vol_and_surf_esp_tversky = score.numpy()
+        return aligned_fit_points.numpy()
+
+
+    def align_with_pharm_tversky(self,
+                                 extended_points: bool = False,
+                                 only_extended: bool = False,
+                                 num_repeats: int = 50,
+                                 trans_init: bool = False,
+                                 lr: float = 0.1,
+                                 max_num_steps: int = 200,
+                                 use_analytical: bool = True,
+                                 verbose: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """Align using pharmacophore similarity scored with **Tversky** (OpenEye 0.95 formulation)
+        rather than Tanimoto -- i.e. ``align_with_pharm`` with ``similarity='tversky'`` registered as
+        its own mode. Requires pharmacophores. Score/transform stored in
+        ``self.sim_aligned_pharm_tversky`` / ``self.transform_pharm_tversky``; returns the aligned
+        pharmacophore anchors and vectors like ``align_with_pharm``."""
+        if self.ref_molec.pharm_types is None or self.fit_molec.pharm_types is None:
+            raise ValueError('Both Molecule objects must have pharmacophores to use align_with_pharm_tversky.')
+        _pharm_fn = optimize_pharm_overlay_analytical if use_analytical else optimize_pharm_overlay
+        aligned_fit_anchors, aligned_fit_vectors, se3_transform, score = _pharm_fn(
+            ref_pharms=self._to_tensor(self.ref_molec.pharm_types),
+            fit_pharms=self._to_tensor(self.fit_molec.pharm_types),
+            ref_anchors=self._to_tensor(self.ref_molec.pharm_ancs),
+            fit_anchors=self._to_tensor(self.fit_molec.pharm_ancs),
+            ref_vectors=self._to_tensor(self.ref_molec.pharm_vecs),
+            fit_vectors=self._to_tensor(self.fit_molec.pharm_vecs),
+            similarity='tversky',
+            extended_points=extended_points, only_extended=only_extended,
+            num_repeats=num_repeats,
+            trans_centers=self._to_tensor(self.ref_molec.pharm_ancs) if trans_init else None,
+            lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+        )
+        self.transform_pharm_tversky = se3_transform.numpy()
+        self.sim_aligned_pharm_tversky = score.numpy()
         return aligned_fit_anchors.numpy(), aligned_fit_vectors.numpy()
 
 

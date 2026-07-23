@@ -16,6 +16,7 @@ from shepherd_score.score.gaussian_overlap import VAB_2nd_order
 from shepherd_score.score.electrostatic_scoring import get_overlap_esp, esp_combo_score
 from shepherd_score.score.electrostatic_scoring import VAB_2nd_order_esp
 from shepherd_score.score.pharmacophore_scoring import get_overlap_pharm, _SIM_TYPE
+from shepherd_score.score.atomtype_scoring import get_overlap_atomtype
 from shepherd_score.alignment.utils.se3 import get_SE3_transform, apply_SE3_transform, quaternions_to_rotation_matrix, apply_SO3_transform
 from shepherd_score.alignment.utils.pca_np import quaternions_for_principal_component_alignment_np
 from shepherd_score.alignment.utils.pca import angle_between_vecs, rotation_axis, quaternion_from_axis_angle
@@ -2269,6 +2270,690 @@ def optimize_vol_esp_tversky_overlay(ref_points: torch.Tensor,
             print(f'Optimized vol_esp_tversky similarity -- max: {scores.max():.3f} | mean: {scores.mean():.3f} | min: {scores.min():.3f}')
         best_idx = torch.argmax(scores.detach().cpu())
         best_alignment = aligned_points.cpu()[best_idx]
+        best_transform = SE3_transform.cpu()[best_idx]
+        best_score = scores.detach().cpu()[best_idx]
+    return best_alignment, best_transform, best_score
+
+
+# =============================================================================
+# vol_atomtype -- shape (volume) + atom-identity (element) categorical overlay
+# -----------------------------------------------------------------------------
+# The atom-identity counterpart of vol_color / vol_lipo: instead of a pharmacophore-colour or a
+# lipophilicity channel, the second channel is a Gaussian overlap partitioned by element identity
+# (only same-element atoms overlap; ``score/atomtype_scoring.get_overlap_atomtype``). Structurally
+# identical to vol_lipo (shape channel on the RemoveHs centres; the identity channel on the
+# TRUE-heavy centres carrying the atomic-number labels).
+# =============================================================================
+def _vol_atomtype_overlap(ref_centers: torch.Tensor,
+                          fit_centers: torch.Tensor,
+                          ref_type_pos: torch.Tensor,
+                          fit_type_pos: torch.Tensor,
+                          ref_labels: torch.Tensor,
+                          fit_labels: torch.Tensor,
+                          alpha: float,
+                          atomtype_weight: float,
+                          similarity: _SIM_TYPE = 'tanimoto') -> torch.Tensor:
+    """Combined shape + atom-identity similarity (helper shared by the objective/optimizer).
+
+    ``shape`` is the atom-centred Gaussian volume Tanimoto over the shape centres (the vol-mode
+    RemoveHs coordinates); ``atomtype`` is the categorical Gaussian overlap of the per-atom element
+    labels placed at the TRUE-heavy centres (``get_overlap_atomtype``, only same-element atoms
+    contribute). Each channel self-normalises (Tanimoto/Tversky), so a self-copy scores 1.000. If
+    either label set is empty the identity channel is 0 (shape-only). ``fit_*`` are assumed already
+    SE(3)-transformed."""
+    shape_sim = get_overlap(ref_centers, fit_centers, alpha)
+    n_ref = ref_type_pos.shape[-2]
+    n_fit = fit_type_pos.shape[-2]
+    if n_ref == 0 or n_fit == 0:
+        type_sim = torch.zeros_like(shape_sim)
+    else:
+        type_sim = get_overlap_atomtype(ref_labels, fit_labels,
+                                        ref_type_pos, fit_type_pos,
+                                        alpha, similarity).reshape(shape_sim.shape)
+    return (1 - atomtype_weight) * shape_sim + atomtype_weight * type_sim
+
+
+def objective_vol_atomtype_overlay(se3_params: torch.Tensor,
+                                   ref_centers: torch.Tensor,
+                                   fit_centers: torch.Tensor,
+                                   ref_type_pos: torch.Tensor,
+                                   fit_type_pos: torch.Tensor,
+                                   ref_labels: torch.Tensor,
+                                   fit_labels: torch.Tensor,
+                                   alpha: float = 0.81,
+                                   atomtype_weight: float = 0.5,
+                                   similarity: _SIM_TYPE = 'tanimoto',
+                                   ) -> torch.Tensor:
+    """Objective for the ``vol_atomtype`` overlay: a weighted combination of atom-centred Gaussian
+    *shape* (volume) similarity and *atom-identity* (element-categorical) similarity, i.e. exactly
+    what ``objective_vol_lipo_overlay`` is with the lipophilicity ESP channel swapped for the
+    element-identity categorical channel. ``(1 - atomtype_weight) * shape + atomtype_weight * type``.
+    Only the fit inputs are transformed; both the fit shape centres AND the fit identity centres move
+    rigidly under the same SE(3) pose. Supports batched and non-batched inputs."""
+    if len(fit_centers.shape) - 1 != len(se3_params.shape):
+        err_mssg = f'Instead these shapes were given: fit_centers {fit_centers.shape} and se3_params {se3_params.shape}'
+        if len(fit_centers.shape) == 2:
+            raise ValueError(f'Since "fit_centers" is a single point cloud, there should only be one set of "se3_params". {err_mssg}')
+        elif len(fit_centers.shape) == 3:
+            raise ValueError(f'Since "fit_centers" is batched, there should be a row of "se3_params" for each batch. {err_mssg}')
+
+    se3_matrix = get_SE3_transform(se3_params)
+    fit_centers = apply_SE3_transform(fit_centers, se3_matrix)
+    if fit_type_pos.shape[-2] != 0:
+        fit_type_pos = apply_SE3_transform(fit_type_pos, se3_matrix)
+
+    combo = _vol_atomtype_overlap(ref_centers, fit_centers,
+                                  ref_type_pos, fit_type_pos,
+                                  ref_labels, fit_labels,
+                                  alpha, atomtype_weight, similarity)
+
+    if len(se3_params.shape) == 1:
+        return 1 - combo
+    elif len(se3_params.shape) == 2:
+        return 1 - combo.mean()
+
+
+def optimize_vol_atomtype_overlay(ref_centers: torch.Tensor,
+                                  fit_centers: torch.Tensor,
+                                  ref_type_pos: torch.Tensor,
+                                  fit_type_pos: torch.Tensor,
+                                  ref_labels: torch.Tensor,
+                                  fit_labels: torch.Tensor,
+                                  alpha: float = 0.81,
+                                  atomtype_weight: float = 0.5,
+                                  similarity: _SIM_TYPE = 'tanimoto',
+                                  num_repeats: int = 50,
+                                  trans_centers: Union[torch.Tensor, None] = None,
+                                  lr: float = 0.1,
+                                  max_num_steps: int = 200,
+                                  verbose: bool = False
+                                  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Optimize a combined shape (atom-centred Gaussian volume) + atom-identity (element-categorical)
+    overlay over SE(3), maximizing ``(1 - atomtype_weight) * shape + atomtype_weight * atomtype``.
+
+    Multi-start (identity + 4 principal-component + Fibonacci rotations, all COM-aligned) with Adam;
+    the best-scoring pose by the combined similarity is returned. The SE(3) seed comes from the shape
+    point clouds, matching the ``vol``/``vol_lipo`` optimizers. Both the fit shape centres and the
+    fit identity centres are transformed by the pose. Returns ``(aligned_fit_centers, transform,
+    score)``."""
+    if trans_centers is None:
+        se3_params = _initialize_se3_params(ref_points=ref_centers, fit_points=fit_centers, num_repeats=num_repeats)
+    else:
+        se3_params = _initialize_se3_params_with_translations(
+            ref_points=ref_centers, fit_points=fit_centers,
+            trans_centers=trans_centers, num_repeats_per_trans=10)
+    num_repeats = len(se3_params) if len(se3_params.shape) == 2 else 1
+
+    optimizer = optim.Adam([se3_params], lr=lr)
+
+    has_type = ref_type_pos.shape[-2] != 0 and fit_type_pos.shape[-2] != 0
+
+    ref_centers_rep = ref_centers.repeat((num_repeats, 1, 1)).squeeze(0)
+    fit_centers_rep = fit_centers.repeat((num_repeats, 1, 1)).squeeze(0)
+    if has_type:
+        ref_type_pos_rep = ref_type_pos.repeat((num_repeats, 1, 1)).squeeze(0)
+        fit_type_pos_rep = fit_type_pos.repeat((num_repeats, 1, 1)).squeeze(0)
+    else:
+        ref_type_pos_rep, fit_type_pos_rep = ref_type_pos, fit_type_pos
+
+    if verbose:
+        init_score = _vol_atomtype_overlap(ref_centers, fit_centers, ref_type_pos, fit_type_pos,
+                                           ref_labels, fit_labels, alpha, atomtype_weight, similarity)
+        print(f'Initial vol_atomtype similarity score: {float(init_score):.3f}')
+
+    last_loss = 1
+    counter = 0
+    for step in range(max_num_steps):
+        loss = objective_vol_atomtype_overlay(
+            se3_params=se3_params,
+            ref_centers=ref_centers_rep,
+            fit_centers=fit_centers_rep,
+            ref_type_pos=ref_type_pos_rep,
+            fit_type_pos=fit_type_pos_rep,
+            ref_labels=ref_labels,
+            fit_labels=fit_labels,
+            alpha=alpha,
+            atomtype_weight=atomtype_weight,
+            similarity=similarity,
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if verbose and step % 100 == 0:
+            print(f"Step {step}, Score: {1 - loss.item()}")
+
+        if abs(loss - last_loss) > 1e-5:
+            counter = 0
+        else:
+            counter += 1
+        last_loss = loss
+        if counter > 10:
+            break
+
+    optimized_se3_params = se3_params.detach()
+    SE3_transform = get_SE3_transform(optimized_se3_params)
+    aligned_fit_centers = apply_SE3_transform(fit_centers_rep, SE3_transform)
+    if has_type:
+        aligned_fit_type_pos = apply_SE3_transform(fit_type_pos_rep, SE3_transform)
+    else:
+        aligned_fit_type_pos = fit_type_pos_rep
+
+    scores = _vol_atomtype_overlap(ref_centers_rep, aligned_fit_centers,
+                                   ref_type_pos_rep, aligned_fit_type_pos,
+                                   ref_labels, fit_labels,
+                                   alpha, atomtype_weight, similarity)
+
+    if num_repeats == 1:
+        if verbose:
+            print(f'Optimized vol_atomtype similarity score: {float(scores):.3f}')
+        best_alignment = aligned_fit_centers.cpu()
+        best_transform = SE3_transform.cpu()
+        best_score = scores.detach().cpu()
+    else:
+        if verbose:
+            print(f'Optimized vol_atomtype similarity -- max: {scores.max():.3f} | mean: {scores.mean():.3f} | min: {scores.min():.3f}')
+        best_idx = torch.argmax(scores.detach().cpu())
+        best_alignment = aligned_fit_centers.cpu()[best_idx]
+        best_transform = SE3_transform.cpu()[best_idx]
+        best_score = scores.detach().cpu()[best_idx]
+    return best_alignment, best_transform, best_score
+
+
+# =============================================================================
+# vol_color_tversky -- vol_color (shape + directionless colour) scored with Tversky
+# =============================================================================
+def objective_vol_color_tversky_overlay(se3_params: torch.Tensor,
+                                        ref_centers: torch.Tensor,
+                                        fit_centers: torch.Tensor,
+                                        ref_pharms: torch.Tensor,
+                                        fit_pharms: torch.Tensor,
+                                        ref_anchors: torch.Tensor,
+                                        fit_anchors: torch.Tensor,
+                                        ref_vectors: torch.Tensor,
+                                        fit_vectors: torch.Tensor,
+                                        alpha: float = 0.81,
+                                        color_weight: float = 0.5,
+                                        tversky_alpha: float = 0.95,
+                                        tversky_beta: float = 0.05,
+                                        directionless: bool = True,
+                                        extended_points: bool = False,
+                                        only_extended: bool = False,
+                                        ) -> torch.Tensor:
+    """Objective for ``vol_color_tversky``: the ``vol_color`` shape+colour combo scored with an
+    asymmetric **Tversky** reduction on BOTH channels instead of Tanimoto. Shape Tversky is
+    ``AB/(AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))`` (== ``AB/(tversky_alpha*AA +
+    tversky_beta*BB)`` for the default alpha+beta=1); the colour channel uses the OpenEye 0.95
+    Tversky via ``get_overlap_pharm(similarity='tversky')`` (consistent with the default
+    ``tversky_alpha=0.95``). ``(1 - color_weight) * shape_tversky + color_weight * color_tversky``.
+    Tversky(A,A)=1 for each channel, so the self-overlap gate holds. Only the fit is transformed."""
+    if len(fit_centers.shape) - 1 != len(se3_params.shape):
+        raise ValueError(f'fit_centers {fit_centers.shape} incompatible with se3_params {se3_params.shape}')
+
+    se3_matrix = get_SE3_transform(se3_params)
+    fit_centers = apply_SE3_transform(fit_centers, se3_matrix)
+    fit_anchors = apply_SE3_transform(fit_anchors, se3_matrix)
+    fit_vectors = apply_SO3_transform(fit_vectors, se3_matrix)
+
+    AB = VAB_2nd_order(ref_centers, fit_centers, alpha)
+    AA = VAB_2nd_order(ref_centers, ref_centers, alpha)
+    BB = VAB_2nd_order(fit_centers, fit_centers, alpha)
+    shape_sim = AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))
+
+    color_sim = get_overlap_pharm(ptype_1=ref_pharms, ptype_2=fit_pharms,
+                                  anchors_1=ref_anchors, anchors_2=fit_anchors,
+                                  vectors_1=ref_vectors, vectors_2=fit_vectors,
+                                  similarity='tversky',
+                                  extended_points=extended_points, only_extended=only_extended,
+                                  directionless=directionless)
+    combo = (1 - color_weight) * shape_sim + color_weight * color_sim
+
+    if len(se3_params.shape) == 1:
+        return 1 - combo
+    elif len(se3_params.shape) == 2:
+        return 1 - combo.mean()
+
+
+def optimize_vol_color_tversky_overlay(ref_centers: torch.Tensor,
+                                       fit_centers: torch.Tensor,
+                                       ref_pharms: torch.Tensor,
+                                       fit_pharms: torch.Tensor,
+                                       ref_anchors: torch.Tensor,
+                                       fit_anchors: torch.Tensor,
+                                       ref_vectors: torch.Tensor,
+                                       fit_vectors: torch.Tensor,
+                                       alpha: float = 0.81,
+                                       color_weight: float = 0.5,
+                                       tversky_alpha: float = 0.95,
+                                       tversky_beta: float = 0.05,
+                                       directionless: bool = True,
+                                       extended_points: bool = False,
+                                       only_extended: bool = False,
+                                       num_repeats: int = 50,
+                                       trans_centers: Union[torch.Tensor, None] = None,
+                                       lr: float = 0.1,
+                                       max_num_steps: int = 200,
+                                       verbose: bool = False
+                                       ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Optimize the ``vol_color_tversky`` overlay over SE(3): the ROCS/ROSHAMBO shape+colour combo
+    scored with an asymmetric Tversky reduction. Same multi-start/Adam machinery as
+    ``optimize_vol_color_overlay``. Returns ``(aligned_fit_centers, transform, score)``."""
+    if trans_centers is None:
+        se3_params = _initialize_se3_params(ref_points=ref_centers, fit_points=fit_centers, num_repeats=num_repeats)
+    else:
+        se3_params = _initialize_se3_params_with_translations(
+            ref_points=ref_centers, fit_points=fit_centers,
+            trans_centers=trans_centers, num_repeats_per_trans=10)
+    num_repeats = len(se3_params) if len(se3_params.shape) == 2 else 1
+
+    optimizer = optim.Adam([se3_params], lr=lr)
+
+    ref_centers_rep = ref_centers.repeat((num_repeats, 1, 1)).squeeze(0)
+    fit_centers_rep = fit_centers.repeat((num_repeats, 1, 1)).squeeze(0)
+    ref_pharms_rep = ref_pharms.repeat((num_repeats, 1)).squeeze(0)
+    fit_pharms_rep = fit_pharms.repeat((num_repeats, 1)).squeeze(0)
+    ref_anchors_rep = ref_anchors.repeat((num_repeats, 1, 1)).squeeze(0)
+    fit_anchors_rep = fit_anchors.repeat((num_repeats, 1, 1)).squeeze(0)
+    ref_vectors_rep = ref_vectors.repeat((num_repeats, 1, 1)).squeeze(0)
+    fit_vectors_rep = fit_vectors.repeat((num_repeats, 1, 1)).squeeze(0)
+
+    last_loss = 1
+    counter = 0
+    for step in range(max_num_steps):
+        loss = objective_vol_color_tversky_overlay(
+            se3_params=se3_params,
+            ref_centers=ref_centers_rep, fit_centers=fit_centers_rep,
+            ref_pharms=ref_pharms_rep, fit_pharms=fit_pharms_rep,
+            ref_anchors=ref_anchors_rep, fit_anchors=fit_anchors_rep,
+            ref_vectors=ref_vectors_rep, fit_vectors=fit_vectors_rep,
+            alpha=alpha, color_weight=color_weight,
+            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+            directionless=directionless, extended_points=extended_points, only_extended=only_extended,
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if verbose and step % 100 == 0:
+            print(f"Step {step}, Score: {1 - loss.item()}")
+
+        if abs(loss - last_loss) > 1e-5:
+            counter = 0
+        else:
+            counter += 1
+        last_loss = loss
+        if counter > 10:
+            break
+
+    optimized_se3_params = se3_params.detach()
+    SE3_transform = get_SE3_transform(optimized_se3_params)
+    aligned_fit_centers = apply_SE3_transform(fit_centers_rep, SE3_transform)
+    aligned_fit_anchors = apply_SE3_transform(fit_anchors_rep, SE3_transform)
+    aligned_fit_vectors = apply_SO3_transform(fit_vectors_rep, SE3_transform)
+
+    AB = VAB_2nd_order(ref_centers_rep, aligned_fit_centers, alpha)
+    AA = VAB_2nd_order(ref_centers_rep, ref_centers_rep, alpha)
+    BB = VAB_2nd_order(aligned_fit_centers, aligned_fit_centers, alpha)
+    shape_sim = AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))
+    color_sim = get_overlap_pharm(ptype_1=ref_pharms_rep, ptype_2=fit_pharms_rep,
+                                  anchors_1=ref_anchors_rep, anchors_2=aligned_fit_anchors,
+                                  vectors_1=ref_vectors_rep, vectors_2=aligned_fit_vectors,
+                                  similarity='tversky',
+                                  extended_points=extended_points, only_extended=only_extended,
+                                  directionless=directionless)
+    scores = (1 - color_weight) * shape_sim + color_weight * color_sim
+
+    if num_repeats == 1:
+        if verbose:
+            print(f'Optimized vol_color_tversky similarity score: {float(scores):.3f}')
+        best_alignment = aligned_fit_centers.cpu()
+        best_transform = SE3_transform.cpu()
+        best_score = scores.detach().cpu()
+    else:
+        if verbose:
+            print(f'Optimized vol_color_tversky similarity -- max: {scores.max():.3f} | mean: {scores.mean():.3f} | min: {scores.min():.3f}')
+        best_idx = torch.argmax(scores.detach().cpu())
+        best_alignment = aligned_fit_centers.cpu()[best_idx]
+        best_transform = SE3_transform.cpu()[best_idx]
+        best_score = scores.detach().cpu()[best_idx]
+    return best_alignment, best_transform, best_score
+
+
+# =============================================================================
+# vol_lipo_tversky -- vol_lipo (shape + lipophilicity) scored with Tversky per channel
+# =============================================================================
+def objective_vol_lipo_tversky_overlay(se3_params: torch.Tensor,
+                                       ref_centers: torch.Tensor,
+                                       fit_centers: torch.Tensor,
+                                       ref_lipo_pos: torch.Tensor,
+                                       fit_lipo_pos: torch.Tensor,
+                                       ref_lipo: torch.Tensor,
+                                       fit_lipo: torch.Tensor,
+                                       alpha: float = 0.81,
+                                       lam: float = 0.1,
+                                       lipo_weight: float = 0.5,
+                                       tversky_alpha: float = 0.95,
+                                       tversky_beta: float = 0.05,
+                                       ) -> torch.Tensor:
+    """Objective for ``vol_lipo_tversky``: the ``vol_lipo`` shape+lipophilicity combo scored with an
+    asymmetric **Tversky** reduction on BOTH channels. Shape Tversky uses ``VAB_2nd_order``; the
+    lipophilicity Tversky uses the ESP overlap ``VAB_2nd_order_esp`` (Crippen logP as the "charge"),
+    each reduced by ``AB/(AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))``. Both fit centre sets
+    move rigidly under the same SE(3) pose. Tversky(A,A)=1 per channel → self-overlap 1.000."""
+    if len(fit_centers.shape) - 1 != len(se3_params.shape):
+        raise ValueError(f'fit_centers {fit_centers.shape} incompatible with se3_params {se3_params.shape}')
+
+    se3_matrix = get_SE3_transform(se3_params)
+    fit_centers = apply_SE3_transform(fit_centers, se3_matrix)
+    if fit_lipo_pos.shape[-2] != 0:
+        fit_lipo_pos = apply_SE3_transform(fit_lipo_pos, se3_matrix)
+
+    AB = VAB_2nd_order(ref_centers, fit_centers, alpha)
+    AA = VAB_2nd_order(ref_centers, ref_centers, alpha)
+    BB = VAB_2nd_order(fit_centers, fit_centers, alpha)
+    shape_sim = AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))
+
+    if ref_lipo_pos.shape[-2] == 0 or fit_lipo_pos.shape[-2] == 0:
+        lipo_sim = torch.zeros_like(shape_sim)
+    else:
+        _rl = ref_lipo.reshape((-1, 1)) if ref_lipo.dim() == 1 else ref_lipo.unsqueeze(2)
+        _fl = fit_lipo.reshape((-1, 1)) if fit_lipo.dim() == 1 else fit_lipo.unsqueeze(2)
+        lAB = VAB_2nd_order_esp(ref_lipo_pos, fit_lipo_pos, _rl, _fl, alpha, lam).reshape(shape_sim.shape)
+        lAA = VAB_2nd_order_esp(ref_lipo_pos, ref_lipo_pos, _rl, _rl, alpha, lam).reshape(shape_sim.shape)
+        lBB = VAB_2nd_order_esp(fit_lipo_pos, fit_lipo_pos, _fl, _fl, alpha, lam).reshape(shape_sim.shape)
+        lipo_sim = lAB / (lAB + tversky_alpha * (lAA - lAB) + tversky_beta * (lBB - lAB))
+
+    combo = (1 - lipo_weight) * shape_sim + lipo_weight * lipo_sim
+
+    if len(se3_params.shape) == 1:
+        return 1 - combo
+    elif len(se3_params.shape) == 2:
+        return 1 - combo.mean()
+
+
+def optimize_vol_lipo_tversky_overlay(ref_centers: torch.Tensor,
+                                      fit_centers: torch.Tensor,
+                                      ref_lipo_pos: torch.Tensor,
+                                      fit_lipo_pos: torch.Tensor,
+                                      ref_lipo: torch.Tensor,
+                                      fit_lipo: torch.Tensor,
+                                      alpha: float = 0.81,
+                                      lam: float = 0.1,
+                                      lipo_weight: float = 0.5,
+                                      tversky_alpha: float = 0.95,
+                                      tversky_beta: float = 0.05,
+                                      num_repeats: int = 50,
+                                      trans_centers: Union[torch.Tensor, None] = None,
+                                      lr: float = 0.1,
+                                      max_num_steps: int = 200,
+                                      verbose: bool = False
+                                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Optimize the ``vol_lipo_tversky`` overlay over SE(3): the shape+lipophilicity combo scored
+    with an asymmetric Tversky reduction per channel. Same machinery as ``optimize_vol_lipo_overlay``.
+    Returns ``(aligned_fit_centers, transform, score)``."""
+    if trans_centers is None:
+        se3_params = _initialize_se3_params(ref_points=ref_centers, fit_points=fit_centers, num_repeats=num_repeats)
+    else:
+        se3_params = _initialize_se3_params_with_translations(
+            ref_points=ref_centers, fit_points=fit_centers,
+            trans_centers=trans_centers, num_repeats_per_trans=10)
+    num_repeats = len(se3_params) if len(se3_params.shape) == 2 else 1
+
+    optimizer = optim.Adam([se3_params], lr=lr)
+
+    has_lipo = ref_lipo_pos.shape[-2] != 0 and fit_lipo_pos.shape[-2] != 0
+
+    ref_centers_rep = ref_centers.repeat((num_repeats, 1, 1)).squeeze(0)
+    fit_centers_rep = fit_centers.repeat((num_repeats, 1, 1)).squeeze(0)
+    if has_lipo:
+        ref_lipo_pos_rep = ref_lipo_pos.repeat((num_repeats, 1, 1)).squeeze(0)
+        fit_lipo_pos_rep = fit_lipo_pos.repeat((num_repeats, 1, 1)).squeeze(0)
+        ref_lipo_rep = ref_lipo.repeat((num_repeats, 1)).squeeze(0)
+        fit_lipo_rep = fit_lipo.repeat((num_repeats, 1)).squeeze(0)
+    else:
+        ref_lipo_pos_rep, fit_lipo_pos_rep = ref_lipo_pos, fit_lipo_pos
+        ref_lipo_rep, fit_lipo_rep = ref_lipo, fit_lipo
+
+    last_loss = 1
+    counter = 0
+    for step in range(max_num_steps):
+        loss = objective_vol_lipo_tversky_overlay(
+            se3_params=se3_params,
+            ref_centers=ref_centers_rep, fit_centers=fit_centers_rep,
+            ref_lipo_pos=ref_lipo_pos_rep, fit_lipo_pos=fit_lipo_pos_rep,
+            ref_lipo=ref_lipo_rep, fit_lipo=fit_lipo_rep,
+            alpha=alpha, lam=lam, lipo_weight=lipo_weight,
+            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if verbose and step % 100 == 0:
+            print(f"Step {step}, Score: {1 - loss.item()}")
+
+        if abs(loss - last_loss) > 1e-5:
+            counter = 0
+        else:
+            counter += 1
+        last_loss = loss
+        if counter > 10:
+            break
+
+    optimized_se3_params = se3_params.detach()
+    SE3_transform = get_SE3_transform(optimized_se3_params)
+    aligned_fit_centers = apply_SE3_transform(fit_centers_rep, SE3_transform)
+    if has_lipo:
+        aligned_fit_lipo_pos = apply_SE3_transform(fit_lipo_pos_rep, SE3_transform)
+    else:
+        aligned_fit_lipo_pos = fit_lipo_pos_rep
+
+    AB = VAB_2nd_order(ref_centers_rep, aligned_fit_centers, alpha)
+    AA = VAB_2nd_order(ref_centers_rep, ref_centers_rep, alpha)
+    BB = VAB_2nd_order(aligned_fit_centers, aligned_fit_centers, alpha)
+    shape_sim = AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))
+    if has_lipo:
+        _rl = ref_lipo_rep.reshape((-1, 1)) if ref_lipo_rep.dim() == 1 else ref_lipo_rep.unsqueeze(2)
+        _fl = fit_lipo_rep.reshape((-1, 1)) if fit_lipo_rep.dim() == 1 else fit_lipo_rep.unsqueeze(2)
+        lAB = VAB_2nd_order_esp(ref_lipo_pos_rep, aligned_fit_lipo_pos, _rl, _fl, alpha, lam).reshape(shape_sim.shape)
+        lAA = VAB_2nd_order_esp(ref_lipo_pos_rep, ref_lipo_pos_rep, _rl, _rl, alpha, lam).reshape(shape_sim.shape)
+        lBB = VAB_2nd_order_esp(aligned_fit_lipo_pos, aligned_fit_lipo_pos, _fl, _fl, alpha, lam).reshape(shape_sim.shape)
+        lipo_sim = lAB / (lAB + tversky_alpha * (lAA - lAB) + tversky_beta * (lBB - lAB))
+    else:
+        lipo_sim = torch.zeros_like(shape_sim)
+    scores = (1 - lipo_weight) * shape_sim + lipo_weight * lipo_sim
+
+    if num_repeats == 1:
+        if verbose:
+            print(f'Optimized vol_lipo_tversky similarity score: {float(scores):.3f}')
+        best_alignment = aligned_fit_centers.cpu()
+        best_transform = SE3_transform.cpu()
+        best_score = scores.detach().cpu()
+    else:
+        if verbose:
+            print(f'Optimized vol_lipo_tversky similarity -- max: {scores.max():.3f} | mean: {scores.mean():.3f} | min: {scores.min():.3f}')
+        best_idx = torch.argmax(scores.detach().cpu())
+        best_alignment = aligned_fit_centers.cpu()[best_idx]
+        best_transform = SE3_transform.cpu()[best_idx]
+        best_score = scores.detach().cpu()[best_idx]
+    return best_alignment, best_transform, best_score
+
+
+# =============================================================================
+# vol_and_surf_esp_tversky -- ShaEP-style vol+surf-ESP with a Tversky SHAPE channel
+# -----------------------------------------------------------------------------
+# vol_and_surf_esp blends a shape Tanimoto (volume) with a surface-ESP AGREEMENT channel. The ESP
+# channel is a point-to-point potential-agreement average (range [0,1]), NOT an overlap ratio, so a
+# Tversky reduction is not defined for it -- Tversky applies only to the shape channel. This mode is
+# therefore ``esp_weight * esp_agreement + (1-esp_weight) * shape_TVERSKY``. The ESP channel is
+# reused verbatim from ``esp_combo_score`` (called with ``esp_weight=1.0``) so its well-tested
+# masking / potential math is not re-derived here.
+# =============================================================================
+def objective_vol_and_surf_esp_tversky_overlay(se3_params: torch.Tensor,
+                                               ref_centers_w_H: torch.Tensor,
+                                               fit_centers_w_H: torch.Tensor,
+                                               ref_centers: torch.Tensor,
+                                               fit_centers: torch.Tensor,
+                                               ref_points: torch.Tensor,
+                                               fit_points: torch.Tensor,
+                                               ref_partial_charges: torch.Tensor,
+                                               fit_partial_charges: torch.Tensor,
+                                               ref_surf_esp: torch.Tensor,
+                                               fit_surf_esp: torch.Tensor,
+                                               ref_radii: torch.Tensor,
+                                               fit_radii: torch.Tensor,
+                                               alpha: float,
+                                               lam: float,
+                                               probe_radius: float,
+                                               esp_weight: float,
+                                               tversky_alpha: float = 0.95,
+                                               tversky_beta: float = 0.05,
+                                               ) -> torch.Tensor:
+    """Objective for ``vol_and_surf_esp_tversky``: the ShaEP-style vol+surf-ESP score with the SHAPE
+    channel scored by Tversky instead of Tanimoto (the surface-ESP agreement channel is unchanged --
+    it is not an overlap ratio, so Tversky does not apply). ``esp_weight * esp_agreement +
+    (1-esp_weight) * shape_tversky``. Only the fit is transformed."""
+    if len(fit_points.shape) - 1 != len(se3_params.shape):
+        raise ValueError(f'fit_points {fit_points.shape} incompatible with se3_params {se3_params.shape}')
+
+    se3_matrix = get_SE3_transform(se3_params)
+    transformed_fit_centers_w_H = apply_SE3_transform(fit_centers_w_H, se3_matrix)
+    transformed_fit_centers = apply_SE3_transform(fit_centers, se3_matrix)
+    transformed_fit_points = apply_SE3_transform(fit_points, se3_matrix)
+
+    # Surface-ESP agreement channel: esp_combo_score with esp_weight=1.0 returns the pure ESP term.
+    esp_sim = esp_combo_score(centers_w_H_1=ref_centers_w_H, centers_w_H_2=transformed_fit_centers_w_H,
+                              centers_1=ref_centers, centers_2=transformed_fit_centers,
+                              points_1=ref_points, points_2=transformed_fit_points,
+                              partial_charges_1=ref_partial_charges, partial_charges_2=fit_partial_charges,
+                              point_charges_1=ref_surf_esp, point_charges_2=fit_surf_esp,
+                              radii_1=ref_radii, radii_2=fit_radii,
+                              alpha=alpha, lam=lam, probe_radius=probe_radius, esp_weight=1.0)
+
+    AB = VAB_2nd_order(ref_centers, transformed_fit_centers, alpha)
+    AA = VAB_2nd_order(ref_centers, ref_centers, alpha)
+    BB = VAB_2nd_order(transformed_fit_centers, transformed_fit_centers, alpha)
+    shape_tversky = AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))
+
+    score = esp_weight * esp_sim + (1 - esp_weight) * shape_tversky
+
+    if len(se3_params.shape) == 1:
+        return 1 - score
+    elif len(se3_params.shape) == 2:
+        return 1 - score.mean()
+
+
+def optimize_vol_and_surf_esp_tversky_overlay(ref_centers_w_H: torch.Tensor,
+                                              fit_centers_w_H: torch.Tensor,
+                                              ref_centers: torch.Tensor,
+                                              fit_centers: torch.Tensor,
+                                              ref_points: torch.Tensor,
+                                              fit_points: torch.Tensor,
+                                              ref_partial_charges: torch.Tensor,
+                                              fit_partial_charges: torch.Tensor,
+                                              ref_surf_esp: torch.Tensor,
+                                              fit_surf_esp: torch.Tensor,
+                                              ref_radii: torch.Tensor,
+                                              fit_radii: torch.Tensor,
+                                              alpha: float,
+                                              lam: float,
+                                              probe_radius: float = 1.0,
+                                              esp_weight: float = 0.5,
+                                              tversky_alpha: float = 0.95,
+                                              tversky_beta: float = 0.05,
+                                              num_repeats: int = 50,
+                                              trans_centers: Union[torch.Tensor, None] = None,
+                                              lr: float = 0.1,
+                                              max_num_steps: int = 200,
+                                              verbose: bool = False
+                                              ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Optimize ``vol_and_surf_esp_tversky`` over SE(3): the ShaEP-style vol+surf-ESP score with a
+    Tversky shape channel. Mirrors ``optimize_esp_combo_score_overlay``; returns the aligned surface
+    points as ``best_alignment`` (consistent with the parent mode)."""
+    if trans_centers is None:
+        se3_params = _initialize_se3_params(ref_points=ref_points, fit_points=fit_points, num_repeats=num_repeats)
+    else:
+        se3_params = _initialize_se3_params_with_translations(
+            ref_points=ref_points, fit_points=fit_points,
+            trans_centers=trans_centers, num_repeats_per_trans=10)
+    current_num_repeats = len(se3_params) if len(se3_params.shape) == 2 else 1
+
+    optimizer = optim.Adam([se3_params], lr=lr)
+
+    if current_num_repeats == 1:
+        fit_centers_w_H_obj = fit_centers_w_H
+        fit_centers_obj = fit_centers
+        fit_points_obj = fit_points
+        fit_partial_charges_obj = fit_partial_charges
+        fit_surf_esp_obj = fit_surf_esp
+        fit_radii_obj = fit_radii
+    else:
+        fit_centers_w_H_obj = fit_centers_w_H.repeat((current_num_repeats, 1, 1))
+        fit_centers_obj = fit_centers.repeat((current_num_repeats, 1, 1))
+        fit_points_obj = fit_points.repeat((current_num_repeats, 1, 1))
+        fit_partial_charges_obj = fit_partial_charges.repeat((current_num_repeats, 1) if fit_partial_charges.dim() > 0 else (current_num_repeats,))
+        fit_surf_esp_obj = fit_surf_esp.repeat((current_num_repeats, 1) if fit_surf_esp.dim() > 0 else (current_num_repeats,))
+        fit_radii_obj = fit_radii.repeat((current_num_repeats, 1) if fit_radii.dim() > 0 else (current_num_repeats,))
+
+    last_loss = torch.tensor(float('inf'), device=ref_points.device)
+    counter = 0
+    for step in range(max_num_steps):
+        loss = objective_vol_and_surf_esp_tversky_overlay(
+            se3_params=se3_params,
+            ref_centers_w_H=ref_centers_w_H, fit_centers_w_H=fit_centers_w_H_obj,
+            ref_centers=ref_centers, fit_centers=fit_centers_obj,
+            ref_points=ref_points, fit_points=fit_points_obj,
+            ref_partial_charges=ref_partial_charges, fit_partial_charges=fit_partial_charges_obj,
+            ref_surf_esp=ref_surf_esp, fit_surf_esp=fit_surf_esp_obj,
+            ref_radii=ref_radii, fit_radii=fit_radii_obj,
+            alpha=alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight,
+            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if verbose and step % 100 == 0:
+            print(f"Step {step}, Score: {1 - loss.item():.3f}")
+
+        if torch.abs(loss - last_loss) > 1e-5:
+            counter = 0
+        else:
+            counter += 1
+        last_loss = loss
+        if counter > 10:
+            break
+
+    optimized_se3_params = se3_params.detach()
+    SE3_transform = get_SE3_transform(optimized_se3_params)
+    aligned_fit_centers_w_H = apply_SE3_transform(fit_centers_w_H_obj, SE3_transform)
+    aligned_fit_centers = apply_SE3_transform(fit_centers_obj, SE3_transform)
+    aligned_fit_points = apply_SE3_transform(fit_points_obj, SE3_transform)
+
+    esp_sim = esp_combo_score(centers_w_H_1=ref_centers_w_H, centers_w_H_2=aligned_fit_centers_w_H,
+                              centers_1=ref_centers, centers_2=aligned_fit_centers,
+                              points_1=ref_points, points_2=aligned_fit_points,
+                              partial_charges_1=ref_partial_charges, partial_charges_2=fit_partial_charges_obj,
+                              point_charges_1=ref_surf_esp, point_charges_2=fit_surf_esp_obj,
+                              radii_1=ref_radii, radii_2=fit_radii_obj,
+                              alpha=alpha, lam=lam, probe_radius=probe_radius, esp_weight=1.0)
+    AB = VAB_2nd_order(ref_centers, aligned_fit_centers, alpha)
+    AA = VAB_2nd_order(ref_centers, ref_centers, alpha)
+    BB = VAB_2nd_order(aligned_fit_centers, aligned_fit_centers, alpha)
+    shape_tversky = AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))
+    scores = esp_weight * esp_sim + (1 - esp_weight) * shape_tversky
+
+    if current_num_repeats == 1:
+        if verbose:
+            print(f'Optimized vol_and_surf_esp_tversky score: {float(scores):.3f}')
+        best_alignment = aligned_fit_points.cpu()
+        best_transform = SE3_transform.cpu()
+        best_score = scores.detach().cpu()
+    else:
+        best_idx = torch.argmax(scores.detach().cpu())
+        if verbose:
+            print(f'Optimized vol_and_surf_esp_tversky score -- max: {scores[best_idx].item():.3f} | mean: {scores.mean().item():.3f}')
+        best_alignment = aligned_fit_points.cpu()[best_idx]
         best_transform = SE3_transform.cpu()[best_idx]
         best_score = scores.detach().cpu()[best_idx]
     return best_alignment, best_transform, best_score

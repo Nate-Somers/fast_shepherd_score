@@ -42,6 +42,7 @@ callers are enumerated in [Behavior changes](#7-behavior-changes-read-this) — 
 7. [Behavior changes (read this)](#7-behavior-changes-read-this)
 8. [Testing and validation](#8-testing-and-validation)
 9. [Known gaps](#9-known-gaps)
+10. [Session update: nine new alignment modes via the agent skills](#10-session-update-nine-new-alignment-modes-via-the-agent-skills)
 
 ---
 
@@ -826,12 +827,13 @@ build_lookup_tables_cached(..., directionless=False)
 
 ## 6. Extensibility: the two agent skills
 
-> **Status: not implemented.** This section reserves the design. The two skills described below
-> are **not shipped in this release** — neither is written, and the two internal playbooks that
-> specified them (`docs/ADDING_A_FAST_MODE.md` and `accel/agent_prompt.md`) were removed from the
-> release tree. What *does* ship is the machinery they will drive: the mode registry, the layered
-> `accel/` architecture, and `vol_color` as a complete worked example of the path end to end.
-> Treat everything in this section as a roadmap, not an API.
+> **Status update: both skills now exist and have been exercised, repeatedly.** The two playbooks
+> this section originally reserved as a roadmap are now real, packaged skills —
+> `.claude/skills/design-scoring-mode/` and `.claude/skills/accelerate-scoring-mode/` — and have
+> been used end to end to add `vol_tversky`, `vol_lipo`, `vol_esp_tversky`, and, in one session, a
+> further **nine** new modes at once. See [§10](#10-session-update-nine-new-alignment-modes-via-the-agent-skills)
+> for that session's results. The four-step path and worked example below are unchanged and still
+> accurate — read on for how the skills map to it.
 
 Adding a new alignment type to this library is a four-step path. Every step already exists as a
 real, shipped extension point — `vol_color` was built by walking exactly this path:
@@ -869,13 +871,13 @@ The intended shortcut, and the reason step 2 matters, is that a correct autograd
 first be *batched* over pairs for a no-kernel GPU speedup. Only if the per-step autograd is still
 the bottleneck do you need to write kernels at all.
 
-### What is missing before these can ship
+### Status
 
-- Both skills need to be written; neither exists.
-- The two playbooks they were derived from were removed from this release and would need to be
-  restored (in a user-facing form) or rewritten.
-- The parity and throughput gates the skills depend on for step 4 are **not currently in the test
-  suite** — see [Known gaps](#9-known-gaps).
+- Both skills exist and ship (`.claude/skills/design-scoring-mode/`,
+  `.claude/skills/accelerate-scoring-mode/`) and have been used repeatedly, most recently to add
+  nine modes in one session — see [§10](#10-session-update-nine-new-alignment-modes-via-the-agent-skills).
+- The parity and throughput gates the skills depend on for step 4 are still **not fully in the
+  committed test suite** for every optimization path — see [Known gaps](#9-known-gaps).
 
 ---
 
@@ -1137,3 +1139,91 @@ not any existing caller.
   `_INT_BUFFER_CACHE`, `_PAIR_FOOTPRINT_BYTES`, and the captured-graph LRU) so a long-lived process
   that has seen many distinct molecule sizes can reclaim device memory between workloads. They still
   do not shrink on their own.
+
+## 10. Session update: nine new alignment modes via the agent skills
+
+> **Status: uncommitted, on this branch.** Everything below was built in one working session by
+> running the two packaged skills ([§6](#6-extensibility-the-two-agent-skills)) end to end for nine
+> new modes at once — the largest single exercise of that path so far. The canonical registry now
+> has **19 modes** (10 from before this session + these 9). Nothing here has landed on `main`; this
+> section documents what exists on the working branch right now, including what is still running.
+
+### What was added
+
+Nine modes, in two families:
+
+**A Tversky scoring option for six modes that lacked one** (`vol`/`vol_esp` already shipped
+Tversky variants): `surf_tversky`, `surf_esp_tversky`, `vol_and_surf_esp_tversky` (Tversky on the
+shape channel only — the ShaEP-style surface-ESP *agreement* channel is a masked point-to-point
+average, not an overlap ratio, so Tversky does not apply to it), `vol_color_tversky`,
+`vol_lipo_tversky`, `pharm_tversky`.
+
+**Three genuinely new objectives:**
+
+| Mode | Scores | New per-atom `Molecule` data |
+|---|---|---|
+| `vol_pharm` | shape + **directional** pharmacophore overlap (a ROCS *ColorTanimoto* analogue — `vol_color` with `directionless=False`) | none (reuses `pharm_vecs`) |
+| `vol_atomtype` | shape + a **categorical** Gaussian overlap keyed by element (atomic number) — only same-element atoms contribute | `get_atomic_numbers()`, `get_atomtype_positions()` |
+| `vol_mr` | shape + per-atom Crippen **molar refractivity** (polarizability), overlaid like an ESP field (structurally identical to `vol_lipo`, swapping the Crippen `logP` element for the `MR` element of the same `_CalcCrippenContribs` call) | `get_molar_refractivity_contribs()`, `get_molar_refractivity()`, `get_mr_positions()` |
+
+`vol_atomtype` is the only one of the nine that needed a new *kernel* concept: it reuses the
+existing directionless-colour Triton/numba kernel (`pharm_color_score_grad_se3_batch`) with a
+purpose-built **element-indexed lookup table** (`accel/drivers/vol_atomtype.py::build_element_tables`)
+in place of the pharmacophore-type table — no new kernel code, same in-register `dO/dq` kernel the
+`vol_color`/`pharm` modes already validate.
+
+### Both skill layers, both run
+
+**Reference layer** (`design-scoring-mode`): a new `score/atomtype_scoring.py` module (the
+element-identity overlap primitive), four new eager optimizers in `alignment/_torch.py`
+(`vol_atomtype`, `vol_color_tversky`, `vol_lipo_tversky`, `vol_and_surf_esp_tversky`), nine new
+`MoleculePair.align_with_<mode>` methods, and the `_ALIGN_KEYS` / export wiring. Validated with the
+standard gate set — self-overlap = 1.000, autograd ≡ finite-difference gradient (non-identity pose),
+determinism, and the retained-H per-atom basis — in `tests/test_si_modes.py` (26 cases; the 3
+surface-mode gates need Open3D and are skipped on a CPU-only box, but their math is exercised via a
+synthetic-surface test that doesn't need it).
+
+**Accelerated layer** (`accelerate-scoring-mode`): nine driver files in `accel/drivers/`, nine
+`_align_batch_<mode>` functions in `accel/batch/aligners.py`, canonical registration in
+`accel/_modes.py` (`MODE_ATTRS`/`MODE_SEEDS`/`MODE_STEPS`, bumping `CANONICAL_MODES` 10 → 19), and
+nine `MoleculePairBatch.align_with_<mode>` API methods. Six of the nine reuse an existing driver
+outright (`vol_mr` → the `vol_lipo` driver, `surf_tversky`/`surf_esp_tversky` → the
+`vol_tversky`/`vol_esp_tversky` drivers over surface data, `pharm_tversky` → the `pharm` driver,
+which already accepted `similarity='tversky'`); three needed a new driver (`vol_lipo_tversky`,
+`vol_color_tversky` — the Tversky reduction `V_AB / (k·V_AB + C)` proven in `vol_tversky`, applied
+to a second channel; `vol_pharm` — the `vol_color` two-channel joint-gradient driver with the
+directional pharmacophore kernel swapped in for the directionless one; `vol_and_surf_esp_tversky` —
+the `esp_combo` driver with the shape channel's Tanimoto reduction swapped for Tversky).
+
+Parity, measured on an NVIDIA L40S (`node3615`, `pi_melkin`):
+
+- **numba ≡ per-pair reference**: within 8e-5 for every non-surface mode (added to
+  `tests/test_new_modes_accel.py`).
+- **Triton ≡ numba**: agreement to **~1e-7** for all nine modes (single precision, effectively
+  bit-identical) — including the three surface modes, verified with a shared-surface self-pair
+  (self-overlap = 1.00000 on both backends; a *separately re-built* surface pair reads ~0.97-0.98,
+  which is surface-cloud reproducibility across two independent builds, not a backend or mode bug).
+- **Screen (`ProfileStore`) wiring was explicitly *not* done for these nine modes** — that is a
+  separate, large per-mode `screen.py` change (§10 of the accel skill's own docs) and was out of
+  scope for this session. All nine work through `MoleculePairBatch` (in-memory, GPU/CPU) only; none
+  are screen-able from an on-disk `ProfileStore` yet.
+
+Zero regressions: the full suite went from 305 → 317 passing (the new parity cases) with the same
+11 pre-existing environment-only failures (`open3d` absent locally) both before and after.
+
+### Benchmarks
+
+Both run on `pi_melkin` (priority partition), against the exact DUDE-Z / speed protocols the
+paper's Figures 2–3 use, so the numbers are directly comparable to the shipped baselines:
+
+- **Throughput** (`paper/SI/speed/run_speed.py`, batched `MoleculePairBatch`, Triton): all 19
+  modes measured at both ~3k and 100k alignments/mode. The nine new modes screen at throughput
+  comparable to their parent mode (e.g. `surf_tversky` ≈ `surf`, `vol_mr` ≈ `vol_lipo`).
+- **Accuracy** (`paper/SI/accuracy/run_accuracy.py`, mirrors `fig3_enrichment`'s protocol exactly):
+  a 41-target DUDE-Z retrospective screen, leave-one-out over 8 query actives + 3000 decoys per
+  target, at each mode's shipped default SE(3) budget. **28 of 41 targets complete as of this
+  writing**; the campaign is still running (SLURM array `18646996`, 4-way concurrent).
+
+Full write-up, per-mode math, and the aggregated results (regenerated automatically as the campaign
+finishes) live in `paper/SI/` in the sibling `Shepherd-Score-Paper` repo — see
+`paper/SI/README.md` and `paper/SI/modes/MODES.md`.
