@@ -543,3 +543,113 @@ def test_vol_lipo_stream_retained_h(tmp_path):
         backend="numba", num_repeats=16, max_num_steps=50)
     for i, rs in enumerate(ref):                     # incl. the retained-H molecule
         assert fast_by_id[i] == pytest.approx(float(rs), abs=1e-2)
+
+
+# --------------------------------------------------------------------------- #
+# vol_fukui -- same store/fast-path plumbing as vol_lipo, but the per-atom field is the signed
+# condensed Fukui dual descriptor (f+ - f-). The real field needs three gfn2-xTB single points, so
+# these tests INJECT a deterministic synthetic field via Molecule(fukui=...) -- the *screen* wiring
+# (variable-length store + resident-tensor fast path) is independent of how the field was produced.
+# --------------------------------------------------------------------------- #
+def _synthetic_fukui(rd):
+    """Deterministic SIGNED per-atom field (full with-H order) standing in for the xTB Fukui dual
+    descriptor; a pure function of atom order so a molecule and its copy get the same field."""
+    z = np.array([a.GetAtomicNum() for a in rd.GetAtoms()], dtype=np.float32)
+    return (0.2 * ((z % 4) - 1.5)).astype(np.float32)
+
+
+def _build_molecule_fukui(smi, seed, S=64):
+    """As ``_build_molecule`` but injects the synthetic Fukui field so no xTB binary is needed."""
+    m = Chem.AddHs(Chem.MolFromSmiles(smi))
+    params = AllChem.ETKDGv3()
+    params.randomSeed = seed
+    assert AllChem.EmbedMolecule(m, params) == 0, f"embed failed for {smi}"
+    rng = np.random.default_rng(seed)
+    surf = rng.standard_normal((S, 3)).astype(np.float32) * 3.0
+    esp = rng.standard_normal((S,)).astype(np.float32)
+    return Molecule(m, surface_points=surf, electrostatics=esp, pharm_multi_vector=False,
+                    fukui=_synthetic_fukui(m))
+
+
+def test_vol_fukui_stream_matches_object(tmp_path):
+    """vol_fukui carries a NEW per-molecule data set (the TRUE-heavy Fukui centres + per-atom Fukui
+    field) through the store's variable-length serialization, then screens through the resident-tensor
+    FAST path (vol_fukui in _FAST_MODES). Streamed scores must match the per-pair object path, and the
+    store must actually persist the Fukui arrays (offset table + centres + scalar)."""
+    import copy, glob
+    smis = ["CCO", "CC(=O)Oc1ccccc1C(=O)O", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C", "c1ccccc1O"]
+    mols = [_build_molecule_fukui(s, seed=i) for i, s in enumerate(smis)]
+
+    store_path = os.path.join(tmp_path, "lib.fss")
+    with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_fukui",),
+                             dtype="float32", pre_centered=True) as store:
+        for i, m in enumerate(mols):
+            store.add(m, id=i)
+    store = ProfileStore.open(store_path)
+    assert store.supports("vol_fukui") and store.supports("vol")
+    assert store.schema["fukui"]
+    # the variable-length Fukui set made it to disk (offset table + centres + scalar arrays)
+    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
+        assert {"fukui_off", "fukui_pos", "fukui"} <= set(d.files)
+
+    query = mols[1]
+    hits = screen(query, store, mode="vol_fukui", backend="numba",
+                  num_repeats=16, max_num_steps=50, top_k=len(mols))
+    by_id = {h.id: h.score for h in hits}
+    assert by_id[1] == pytest.approx(1.0, abs=1e-2)        # self-overlay optimum (shape+fukui)
+
+    cq = copy.deepcopy(query); cq.center_to(cq.atom_pos.mean(0))
+    profiles = [p for shard in store.iter_shards() for p in shard]
+    pairs = [MoleculePair(cq, p, do_center=False) for p in profiles]
+    ref, _ = MoleculePairBatch(pairs).align_with_vol_fukui(
+        backend="numba", num_repeats=16, max_num_steps=50)
+    # pre_centered store -> screen() takes the resident-tensor FAST path (mode in _FAST_MODES).
+    # Same abs=1e-2 the accel/vol_lipo tests use: loose enough for a near-tie multi-start flip from
+    # the ~fp re-centering tickle, tight enough that wrong/empty Fukui data is still caught.
+    for p, rs in zip(profiles, ref):
+        assert by_id[p.id] == pytest.approx(float(rs), abs=1e-2)
+
+
+def test_vol_fukui_stream_retained_h(tmp_path):
+    """vol_fukui's two channels live on DIFFERENT bases: shape on ``atom_pos`` (RemoveHs) and the
+    Fukui field on the TRUE-heavy centres. When Chem.RemoveHs RETAINS an H (deuterium), the RemoveHs
+    set is longer than the heavy Fukui set, so the two per-molecule offset tables (``atom_off`` vs
+    ``fukui_off``) legitimately diverge. The store must persist both bases self-consistently and the
+    streamed scores must match the in-memory MoleculePairBatch path."""
+    import copy, glob
+
+    # [2H]OC(=O)c1ccccc1 keeps its deuterium after RemoveHs -> atom_pos (10) != heavy (9).
+    smis = ["CC(=O)Oc1ccccc1C(=O)O", "c1ccccc1O", "[2H]OC(=O)c1ccccc1",
+            "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"]
+    mols = [_build_molecule_fukui(s, seed=i) for i, s in enumerate(smis)]
+    retained = [m for m in mols if len(m.atom_pos) != len(m._nonH_atoms_idx)]
+    assert retained, "test premise broken: no molecule retains an H after RemoveHs"
+
+    store_path = os.path.join(tmp_path, "lib.fss")
+    with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_fukui",),
+                             dtype="float32", pre_centered=True) as store:
+        for i, m in enumerate(mols):
+            store.add(m, id=i)
+
+    # The Fukui set reached disk, and its offset table diverges from atom_off on the retained-H
+    # molecule (proving the two bases are stored independently, not desynced).
+    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
+        assert {"fukui_off", "fukui_pos", "fukui"} <= set(d.files)
+        atom_lens = np.diff(d["atom_off"])
+        fukui_lens = np.diff(d["fukui_off"])
+        assert (atom_lens != fukui_lens).any(), "retained-H molecule should diverge atom_off vs fukui_off"
+
+    query = mols[0]                                  # clean query
+    hits = screen(query, ProfileStore.open(store_path), mode="vol_fukui", backend="numba",
+                  num_repeats=16, max_num_steps=50, top_k=len(mols))
+    assert len(hits) == len(mols)
+    fast_by_id = {h.id: h.score for h in hits}
+
+    cq = copy.deepcopy(query); cq.center_to(cq.atom_pos.mean(0))
+    def _c(m):
+        c = copy.deepcopy(m); c.center_to(c.atom_pos.mean(0)); return c
+    pairs = [MoleculePair(cq, _c(m), do_center=False) for m in mols]
+    ref, _ = MoleculePairBatch(pairs).align_with_vol_fukui(
+        backend="numba", num_repeats=16, max_num_steps=50)
+    for i, rs in enumerate(ref):                     # incl. the retained-H molecule
+        assert fast_by_id[i] == pytest.approx(float(rs), abs=1e-2)

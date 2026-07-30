@@ -36,6 +36,7 @@ MODE_ATTRS = {
     "vol_pharm":                ("transform_vol_pharm",                "sim_aligned_vol_pharm"),
     "pharm_tversky":            ("transform_pharm_tversky",            "sim_aligned_pharm_tversky"),
     "vol_and_surf_esp_tversky": ("transform_vol_and_surf_esp_tversky", "sim_aligned_vol_and_surf_esp_tversky"),
+    "vol_fukui":                ("transform_vol_fukui",                "sim_aligned_vol_fukui"),
 }
 
 # The 10 canonical mode ids, in public order.
@@ -73,10 +74,10 @@ MODE_SEEDS = {"vol": 10, "surf": 8, "surf_esp": 8, "vol_esp": 16, "vol_and_surf_
               "vol_esp_tversky": 16,
               "vol_mr": 16, "surf_tversky": 8, "surf_esp_tversky": 8, "vol_lipo_tversky": 16,
               "vol_color_tversky": 16, "vol_atomtype": 16, "vol_pharm": 32, "pharm_tversky": 32,
-              "vol_and_surf_esp_tversky": 8}
+              "vol_and_surf_esp_tversky": 8, "vol_fukui": 16}
 MODE_STEPS = {"vol": 30, "surf": 40, "surf_esp": 40, "vol_esp": 50, "vol_and_surf_esp": 60,
               "pharm": 50, "vol_color": 40, "vol_tversky": 40, "vol_lipo": 50,
               "vol_esp_tversky": 50,
               "vol_mr": 50, "surf_tversky": 40, "surf_esp_tversky": 40, "vol_lipo_tversky": 50,
               "vol_color_tversky": 40, "vol_atomtype": 40, "vol_pharm": 50, "pharm_tversky": 50,
-              "vol_and_surf_esp_tversky": 60}
+              "vol_and_surf_esp_tversky": 60, "vol_fukui": 50}

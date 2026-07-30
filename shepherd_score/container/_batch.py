@@ -1496,6 +1496,26 @@ class MoleculePairBatch:
             'align_with_vol_mr', 'sim_aligned_vol_mr', mr_weight=mr_weight, alpha=alpha, lam=lam,
             num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
 
+    def align_with_vol_fukui(self, fukui_weight: float = 0.5, alpha: float = 0.81, lam: float = 0.1,
+                             num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                             verbose: bool = False, backend: Optional[str] = None,
+                             return_aligned: bool = False):
+        """Batched shape + condensed-Fukui reactivity alignment (reuses the vol_lipo driver)."""
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_fukui")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_fukui")
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_fukui,
+            dict(fukui_weight=fukui_weight, alpha=alpha, lam=lam,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_fukui", "transform_vol_fukui", "_fit_xyz_t", return_aligned)
+        if handled:
+            return _result
+        return self._delegate_alignment(
+            'align_with_vol_fukui', 'sim_aligned_vol_fukui', fukui_weight=fukui_weight, alpha=alpha,
+            lam=lam, num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
+
     def align_with_surf_tversky(self, tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
                                 alpha: float = 0.81, num_repeats: int = None, lr: float = 0.1,
                                 max_num_steps: int = None, verbose: bool = False,

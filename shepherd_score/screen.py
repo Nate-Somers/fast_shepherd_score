@@ -147,12 +147,14 @@ class MoleculeProfile:
     __slots__ = ("atom_pos", "atom_pos_noH", "surf_pos", "surf_esp", "partial_charges", "radii",
                  "_nonH_atoms_idx", "pharm_types", "pharm_ancs", "pharm_vecs",
                  "lipo_pos", "lipophilicity",
+                 "fukui_pos", "fukui",
                  "num_surf_points", "mol", "id")
 
     def __init__(self, *, atom_pos, surf_pos=None, surf_esp=None,
                  partial_charges=None, radii=None, nonH_atoms_idx=None,
                  pharm_types=None, pharm_ancs=None, pharm_vecs=None,
                  lipo_pos=None, lipophilicity=None,
+                 fukui_pos=None, fukui=None,
                  centers_w_H=None, atom_pos_noH=None, id=None):
         self.atom_pos = _f32(atom_pos)
         # Strict-heavy vol_esp centers (1:1 with the heavy charges); None when identical to
@@ -177,6 +179,10 @@ class MoleculeProfile:
         # RemoveHs retained an H) + the per-atom Crippen logP placed at them (already heavy-sliced).
         self.lipo_pos = _f32(lipo_pos)
         self.lipophilicity = _f32(lipophilicity)
+        # vol_fukui: TRUE-heavy atom centres (own count) + the per-atom signed Fukui dual descriptor
+        # (f+ - f-) placed at them (already heavy-sliced), exactly like the vol_lipo channel.
+        self.fukui_pos = _f32(fukui_pos)
+        self.fukui = _f32(fukui)
         self.num_surf_points = None if self.surf_pos is None else len(self.surf_pos)
         self.mol = _MolShim(_f32(centers_w_H)) if centers_w_H is not None else None
         self.id = id
@@ -194,6 +200,8 @@ class MoleculeProfile:
             self.pharm_ancs = self.pharm_ancs - mu
         if self.lipo_pos is not None:
             self.lipo_pos = self.lipo_pos - mu                 # lipo centres move with the molecule
+        if self.fukui_pos is not None:
+            self.fukui_pos = self.fukui_pos - mu               # fukui centres move with the molecule
         if self.mol is not None:
             self.mol = _MolShim(self.mol.GetConformer().GetPositions() - mu)
 
@@ -207,6 +215,17 @@ class MoleculeProfile:
         ``Molecule.get_lipophilicity()``. ``no_H`` is accepted for signature parity; the profile
         only carries the heavy slice the ``vol_lipo`` aligner reads."""
         return self.lipophilicity
+
+    def get_fukui_positions(self):
+        """TRUE-heavy Fukui centres -- mirrors ``Molecule.get_fukui_positions()`` so the
+        ``vol_fukui`` aligner reads a profile identically to a full ``Molecule``."""
+        return self.fukui_pos
+
+    def get_fukui(self, no_H: bool = True):
+        """Per-atom Fukui dual descriptor (stored already heavy-sliced) -- mirrors
+        ``Molecule.get_fukui()``. ``no_H`` is accepted for signature parity; the profile only
+        carries the heavy slice the ``vol_fukui`` aligner reads."""
+        return self.fukui
 
     @classmethod
     def from_molecule(cls, m, *, modes=_VALID_MODES, id=None) -> "MoleculeProfile":
@@ -233,6 +252,7 @@ def _schema_from_modes(modes) -> dict:
         centers_w_H=("vol_and_surf_esp" in modes),
         pharm=bool({"pharm", "vol_color"} & modes),   # vol_color = atoms + directionless pharm
         lipophilicity=("vol_lipo" in modes),          # vol_lipo = atoms + heavy logP centres
+        fukui=("vol_fukui" in modes),                 # vol_fukui = atoms + heavy Fukui-field centres
     )
 
 
@@ -256,6 +276,8 @@ def _store_supports(schema: dict, mode: str) -> bool:
         return True                                     # asymmetric shape overlay; atom_pos always stored
     if mode == "vol_lipo":
         return schema.get("lipophilicity", False)       # atoms (always) + heavy logP centres
+    if mode == "vol_fukui":
+        return schema.get("fukui", False)               # atoms (always) + heavy Fukui-field centres
     if mode == "vol_and_surf_esp":
         return (schema["surf"] and schema["surf_esp"] and schema["centers_w_H"]
                 and schema["radii"] and schema["charges"] and schema["with_H"])
@@ -270,6 +292,7 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
     atom_pos_noH = None
     ph_t = ph_a = ph_v = None
     lipo_pos = lipo_val = None
+    fukui_pos = fukui_val = None
 
     if sch["surf"]:
         if m.surf_pos is None:
@@ -318,6 +341,13 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
         # stored under its own offset table, so a length divergence from atom_pos never desyncs.
         lipo_pos = _f32(m.get_lipo_positions())
         lipo_val = _f32(m.get_lipophilicity(no_H=True))
+    if sch.get("fukui"):
+        if not hasattr(m, "get_fukui_positions") or not hasattr(m, "get_fukui"):
+            raise ValueError("store needs the Fukui field but molecule cannot provide it")
+        # TRUE-heavy centres 1:1 with the heavy Fukui dual descriptor -- own count, own offset
+        # table, exactly like the lipo channel above.
+        fukui_pos = _f32(m.get_fukui_positions())
+        fukui_val = _f32(m.get_fukui(no_H=True))
 
     if pre_center:
         mu = atom_pos.mean(0)
@@ -329,6 +359,8 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
         if lipo_pos is not None and len(lipo_pos):
             lipo_pos = lipo_pos - mu           # shift by the atom_pos COM (matches the in-memory
                                                # conformer transform, not its own COM)
+        if fukui_pos is not None and len(fukui_pos):
+            fukui_pos = fukui_pos - mu         # shift by the atom_pos COM, like lipo_pos
         if cwh is not None:
             cwh = cwh - mu
         if atom_pos_noH is not None:
@@ -340,6 +372,7 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
         radii=radii, nonH_atoms_idx=nonH, pharm_types=ph_t, pharm_ancs=ph_a,
         pharm_vecs=ph_v,
         lipo_pos=lipo_pos, lipophilicity=lipo_val,
+        fukui_pos=fukui_pos, fukui=fukui_val,
         centers_w_H=cwh, atom_pos_noH=atom_pos_noH, id=id,
     )
 
@@ -548,6 +581,14 @@ class ProfileStore:
             out["lipo_off"] = offsets(lipo_lens)
             out["lipo_pos"] = np.concatenate([r.lipo_pos for r in recs]).astype(dt)
             out["lipophilicity"] = np.concatenate([r.lipophilicity for r in recs]).astype(dt)
+        if sch.get("fukui"):
+            # vol_fukui: TRUE-heavy centres + per-atom Fukui dual descriptor as their OWN
+            # variable-length set (one offset table shared by positions + scalar), exactly like the
+            # lipo channel -- independent of atom_off so a retained-H molecule stays self-consistent.
+            fukui_lens = [len(r.fukui_pos) for r in recs]
+            out["fukui_off"] = offsets(fukui_lens)
+            out["fukui_pos"] = np.concatenate([r.fukui_pos for r in recs]).astype(dt)
+            out["fukui"] = np.concatenate([r.fukui for r in recs]).astype(dt)
         return out
 
     # ---- reader ---------------------------------------------------------- #
@@ -625,6 +666,7 @@ class ProfileStore:
         all_off = data["all_off"] if (sch["charges"] and sch["with_H"]) else None
         pharm_off = data["pharm_off"] if sch["pharm"] else None
         lipo_off = data["lipo_off"] if sch.get("lipophilicity") else None
+        fukui_off = data["fukui_off"] if sch.get("fukui") else None
 
         out = []
         for i in range(n):
@@ -654,6 +696,10 @@ class ProfileStore:
                 l0, l1 = int(lipo_off[i]), int(lipo_off[i + 1])
                 kw["lipo_pos"] = data["lipo_pos"][l0:l1]
                 kw["lipophilicity"] = data["lipophilicity"][l0:l1]
+            if sch.get("fukui"):
+                f0, f1 = int(fukui_off[i]), int(fukui_off[i + 1])
+                kw["fukui_pos"] = data["fukui_pos"][f0:f1]
+                kw["fukui"] = data["fukui"][f0:f1]
             out.append(MoleculeProfile(**kw))
         return out
 
@@ -699,7 +745,7 @@ def _centered_copy(query):
 # serves every query.
 # --------------------------------------------------------------------------- #
 _FAST_MODES = ("vol", "surf", "surf_esp", "pharm", "vol_color", "vol_esp", "vol_and_surf_esp",
-               "vol_tversky", "vol_lipo", "vol_esp_tversky")
+               "vol_tversky", "vol_lipo", "vol_esp_tversky", "vol_fukui")
 
 
 class _ArrView:
@@ -739,6 +785,8 @@ class _FastPair:
                  "_ref_radii_t", "_fit_radii_t",                     # esp_combo with-H radii
                  "_ref_lipo_pos_t", "_fit_lipo_pos_t",               # vol_lipo heavy logP centres
                  "_ref_lipo_t", "_fit_lipo_t",                       # vol_lipo per-atom logP
+                 "_ref_fukui_pos_t", "_fit_fukui_pos_t",             # vol_fukui heavy Fukui centres
+                 "_ref_fukui_t", "_fit_fukui_t",                     # vol_fukui per-atom Fukui field
                  "transform_vol_noH", "sim_aligned_vol_noH",
                  "transform_surf", "sim_aligned_surf",
                  "transform_surf_esp", "sim_aligned_surf_esp",
@@ -748,7 +796,8 @@ class _FastPair:
                  "transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp",
                  "transform_vol_tversky", "sim_aligned_vol_tversky",
                  "transform_vol_lipo", "sim_aligned_vol_lipo",
-                 "transform_vol_esp_tversky", "sim_aligned_vol_esp_tversky")
+                 "transform_vol_esp_tversky", "sim_aligned_vol_esp_tversky",
+                 "transform_vol_fukui", "sim_aligned_vol_fukui")
 
     def __init__(self, device):
         self.device = device
@@ -792,6 +841,13 @@ def _query_ref_arrays(q, mode: str) -> dict:
         return {"xyz": np.asarray(q.atom_pos, np.float32),
                 "lipo_pos": np.asarray(q.get_lipo_positions(), np.float32).reshape(-1, 3),
                 "lipo": np.asarray(q.get_lipophilicity(no_H=True), np.float32).reshape(-1)}
+    if mode == "vol_fukui":
+        # Shape centres = atom_pos (RemoveHs); Fukui centres = the TRUE-heavy positions (own count)
+        # via the accessor (Molecule reads its conformer; a MoleculeProfile returns its fukui_pos),
+        # 1:1 with the per-atom Fukui dual descriptor (f+ - f-). Mirrors vol_lipo.
+        return {"xyz": np.asarray(q.atom_pos, np.float32),
+                "fukui_pos": np.asarray(q.get_fukui_positions(), np.float32).reshape(-1, 3),
+                "fukui": np.asarray(q.get_fukui(no_H=True), np.float32).reshape(-1)}
     raise ValueError(mode)
 
 
@@ -834,6 +890,11 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
         # p.ref_molec.get_lipo_positions()/get_lipophilicity() lambdas (no _ArrView needed).
         return {"_ref_xyz_t": f(ra["xyz"]),
                 "_ref_lipo_pos_t": f(ra["lipo_pos"]), "_ref_lipo_t": f(ra["lipo"])}
+    if mode == "vol_fukui":
+        # Pre-set all three ref tensors so _align_batch_vol_fukui's _batch_upload skips its
+        # p.ref_molec.get_fukui_positions()/get_fukui() lambdas (no _ArrView needed). Mirrors vol_lipo.
+        return {"_ref_xyz_t": f(ra["xyz"]),
+                "_ref_fukui_pos_t": f(ra["fukui_pos"]), "_ref_fukui_t": f(ra["fukui"])}
     raise ValueError(mode)
 
 
@@ -934,6 +995,17 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
             p._fit_xyz_t = at
             p._fit_lipo_pos_t = lp
             p._fit_lipo_t = lv
+    elif mode == "vol_fukui":
+        aoff, foff = arrs["atom_off"], arrs["fukui_off"]
+        # RemoveHs shape centres (own atom_off) + the TRUE-heavy Fukui centres and per-atom Fukui
+        # field (own fukui_off), each split by its OWN offset table (they diverge on a retained-H
+        # molecule, so both channels stay 1:1 with their own basis). Mirrors vol_lipo.
+        for p, at, fp, fv in zip(
+                pairs, splitT(f(arrs["atom_pos"]), aoff),
+                splitT(f(arrs["fukui_pos"]), foff), splitT(f(arrs["fukui"]), foff)):
+            p._fit_xyz_t = at
+            p._fit_fukui_pos_t = fp
+            p._fit_fukui_t = fv
     else:
         raise ValueError(mode)
     return ids, pairs
@@ -980,6 +1052,11 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
                     tversky_beta=ak.get("tversky_beta", 0.05), steps_fine=steps)
     if mode == "vol_lipo":     # mirrors align_with_vol_lipo(backend="triton") dispatch
         return dict(lipo_weight=ak.get("lipo_weight", 0.5), alpha=ak.get("alpha", 0.81),
+                    lam=ak.get("lam", 0.1),
+                    num_repeats=ak.get("num_repeats", _seeds_for(mode)),
+                    lr=ak.get("lr", 0.1), steps_fine=steps)
+    if mode == "vol_fukui":    # mirrors align_with_vol_fukui(backend="triton") dispatch
+        return dict(fukui_weight=ak.get("fukui_weight", 0.5), alpha=ak.get("alpha", 0.81),
                     lam=ak.get("lam", 0.1),
                     num_repeats=ak.get("num_repeats", _seeds_for(mode)),
                     lr=ak.get("lr", 0.1), steps_fine=steps)

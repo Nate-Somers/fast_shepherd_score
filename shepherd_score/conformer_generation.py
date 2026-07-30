@@ -496,7 +496,8 @@ def charges_from_single_point_conformer_with_xtb(conformer: Chem.Mol,
                                                  num_cores: int = 1,
                                                  charge: int = 0,
                                                  temp_dir: Union[str, Path] = TMPDIR,
-                                                 timeout: Optional[float] = None
+                                                 timeout: Optional[float] = None,
+                                                 uhf: int = 0
                                                  ):
     """
     Compute atomic partial charges from a single point xTB calculation of a provided conformer.
@@ -519,6 +520,10 @@ def charges_from_single_point_conformer_with_xtb(conformer: Chem.Mol,
     timeout : float, optional
         Maximum number of seconds to allow the xtb subprocess to run before it is
         killed and ``subprocess.TimeoutExpired`` is raised. Default is ``None`` (no timeout).
+    uhf : int, optional
+        Number of unpaired electrons (xTB ``--uhf``), for open-shell species such as the
+        mono-ions used in a finite-difference Fukui calculation. Default is 0 (closed shell);
+        the flag is emitted only when nonzero, so the default path is byte-identical to before.
 
     Returns
     -------
@@ -542,9 +547,10 @@ def charges_from_single_point_conformer_with_xtb(conformer: Chem.Mol,
             input_file = 'input_mol.xyz'
             Chem.rdmolfiles.MolToXYZFile(mol, str(out_dir/input_file))
 
+            uhf_flag = ['--uhf', str(uhf)] if uhf else []   # open-shell (ions) only; else no-op
             if solvent is not None:
                 subprocess.check_call(
-                    ['xtb', input_file, '--scc', '--alpb', solvent, '--parallel', str(num_cores), '--chrg', str(charge)],
+                    ['xtb', input_file, '--scc', '--alpb', solvent, '--parallel', str(num_cores), '--chrg', str(charge)] + uhf_flag,
                     cwd = out_dir,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.STDOUT,
@@ -552,7 +558,7 @@ def charges_from_single_point_conformer_with_xtb(conformer: Chem.Mol,
                 )
             else:
                 subprocess.check_call(
-                    ['xtb', input_file, '--scc', '--parallel', str(num_cores), '--chrg', str(charge)],
+                    ['xtb', input_file, '--scc', '--parallel', str(num_cores), '--chrg', str(charge)] + uhf_flag,
                     cwd = out_dir,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.STDOUT,
@@ -570,6 +576,55 @@ def charges_from_single_point_conformer_with_xtb(conformer: Chem.Mol,
                 shutil.rmtree(out_dir)
 
         return charges
+
+
+def fukui_from_single_point_conformer_with_xtb(conformer: Chem.Mol,
+                                               solvent: Optional[str] = None,
+                                               num_cores: int = 1,
+                                               charge: int = 0,
+                                               temp_dir: Union[str, Path] = TMPDIR,
+                                               timeout: Optional[float] = None
+                                               ):
+    """
+    Condensed (finite-difference) Fukui functions per atom from three GFN2-xTB single points.
+
+    The Fukui function f(r) = d(rho)/dN condenses to per-atom reactivity indices under the
+    finite-difference / frozen-geometry approximation on the atomic partial charges ``q_k``:
+
+        f+_k = q_k(N)   - q_k(N+1)   (nucleophilic-attack susceptibility)
+        f-_k = q_k(N-1) - q_k(N)     (electrophilic-attack susceptibility)
+        f0_k = 0.5 * (f+_k + f-_k)   (radical)
+
+    where ``q_k(N)`` is the neutral partial charge, ``q_k(N+1)`` the anion (one added electron,
+    ``--chrg charge-1``) and ``q_k(N-1)`` the cation (one removed electron, ``--chrg charge+1``).
+    All three single points use the SAME geometry; each mono-ion carries one unpaired electron
+    (``--uhf 1``) to fix the parity flip for a closed-shell neutral. The signed dual descriptor
+    ``f+_k - f-_k`` (positive at nucleophilic, negative at electrophilic sites) is what the
+    ``vol_fukui`` alignment mode uses as its per-atom field.
+
+    Parameters mirror :func:`charges_from_single_point_conformer_with_xtb`.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(N, 3)`` float32 array of ``[f+, f-, f0]`` per atom, in the input (with-H) atom order.
+
+    Raises
+    ------
+    Any exception the underlying xTB single points raise (e.g. a non-converging ion) propagates;
+    callers that want graceful degradation should wrap this (see ``Molecule._generate_fukui``).
+    """
+    import numpy as np
+    q_neutral = np.asarray(charges_from_single_point_conformer_with_xtb(
+        conformer, solvent, num_cores, charge, temp_dir, timeout), dtype=np.float64)
+    q_anion = np.asarray(charges_from_single_point_conformer_with_xtb(
+        conformer, solvent, num_cores, charge - 1, temp_dir, timeout, uhf=1), dtype=np.float64)
+    q_cation = np.asarray(charges_from_single_point_conformer_with_xtb(
+        conformer, solvent, num_cores, charge + 1, temp_dir, timeout, uhf=1), dtype=np.float64)
+    f_plus = q_neutral - q_anion      # nucleophilic
+    f_minus = q_cation - q_neutral    # electrophilic
+    f_zero = 0.5 * (f_plus + f_minus)  # radical
+    return np.stack([f_plus, f_minus, f_zero], axis=1).astype(np.float32)
 
 
 def single_point_xtb_from_xyz(xyz_block: str,

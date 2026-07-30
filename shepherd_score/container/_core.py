@@ -69,6 +69,8 @@ _ALIGN_KEYS = (
     'vol_pharm', 'vol_atomtype', 'vol_mr',
     'surf_tversky', 'surf_esp_tversky', 'vol_and_surf_esp_tversky',
     'vol_color_tversky', 'vol_lipo_tversky', 'pharm_tversky',
+    # shape + condensed-Fukui reactivity field (reuses the vol_lipo overlap; f+ - f- dual descriptor)
+    'vol_fukui',
 )
 
 
@@ -153,7 +155,8 @@ class Molecule:
                  pharm_vecs: Optional[np.ndarray] = None,
                  feature_set: str = 'shepherd',
                  directionless: bool = False,
-                 surface_method: str = 'mesh'
+                 surface_method: str = 'mesh',
+                 fukui: Optional[np.ndarray] = None
                  ):
         """
         Molecule constructor to extract interaction profiles.
@@ -215,6 +218,11 @@ class Molecule:
             surfacer (``generate_point_cloud.get_molecular_surface_smooth_sdf``) intended for the
             generative pipeline; it requires ``num_surf_points`` (not ``density``). Opt-in only;
             using it is a distribution shift vs a model trained on the mesh surface (validate first).
+        fukui : Optional[np.ndarray]
+            Per-atom condensed Fukui field for the ``vol_fukui`` reactivity mode -- a full ``(N,)``
+            signed dual descriptor (f+ - f-) in with-H order, same basis as ``partial_charges``. If
+            ``None`` (default) it is generated lazily on first access via three gfn2-xTB single
+            points (neutral/cation/anion), so non-reactivity modes never pay for it.
         """
         self.mol = mol
         self.atom_pos = Chem.RemoveHs(mol).GetConformer().GetPositions()
@@ -238,6 +246,14 @@ class Molecule:
             self._partial_charges = partial_charges
         else:
             self._partial_charges = None                       # deferred
+        # Per-atom condensed Fukui field (the ``vol_fukui`` reactivity channel), generated LAZILY
+        # like ``partial_charges``: a full ``(N,)`` signed dual descriptor (f+ - f-) in with-H order
+        # -- the same order/basis as ``partial_charges`` -- computed by three gfn2-xTB single points
+        # only when first read, so non-reactivity modes never pay the xTB cost. Explicit ``fukui=``
+        # short-circuits generation (also how tests inject a synthetic field without xTB).
+        if isinstance(fukui, list):
+            fukui = np.array(fukui)
+        self._fukui = fukui if isinstance(fukui, np.ndarray) else None   # deferred
         # Per-atom Crippen atomic logP contributions (the ``vol_lipo`` lipophilicity channel).
         # A full ``(N,)`` array over ALL atoms in RDKit-mol (with-H) order -- the same order and
         # basis as ``partial_charges`` -- so its heavy slice reuses the SAME ``_nonH_atoms_idx``.
@@ -410,6 +426,39 @@ class Molecule:
         return charges.astype(np.float32)
 
 
+    @property
+    def fukui(self) -> np.ndarray:
+        """Per-atom condensed Fukui field (all atoms, with-H order), computed lazily on first access.
+
+        Returns the signed **dual descriptor** ``f+ - f-`` per atom (positive at nucleophilic,
+        negative at electrophilic sites) -- the ``vol_fukui`` mode's reactivity field. Generated the
+        first time it is read (so shape/ESP/pharm modes never pay for it) via three gfn2-xTB single
+        points (neutral, cation, anion) and cached thereafter. Pass ``fukui=...`` to the constructor
+        to supply it explicitly and skip xTB.
+        """
+        if self._fukui is None:
+            self._fukui = self._generate_fukui()
+        return self._fukui
+
+    @fukui.setter
+    def fukui(self, value) -> None:
+        self._fukui = value
+
+    def _generate_fukui(self) -> np.ndarray:
+        """Condensed Fukui dual descriptor (f+ - f-) per atom via three gfn2-xTB single points.
+
+        Runs the neutral, cation (N-1 e-) and anion (N+1 e-) single points at the SAME geometry and
+        returns ``f+ - f-`` as a full ``(N,)`` with-H array. Any xTB failure (e.g. a non-converging
+        ion) propagates -- callers that want to drop such molecules should catch it (the benchmark
+        does), matching how the ESP charge path degrades. There is no cheap non-QM fallback that is a
+        faithful Fukui function, so unlike charges this does NOT fall back to MMFF.
+        """
+        from shepherd_score.conformer_generation import fukui_from_single_point_conformer_with_xtb
+        fpm = fukui_from_single_point_conformer_with_xtb(
+            self.mol, charge=int(Chem.GetFormalCharge(self.mol)))   # (N,3) = [f+, f-, f0]
+        return (fpm[:, 0] - fpm[:, 1]).astype(np.float32)           # signed dual descriptor f+ - f-
+
+
     def get_positions(self, no_H: bool = True) -> np.ndarray:
         """
         Get atom coordinates with or without hydrogens.
@@ -565,6 +614,37 @@ class Molecule:
         via ``_nonH_atoms_idx``, from the with-H conformer, NOT ``atom_pos`` -- the retained-H trap);
         a separate accessor so a ``Molecule`` and the RDKit-free ``MoleculeProfile`` feed the
         ``vol_mr`` aligner identically."""
+        return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
+
+
+    def get_fukui(self, no_H: bool = True) -> np.ndarray:
+        """Get the per-atom Fukui dual-descriptor field with or without hydrogens.
+
+        Slices the lazily-computed ``fukui`` (the signed ``f+ - f-`` array); does not recompute it
+        (see :attr:`fukui` / :meth:`_generate_fukui`). Mirrors :meth:`get_charges` -- heavy atoms via
+        the same ``_nonH_atoms_idx`` the charges use, so it stays 1:1 with :meth:`get_fukui_positions`.
+
+        Parameters
+        ----------
+        no_H : bool, optional
+            If ``True`` (default) return the field for heavy atoms only; else all atoms (with H).
+
+        Returns
+        -------
+        np.ndarray
+            Per-atom Fukui dual descriptor. Shape: (N,).
+        """
+        if no_H:
+            return self.fukui[self._nonH_atoms_idx]
+        return self.fukui
+
+
+    def get_fukui_positions(self) -> np.ndarray:
+        """Get the TRUE-heavy atom coordinates that carry the per-atom Fukui field -- the
+        ``vol_fukui`` channel's centres. Identical basis to :meth:`get_lipo_positions` (strict-heavy
+        via ``_nonH_atoms_idx``, from the with-H conformer, NOT ``atom_pos`` -- the retained-H trap);
+        a separate accessor so a ``Molecule`` and the RDKit-free ``MoleculeProfile`` feed the
+        ``vol_fukui`` aligner identically."""
         return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
 
 
@@ -1968,6 +2048,42 @@ class MoleculePair:
         )
         self.transform_vol_mr = se3_transform.numpy()
         self.sim_aligned_vol_mr = score.numpy()
+        return aligned_fit_centers.numpy()
+
+
+    def align_with_vol_fukui(self,
+                             fukui_weight: float = 0.5,
+                             alpha: float = 0.81,
+                             lam: float = 0.1,
+                             num_repeats: int = 50,
+                             trans_init: bool = False,
+                             lr: float = 0.1,
+                             max_num_steps: int = 200,
+                             verbose: bool = False) -> np.ndarray:
+        """Align using a combined atom-centred Gaussian *shape* (volume) + *Fukui-reactivity* overlay.
+        Structurally identical to ``vol_lipo`` / ``vol_mr`` -- the per-atom condensed Fukui dual
+        descriptor ``f+ - f-`` is overlaid like an ESP/partial-charge field (matched by value, so a
+        nucleophilic site overlaps nucleophilic and electrophilic overlaps electrophilic, and the
+        signed field penalizes reactive-character mismatches) at the TRUE-heavy centres -- but the
+        scalar is the Fukui dual descriptor instead of logP/MR. The Fukui field is a conceptual-DFT
+        reactivity descriptor from three gfn2-xTB single points (generated lazily on
+        ``Molecule.fukui``). ``(1 - fukui_weight) * shape + fukui_weight * fukui``. Score/transform
+        stored in ``self.sim_aligned_vol_fukui`` / ``self.transform_vol_fukui``."""
+        ref_fukui_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
+        fit_fukui_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
+        aligned_fit_centers, se3_transform, score = optimize_vol_lipo_overlay(
+            ref_centers=self._ref_xyz_t,
+            fit_centers=self._fit_xyz_t,
+            ref_lipo_pos=self._to_tensor(np.ascontiguousarray(ref_fukui_pos)),
+            fit_lipo_pos=self._to_tensor(np.ascontiguousarray(fit_fukui_pos)),
+            ref_lipo=self._to_tensor(self.ref_molec.get_fukui(no_H=True)),
+            fit_lipo=self._to_tensor(self.fit_molec.get_fukui(no_H=True)),
+            alpha=alpha, lam=lam, lipo_weight=fukui_weight,
+            num_repeats=num_repeats, trans_centers=self._ref_xyz_t if trans_init else None,
+            lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+        )
+        self.transform_vol_fukui = se3_transform.numpy()
+        self.sim_aligned_vol_fukui = score.numpy()
         return aligned_fit_centers.numpy()
 
 
