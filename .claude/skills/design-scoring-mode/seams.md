@@ -58,7 +58,7 @@ non-obvious part of this skill:
   `CANONICAL_MODES`, which `@_bind_batch_aligners` walks at import time calling
   `getattr(accel.batch, "_align_batch_<mode>")`. That aligner does not exist until the accel skill
   builds it, so adding your mode here makes `import shepherd_score.container` raise. On top of that,
-  `tests/test_mode_registry.py` pins `len(CANONICAL_MODES) == 7`, `set(MODE_SEEDS) ==
+  `tests/test_mode_registry.py` pins an exact `len(CANONICAL_MODES)` count, `set(MODE_SEEDS) ==
   set(CANONICAL_MODES)`, `set(MODE_STEPS) == set(CANONICAL_MODES)`, and a batch-bind for every
   canonical mode — all of which fail the moment you add a mode with no aligner.
 

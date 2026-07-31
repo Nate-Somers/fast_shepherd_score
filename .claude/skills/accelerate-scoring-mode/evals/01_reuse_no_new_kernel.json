@@ -1,0 +1,13 @@
+{
+  "skills": ["accelerate-scoring-mode"],
+  "query": "Accelerate the vol_lipo reference mode (shape blended with a per-atom lipophilicity field) so it screens at 10k-100k alignments/second.",
+  "files": [],
+  "expected_behavior": [
+    "Identifies the driver-analog (vol_color, a two-channel combined-gradient blend) and the kernel-analog (shape kernel + ESP kernel, feeding lipophilicity where the ESP kernel expects charges) INDEPENDENTLY; does not assume 'looks like vol_esp' means reuse vol_esp.",
+    "Writes NO new kernel: reuses overlap_score_grad_se3_batch and the device-dispatched ESP kernel, so it SKIPS steps 2-4 and goes straight to the driver, which blends the per-channel dQs.",
+    "Builds accel/drivers/vol_lipo.py reusing the shared CUDA-graph fine loop in drivers/_graphed.py and helpers in drivers/_common.py; does not reimplement the graph loop.",
+    "Adds _align_batch_vol_lipo to aligners.py (bound + exported), promotes the mode to accel/_modes.py (a row each to MODE_ATTRS/MODE_SEEDS/MODE_STEPS + the test_mode_registry count bump), and adds the MoleculePairBatch API resolving backend=None device-aware.",
+    "Wires screen as Tier B (new per-molecule lipophilicity data): MoleculeProfile slot + schema flag + serialization with an offset table for the variable-length set, then the six-edit fast engine because it will appear in a speed figure.",
+    "Passes every parity gate: gate 1 comparing dO/dq in the tangent space of the unit quaternion (not raw), gate 2 in-process, gate 3, gate 4 on both backends, and gate 5 with the disk check; never weakens a tolerance to pass."
+  ]
+}

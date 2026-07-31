@@ -1,0 +1,12 @@
+{
+  "skills": ["design-scoring-mode"],
+  "query": "Add a Tversky variant of the volumetric shape mode: the same shape overlap as vol, but scored with an asymmetric Tversky reduction (alpha=0.95, beta=0.05) instead of Tanimoto.",
+  "files": [],
+  "expected_behavior": [
+    "Reuses the existing shape overlap channel; adds no new score/ function and exports nothing new from score/ (recognizes this is a reduction, not new channel math).",
+    "Flags that the objective is asymmetric (O(a,b) != O(b,a)) and adjusts the tests accordingly, while confirming a self-pair still scores exactly 1.000 under Tversky.",
+    "Writes objective_vol_tversky_overlay / optimize_vol_tversky_overlay named by mode id; align_with_vol_tversky uses literal seed/step defaults.",
+    "Registers only in _ALIGN_KEYS; does not touch accel/_modes.py.",
+    "Keeps the diff small and additive; the test passes gates 1, 3, 4 and OMITS the retained-H gate 5 (the mode reads no per-atom charge/field), and tests/test_mode_registry.py still passes unchanged."
+  ]
+}

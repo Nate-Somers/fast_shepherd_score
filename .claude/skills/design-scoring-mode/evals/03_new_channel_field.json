@@ -1,0 +1,12 @@
+{
+  "skills": ["design-scoring-mode"],
+  "query": "Add a mode that overlaps two molecules on a new per-atom scalar field the Molecule doesn't carry yet as an INDEPENDENT Gaussian field channel (not shape-weighted).",
+  "files": [],
+  "expected_behavior": [
+    "Recognizes get_overlap_esp folds in the shape Gaussian and is therefore NOT usable for an independent field, so writes a new pure overlap in score/<family>_scoring.py (plus the _np mirror), inputs in and scalar out, no optimization.",
+    "Verifies by hand that the new channel scores exactly 1.000 for a molecule against itself under Tanimoto, matching numerator and self-overlap widths/masks.",
+    "Adds the per-atom property to Molecule via the trio, as a full (N,) RDKit-mol-order array sliced by the same _nonH_atoms_idx the charges use; guards the atom-order and retained-H traps and keeps gate 5.",
+    "Names by mode id; registers only _ALIGN_KEYS; align_with_<mode> uses literal defaults; exports the new score function from score/__init__.py.",
+    "Test passes all gates including the planted-pose recovery (the only gate that catches a consistently-wrong atom-order mapping); tests/test_mode_registry.py passes unchanged."
+  ]
+}

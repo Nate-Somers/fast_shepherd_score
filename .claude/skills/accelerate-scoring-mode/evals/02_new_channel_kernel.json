@@ -1,0 +1,13 @@
+{
+  "skills": ["accelerate-scoring-mode"],
+  "query": "Accelerate a reference mode whose field channel is genuinely new math that no existing kernel computes.",
+  "files": [],
+  "expected_behavior": [
+    "Confirms via step 1 that no existing kernel already emits this channel's value+gradient, so a new kernel pair is actually required (does not write a redundant kernel for a channel that could be reused).",
+    "Writes the numba CPU kernel FIRST (cpu.py / cpu_fused.py / cpu_soa.py), emitting both the overlap value and the analytic dO/dq in-register, then validates it against the autograd reference (gate 1) BEFORE writing any Triton.",
+    "Compares gate 1 in the tangent space of the unit quaternion (subtracting the q-parallel component), knowing a raw comparison fails at ~0.4-0.8 even for a correct kernel.",
+    "Writes the Triton twin with an IDENTICAL call signature to the numba kernel, using tl.exp2 and @triton.autotune, and reuses the shared dR/dq tail; validates Triton vs numba in-process (gate 2).",
+    "Registers the dispatch wrapper routing by tensor device per call with lazy Triton import; then builds driver, aligner, promotion, and API as usual.",
+    "Fixes the kernel rather than the threshold when a gate fails; does not change the reference to make parity pass."
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "skills": ["design-scoring-mode"],
+  "query": "Add a scoring mode that aligns two molecules on shape overlap blended 50/50 with a per-atom lipophilicity field, using Crippen logP as the atom weight.",
+  "files": [],
+  "expected_behavior": [
+    "Reuses the ESP channel for the field: feeds per-atom logP as get_overlap_esp's charges argument (with lam=0.1 for an atom-centred field) rather than writing a new score/ function, and notes the result is a shape-weighted field similarity.",
+    "Adds the lipophilicity 'trio' to Molecule in container/_core.py (attribute in __init__, a get_lipophilicity() compute method, a get_lipophilicity(no_H) heavy-atom slicer via _nonH_atoms_idx), because logP is a per-atom property the Molecule does not already carry.",
+    "Pairs heavy positions with mol.GetConformer().GetPositions()[_nonH_atoms_idx], never self.atom_pos, and calls the heavy slicer only at align time (not in __init__).",
+    "Names the eager functions after the mode id (objective_vol_lipo_overlay / optimize_vol_lipo_overlay), not the physics; gives align_with_vol_lipo literal seed/step defaults.",
+    "Registers the mode only in _ALIGN_KEYS and leaves accel/_modes.py, PROCESS_MODES, and _MODE_SPEC untouched.",
+    "Ships a test from template_test.py that passes gates 1-4 AND keeps gate 5 (retained-H, SMILES [2H]OC(=O)c1ccccc1); tests/test_mode_registry.py still passes unchanged."
+  ]
+}

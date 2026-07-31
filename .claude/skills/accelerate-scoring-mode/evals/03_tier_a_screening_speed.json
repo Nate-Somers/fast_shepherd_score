@@ -1,0 +1,12 @@
+{
+  "skills": ["accelerate-scoring-mode"],
+  "query": "Accelerate vol_tversky (an asymmetric Tversky reduction of the shape overlap) and make it ready to appear in a screening-speed figure.",
+  "files": [],
+  "expected_behavior": [
+    "Recognizes the mode reuses the shape kernel entirely and only changes the reduction, so it writes NO new kernel; the driver applies the Tversky reduction over the shape overlap the existing kernel already emits.",
+    "Promotes the mode to canonical (MODE_ATTRS/MODE_SEEDS/MODE_STEPS + count bump) and adds the MoleculePairBatch API.",
+    "Wires screen as Tier A: a single _store_supports branch (atom_pos is always stored), routing through the fast=False MoleculePairBatch path automatically.",
+    "Because the mode will appear in a speed figure, ADDS it to _FAST_MODES as a drop-in copy of vol's fast path (shape-only, same fit tensors) rather than reporting object-path throughput; alternatively, if left on the object path, explicitly does NOT plot its throughput on the same axis as the fast modes.",
+    "Gate 5 passes bit-identical (abs=1e-4) since fast and object paths feed identical inputs to one driver; never loosens the tolerance."
+  ]
+}

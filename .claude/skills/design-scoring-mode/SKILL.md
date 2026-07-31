@@ -29,6 +29,22 @@ parity oracle the accel skill validates against.** Everything the fast kernels d
 reproduce your `optimize_<mode>_overlay` to floating-point tolerance. So your reference does
 not need to be fast, but it must be *right* and *deterministic*.
 
+## Progress checklist
+
+Copy this into your working notes and check items off as you finish them:
+
+```
+Mode design progress:
+- [ ] 1. Pin the objective in math (channels, similarity, symmetry, what moves, inputs)
+- [ ] 2. Add new per-atom Molecule data — ONLY if a channel needs it (most modes skip)
+- [ ] 3. Write the pure overlap in score/ (or confirm channel reuse — nothing to add)
+- [ ] 4. Write objective_<mode>_overlay + optimize_<mode>_overlay (the oracle)
+- [ ] 5. Add MoleculePair.align_with_<mode> with literal seed/step defaults
+- [ ] 6. Register result slots in _ALIGN_KEYS — NOT accel/_modes.py
+- [ ] 7. Export the public functions
+- [ ] 8. Validate: self-overlap = 1.000, grad vs finite-diff, planted-pose recovery, determinism
+```
+
 ## The contract you must deliver
 
 By the end of this skill the mode must satisfy all of:
@@ -60,40 +76,22 @@ transform `T`. Decide explicitly:
   step 2.
 
 ### 2. Add any new per-atom `Molecule` data (only if your mode needs it)
-Most modes reuse data the `Molecule` already carries — atom positions, partial charges, surface
-points/ESP, pharmacophores. But if a channel needs a **per-atom property the `Molecule` does not
-compute yet**, add it to `Molecule` in `container/_core.py` **before** wiring the channel,
-following the established `partial_charges` "trio":
-- an **attribute** set in `Molecule.__init__` — a full `(N,)` array over *all* atoms in RDKit mol
-  order (e.g. `self.<feature> = self.get_<feature>_contribs()`, right after the `partial_charges`
-  block);
-- a **compute method** that derives it from the `Molecule`'s RDKit mol and returns a float32 array
-  (mirror `get_partial_charges`);
-- a **heavy-atom slicer** `get_<feature>(no_H=True)` returning `self.<feature>[self._nonH_atoms_idx]`
-  (mirror `get_charges`).
+**Most modes skip this entirely** — they reuse data the `Molecule` already carries (atom
+positions, partial charges, surface points/ESP, pharmacophores). Only if a channel needs a
+**per-atom property the `Molecule` does not compute yet** do you add it in `container/_core.py`,
+following the established `partial_charges` "trio": an **attribute** in `Molecule.__init__`, a
+`get_<feature>()` **compute method**, and a `get_<feature>(no_H)` **heavy-atom slicer** via
+`_nonH_atoms_idx`.
 
-**The invariant that matters:** the per-atom array is a full `(N_full,)` array in RDKit-mol (with-H)
-order — the same order as `partial_charges` — and its heavy slice reuses the **same
-`_nonH_atoms_idx`** the charges use. If it does not, the scalar desyncs from the geometry and the
-overlap is silently wrong — and a self-overlap (`ref == fit`) still reads 1.000 under a
-*consistently* wrong mapping, so it will not catch the bug; only a planted-pose test (step 8) will.
-Read `get_partial_charges` / `get_charges` and copy their structure exactly.
-
-**Trap: `self.atom_pos` is NOT the heavy set `_nonH_atoms_idx` selects.** To pair positions with the
-heavy scalar (a Coulomb sum, a distance matrix, an overlap), use
-`mol.GetConformer().GetPositions()[self._nonH_atoms_idx]` — **never** `self.atom_pos`. `atom_pos` is
-the RemoveHs coordinate set, and `Chem.RemoveHs` retains isotope-labelled H (deuterium), so on such
-a molecule `atom_pos` is *longer* than `partial_charges[self._nonH_atoms_idx]` and any elementwise
-pairing broadcasts `(…, N)` against `(…, N-1)` and crashes. This is the retained-H case `vol_esp`
-handles with its separate heavy centres; replicate it, and add the retained-H gate (gate 5 in
-`template_test.py`, SMILES `[2H]OC(=O)c1ccccc1`) — a plain heavy-atom molecule exercises none of it.
-See `pitfalls.md` "retained-H basis".
-
-Compute the attribute at construction (it only needs the RDKit mol), but call the
-`get_<feature>(no_H)` **slicer only at align time**: `_nonH_atoms_idx` is defined *later* in
-`Molecule.__init__`, so slicing during `__init__` would raise `AttributeError` (this is why
-`get_charges` is likewise only ever called at align time, not in the constructor). (Most modes skip
-this step entirely.)
+Two traps make a misaligned field score a silent-wrong 1.000 on a self-pair (so only a planted-pose
+test catches them): **atom-order** (the array must be full `(N,)` RDKit-mol order, sliced with the
+*same* `_nonH_atoms_idx` the charges use), and the **retained-H basis** (`self.atom_pos` is NOT the
+heavy set on deuterated molecules — pair heavy charges with
+`mol.GetConformer().GetPositions()[self._nonH_atoms_idx]`, never `atom_pos`). The full recipe and
+both traps are in **`seams.md`** ("Adding a per-atom Molecule feature") and **`pitfalls.md`**
+("Per-atom data must stay aligned… retained-H basis") — read those before wiring the channel. If you
+do this step, keep gate 5 in `template_test.py` (SMILES `[2H]OC(=O)c1ccccc1`); it is the only gate
+that catches the retained-H desync.
 
 ### 3. Write the pure overlap in `score/`
 Put the channel math in the matching module — `score/gaussian_overlap.py` (shape),
@@ -152,7 +150,7 @@ registry is for *canonical* (screening) modes, and adding to it here **breaks th
 `MODE_ATTRS` feeds `CANONICAL_MODES`, which the `@_bind_batch_aligners` decorator on `MoleculePair`
 walks *at import time*, calling `getattr(accel.batch, "_align_batch_<mode>")` — an aligner that does
 not exist until the accel skill builds it, so `import shepherd_score.container` raises
-`AttributeError`. `tests/test_mode_registry.py` also pins `len(CANONICAL_MODES) == 7`,
+`AttributeError`. `tests/test_mode_registry.py` also pins an exact `len(CANONICAL_MODES)` count,
 `set(MODE_SEEDS) == set(CANONICAL_MODES)`, and a batch-bind for every canonical mode — all of which
 fail the instant you add a mode with no aligner. Promoting your mode to canonical is the accel
 skill's job, done once the aligner exists. Leave `accel/_modes.py`, `PROCESS_MODES`, and
@@ -194,3 +192,4 @@ that too — the batched path must pad that new per-atom scalar into its input t
 - **One clear name per concept.** Do not add back-compat aliases for a name only this mode uses.
 
 See `seams.md` for the exact file map and name-map, and `pitfalls.md` for the recurring traps.
+`evals/` holds worked scenarios that exercise the common paths through this skill.
