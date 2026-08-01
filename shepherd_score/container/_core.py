@@ -71,6 +71,8 @@ _ALIGN_KEYS = (
     'vol_color_tversky', 'vol_lipo_tversky', 'pharm_tversky',
     # shape + condensed-Fukui reactivity field (reuses the vol_lipo overlap; f+ - f- dual descriptor)
     'vol_fukui',
+    # shape MINUS a linear hard-sphere excluded-volume penalty against a fixed avoid-point cloud
+    'vol_avoid',
 )
 
 
@@ -1013,6 +1015,71 @@ class MoleculePair:
             self.transform_vol = se3_transform
             self.sim_aligned_vol = score
         return aligned_fit_points
+
+
+    def align_with_vol_avoid(self,
+                             avoid_points: np.ndarray,
+                             avoid_weight: float = 1.0,
+                             avoid_min_dist: float = 2.0,
+                             no_H: bool = True,
+                             num_repeats: int = None,
+                             trans_init: bool = False,
+                             lr: float = 0.1,
+                             max_num_steps: int = None,
+                             verbose: bool = False) -> np.ndarray:
+        """Align fit_molec to ref_molec by volumetric (shape) similarity MINUS a linear hard-sphere
+        excluded-volume penalty that keeps the fit out of a FIXED cloud of ``avoid_points``.
+
+            score = shape_Tanimoto - avoid_weight * sum relu((avoid_min_dist - d)/avoid_min_dist)
+
+        ``avoid_points`` (K,3) is an arbitrary point cloud in the reference frame (a pocket wall, a
+        region to grow away from, etc.) -- NOT one of the two molecules. Score/transform stored in
+        ``self.sim_aligned_vol_avoid`` / ``self.transform_vol_avoid``. This is the eager AUTOGRAD
+        reference (the oracle for the accelerated ``MoleculePairBatch.align_with_vol_avoid``); it
+        wraps ``optimize_ROCS_overlay(..., avoid_points=...)``. The fit-avoid cloud defaults to the
+        fit shape atoms.
+
+        Parameters
+        ----------
+        avoid_points : np.ndarray (K,3)
+            Points to penalize the fit for coming within ``avoid_min_dist`` of.
+        avoid_weight : float, optional
+            Weight of the subtracted penalty term. Default 1.0.
+        avoid_min_dist : float, optional
+            Hard-sphere cutoff/scale (Angstrom): the penalty ramps linearly from 1 at coincidence to
+            0 at this distance, and is 0 beyond. Default 2.0.
+        no_H : bool, optional
+            Score the shape channel without hydrogens. Default ``True``.
+        num_repeats, trans_init, lr, max_num_steps, verbose
+            As in :meth:`align_with_vol`.
+
+        Returns
+        -------
+        aligned_fit_points : np.ndarray (M,3)
+        """
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_avoid")
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_avoid")
+        ref_atom_pos = self.ref_molec.get_positions(no_H)
+        fit_atom_pos = self.fit_molec.get_positions(no_H)
+        avoid_t = self._to_tensor(np.ascontiguousarray(np.asarray(avoid_points, dtype=np.float32)))
+        aligned_fit_points, se3_transform, score = optimize_ROCS_overlay(
+            ref_points=self._to_tensor(ref_atom_pos),
+            fit_points=self._to_tensor(fit_atom_pos),
+            alpha=0.81,
+            avoid_points=avoid_t,
+            avoid_min_dist=avoid_min_dist,
+            avoid_weight=avoid_weight,
+            num_repeats=num_repeats,
+            trans_centers=self._to_tensor(self.ref_molec.atom_pos) if trans_init else None,
+            lr=lr,
+            max_num_steps=max_num_steps,
+            verbose=verbose,
+        )
+        self.transform_vol_avoid = se3_transform.numpy()
+        self.sim_aligned_vol_avoid = score.numpy()
+        return aligned_fit_points.numpy()
 
 
     def align_with_vol_esp(self,

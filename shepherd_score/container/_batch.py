@@ -1516,6 +1516,50 @@ class MoleculePairBatch:
             'align_with_vol_fukui', 'sim_aligned_vol_fukui', fukui_weight=fukui_weight, alpha=alpha,
             lam=lam, num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
 
+    def align_with_vol_avoid(self, avoid_points, avoid_weight: float = 1.0,
+                             avoid_min_dist: float = 2.0, alpha: float = 0.81,
+                             num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                             verbose: bool = False, backend: Optional[str] = None,
+                             return_aligned: bool = False):
+        """Batched shape Tanimoto MINUS a linear-hard-sphere excluded-volume (avoid) penalty.
+
+        ``avoid_points`` is the FIXED reference-frame cloud to keep the fit molecule out of: either
+        a single ``(K,3)`` array applied to EVERY pair, or a list of per-pair ``(K_i,3)`` arrays. It
+        is attached to each MoleculePair (``p.avoid_points``) and read by the batched aligner; the
+        fit-avoid cloud defaults to the fit shape atoms. Unlike the other modes this input is not
+        molecule data, so ``vol_avoid`` is pairwise-only (not wired into ``screen``)."""
+        import numpy as np
+        if max_num_steps is None:
+            max_num_steps = _default_steps("vol_avoid")
+        if num_repeats is None:
+            num_repeats = _default_seeds("vol_avoid")
+        # attach per-pair avoid clouds (a single cloud broadcasts to every pair)
+        if isinstance(avoid_points, (list, tuple)):
+            if len(avoid_points) != len(self.pairs):
+                raise ValueError(f"avoid_points list length {len(avoid_points)} != "
+                                 f"number of pairs {len(self.pairs)}")
+            clouds = [np.ascontiguousarray(np.asarray(a, dtype=np.float32)) for a in avoid_points]
+        else:
+            cloud = np.ascontiguousarray(np.asarray(avoid_points, dtype=np.float32))
+            clouds = [cloud] * len(self.pairs)
+        for p, c in zip(self.pairs, clouds):
+            p.avoid_points = c
+        handled, _result = self._run_fast_or_fallthrough(
+            backend, MoleculePair._align_batch_vol_avoid,
+            dict(avoid_weight=avoid_weight, avoid_min_dist=avoid_min_dist, alpha=alpha,
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
+            "sim_aligned_vol_avoid", "transform_vol_avoid", "_fit_xyz_t", return_aligned)
+        if handled:
+            return _result
+        # jax / fallback backend: per-pair eager autograd reference (each pair carries its own cloud)
+        scores = []
+        for p in self.pairs:
+            p.align_with_vol_avoid(p.avoid_points, avoid_weight=avoid_weight,
+                                   avoid_min_dist=avoid_min_dist, num_repeats=num_repeats,
+                                   lr=lr, max_num_steps=max_num_steps, verbose=verbose)
+            scores.append(float(p.sim_aligned_vol_avoid))
+        return np.array(scores), [None] * len(self.pairs)
+
     def align_with_surf_tversky(self, tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
                                 alpha: float = 0.81, num_repeats: int = None, lr: float = 0.1,
                                 max_num_steps: int = None, verbose: bool = False,

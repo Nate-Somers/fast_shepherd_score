@@ -109,6 +109,92 @@ def overlap_score_grad_se3_batch(A, B, q, t, *, alpha: float = 0.81,
             torch.as_tensor(dT, device=dev, dtype=dt))
 
 
+@njit(parallel=True, fastmath=True, cache=True)
+def _avoid_grad_kernel(A, B, q, t, Nr, Mr, min_dist, need_grad):
+    """Fused linear-hard-sphere AVOID penalty value + SE(3) gradient, one pose per prange iter.
+
+    A structural clone of ``_overlap_grad_kernel`` (same quaternion->R, same dR/dq tail): A is the
+    FIXED avoid-point cloud in the ref frame (NOT transformed), B is the fit-avoid cloud transformed
+    by (q,t). Only the inner per-pair scalar changes -- a piecewise-linear hinge instead of a
+    Gaussian, and NO ``exp``:
+
+      penalty  A_pen = sum_a sum_b relu( (d0 - ||A_a - B'_b||) / d0 ),   B'_b = R*B_b + t
+      value    (d0 - d)/d0     for d < d0    (relu; 1 at coincidence, 0 at/after d0)
+      grad     force f_b = dA_pen/dB'_b = sum_a mask * (1/(d0*d)) * (A_a - B'_b)
+               active for 0 < d < d0; the d~0 point is skipped (torch.cdist's gradient is 0 at
+               coincidence, so autograd contributes nothing there -- match it, and avoid 1/0).
+
+    Returns V (K,) = A_pen, dQ (K,4) = dA_pen/dq, dT (K,3) = dA_pen/dt. fp64 accumulation.
+    Mirrors the shape kernel exactly so the driver blends dA_pen/dq with dVAB/dq in one quaternion
+    space: g = -scale_s*dQ_shape + avoid_weight*dQ_avoid.
+    """
+    K = A.shape[0]
+    inv_d0 = 1.0 / min_dist
+    V = np.zeros(K, dtype=np.float64)
+    dQ = np.zeros((K, 4), dtype=np.float64)
+    dT = np.zeros((K, 3), dtype=np.float64)
+    for k in prange(K):
+        qr = q[k, 0]; qi = q[k, 1]; qj = q[k, 2]; qk_ = q[k, 3]
+        tx = t[k, 0]; ty = t[k, 1]; tz = t[k, 2]
+        r00 = 1.0 - 2.0 * (qj * qj + qk_ * qk_); r01 = 2.0 * (qi * qj - qk_ * qr); r02 = 2.0 * (qi * qk_ + qj * qr)
+        r10 = 2.0 * (qi * qj + qk_ * qr); r11 = 1.0 - 2.0 * (qi * qi + qk_ * qk_); r12 = 2.0 * (qj * qk_ - qi * qr)
+        r20 = 2.0 * (qi * qk_ - qj * qr); r21 = 2.0 * (qj * qk_ + qi * qr); r22 = 1.0 - 2.0 * (qi * qi + qj * qj)
+        n_real = Nr[k]; m_real = Mr[k]
+        Vacc = 0.0
+        dTx = 0.0; dTy = 0.0; dTz = 0.0
+        dQw = 0.0; dQx = 0.0; dQy = 0.0; dQz = 0.0
+        for m in range(m_real):
+            bx0 = B[k, m, 0]; by0 = B[k, m, 1]; bz0 = B[k, m, 2]
+            bx = r00 * bx0 + r01 * by0 + r02 * bz0 + tx
+            by = r10 * bx0 + r11 * by0 + r12 * bz0 + ty
+            bz = r20 * bx0 + r21 * by0 + r22 * bz0 + tz
+            fxj = 0.0; fyj = 0.0; fzj = 0.0
+            for n in range(n_real):
+                dx = A[k, n, 0] - bx; dy = A[k, n, 1] - by; dz = A[k, n, 2] - bz
+                r2 = dx * dx + dy * dy + dz * dz
+                d = math.sqrt(r2)
+                if d < min_dist:
+                    Vacc += (min_dist - d) * inv_d0
+                    if need_grad and d > 1e-8:
+                        c = inv_d0 / d       # (1/d0)/d ; f += c*dx == +dA_pen/dB' (fit-avoid coord)
+                        fxj += c * dx; fyj += c * dy; fzj += c * dz
+            if need_grad:
+                dTx += fxj; dTy += fyj; dTz += fzj
+                # dA_pen/dq, body-frame coords (bx0,by0,bz0); identical tail to the shape kernel
+                dQw += fxj * (-2.0 * qk_ * by0 + 2.0 * qj * bz0) + fyj * (2.0 * qk_ * bx0 - 2.0 * qi * bz0) + fzj * (-2.0 * qj * bx0 + 2.0 * qi * by0)
+                dQx += fxj * (2.0 * qj * by0 + 2.0 * qk_ * bz0) + fyj * (2.0 * qj * bx0 - 4.0 * qi * by0 - 2.0 * qr * bz0) + fzj * (2.0 * qk_ * bx0 + 2.0 * qr * by0 - 4.0 * qi * bz0)
+                dQy += fxj * (-4.0 * qj * bx0 + 2.0 * qi * by0 + 2.0 * qr * bz0) + fyj * (2.0 * qi * bx0 + 2.0 * qk_ * bz0) + fzj * (-2.0 * qr * bx0 + 2.0 * qk_ * by0 - 4.0 * qj * bz0)
+                dQz += fxj * (-4.0 * qk_ * bx0 - 2.0 * qr * by0 + 2.0 * qi * bz0) + fyj * (2.0 * qr * bx0 - 4.0 * qk_ * by0 + 2.0 * qj * bz0) + fzj * (2.0 * qi * bx0 + 2.0 * qj * by0)
+        V[k] = Vacc
+        dT[k, 0] = dTx; dT[k, 1] = dTy; dT[k, 2] = dTz
+        dQ[k, 0] = dQw; dQ[k, 1] = dQx; dQ[k, 2] = dQy; dQ[k, 3] = dQz
+    return V, dQ, dT
+
+
+def overlap_score_grad_avoid_se3_batch(A, B, q, t, *, min_dist: float = 2.0,
+                                       N_real=None, M_real=None, NEED_GRAD: bool = True,
+                                       BLOCK=None, num_warps=None, num_stages=None):
+    """CPU drop-in for the Triton ``overlap_score_grad_avoid_se3_batch``. Linear-hard-sphere avoid
+    penalty value + SE(3) gradient. A = fixed avoid points (ref frame), B = fit-avoid points
+    (transformed). Returns (V, dQ, dT) as torch tensors on A.device with A.dtype. Extra kwargs
+    (GPU-only knobs) ignored. Identical call shape to ``overlap_score_grad_se3_batch``."""
+    K, N_pad, _ = A.shape
+    _, M_pad, _ = B.shape
+    dev, dt = A.device, A.dtype
+    An = np.ascontiguousarray(A.detach().cpu().numpy())
+    Bn = np.ascontiguousarray(B.detach().cpu().numpy())
+    qn = np.ascontiguousarray(q.detach().cpu().numpy())
+    tn = np.ascontiguousarray(t.detach().cpu().numpy())
+    Nr = (np.full(K, N_pad, np.int64) if N_real is None
+          else N_real.detach().cpu().numpy().astype(np.int64))
+    Mr = (np.full(K, M_pad, np.int64) if M_real is None
+          else M_real.detach().cpu().numpy().astype(np.int64))
+    V, dQ, dT = _avoid_grad_kernel(An, Bn, qn, tn, Nr, Mr, float(min_dist), bool(NEED_GRAD))
+    return (torch.as_tensor(V, device=dev, dtype=dt),
+            torch.as_tensor(dQ, device=dev, dtype=dt),
+            torch.as_tensor(dT, device=dev, dtype=dt))
+
+
 @torch.no_grad()
 def fused_adam_qt_with_tangent_proj(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr,
                                     beta1=0.9, beta2=0.999, eps=1e-8):

@@ -281,6 +281,10 @@ def _store_supports(schema: dict, mode: str) -> bool:
     if mode == "vol_and_surf_esp":
         return (schema["surf"] and schema["surf_esp"] and schema["centers_w_H"]
                 and schema["radii"] and schema["charges"] and schema["with_H"])
+    if mode == "vol_avoid":
+        return False                                    # PAIRWISE-ONLY (deliberate): the avoid
+        # cloud is a fixed non-molecule input (a query/global constant), which the per-molecule
+        # ProfileStore does not model -- use MoleculePairBatch.align_with_vol_avoid, not screen().
     return False
 
 

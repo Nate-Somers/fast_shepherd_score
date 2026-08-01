@@ -46,6 +46,8 @@ def _mod(tag: str):
             from . import esp_triton as m
         elif tag == "pharm":
             from . import pharm_triton as m
+        elif tag == "avoid":
+            from . import avoid_triton as m
         else:  # pragma: no cover - defensive
             raise KeyError(tag)
         _MODS[tag] = m
@@ -106,6 +108,9 @@ esp_comparison_batch = _make("esp_comparison_batch", "esp")
 
 # --- pharmacophore kernel (pharm_triton <-> cpu) ------------------------------
 pharm_score_grad_se3_batch = _make("pharm_score_grad_se3_batch", "pharm")
+
+# --- avoid (linear hard-sphere excluded-volume) kernel (avoid_triton <-> cpu) -
+overlap_score_grad_avoid_se3_batch = _make("overlap_score_grad_avoid_se3_batch", "avoid")
 # Directional pharm value+QUATERNION-grad kernel (pharm mode, in-register dQ).
 pharm_grad_dq_se3_batch = _make("pharm_grad_dq_se3_batch", "pharm")
 # Directionless "color" value+quaternion-grad kernel (vol_color).

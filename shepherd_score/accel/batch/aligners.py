@@ -1714,6 +1714,90 @@ def _align_batch_vol_fukui(
         p.sim_aligned_vol_fukui = s
 
 
+def _align_batch_vol_avoid(
+    pairs: list["MoleculePair"],
+    *,
+    avoid_weight: float = 1.0,
+    avoid_min_dist: float = 2.0,
+    alpha: float = 0.81,
+    num_repeats: int = 50,
+    topk: int = 30,
+    steps_fine: int = 100,
+    lr: float = 0.075,
+) -> None:
+    """Excluded-volume (avoid) mode: shape Tanimoto MINUS a linear hard-sphere penalty against each
+    pair's FIXED ``avoid_points`` cloud (attached on the MoleculePair as ``p.avoid_points``). The
+    fit-avoid cloud is the fit shape centres, so the ONLY extra per-pair input beyond the two
+    molecules is the avoid cloud. Runs the forked ``drivers/avoid.py`` driver (shape kernel + the
+    new hard-sphere kernel; NO second Tanimoto)."""
+    if not pairs:
+        return
+    if _should_distribute(pairs):
+        return _run_distributed(_align_batch_vol_avoid, pairs,
+                                avoid_weight=avoid_weight, avoid_min_dist=avoid_min_dist, alpha=alpha,
+                                num_repeats=num_repeats, topk=topk, steps_fine=steps_fine, lr=lr)
+
+    from shepherd_score.accel.drivers.avoid import fast_optimize_vol_avoid_overlay_batch
+
+    device = pairs[0].device
+    _batch_upload(pairs, "_ref_xyz_t", lambda p: p.ref_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_fit_xyz_t", lambda p: p.fit_molec.atom_pos, torch.float32, device)
+    _batch_upload(pairs, "_avoid_pts_t", lambda p: p.avoid_points, torch.float32, device)
+
+    all_pairs, all_scores, all_q, all_t = [], [], [], []
+    _spec = PadSpec(merge={"ref": lambda p: p._ref_xyz_t.shape[0],
+                           "fit": lambda p: p._fit_xyz_t.shape[0]},
+                    seeds=_seeds_for("vol_avoid"))
+    for _bk in plan_buckets(pairs, _spec, device):
+        n_cent_pad, m_cent_pad = _bk.pad["ref"], _bk.pad["fit"]
+        bucket = _bk.members
+        K = len(bucket)
+
+        ref_cent_ts = [p._ref_xyz_t for p in bucket]
+        fit_cent_ts = [p._fit_xyz_t for p in bucket]
+        avoid_ts = [p._avoid_pts_t for p in bucket]
+        n_cent_list = [t.shape[0] for t in ref_cent_ts]
+        m_cent_list = [t.shape[0] for t in fit_cent_ts]
+        k_avoid_list = [t.shape[0] for t in avoid_ts]
+        k_avoid_pad = _band_key(max(k_avoid_list)) or _BAND
+
+        centers_1 = torch.zeros(K, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_2 = torch.zeros(K, m_cent_pad, 3, device=device, dtype=torch.float32)
+        avoid_pts = torch.zeros(K, k_avoid_pad, 3, device=device, dtype=torch.float32)
+
+        N_real_centers = torch.tensor(n_cent_list, device=device, dtype=torch.int32)
+        M_real_centers = torch.tensor(m_cent_list, device=device, dtype=torch.int32)
+        K_real_avoid = torch.tensor(k_avoid_list, device=device, dtype=torch.int32)
+
+        _scatter_fill(centers_1, ref_cent_ts, n_cent_list)
+        _scatter_fill(centers_2, fit_cent_ts, m_cent_list)
+        _scatter_fill(avoid_pts, avoid_ts, k_avoid_list)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_vol_avoid_overlay_batch(
+                centers_1[sl], centers_2[sl], avoid_pts[sl],
+                alpha=alpha, avoid_min_dist=avoid_min_dist, avoid_weight=avoid_weight,
+                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
+                K_real_avoid=K_real_avoid[sl],
+                steps_fine=steps_fine, lr=lr, num_seeds=_seeds_for("vol_avoid"))
+            return sc, q, t
+        scores, q_batch, t_batch = _subbatched_align(
+            _proc, K, key=("vol_avoid", n_cent_pad, m_cent_pad, k_avoid_pad,
+                           _seeds_for("vol_avoid")), device=device)
+
+        all_pairs.extend(bucket); all_scores.append(scores); all_q.append(q_batch); all_t.append(t_batch)
+
+    scores_cpu = torch.cat(all_scores).cpu()
+    q_cpu = torch.cat(all_q).cpu()
+    t_cpu = torch.cat(all_t).cpu()
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    scores_list = scores_cpu.tolist()
+    for p, s, S in zip(all_pairs, scores_list, SE3_all):
+        p.transform_vol_avoid = S
+        p.sim_aligned_vol_avoid = s
+
+
 def _align_batch_surf_tversky(pairs: list["MoleculePair"], *, alpha: float = 0.81,
                               tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
                               steps_fine: int = 100):

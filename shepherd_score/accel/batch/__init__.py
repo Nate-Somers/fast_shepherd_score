@@ -21,6 +21,7 @@ from .aligners import (
     _align_batch_vol_lipo_tversky, _align_batch_vol_color_tversky, _align_batch_vol_atomtype,
     _align_batch_vol_pharm, _align_batch_pharm_tversky, _align_batch_vol_and_surf_esp_tversky,
     _align_batch_vol_fukui,
+    _align_batch_vol_avoid,
     _esp_bucketed_align,
     # legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp)
     _align_batch_esp, _align_batch_esp_combo,
