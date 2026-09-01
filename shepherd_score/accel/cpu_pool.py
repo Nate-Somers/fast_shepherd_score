@@ -14,9 +14,9 @@ This module is the alternative that scales closer to *N*: shard the **pairs** ac
 SE(3) seeds), so sharding does not change the optimization problem for any pair -- it
 only removes the per-step cross-core barrier, so heterogeneous cores no longer drag each
 other and the aggregate approaches one-core-throughput x N. Agreement with one big call
-is to convergence tolerance, not bitwise: the fine loop's early-stop tests a
-batch-GLOBAL max, so a pair's step count depends on which pairs share its batch and a
-shard may plateau a step or two apart.
+is to convergence tolerance, not bitwise: the fine loop's early-stop runs until EVERY
+pair in the batch has stopped improving, so a pair's step count depends on which pairs
+share its batch and a shard may plateau a step or two apart.
 
 Design
 ------

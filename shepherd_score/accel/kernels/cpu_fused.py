@@ -5,7 +5,7 @@ Constraints this module exists to satisfy:
 * No torch in the hot loop. torch's thread pool (``OMP_NUM_THREADS``) contends with numba's
   ``prange``, and the per-step score/best/Adam tail would be serial. Inputs are marshalled to
   numpy once; each step chains the overlap+grad njit kernel with an njit ``prange`` tail, and
-  the early-stop check is a numpy ``.max()``.
+  the early-stop check is a numpy per-pair ``.max(axis=1)``.
 * The tail must stay bit-compatible with ``fused_adam_qt_with_tangent_proj``: β1=0.9,
   β2=0.999, eps=1e-8 *inside* the sqrt, no bias correction, unit-quaternion renorm — and with
   ``_update_best``: the tracked best pose is the PRE-Adam pose. Seeds, step count and
@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import numpy as np
 from numba import njit, prange
+
+from .._stats import record as _record_steps
 
 # Adam constants — must match fused_adam_qt_with_tangent_proj in cpu.py / the Triton tail.
 _B1 = 0.9
@@ -177,14 +179,17 @@ def _i64(x):
 
 
 def fine_loop_cpu(overlap_fn, q_seed, t_seed, norm, *, lr, steps,
-                  es_patience, es_tol, tail="tanimoto", tail_args=()):
+                  es_patience, es_tol, n_seeds=0, tail="tanimoto", tail_args=()):
     """Run the whole fine loop on CPU with NO torch in the hot path.
 
     overlap_fn(q_np, t_np) -> the kernel outputs the tail needs at the current pose:
         tanimoto:  (O, dQ, dT)
         vol_color: (Vs, dQs, dTs, Oc, dQc, dTc)
     q_seed/t_seed/norm: float32 numpy (P,4)/(P,3)/(P,). Returns (best, bq, bt) float32 numpy.
-    Early-stop semantics match the eager loop (global best, checked every 5 steps).
+    n_seeds: seed rows per PAIR, so the early stop can reduce ``best`` per pair -- the P rows
+    are n_seeds consecutive seed poses per pair, laid out pair-major. 0 means the caller did
+    not say, which degenerates to one global row.
+    Early-stop semantics match the eager loop: per pair, checked every 5 steps.
     """
     _warn_if_no_svml()
     P = q_seed.shape[0]
@@ -193,7 +198,10 @@ def fine_loop_cpu(overlap_fn, q_seed, t_seed, norm, *, lr, steps,
     mt = np.zeros((P, 3), np.float32); vt = np.zeros((P, 3), np.float32)
     best = np.full(P, -np.inf, np.float32)
     bq = q_seed.copy(); bt = t_seed.copy()
-    prev = -np.inf; no_improve = 0
+    S = int(n_seeds) or P
+    # Per-pair early-stop baseline: prev[k] is pair k's best as of its last recorded
+    # improvement. One entry per PAIR, not per pose.
+    prev = np.full(P // S, -np.inf, np.float32); no_improve = 0
     lr = np.float32(lr)
     for step in range(steps):
         out = overlap_fn(q, t)
@@ -206,14 +214,29 @@ def fine_loop_cpu(overlap_fn, q_seed, t_seed, norm, *, lr, steps,
             _tail_vol_color(Vs, dQs, dTs, Oc, dQc, dTc, q, t, mq, vq, mt, vt, best, bq, bt,
                             norm, norm_c, np.float32(w), lr)
         if step % 5 == 0:
-            cur = float(best.max())
-            if cur - prev < es_tol:
+            # PER-PAIR convergence, matching the eager driver loop: a pair has converged
+            # when ITS OWN best (max over its own S seed rows) stops improving, and the
+            # loop may break only once EVERY pair has stalled. A bucket-global max would
+            # let one converged pair halt the optimisation of every other pair sharing
+            # the bucket -- which is the whole reason a bucket holds many pairs.
+            cur = best.reshape(-1, S).max(axis=1)
+            improved = (cur - prev) > es_tol
+            if not improved.any():
                 no_improve += 1
                 if no_improve >= es_patience:
                     break
             else:
                 no_improve = 0
-                prev = cur
+            # Advance a pair's baseline only where that pair actually improved, as the old
+            # rule did. At least as long as the global test it replaces in every measured
+            # case, but NOT provably never-earlier: per-check gains that straddle es_tol can
+            # spend a baseline reset the global rule still holds, costing one 5-step block.
+            prev = np.where(improved, cur, prev)
+    # Value+grad evaluations executed vs the configured budget. Unlike the eager loops
+    # this one applies its Adam tail BEFORE the check, so an N-iteration run here is N
+    # evaluations AND N updates. No-op unless _stats recording was enabled.
+    _ran = (step + 1) if steps else 0
+    _record_steps(_ran, steps, _ran < steps)
     return best, bq, bt
 
 
@@ -223,7 +246,7 @@ def fine_loop_cpu(overlap_fn, q_seed, t_seed, norm, *, lr, steps,
 # the GPU drivers call on their CPU branch.
 # ===========================================================================
 def cpu_fused_shape(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps,
-                    es_patience, es_tol):
+                    es_patience, es_tol, n_seeds=0):
     """vol / surf (and the shape channel): Gaussian overlap Tanimoto."""
     import torch
     Nr = _i64(N_k); Mr = _i64(M_k); a_f = float(alpha)
@@ -242,14 +265,15 @@ def cpu_fused_shape(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps,
             return V.astype(np.float32), dQ.astype(np.float32), dT.astype(np.float32)
 
     bs, bq, bt = fine_loop_cpu(_ov, _f32c(q_seed), _f32c(t_seed), _f32c(norm),
-                               lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol)
+                               lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol,
+                               n_seeds=n_seeds)
     dev = A_k.device
     return (torch.from_numpy(bs).to(dev), torch.from_numpy(bq).to(dev),
             torch.from_numpy(bt).to(dev))
 
 
 def cpu_fused_esp(A_k, B_k, CA_k, CB_k, q_seed, t_seed, N_k, M_k, norm, alpha, lam, lr, steps,
-                  es_patience, es_tol):
+                  es_patience, es_tol, n_seeds=0):
     """vol_esp / surf_esp: ESP-weighted Gaussian overlap Tanimoto (shape kernel × charge)."""
     import torch
     CA = _f32c(CA_k); CB = _f32c(CB_k); Nr = _i64(N_k); Mr = _i64(M_k)
@@ -269,14 +293,15 @@ def cpu_fused_esp(A_k, B_k, CA_k, CB_k, q_seed, t_seed, N_k, M_k, norm, alpha, l
             return V.astype(np.float32), dQ.astype(np.float32), dT.astype(np.float32)
 
     bs, bq, bt = fine_loop_cpu(_ov, _f32c(q_seed), _f32c(t_seed), _f32c(norm),
-                               lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol)
+                               lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol,
+                               n_seeds=n_seeds)
     dev = A_k.device
     return (torch.from_numpy(bs).to(dev), torch.from_numpy(bq).to(dev),
             torch.from_numpy(bt).to(dev))
 
 
 def cpu_fused_pharm(anc1_k, anc2_k, vec1_k, vec2_k, t1_k, t2_k, q_seed, t_seed,
-                    N_k, M_k, norm, al, Ks, cats, lr, steps, es_patience, es_tol):
+                    N_k, M_k, norm, al, Ks, cats, lr, steps, es_patience, es_tol, n_seeds=0):
     """pharm: directional pharmacophore overlap Tanimoto (in-register dO/dq kernel)."""
     import torch
     from .cpu import _pharm_grad_dq_kernel
@@ -291,7 +316,8 @@ def cpu_fused_pharm(anc1_k, anc2_k, vec1_k, vec2_k, t1_k, t2_k, q_seed, t_seed,
         return O.astype(np.float32), dQ.astype(np.float32), dT.astype(np.float32)
 
     bs, bq, bt = fine_loop_cpu(_ov, _f32c(q_seed), _f32c(t_seed), _f32c(norm),
-                               lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol)
+                               lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol,
+                               n_seeds=n_seeds)
     dev = anc1_k.device
     return (torch.from_numpy(bs).to(dev), torch.from_numpy(bq).to(dev),
             torch.from_numpy(bt).to(dev))
@@ -299,7 +325,7 @@ def cpu_fused_pharm(anc1_k, anc2_k, vec1_k, vec2_k, t1_k, t2_k, q_seed, t_seed,
 
 def cpu_fused_vol_color(A_k, B_k, anc1_k, anc2_k, pt1_k, pt2_k, q_seed, t_seed,
                         Nc_k, Mc_k, Na_k, Ma_k, norm_s, norm_c, al, Ks, cats,
-                        alpha, color_weight, lr, steps, es_patience, es_tol):
+                        alpha, color_weight, lr, steps, es_patience, es_tol, n_seeds=0):
     """vol_color: (1-w)*shape_Tc + w*directionless-color_Tc, combined-objective descent."""
     import torch
     from .cpu import _pharm_color_grad_kernel                  # color channel: typed, AoS
@@ -332,6 +358,7 @@ def cpu_fused_vol_color(A_k, B_k, anc1_k, anc2_k, pt1_k, pt2_k, q_seed, t_seed,
 
     bs, bq, bt = fine_loop_cpu(_ov, _f32c(q_seed), _f32c(t_seed), _f32c(norm_s),
                                lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol,
+                               n_seeds=n_seeds,
                                tail="vol_color", tail_args=(_f32c(norm_c), float(color_weight)))
     dev = A_k.device
     return (torch.from_numpy(bs).to(dev), torch.from_numpy(bq).to(dev),

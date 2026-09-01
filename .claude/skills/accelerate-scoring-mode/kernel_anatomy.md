@@ -55,9 +55,15 @@ survivors, then a fine pass. The fine loop is shared across modes in `drivers/_g
 capture the per-step kernel+optimizer update once as a CUDA graph, then replay it. Reuse it;
 do not write a per-mode graph loop.
 
-- **Blocked early-stop**: match the reference's step schedule (plus a small margin) rather than
-  stopping per-pair, so the graphed loop does not over- or under-run relative to the eager
-  reference — that keeps gate 3 (batched ≡ per-pair) tight.
+- **Blocked early-stop**: the convergence test is **per pair** — a pair has converged when its own
+  best (the max over its own seeds) stops improving, and the loop may break only once every pair
+  has. Never test a maximum over the whole bucket: that lets one converged pair halt every pair
+  sharing the bucket, which silently truncates the search and makes the mode read faster than it
+  is. `_graphed.py` needs the per-pair seed count to do the reshape, so pass `es_seeds=` from your
+  driver (the same value it uses to gather its own result). The test is *blocked* — checked every
+  `_GRAPH_ES_BLOCK` replays, plus `_GRAPH_ES_MARGIN` — so the graphed loop reproduces the eager
+  schedule and does not over- or under-run relative to it; that keeps gate 3 (batched ≡ per-pair)
+  tight.
 - Use the shared helpers in `drivers/_common.py` for seed generation, padding, and result
   extraction so your driver stays small.
 

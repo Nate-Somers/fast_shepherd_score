@@ -159,8 +159,9 @@ class MoleculePairBatch:
         single-threaded process pool (:mod:`shepherd_score.accel.cpu_pool`) for
         near-linear multi-core scaling. Pairs are independent, so sharding does not
         change the optimization problem, but results agree to convergence tolerance
-        rather than bitwise: the fine loop's early-stop tests a batch-GLOBAL max, so a
-        pair's step count depends on which pairs share its shard. It is ignored on CUDA
+        rather than bitwise: the fine loop's early-stop runs until every pair in the
+        batch has stopped improving, so a pair's step count depends on which pairs
+        share its shard. It is ignored on CUDA
         tensors and for modes the pool does not cover -- only ``vol``, ``surf``,
         ``surf_esp`` and ``pharm`` have a pool path; the rest run the single call.
 

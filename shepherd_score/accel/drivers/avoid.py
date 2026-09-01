@@ -42,6 +42,7 @@ from ._common import (
     _update_best,
 )
 from .esp_combo import _self_overlap_chunks
+from .._stats import record as _record_steps
 
 
 def coarse_fine_vol_avoid_align_many(
@@ -108,7 +109,10 @@ def coarse_fine_vol_avoid_align_many(
     m_t = torch.zeros_like(t_k); v_t = torch.zeros_like(t_k)
     best_score = torch.full((PK,), -float('inf'), device=device)
     best_q = q_k.clone(); best_t = t_k.clone()
-    prev_max_score = -float('inf'); no_improve_count = 0
+    # Per-pair early-stop baseline: prev_best[k] is pair k's best score as of its
+    # last recorded improvement. One entry per PAIR, not per pose.
+    prev_best = torch.full((BATCH,), -float('inf'), device=device)
+    no_improve_count = 0
 
     for step in range(steps_fine):
         # shape channel (Gaussian volume Tanimoto)
@@ -134,17 +138,39 @@ def coarse_fine_vol_avoid_align_many(
 
         best_score, best_q, best_t = _update_best(score, q_k, t_k, best_score, best_q, best_t)
 
+        # Early-stop check every 5 steps, so the host sync it needs costs one sync per
+        # 5 steps, not one per step. Gating only makes the early stop LESS aggressive.
         if step % 5 == 0:
-            current_max = best_score.max().item()
-            if current_max - prev_max_score < early_stop_tol:
+            # PER-PAIR convergence test. `best_score` is (BATCH*P,) laid out
+            # pair-major, so .view(BATCH, P) row k is pair k -- the same reshape the
+            # result gather uses below. A pair has converged when ITS OWN best (max over
+            # its own seeds) stops improving, and the loop may break only once EVERY pair
+            # has stalled. A bucket-global max would let one converged pair halt the
+            # optimisation of every other pair sharing the bucket.
+            cur = best_score.view(BATCH, P).amax(dim=1)
+            improved = (cur - prev_best) > early_stop_tol
+            # amax stays on-device; this .any() is the ONE host sync per check, exactly
+            # where the old .max().item() sync was. No per-pair sync is introduced.
+            if not improved.any():
                 no_improve_count += 1
                 if no_improve_count >= early_stop_patience:
                     break
             else:
                 no_improve_count = 0
-                prev_max_score = current_max
+            # Advance a pair's baseline only where that pair actually improved, as the old
+            # rule did. In every measured case this runs at least as long as the bucket-global
+            # test it replaces; it is NOT provably never-earlier. A trajectory whose per-check
+            # gains straddle es_tol can spend a baseline reset the global rule still holds, and
+            # stop one check block (5 steps) sooner. Never seen on real molecules.
+            prev_best = torch.where(improved, cur, prev_best)
 
         fused_adam_qt_with_tangent_proj(q_k, t_k, g_q, g_t, m_q, v_q, m_t, v_t, lr)
+
+    # One record per eager fine-loop invocation: value+grad evaluations actually
+    # executed (the loop breaks AFTER an evaluation, before that step's Adam update)
+    # against the configured budget. No-op unless _stats recording was enabled.
+    _ran = (step + 1) if steps_fine else 0
+    _record_steps(_ran, steps_fine, _ran < steps_fine)
 
     final_score = best_score.view(BATCH, P)
     best = final_score.argmax(dim=1)

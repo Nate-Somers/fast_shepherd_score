@@ -105,8 +105,8 @@ def _make_pairs(k, rng, kind="se3"):
 def test_pool_matches_single_process(mode, num_workers):
     """Pooled (sharded) scores match the single-process batch on the representative
     workload -- rigid SE(3) self-copies (optimum 1.0), the benchmark's case. Not strictly
-    bit-identical (the fine loop's early-stop is batch-GLOBAL, so a different shard
-    plateaus a step or two apart), but a clean optimum converges to the same point."""
+    bit-identical (the fine loop runs until EVERY pair in the batch has stopped improving,
+    so a shard plateaus a step or two apart), but a clean optimum converges to the same point."""
     rng = np.random.default_rng(0)
     raw = _make_pairs(10, rng, kind="se3")
     sc_attr = bm._MODE_SPEC[_cpu_pool._LEGACY_MODE_ALIASES.get(mode, mode)]["out"][1]
@@ -126,7 +126,8 @@ def test_pool_matches_single_process(mode, num_workers):
 def test_pool_distinct_pairs_sanity(mode):
     """Distinct (different) molecules: a looser guard that the pool routes pairs and
     kwargs correctly -- a real bug (wrong pairing / dropped charge) moves a score by
-    >>5e-2, while the batch-global early-stop drift on these harder optima stays under it."""
+    >>5e-2, while the early-stop drift from shard composition on these harder optima stays
+    under it (a pair runs as long as its slowest-converging batch-mate)."""
     rng = np.random.default_rng(7)
     raw = _make_pairs(8, rng, kind="distinct")
     sc_attr = bm._MODE_SPEC[_cpu_pool._LEGACY_MODE_ALIASES.get(mode, mode)]["out"][1]

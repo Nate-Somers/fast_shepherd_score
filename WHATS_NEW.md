@@ -3,7 +3,7 @@
 This document describes the accelerated-alignment update to `shepherd-score`. It covers the
 code, the organization of every new file, the full public API, and every new feature.
 
-> ## ⚠️ Read first — three changes affect existing results and installs
+> ## ⚠️ Read first — four changes affect existing results and installs
 >
 > 1. **The default batch backend changed, and it changes scores.** `MoleculePairBatch.align_with_*`
 >    used to default to JAX; it now defaults to the accelerated backends — **Triton on a CUDA host,
@@ -21,7 +21,14 @@ code, the organization of every new file, the full public API, and every new fea
 >    back to MMFF94 with a warning. Pass `charge_model="mmff"` (or explicit `partial_charges=`) for the
 >    old behavior. xTB is **not uniformly better**: on the DUDE-Z enrichment benchmark it helps the
 >    surface-ESP modes (`vol_and_surf_esp` +0.036 ROC-AUC) but *hurts* atom-centred `vol_esp`
->    (−0.041); pick the charge model to match the representation. See [Behavior changes B6](#7-behavior-changes-read-this).
+>    (−0.041); pick the charge model to match the representation. See [Behavior changes B8](#7-behavior-changes-read-this).
+> 4. **Early stopping is now per-pair, and alignment scores can go UP.** Every accelerated fine
+>    loop used to stop when the *batch-global* best score stalled, so one converged pair cut short
+>    every pair sharing its bucket — as few as 11 executed steps against a configured 30-60. The
+>    criterion is now each pair's own best. Measured across 13 modes, 331 of 696 scores rose, none
+>    fell. Search effort (`MODE_SEEDS`/`MODE_STEPS`) is unchanged; **every throughput and score
+>    number measured before this fix is stale and reads too fast.** See
+>    [Behavior changes B9](#7-behavior-changes-read-this).
 
 Structurally the fork is still additive on top of upstream (no upstream file deleted, no upstream
 public name removed), and this release also **merges upstream's `Molecule` refactor** (the
@@ -308,10 +315,13 @@ correction**, a quaternion tangent-space projection fused into the kernel, and u
 renormalization every step. `lr` does not mean what it means in `torch.optim.Adam`. The drivers'
 internal default is `lr=0.075`, not the `lr=0.1` the public API advertises.
 
-**Early stopping is on, per-mode, and batch-global.** Patience is 2 for `vol`/`surf`/`vol_color`
+**Early stopping is on, per-mode, and per-pair.** Patience is 2 for `vol`/`surf`/`vol_color`
 and 5 for the ESP and pharmacophore modes; tolerance 1e-5; checked every 5 steps to avoid a
-per-step GPU→CPU sync. The criterion is a **batch-global maximum**, so a pair's step count depends
-on which pairs share its batch — in every path, not just the worker-pool one.
+per-step GPU→CPU sync. The criterion is **per pair**: a pair has converged when its own best —
+the max over its own seeds — stops improving, and the loop stops only once every pair in the
+batch has converged. A pair's step count therefore still depends on which pairs share its
+batch (a still-improving neighbour keeps the loop running), but no pair is ever cut short by
+another pair converging first.
 
 **CUDA graphs.** All seven modes share one implementation (`accel/drivers/_graphed.py`): one fine
 step is captured and replayed, removing per-step host launch overhead. Engagement is *not* uniform
@@ -389,6 +399,9 @@ Things that will bite you if you don't know them:
   molecule's COM first — or build the store with `pre_centered=False`.
 - **`shard_size` is a GPU-memory knob**, not just an I/O knob: on the fast path a whole shard is
   uploaded as device tensors at once.
+- **A screen holds two shards in host RAM**, the one being aligned plus one read ahead on a
+  background thread. `FSS_SCREEN_PREFETCH=0` disables the read-ahead and restores single-shard
+  residency. See [B10](#7-behavior-changes-read-this).
 - **`trans_init=True`, `backend="jax"`, or a non-pre-centered store** silently drop you off the
   fast path onto a much slower object path.
 - The manifest is rewritten after every shard flush, so **a killed build leaves a readable store**
@@ -435,8 +448,8 @@ multi-GPU host therefore runs on a **single GPU** and emits a one-time warning p
 **`num_workers=N` with `backend="numba"`** uses a persistent pool of single-threaded worker
 processes (`accel/cpu_pool.py`), sharding *pairs* across processes. Pairs are independent, so this
 does not change the optimization problem — but agreement with one large call is to **convergence
-tolerance, not bitwise**, because the fine loop's early-stop tests a batch-global maximum and a
-pair's step count depends on which pairs share its shard.
+tolerance, not bitwise**, because the fine loop runs until every pair in the batch has converged
+and a pair's step count therefore depends on which pairs share its shard.
 
 - It uses `spawn`, so it needs an **`if __name__ == "__main__":` guard**.
 - It applies to **`vol`, `surf`, `surf_esp` and `pharm` only**. On `vol_esp`, `vol_and_surf_esp`
@@ -883,8 +896,9 @@ the bottleneck do you need to write kernels at all.
 
 ## 7. Behavior changes (read this)
 
-Seven changes are visible to code written against the previous release. **B5 (the default batch
-backend) and B6 (numba required) are the ones most likely to affect you.**
+Ten changes are visible to code written against the previous release. **B5 (the default batch
+backend), B6 (numba required) and B9 (per-pair early stopping) are the ones most likely to affect
+you.**
 
 ### B1. `num_repeats` and `max_num_steps` defaults — the important one
 
@@ -1060,6 +1074,95 @@ xTB helps the surface-ESP modes (`vol_and_surf_esp` +0.036 ROC-AUC, `surf_esp` ~
 the atom-centred `vol_esp` (−0.041), which does better on MMFF94. The representation and the charge
 model interact — surface ESP rewards a faithful field, atom-centred ESP suits atom-centred charges —
 so choose `charge_model` per mode rather than assuming xTB is always best.
+
+### B9. Early stopping is now per-pair, not batch-global (scores can go UP) — the important one
+
+Every accelerated fine loop — the 14 eager drivers in `accel/drivers/`, the CUDA-graph replay loop
+in `accel/drivers/_graphed.py`, and the fused numba CPU loop in `accel/kernels/cpu_fused.py` —
+decided when to stop from a **maximum over the whole batch**:
+
+```python
+current_max = best_score.max().item()          # every pose of every PAIR collapsed to one scalar
+if current_max - prev_max_score < early_stop_tol: ...
+```
+
+`best_score` holds one row per *(pair, seed)*, so this asked "did anything anywhere improve?".
+A pair that converged early — most cheaply, a molecule aligned against itself, but any easy pair
+does it — pinned that maximum and **halted optimization for every other pair sharing its bucket**.
+With patience 2 and a check every 5 steps the floor is **11 executed steps**, whatever the
+configured budget says. A measured `vol_lipo` CPU cell ran 11 of 50 steps.
+
+The criterion is now **per pair**: a pair improves when its own best (the max over its own seeds)
+gains more than `early_stop_tol`, and the loop breaks only after `early_stop_patience` consecutive
+checks in which **no** pair improved. See [§4.3](#43-the-optimizer-seeds-analytic-gradients-cuda-graphs).
+
+**This changes results, and only upward.** A pair that was cut short now finishes its budget and
+lands on a better (or identical) optimum. Measured over 696 scores from true pre-fix code across 13
+modes and both CPU routes: **331 rose, 365 were bit-identical, none fell** (largest gain +0.0235
+on a single pair); executed optimizer work rose from 63.3% to 94.0% of the configured budget.
+Every previously-truncated case now equals its own full-budget reference exactly.
+
+- **Search effort is unchanged.** `MODE_SEEDS`, `MODE_STEPS`, every patience and every tolerance are
+  byte-identical to the previous release. The extra work is the work that was already configured and
+  was being skipped, not more searching. B1's defaults still apply.
+- **Early stopping is not disabled.** A bucket in which every pair genuinely converges still stops
+  at 11 of 30 steps.
+- **Throughput drops on any workload that was truncating, and that is the honest direction.** The
+  `vol_lipo` cell above read 4.4x too fast. **Any score table, throughput number, or enrichment
+  figure produced before this fix was computed on truncated optimizations and must be re-measured,
+  not re-labelled** — including, because truncation depended on which pairs shared a bucket, results
+  that were never reproducible in the first place.
+- **On a large screening bucket early stopping now effectively never fires**, since thousands of
+  pairs must stall on the same check. Those buckets run the full budget; the check itself is cheap
+  (one `amax` and one host sync per 5 steps, exactly what the old test cost) but can no longer
+  terminate anything.
+- Small print: the per-pair rule is *not* provably never-earlier. A trajectory whose per-check gains
+  straddle `early_stop_tol` can spend a baseline reset the global rule would still be holding, and
+  stop one check block (5 steps) sooner. It fired in 0 of 40,000 randomized trajectories and 0 of the
+  696 real scores above, and in ~2.5% of draws from a generator built specifically to provoke it.
+
+To see what a run actually executed, `shepherd_score.accel._stats` records it:
+
+```python
+from shepherd_score.accel import _stats
+_stats.reset()                      # clear + enable (a no-op recorder until you do this)
+batch.align_with_vol()
+_stats.summary()                    # {'calls':…, 'steps_min':…, 'steps_max':…, 'steps_mean':…,
+                                    #  'steps_configured':…, 'early_stop_frac':…}
+_stats.disable()
+```
+
+It is process-local and not thread-safe, so a forked or spawned worker (`accel/cpu_pool.py`,
+`accel/screen_parallel.py`, `screen(..., ndev>1)`) records only in its own process and reports
+nothing to the parent — an empty summary means *unmeasured*, not *full effort*.
+
+### B10. Screening host path is faster; results are bit-identical
+
+`shepherd_score.screen`'s reduce no longer touches Python once per library molecule. The
+per-molecule `heap.offer_pair(...)` loop and the per-shard `[_id_to_py(x) for x in ids]`
+comprehension are replaced by a numpy pre-filter against the top-K heap's current threshold
+(re-read every 4096 molecules); only a molecule that can actually enter the heap pays a `float()`,
+an id conversion and a heap call. Separately, `screen`/`screen_many` now read the **next** shard on
+a background thread while the current one aligns.
+
+**No result changes.** The heap's threshold is `-inf` until it fills and non-decreasing afterwards,
+and a rejected `offer_pair` performs no push and does not advance the tie-break counter, so
+skipping it leaves no trace — hit lists, hit *order* (including exact score ties), ids, transforms
+and `scores_out` are bit-identical to the previous release. Verified against the pre-change module
+loaded side by side: 144 end-to-end screens across the fast and object paths, plus ~1,000 randomized
+reduce differentials comparing the entire internal heap array, with libraries built from exact
+duplicates so ties are dense. Zero mismatches.
+
+Two things to know:
+
+- **A screen now holds two shards in host RAM**, the one aligning plus the one being read ahead.
+  Set **`FSS_SCREEN_PREFETCH=0`** to disable the read-ahead and go back to exactly one — the first
+  thing to try if a large-`shard_size` store runs out of host memory.
+- The saving is host-side only, roughly 0.65 µs per library molecule at a 210,000-molecule library
+  with `top_k=1000` (the reduce itself goes 0.73 → 0.07 µs/molecule; the tighter the `top_k`, the
+  more the filter removes). Whether that is visible depends entirely on what an alignment costs on
+  your device: it is a fraction of a percent of a CPU screen and a few percent of a GPU one. No
+  kernel changed.
 
 ### Minor
 

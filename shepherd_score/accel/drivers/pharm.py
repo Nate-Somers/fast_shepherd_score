@@ -36,6 +36,7 @@ from ...score.analytical_gradients import (
     project_grad_R_to_quaternion,
     _rotation_matrix_from_unit_quat,
 )
+from .._stats import record as _record_steps
 
 _PHARM_SIGMA_MAP = {'tversky': 0.95, 'tversky_ref': 1.0, 'tversky_fit': 0.05}
 
@@ -112,12 +113,12 @@ class _GraphedFinePharm(_GraphedFineBase):
 
 def _run_graphed_pharm(anc1_k, anc2_k, vec1_k, vec2_k, types1_k, types2_k, N_k, M_k, norm,
                        q_seed, t_seed, tables, lr, steps, N_pad, M_pad, P,
-                       es_patience=0, es_tol=1e-5):
+                       es_patience=0, es_tol=1e-5, es_seeds=0):
     key = (anc1_k.device.index, "pharm", N_pad, M_pad, P, steps, round(float(lr), 5))
     return run_graphed(
         lambda: _GraphedFinePharm(N_pad, M_pad, P, steps, lr, tables, anc1_k.device),
         key, (anc1_k, anc2_k, vec1_k, vec2_k, types1_k, types2_k, N_k, M_k, norm, q_seed, t_seed),
-        es_patience=es_patience, es_tol=es_tol)
+        es_patience=es_patience, es_tol=es_tol, es_seeds=es_seeds)
 
 
 def coarse_fine_pharm_align_many(
@@ -311,7 +312,9 @@ def coarse_fine_pharm_align_many(
     best_q = q_param.clone()
     best_t = t_param.clone()
 
-    prev_max_score = -float('inf')
+    # Per-pair early-stop baseline: prev_best[k] is pair k's best score as of its
+    # last recorded improvement. One entry per PAIR, not per pose.
+    prev_best = torch.full((BATCH,), -float('inf'), device=device)
     no_improve_count = 0
 
     # The Triton value+grad kernel (pharm_score_grad_se3_batch) is the fast,
@@ -372,7 +375,8 @@ def coarse_fine_pharm_align_many(
                 vectors_1_k.contiguous(), vectors_2_k.contiguous(),
                 types_1_k, types_2_k, N_k, M_k, VAA_an + VBB_an, q_param, t_param,
                 _pk_tables, lr, steps_fine, N_pad, M_pad, anchors_1_k.shape[0],
-                es_patience=early_stop_patience, es_tol=early_stop_tol)
+                es_patience=early_stop_patience, es_tol=early_stop_tol,
+                es_seeds=P)
         except Exception:
             _graphed = None
     if _graphed is not None:
@@ -390,7 +394,7 @@ def coarse_fine_pharm_align_many(
             best_score, best_q, best_t = cpu_fused_pharm(
                 anchors_1_k, anchors_2_k, vectors_1_k, vectors_2_k, types_1_k, types_2_k,
                 q_param, t_param, N_k, M_k, VAA_an + VBB_an, _al, _Ks, _cats, lr, steps_fine,
-                early_stop_patience, early_stop_tol)
+                early_stop_patience, early_stop_tol, n_seeds=P)
             _graphed = True                                # skip the eager loop below
         except Exception:
             pass                                           # fall through to the eager loop
@@ -476,16 +480,31 @@ def coarse_fine_pharm_align_many(
         best_q = torch.where(mask_q, q_param, best_q)
         best_t = torch.where(mask_q, t_param, best_t)
 
-        # Early stopping check every 5 iterations to reduce GPU→CPU sync overhead
+        # Early-stop check every 5 steps, so the host sync it needs costs one sync per
+        # 5 steps, not one per step. Gating only makes the early stop LESS aggressive.
         if step % 5 == 0:
-            current_max = best_score.max().item()
-            if current_max - prev_max_score < early_stop_tol:
+            # PER-PAIR convergence test. `best_score` is (BATCH*P,) laid out
+            # pair-major, so .view(BATCH, P) row k is pair k -- the same reshape the
+            # result gather uses below. A pair has converged when ITS OWN best (max over
+            # its own seeds) stops improving, and the loop may break only once EVERY pair
+            # has stalled. A bucket-global max would let one converged pair halt the
+            # optimisation of every other pair sharing the bucket.
+            cur = best_score.view(BATCH, P).amax(dim=1)
+            improved = (cur - prev_best) > early_stop_tol
+            # amax stays on-device; this .any() is the ONE host sync per check, exactly
+            # where the old .max().item() sync was. No per-pair sync is introduced.
+            if not improved.any():
                 no_improve_count += 1
                 if no_improve_count >= early_stop_patience:
                     break
             else:
                 no_improve_count = 0
-                prev_max_score = current_max
+            # Advance a pair's baseline only where that pair actually improved, as the old
+            # rule did. In every measured case this runs at least as long as the bucket-global
+            # test it replaces; it is NOT provably never-earlier. A trajectory whose per-check
+            # gains straddle es_tol can spend a baseline reset the global rule still holds, and
+            # stop one check block (5 steps) sooner. Never seen on real molecules.
+            prev_best = torch.where(improved, cur, prev_best)
 
         # Tangent-space projection for quaternion (q_param is ~unit; for the
         # analytical branch dQ is already tangent so this is a no-op).
@@ -494,6 +513,13 @@ def coarse_fine_pharm_align_many(
 
         # Adam update (using fused kernel for efficiency)
         fused_adam_qt(q_param, t_param, dQ_tan.detach(), dT.detach(), m_q, v_q, m_t, v_t, lr)
+
+    if _graphed is None:
+        # One record per eager fine-loop invocation: value+grad evaluations actually
+        # executed (the loop breaks AFTER an evaluation, before that step's Adam update)
+        # against the configured budget. No-op unless _stats recording was enabled.
+        _ran = (step + 1) if steps_fine else 0
+        _record_steps(_ran, steps_fine, _ran < steps_fine)
 
     # ------------------------------------------------------------------
     # 5) Gather final results

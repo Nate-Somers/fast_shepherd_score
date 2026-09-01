@@ -5,8 +5,10 @@ unbounded size by (1) precomputing each library molecule's interaction profile
 **once**, persisting it to a sharded on-disk store, and (2) streaming shards back
 through the **existing** :class:`~shepherd_score.container.MoleculePairBatch` /
 :func:`~shepherd_score.accel.multi_gpu.align_multi_gpu` API, reducing scores on
-the fly. Only one shard is resident at a time, so host RAM never holds the whole
-library.
+the fly. Host RAM never holds the whole library: the screen keeps the shard it is
+aligning plus (by default) one shard being read ahead on a background thread, so
+residency is bounded at two shards. Set ``FSS_SCREEN_PREFETCH=0`` to disable the
+read-ahead and hold exactly one.
 
 Three pieces:
 
@@ -52,6 +54,7 @@ import json
 import os
 import re
 from collections import namedtuple
+from operator import attrgetter
 from typing import Iterator, List, Optional, Sequence
 
 import numpy as np
@@ -67,6 +70,9 @@ from shepherd_score.accel._modes import (
 )
 _TRANSFORM_ATTR = {m: a[0] for m, a in _MODE_ATTRS.items()}
 _SCORE_ATTR = {m: a[1] for m, a in _MODE_ATTRS.items()}
+# Prebuilt score readers: ``attrgetter`` + ``map`` pulls the per-pair score in C, so the
+# K-element score vector costs one iterator pass instead of K Python ``getattr`` calls.
+_SCORE_GETTER = {m: attrgetter(a) for m, a in _SCORE_ATTR.items()}
 _VALID_MODES = tuple(_SCORE_ATTR)
 # Modes whose surface ``alpha`` should auto-default to ALPHA(num_surf_points).
 _SURF_ALPHA_MODES = {"surf", "surf_esp"}
@@ -642,8 +648,13 @@ class ProfileStore:
             return {k: data[k] for k in data.files}
 
     def read_shard(self, idx: int) -> tuple:
-        """Return ``(shard_meta, arrays_dict)`` for shard ``idx`` (random access; used
-        by the multi-GPU shard pool so each worker reads only its assigned shards)."""
+        """Return ``(shard_meta, arrays_dict)`` for shard ``idx`` (random access; the
+        multi-GPU shard pool uses it so each worker reads only its assigned shards, and
+        the in-process screen reads every shard through it).
+
+        Must stay free of shared mutable state: :func:`_iter_shards_prefetched` calls this
+        on a background thread to read the next shard while the current one aligns. It only
+        indexes the (read-only) manifest and opens its own file handle, so it is safe to."""
         sh = self.manifest["shards"][idx]
         return sh, self._load_raw(sh)
 
@@ -1073,11 +1084,16 @@ def _align_fast(pairs, ref_tensors: dict, mode: str, batch_kw: dict):
     materialized lazily for top-K survivors only (``_TopK.offer_pair``), since building
     all K per shard is the dominant overhead and a screen keeps only ~top_k."""
     from shepherd_score.accel.batch import aligners
+    items = tuple(ref_tensors.items())          # materialize the view ONCE, not per pair
     for p in pairs:
-        for k, v in ref_tensors.items():
+        for k, v in items:
             setattr(p, k, v)
     getattr(aligners, "_align_batch_" + mode)(pairs, **batch_kw)
-    return np.array([float(getattr(p, _SCORE_ATTR[mode])) for p in pairs], dtype=float)
+    # The batched aligners write plain Python floats (``scores_cpu.tolist()``), so reading
+    # them through ``map(attrgetter(...))`` into a preallocated ``fromiter`` is the same
+    # float64 vector as a ``[float(getattr(...)) for p in pairs]`` list comprehension --
+    # minus K Python-level ``getattr``/``float`` calls and the intermediate list.
+    return np.fromiter(map(_SCORE_GETTER[mode], pairs), dtype=float, count=len(pairs))
 
 
 class _TopK:
@@ -1105,6 +1121,22 @@ class _TopK:
         still holds this query's pose (before the next query/shard re-aligns it)."""
         if len(self.heap) < self.k or score > self.heap[0][0]:
             self._push(score, id_, _transform_of(pair, tf_attr))
+
+    def threshold(self):
+        """Score a candidate must **strictly exceed** to change this heap at all, or
+        ``-inf`` while the heap has not yet filled (every offer is accepted then).
+
+        Exactness of the pre-filter in :func:`_accumulate` rests on this being monotone
+        non-decreasing once the heap is full: ``_push`` then only ever ``heapreplace``s
+        the minimum with a *strictly larger* score, so the minimum never falls. A
+        candidate scoring ``<= threshold()`` is therefore guaranteed to be rejected by
+        every later ``offer_pair`` in the batch too -- and a rejected ``offer_pair``
+        mutates nothing (no push, no ``_c`` increment), so skipping it is a bit-exact
+        no-op rather than an approximation.
+        """
+        # ``self.k`` guard keeps a degenerate k=0 heap failing exactly where it does today
+        # (inside offer_pair), instead of raising from here.
+        return self.heap[0][0] if (self.k and len(self.heap) >= self.k) else float("-inf")
 
     def merge_raw(self, raw):
         for (s, i, t) in raw:
@@ -1144,6 +1176,40 @@ def _resolve_screen(store, mode, alpha, align_kwargs):
     return align_kwargs
 
 
+def _iter_shards_prefetched(store, shard_idxs):
+    """Yield ``(shard_meta, arrays)`` for ``shard_idxs`` **in order**, reading the next
+    shard on a single background thread so the disk read overlaps the current shard's
+    alignment.
+
+    Pure I/O overlap: the worker only calls :meth:`ProfileStore.read_shard`, which opens
+    its own file handle and returns fresh arrays, touching no shared mutable state, and
+    the consumer still sees shards strictly in ``shard_idxs`` order. A read that raises
+    is re-raised in the caller's thread by ``Future.result()`` before the shard is yielded,
+    and the executor is shut down (joining the in-flight read) on any exit path, including
+    the generator being closed early.
+
+    Costs one extra resident shard. ``FSS_SCREEN_PREFETCH=0`` disables the read-ahead and
+    restores strictly-one-shard residency.
+    """
+    idxs = list(shard_idxs)
+    if len(idxs) < 2 or os.environ.get("FSS_SCREEN_PREFETCH", "1") == "0":
+        for i in idxs:
+            yield store.read_shard(i)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fss-screen-prefetch")
+    try:
+        fut = ex.submit(store.read_shard, idxs[0])
+        for nxt in idxs[1:]:
+            cur = fut.result()                  # re-raises a failed read here, in order
+            fut = ex.submit(store.read_shard, nxt)
+            yield cur
+            del cur                             # drop before waiting on the next read
+        yield fut.result()
+    finally:
+        ex.shutdown(wait=True)                  # never leave a reader thread behind
+
+
 def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                        align_kwargs, backend, fast, center_profiles, scores_out, progress,
                        n_total):
@@ -1169,19 +1235,20 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
         done = 0
         if not fast:
             from shepherd_score.container import MoleculePair, MoleculePairBatch
-        for idx in shard_idxs:
+        # Shards arrive in order from the read-ahead reader; ``arrs`` is exactly what
+        # ``store.read_shard(idx)`` returned, just read one shard earlier.
+        for sh, arrs in _iter_shards_prefetched(store, shard_idxs):
             if fast:
-                sh, arrs = store.read_shard(idx)
+                # ``ids`` stays the raw store array: _accumulate applies ``_id_to_py`` to
+                # top-K survivors only, instead of converting every library molecule here.
                 ids, pairs = _build_fit_fast_pairs(arrs, mode, device)
-                ids = [_id_to_py(x) for x in ids]
                 start = sh["start"]
                 for qi, ra in enumerate(qs_ref):
                     ref = _ref_tensors_from_arrays(ra, mode, device)
                     scores = _align_fast(pairs, ref, mode, batch_kw)
                     _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
             else:
-                sh = store.manifest["shards"][idx]
-                profiles = store.read_profiles(idx)
+                profiles = store._reconstruct(arrs, sh)   # == store.read_profiles(idx)
                 if center_profiles:
                     for p in profiles:
                         p.center_to(p.atom_pos.mean(0))
@@ -1202,11 +1269,58 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
         _DISPATCH_LOCAL.active = _prev_active
 
 
+# Candidates are pre-filtered against the heap threshold in blocks of this many, so the
+# threshold used is refreshed as the heap tightens instead of being read once per shard
+# (a 100k-molecule shard would otherwise pre-filter its whole tail against the stale
+# threshold it had before its own first molecule was offered). Block size only trades a
+# handful of numpy calls against a few wasted offers; it never changes the result.
+_ACCUM_BLOCK = 4096
+
+
 def _accumulate(heap, ids, scores, pairs, tf_attr, scores_out, qi, start):
-    for i in range(len(ids)):
-        heap.offer_pair(float(scores[i]), ids[i], pairs[i], tf_attr)
+    """Reduce one shard's scores for one query: full score vector out, top-K heap in.
+
+    ``scores_out`` still receives EVERY score, in library order, via the same single
+    vectorised slice assignment as before.
+
+    The heap, by contrast, is only ever changed by a candidate that strictly beats its
+    current minimum, so the per-molecule Python offer loop is pre-selected in C: a
+    numpy ``> threshold`` comparison plus ``flatnonzero`` picks the candidates that can
+    actually enter, and only those pay a ``float()``, an ``_id_to_py()`` and a heap call.
+    On a large screen the heap threshold sits near the k-th best score seen so far, so
+    this is a handful of survivors per block instead of one Python iteration per library
+    molecule.
+
+    **This is exact, not approximate.** ``_TopK.threshold()`` is ``-inf`` until the heap
+    fills (nothing is skipped during that phase) and non-decreasing afterwards, so a
+    candidate scoring ``<= threshold`` at the start of a block still scores ``<=`` the
+    heap minimum when its turn comes and would be rejected by ``offer_pair``. A rejected
+    ``offer_pair`` performs no push and does not advance the ``_c`` tie-break counter, so
+    it leaves *no* trace: skipping it reproduces the old push sequence, the old counters,
+    the old heap array layout and therefore the old hit order down to ties. Survivors are
+    still offered in ascending library index, and still inside this query/shard iteration
+    so ``offer_pair`` materialises each transform while its ``pair`` holds THIS query's
+    pose.
+    """
+    n = len(ids)
+    lo = 0
+    while lo < n:
+        hi = lo + _ACCUM_BLOCK
+        if hi > n:
+            hi = n
+        thr = heap.threshold()
+        if thr == float("-inf"):
+            cand = range(lo, hi)                     # heap not full: every offer is taken
+        else:
+            # ``.tolist()`` so the offers below index with Python ints, not numpy scalars.
+            cand = (np.flatnonzero(scores[lo:hi] > thr) + lo).tolist()
+        for i in cand:
+            # ``_id_to_py`` is applied HERE rather than to the whole shard up front, so the
+            # numpy-scalar -> python conversion only runs for candidates that survive.
+            heap.offer_pair(float(scores[i]), _id_to_py(ids[i]), pairs[i], tf_attr)
+        lo = hi
     if scores_out is not None and scores_out[qi] is not None:
-        scores_out[qi][start:start + len(ids)] = scores
+        scores_out[qi][start:start + n] = scores
 
 
 def _normalize_scores_out(scores_out, n_queries):
@@ -1407,11 +1521,13 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
                 break
             _sh, arrs = store.read_shard(idx)
             ids, pairs = _build_fit_fast_pairs(arrs, mode, dev)
-            ids = [_id_to_py(x) for x in ids]
             for qi, ref in enumerate(ref_tensors):
                 scores = _align_fast(pairs, ref, mode, batch_kw)
-                for i in range(len(ids)):
-                    heaps[qi].offer_pair(float(scores[i]), ids[i], pairs[i], tf_attr)
+                # Same pre-filtered reduce as the in-process driver (scores_out is not
+                # supported with ndev>1, hence the None). No read-ahead here on purpose:
+                # a worker pulls its shards off a shared queue, and grabbing the next
+                # index early would unbalance the pool's work stealing.
+                _accumulate(heaps[qi], ids, scores, pairs, tf_attr, None, qi, 0)
             torch.cuda.synchronize()
         out_q.put((rank, [h.raw() for h in heaps]))
     except Exception:                            # noqa: BLE001 - relayed to parent
