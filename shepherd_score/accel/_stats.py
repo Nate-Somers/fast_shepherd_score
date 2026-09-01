@@ -29,12 +29,15 @@ _steps_min = 0
 _steps_max = 0
 _early = 0
 _configured: set = set()
+_configured_total = 0        # sum of the budget over CALLS, for a call-weighted mean
 
 
 def reset() -> None:
     """Clear the counters and ENABLE recording."""
     global _enabled, _calls, _steps_total, _steps_min, _steps_max, _early, _configured
+    global _configured_total
     _enabled = True
+    _configured_total = 0
     _calls = 0
     _steps_total = 0
     _steps_min = 0
@@ -58,7 +61,7 @@ def record(steps_run: int, steps_configured: int, early_stopped: bool) -> None:
     """
     if not _enabled:
         return
-    global _calls, _steps_total, _steps_min, _steps_max, _early
+    global _calls, _steps_total, _steps_min, _steps_max, _early, _configured_total
     steps_run = int(steps_run)
     if _calls == 0 or steps_run < _steps_min:
         _steps_min = steps_run
@@ -69,29 +72,34 @@ def record(steps_run: int, steps_configured: int, early_stopped: bool) -> None:
     if early_stopped:
         _early += 1
     _configured.add(int(steps_configured))
+    _configured_total += int(steps_configured)
 
 
 def summary() -> dict:
     """Aggregate of everything recorded since the last :func:`reset`; ``{}`` if nothing was.
 
     ``steps_configured`` is the budget itself when every recorded call shared one -- the usual
-    single-mode case, and the only case in which it means anything. When calls with DIFFERENT
-    budgets share one recording window it is the unweighted mean over the DISTINCT budgets seen,
-    NOT over calls: 99 calls at 30 plus one at 50 reports 40.0, not 30.2. Any effort fraction
-    computed against a mixed window is therefore wrong (here, low enough to look truncated).
-    Reset per mode.
+    single-mode case. When calls with DIFFERENT budgets share one window it is the CALL-weighted
+    mean, so an effort fraction taken against it stays meaningful, and ``steps_configured_mixed``
+    is True so a consumer can tell that the window spanned more than one budget. Resetting per
+    mode is still preferable, because min/max then describe one budget rather than several.
     """
     if not _calls:
         return {}
-    if len(_configured) == 1:
+    mixed = len(_configured) > 1
+    if not mixed:
         cfg = next(iter(_configured))
     else:
-        cfg = sum(_configured) / len(_configured)
+        # CALL-weighted, not a mean over distinct budgets. Averaging the distinct values made
+        # 99 calls at 30 plus one at 50 report 40.0 instead of 30.2, which drove effort_frac to
+        # 0.755 and stamped effort_truncated on a cell that ran 100% of its budget.
+        cfg = _configured_total / _calls
     return {
         "calls": _calls,
         "steps_min": _steps_min,
         "steps_max": _steps_max,
         "steps_mean": _steps_total / _calls,
         "steps_configured": cfg,
+        "steps_configured_mixed": mixed,
         "early_stop_frac": _early / _calls,
     }

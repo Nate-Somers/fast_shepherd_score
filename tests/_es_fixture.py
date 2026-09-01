@@ -24,7 +24,8 @@ which scores 1.0 from the identity seed and can never improve) in the same bucke
 genuinely different cross-pairs. Under the old rule the self-pair pinned the global max at
 1.0 immediately, the whole bucket broke at step 10, and the cross-pairs got 11 steps instead
 of their configured 30 / 40 / 50. A PASS today is every BASELINE row running its full budget
-and printing ``deficit=+0.0000000000``; a row that reads 11 steps again is the defect back.
+with its deficit at the fp32 noise floor (|deficit| < 1e-6); a row that reads 11 steps again,
+or a deficit that grows past noise, is the defect back.
 
 Four variants are printed per mode, plus a control:
 
@@ -32,7 +33,7 @@ Four variants are printed per mode, plus a control:
     fire and the configured budget runs in full. These are the scores the fix has to reach.
     ``MODE_SEEDS`` / ``MODE_STEPS`` are NOT touched; search effort is identical.
   * BASELINE  -- the shipped behaviour. Each cross-pair prints its ``deficit`` against the
-    reference; with the per-pair criterion in place that deficit is +0.0000000000.
+    reference; with the per-pair criterion in place that deficit is fp32 noise.
   * CONTROL   -- the same four cross-pairs with the self-pair dropped from the bucket and
     nothing else changed. They run their full budget and land back on the reference scores,
     which attributes the whole deficit to the other pair sharing the bucket.
