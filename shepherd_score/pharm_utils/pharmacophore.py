@@ -209,6 +209,51 @@ def find_hydrophobes(mol: rdkit.Chem.rdchem.Mol,
 ### End Tsuda Lab code
 
 
+def find_hydrophobes_full_atom_ids(mol: rdkit.Chem.rdchem.Mol,
+                                   cluster_hydrophobic: bool = True) -> List[set]:
+    """
+    Cluster hydrophobic matches identically to :func:`find_hydrophobes` (same
+    patterns, same 2A clustering), but return the FULL atom-id set for each
+    cluster -- aromatic and aliphatic matches alike.
+
+    Arguments
+    ---------
+    mol : rdkit Mol object with a conformer.
+    cluster_hydrophobic : bool (default=True) to cluster hydrophobic atoms if they fall within 2A.
+
+    Returns
+    -------
+    list of set[int], one full atom-id set per cluster (or per raw match if
+    ``cluster_hydrophobic=False``). Aligned with :func:`find_hydrophobes`'s
+    cluster order when called with the same ``mol``.
+    """
+    all_hydrophobes = __find_matches(mol, __hydrophobic_patterns, return_atom_ids=True)
+    if not cluster_hydrophobic:
+        return [h[1] for h in all_hydrophobes]
+
+    centers = [h[0] for h in all_hydrophobes]
+    n = len(all_hydrophobes)
+    idx2cluster = list(range(n))
+    if n > 1:
+        # Precompute all pairwise distances in one vectorized call
+        within_cutoff = distance.squareform(distance.pdist(np.asarray(centers))) <= 2.0
+        for i in range(n):
+            cluster_id = idx2cluster[i]
+            for j in range(i + 1, n):
+                if within_cutoff[i, j]:
+                    idx2cluster[j] = cluster_id
+
+    grouped_ids = []
+    for cid in set(idx2cluster):
+        full_ids = set()
+        for i, h in enumerate(all_hydrophobes):
+            if idx2cluster[i] != cid:
+                continue
+            full_ids |= h[1]
+        grouped_ids.append(full_ids)
+    return grouped_ids
+
+
 def _get_points_fibonacci(num_samples):
     """
     Generate points on unit sphere using fibonacci approach.
@@ -600,7 +645,7 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
                                        return_atom_ids=return_atom_ids)
     if return_atom_ids:
         hydrophobe_centers = [entry[0] for entry in hydrophobes_raw]
-        hydrophobe_atom_ids = [entry[1] for entry in hydrophobes_raw]
+        hydrophobe_atom_ids = find_hydrophobes_full_atom_ids(mol=mol, cluster_hydrophobic=True)
     else:
         hydrophobe_centers = hydrophobes_raw
         hydrophobe_atom_ids = None
@@ -618,9 +663,18 @@ _RING_PRIORITY_TYPE_INDICES = frozenset({
     P_TYPES.index('Hydrophobe'),
 })
 
+_HYDROPHOBE_TYPE_INDEX = P_TYPES.index('Hydrophobe')
+
 
 def _heavy_atoms_in_ring(mol: rdkit.Chem.rdchem.Mol, ring: Tuple[int, ...]) -> set[int]:
     return {i for i in ring if mol.GetAtomWithIdx(i).GetAtomicNum() > 1}
+
+
+def _atom_ids_touch_any_ring(ring_heavy_sets: List[set], atom_ids: set[int]) -> bool:
+    """
+    Whether ``atom_ids`` overlaps at least one ring's heavy atoms at all.
+    """
+    return any(heavy & atom_ids for heavy in ring_heavy_sets)
 
 
 def _max_priority_atoms_in_shared_rings(ring_heavy_sets: List[set],
@@ -665,16 +719,22 @@ def priority_pharm_labels(mol: rdkit.Chem.rdchem.Mol,
         Atom indices considered "priority".
     min_ring_priority_atoms : int, optional
         Minimum number of heavy ring atoms that must also be in ``priority_atoms``
-        before an aromatic or aromatic-derived hydrophobe is labeled 1. Use ``1`` to
+        before an aromatic or ring-associated hydrophobe is labeled 1. Use ``1`` to
         treat any single priority atom in the ring as sufficient. Default is ``3``.
+        Only applies to hydrophobes that themselves touch a ring -- a hydrophobe
+        with no ring overlap at all (e.g. an aliphatic chain) bypasses this gate
+        entirely (see Returns).
 
     Returns
     -------
     np.ndarray, shape (N,), dtype int64
         1 where the pharmacophore is priority, else 0. Non-ring pharmacophores use
-        simple atom-id intersection. Aromatic and aromatic-derived hydrophobe
-        pharmacophores additionally require at least ``min_ring_priority_atoms`` heavy
-        atoms from a shared ring to appear in ``priority_atoms``.
+        simple atom-id intersection. Aromatic pharmacophores, and hydrophobes that
+        touch a ring (aromatic-derived or an aliphatic ring match), additionally
+        require at least ``min_ring_priority_atoms`` heavy atoms from a shared ring
+        to appear in ``priority_atoms``. A hydrophobe that touches no ring at all
+        (e.g. an aliphatic chain) is not ring-gated and uses simple atom-id
+        intersection instead, same as non-ring-gated types.
     """
     priority = {int(a) for a in priority_atoms}
     ring_heavy_sets: Optional[List[set]] = None
@@ -687,6 +747,9 @@ def priority_pharm_labels(mol: rdkit.Chem.rdchem.Mol,
             if ring_heavy_sets is None:
                 ring_heavy_sets = [_heavy_atoms_in_ring(mol, ring)
                                    for ring in mol.GetRingInfo().AtomRings()]
+            if int(pharm_type) == _HYDROPHOBE_TYPE_INDEX and not _atom_ids_touch_any_ring(ring_heavy_sets, aids):
+                labels.append(1)
+                continue
             ring_priority_count = _max_priority_atoms_in_shared_rings(
                 ring_heavy_sets, aids, priority)
             labels.append(1 if ring_priority_count >= min_ring_priority_atoms else 0)
@@ -762,7 +825,9 @@ class Pharmacophore:
             Atom indices considered "priority".
         min_ring_priority_atoms : int, optional
             Minimum heavy ring atoms in ``priority_atoms`` before an aromatic or
-            aromatic-derived hydrophobe is labeled 1. Default is ``3``.
+            ring-associated hydrophobe is labeled 1. Does not apply to a
+            hydrophobe that touches no ring at all (e.g. an aliphatic chain),
+            which bypasses this gate. Default is ``3``.
 
         Returns
         -------
@@ -778,6 +843,99 @@ class Pharmacophore:
                                      self.types,
                                      priority_atoms,
                                      min_ring_priority_atoms=min_ring_priority_atoms)
+
+    def expand_atom_selection(self,
+                              seed_atoms: Iterable[int],
+                              min_ring_priority_atoms: int = 1) -> np.ndarray:
+        """
+        Expand ``seed_atoms`` to the pharmacophore-consistent superset: for every
+        pharmacophore touched by a seed atom, pull in all of that pharmacophore's
+        atom ids.
+
+        Requires the container to have been built with ``return_atom_ids=True``.
+        Composes :meth:`priority_labels` (to find touched pharmacophores) with
+        ``.atom_ids`` (to recover their atom-id union).
+
+        Parameters
+        ----------
+        seed_atoms : iterable of int
+            Atom indices to expand.
+        min_ring_priority_atoms : int, optional
+            Forwarded to :meth:`priority_labels`. Only matters for a
+            pharmacophore that touches a ring (Aromatic, or a ring-associated
+            Hydrophobe) -- a non-ring hydrophobe (e.g. an aliphatic chain)
+            bypasses this gate entirely and counts as "touched" on any plain
+            atom overlap. Default is ``1``, i.e. any single shared ring atom
+            is enough to count as "touched" for ring-associated features
+            (unlike :meth:`priority_labels`'s own default of ``3``).
+
+        Returns
+        -------
+        np.ndarray, dtype int64
+            Sorted, de-duplicated atom indices: ``seed_atoms`` plus every atom
+            belonging to a pharmacophore touched by ``seed_atoms``.
+        """
+        if self.atom_ids is None:
+            raise ValueError(
+                "expand_atom_selection requires per-pharmacophore atom ids; rebuild with "
+                "get_pharmacophores(..., return_atom_ids=True)."
+            )
+        touched = self.priority_labels(seed_atoms, min_ring_priority_atoms=min_ring_priority_atoms)
+        expanded = {int(a) for a in seed_atoms}
+        for is_touched, aids in zip(touched, self.atom_ids):
+            if is_touched:
+                expanded |= aids
+        return np.array(sorted(expanded), dtype=np.int64)
+
+    def select(self, mask: np.ndarray) -> 'Pharmacophore':
+        """
+        Return a new :class:`Pharmacophore` containing only the rows where ``mask`` is truthy.
+
+        Parameters
+        ----------
+        mask : np.ndarray
+            Boolean (or 0/1) mask aligned with ``types``/``positions``/``vectors``.
+
+        Returns
+        -------
+        Pharmacophore
+        """
+        mask = np.asarray(mask, dtype=bool)
+        return Pharmacophore(
+            types=self.types[mask],
+            positions=self.positions[mask],
+            vectors=self.vectors[mask],
+            mol=self.mol,
+            atom_ids=(
+                [a for a, m in zip(self.atom_ids, mask) if m]
+                if self.atom_ids is not None else None
+            ),
+            labels=self.labels[mask] if self.labels is not None else None,
+        )
+
+    def subset_to_atoms(self,
+                        seed_atoms: Iterable[int],
+                        min_ring_priority_atoms: int = 1) -> 'Pharmacophore':
+        """
+        Filter down to only the pharmacophores touched by ``seed_atoms``.
+
+        Requires the container to have been built with ``return_atom_ids=True``.
+        Composes :meth:`priority_labels` with :meth:`select`.
+
+        Parameters
+        ----------
+        seed_atoms : iterable of int
+            Atom indices to filter by.
+        min_ring_priority_atoms : int, optional
+            Forwarded to :meth:`priority_labels`. Default is ``1`` (see
+            :meth:`expand_atom_selection` for the non-ring-hydrophobe bypass).
+
+        Returns
+        -------
+        Pharmacophore
+        """
+        mask = self.priority_labels(seed_atoms, min_ring_priority_atoms=min_ring_priority_atoms)
+        return self.select(mask.astype(bool))
 
 
 def get_pharmacophores(mol: rdkit.Chem.rdchem.Mol,
