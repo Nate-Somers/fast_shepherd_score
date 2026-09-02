@@ -253,6 +253,48 @@ class Molecule:
                 )
 
 
+    def __setstate__(self, state):
+        """
+        Restore a pickled Molecule, upgrading the pre-refactor flat layout.
+
+        Molecules pickled before the Surface/Pharmacophore refactor carry
+        ``surf_pos`` / ``surf_esp`` / ``probe_radius`` / ``pharm_types`` /
+        ``pharm_ancs`` / ``pharm_vecs`` directly in ``__dict__``. Those names are
+        now data descriptors, so they take precedence over the instance dict and
+        forward to ``self._surface`` / ``self._pharmacophore``. Without this hook
+        every one of those reads raises AttributeError on an old pickle, which
+        silently strands any on-disk store written by a prior release.
+
+        (``MoleculePair`` has the same hazard for ``transform_esp`` /
+        ``sim_aligned_esp``; see WHATS_NEW B3. ORCHARD only pickles ``Molecule``,
+        so only this class is shimmed here.)
+        """
+        state = dict(state)
+
+        if "_surface" not in state:
+            state["_surface"] = Surface(
+                positions=state.pop("surf_pos", None),
+                esp=state.pop("surf_esp", None),
+                probe_radius=state.pop("probe_radius", 1.2),
+            )
+        else:
+            for _k in ("surf_pos", "surf_esp", "probe_radius"):
+                state.pop(_k, None)
+
+        if "_pharmacophore" not in state:
+            _t = state.pop("pharm_types", None)
+            _a = state.pop("pharm_ancs", None)
+            _v = state.pop("pharm_vecs", None)
+            state["_pharmacophore"] = (
+                None if _t is None and _a is None and _v is None
+                else Pharmacophore(types=_t, positions=_a, vectors=_v)
+            )
+        else:
+            for _k in ("pharm_types", "pharm_ancs", "pharm_vecs"):
+                state.pop(_k, None)
+
+        self.__dict__.update(state)
+
     # Interaction-profile accessors (backwards-compatible with the loose
     # ``surf_pos``/``surf_esp``/``probe_radius`` and ``pharm_*`` attributes)
     @property
