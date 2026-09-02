@@ -17,6 +17,23 @@ import torch
 from shepherd_score.score.pharmacophore_scoring import _SIM_TYPE
 from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
 
+# Every driver's epilogue calls quaternions_to_SE3_batch(...).detach().numpy(). The .numpy() is
+# LOAD-BEARING, not tidiness, and it is why the screen path stopped paying twice for transforms:
+#
+#   * quaternions_to_SE3_batch returns a torch (K,4,4). Zipping over a torch tensor yields K
+#     freshly-constructed 1-element-slice tensors -- K TensorImpl + K PyObject allocations, on a
+#     path that already knows it is done with autograd and already lives on the host.
+#   * screen.py:_transform_of then hits its `isinstance(t, torch.Tensor)` branch and pays
+#     .detach().cpu().numpy() PER SURVIVOR. Survivors are not top_k: _TopK.threshold() is -inf
+#     for the first block, so ~6k of 20k molecules reach it at top_k=1000.
+#
+# q_cpu/t_cpu are already on the host, so .numpy() is a zero-copy view of the same float32
+# buffer -- identical floats into the heap, identical push order, identical tie-break counters.
+#
+# It also CONVERGES a contract that was split rather than breaking one: the reference per-pair
+# path already stores numpy (container/_core.py, `se3_transform = se3_transform.numpy()`), and
+# container/_batch.py re-wraps with torch.as_tensor(...), which takes numpy happily.
+
 if TYPE_CHECKING:                     # annotations only; never imported at runtime
     from shepherd_score.container._core import MoleculePair
 
@@ -192,7 +209,7 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()        # batched
     scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_noH = S
@@ -340,7 +357,7 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()        # batched
     scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_surf = S
@@ -561,7 +578,7 @@ def _esp_bucketed_align(
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()        # batched
     scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         setattr(p, out_tf_attr, S)
@@ -857,7 +874,7 @@ def _align_batch_vol_and_surf_esp(
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()        # batched
     scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_and_surf_esp = S
@@ -995,7 +1012,7 @@ def _align_batch_pharm(
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()        # batched
     scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_pharm = S
@@ -1131,7 +1148,7 @@ def _align_batch_vol_color(
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_color = S
@@ -1244,7 +1261,7 @@ def _align_batch_vol_tversky(pairs: list["MoleculePair"], *, alpha: float = 0.81
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()        # batched
     scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_tversky = S
@@ -1379,7 +1396,7 @@ def _align_batch_vol_lipo(
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()        # batched
     scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_lipo = S
@@ -1506,7 +1523,7 @@ def _align_batch_vol_esp_tversky(pairs: list["MoleculePair"], *, lam: float = 0.
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
 
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)        # batched
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()        # batched
     scores_list = scores_cpu.tolist()                       # one C call
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_esp_tversky = S
@@ -1609,7 +1626,7 @@ def _align_batch_vol_mr(
     scores_cpu = torch.cat(all_scores).cpu()
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_mr = S
@@ -1707,7 +1724,7 @@ def _align_batch_vol_fukui(
     scores_cpu = torch.cat(all_scores).cpu()
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_fukui = S
@@ -1791,7 +1808,7 @@ def _align_batch_vol_avoid(
     scores_cpu = torch.cat(all_scores).cpu()
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_avoid = S
@@ -1860,7 +1877,7 @@ def _align_batch_surf_tversky(pairs: list["MoleculePair"], *, alpha: float = 0.8
     scores_cpu = torch.cat(all_scores).cpu()
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_surf_tversky = S
@@ -1940,7 +1957,7 @@ def _align_batch_surf_esp_tversky(pairs: list["MoleculePair"], *, lam: float = 0
     scores_cpu = torch.cat(all_scores).cpu()
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_surf_esp_tversky = S
@@ -2041,7 +2058,7 @@ def _align_batch_vol_lipo_tversky(
     scores_cpu = torch.cat(all_scores).cpu()
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_lipo_tversky = S
@@ -2146,7 +2163,7 @@ def _align_batch_vol_color_tversky(
     scores_cpu = torch.cat(all_scores).cpu()
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_color_tversky = S
@@ -2244,7 +2261,7 @@ def _align_batch_vol_atomtype(
     scores_cpu = torch.cat(all_scores).cpu()
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_atomtype = S
@@ -2350,7 +2367,7 @@ def _align_batch_vol_pharm(
     scores_cpu = torch.cat(all_scores).cpu()
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_pharm = S
@@ -2512,7 +2529,7 @@ def _align_batch_vol_and_surf_esp_tversky(
     scores_cpu = torch.cat(all_scores).cpu()
     q_cpu = torch.cat(all_q).cpu()
     t_cpu = torch.cat(all_t).cpu()
-    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu)
+    SE3_all = quaternions_to_SE3_batch(q_cpu, t_cpu).detach().numpy()
     scores_list = scores_cpu.tolist()
     for p, s, S in zip(all_pairs, scores_list, SE3_all):
         p.transform_vol_and_surf_esp_tversky = S
