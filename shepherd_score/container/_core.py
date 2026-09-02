@@ -293,6 +293,9 @@ class Molecule:
             for _k in ("pharm_types", "pharm_ancs", "pharm_vecs"):
                 state.pop(_k, None)
 
+        # Added after the flat layout; get_pc() reads it.
+        state.setdefault("surface_method", "mesh")
+
         self.__dict__.update(state)
 
     # Interaction-profile accessors (backwards-compatible with the loose
