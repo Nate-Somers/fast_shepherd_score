@@ -5,6 +5,7 @@ from typing import Optional
 from ..alignment import _initialize_se3_params as _legacy_init
 from pathlib import Path
 from contextlib import suppress
+import torch.nn.functional as F
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
