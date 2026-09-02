@@ -308,6 +308,80 @@ class Molecule:
                 )
 
 
+    def __setstate__(self, state):
+        """
+        Restore a pickled Molecule, upgrading any pre-refactor flat layout.
+
+        Several attributes that used to live directly in ``__dict__`` are now
+        either data descriptors over ``_surface`` / ``_pharmacophore``, lazily
+        generated behind a property, or derived in ``__init__``. Data descriptors
+        take precedence over the instance dict and pickle bypasses ``__init__``,
+        so without this hook a Molecule written by an earlier release either
+        raises ``AttributeError`` on read or silently lacks the newer fields.
+
+        Remapped here:
+
+        ==========================  ===================================
+        legacy ``__dict__`` key     restored as
+        ==========================  ===================================
+        surf_pos / surf_esp /       ``_surface`` (:class:`Surface`)
+        probe_radius
+        pharm_types / pharm_ancs /  ``_pharmacophore`` (:class:`Pharmacophore`)
+        pharm_vecs
+        partial_charges             ``_partial_charges`` (now lazy)
+        ==========================  ===================================
+
+        Backfilled when absent: ``_fukui`` (deferred; three gfn2-xTB single
+        points on first read), ``_charge_model``, ``surface_method``, and the two
+        Crippen per-atom fields ``lipophilicity`` / ``molar_refractivity``, which
+        the constructor derives and which are cheap to recompute from ``mol``.
+
+        New-format pickles are untouched: each branch fires only when the modern
+        key is absent, and stale flat duplicates are stripped so the descriptors
+        stay authoritative.
+        """
+        state = dict(state)
+
+        if "_surface" not in state:
+            state["_surface"] = Surface(
+                positions=state.pop("surf_pos", None),
+                esp=state.pop("surf_esp", None),
+                probe_radius=state.pop("probe_radius", 1.2),
+            )
+        else:
+            for _k in ("surf_pos", "surf_esp", "probe_radius"):
+                state.pop(_k, None)
+
+        if "_pharmacophore" not in state:
+            _t = state.pop("pharm_types", None)
+            _a = state.pop("pharm_ancs", None)
+            _v = state.pop("pharm_vecs", None)
+            state["_pharmacophore"] = (
+                None if _t is None and _a is None and _v is None
+                else Pharmacophore(types=_t, positions=_a, vectors=_v)
+            )
+        else:
+            for _k in ("pharm_types", "pharm_ancs", "pharm_vecs"):
+                state.pop(_k, None)
+
+        if "_partial_charges" not in state:
+            state["_partial_charges"] = state.pop("partial_charges", None)
+        else:
+            state.pop("partial_charges", None)
+
+        state.setdefault("_fukui", None)
+        state.setdefault("_charge_model", "xtb")
+        state.setdefault("surface_method", "mesh")
+
+        self.__dict__.update(state)
+
+        # Derived per-atom Crippen fields. Recomputed rather than stored, and
+        # done after the dict update because they read self.mol.
+        if getattr(self, "lipophilicity", None) is None:
+            self.lipophilicity = self.get_lipophilicity_contribs()
+        if getattr(self, "molar_refractivity", None) is None:
+            self.molar_refractivity = self.get_molar_refractivity_contribs()
+
     # Interaction-profile accessors (backwards-compatible with the loose
     # ``surf_pos``/``surf_esp``/``probe_radius`` and ``pharm_*`` attributes)
     @property
