@@ -368,7 +368,27 @@ def batched_seeds_torch(A_batch: torch.Tensor,
 
     quat_order = [None, None]
     for ax in range(2):
-        fit_axes = _masked_principal_axes(fit4, mask_m4)            # (4K,3,3)
+        if ax == 0:
+            # ax=0 ONLY: fit4 is still four IDENTICAL copies of fit_c here (it is first rotated
+            # at the bottom of this loop), so the (4K,Mpad,3) eigensolve computes the same answer
+            # four times per molecule. Solve the K distinct rows and expand.
+            #
+            # BIT-IDENTICAL, verified: torch.equal(_masked_principal_axes(fit4, mask_m4),
+            # _masked_principal_axes(fit_c, mask_m64).unsqueeze(1).repeat(1,4,1,1).reshape(4K,3,3))
+            # over randomized clouds -- max|diff| exactly 0.
+            #
+            # This is float64 work on a GPU that runs fp64 at 1/64 the fp32 rate, and seed
+            # generation measured 2.079 device us/mol -- 49% of fss's entire GPU budget for a vol
+            # screen, more than the optimizer it feeds. At ax=1 the four copies HAVE been rotated
+            # by four different ref sign-flips, so that solve is genuine work and stays.
+            #
+            # fit_c depends only on the library molecule (its own coords and COM), never on the
+            # query, so this same tensor is also precomputable at store-build time.
+            _K = fit_c.shape[0]
+            fit_axes = (_masked_principal_axes(fit_c, mask_m64)
+                        .unsqueeze(1).repeat(1, 4, 1, 1).reshape(4 * _K, 3, 3))
+        else:
+            fit_axes = _masked_principal_axes(fit4, mask_m4)        # (4K,3,3)
         v1 = fit_axes[:, ax]                                        # (4K,3)
         v2 = ref_axes_f[:, ax]                                      # (4K,3)
         cos = torch.clamp((v1 * v2).sum(1, keepdim=True), -1.0, 1.0)
