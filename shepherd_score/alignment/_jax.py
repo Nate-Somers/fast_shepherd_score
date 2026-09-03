@@ -32,6 +32,34 @@ vmap_apply_SE3_transform_jax = jit(vmap(apply_SE3_transform_jax, (None, 0)))
 vmap_get_SE3_transform_jax = jit(vmap(get_SE3_transform_jax, 0))
 
 
+@jit
+def _select_best_result(scores: Array, *result_arrays: Array) -> Tuple[Array, ...]:
+    """
+    Pick out the best-scoring row (by argmax of `scores`) from each array in
+    `result_arrays`, as a single JIT-compiled dispatch.
+
+    This replaces doing `best_idx = jnp.argmax(scores)` followed by several separate
+    eager indexing calls (e.g. `arr.at[best_idx].get()` or `arr[best_idx]`) on CPU,
+    each of which pays a fixed JAX dispatch overhead independent of array size. Fusing
+    them into one jitted call turns several dispatches into one.
+
+    Parameters
+    ----------
+    scores : Array (num_repeats,)
+        Scores used to select the best row via argmax.
+    *result_arrays : Array
+        One or more arrays, each with a leading `num_repeats` dimension, to index at
+        the best-scoring row.
+
+    Returns
+    -------
+    Tuple[Array, ...]
+        The best-scoring row from each of `result_arrays`, in the same order.
+    """
+    best_idx = jnp.argmax(scores)
+    return tuple(arr[best_idx] for arr in result_arrays)
+
+
 def apply_SO3_transform_jax(vectors: Array, se3_matrix: Array) -> Array:
     """
     Apply SO(3) transformation (rotation) to a set of vectors.
@@ -703,10 +731,7 @@ def optimize_ROCS_esp_overlay_jax_mask(ref_points: Array,
     if verbose:
         print(f'Optimized score max: {scores.max():.3f} | mean: {scores.mean():.3f}')
 
-    best_idx = jnp.argmax(scores)
-    return (aligned_points.at[best_idx].get(),
-            SE3_transform.at[best_idx].get(),
-            scores.at[best_idx].get())
+    return _select_best_result(scores, aligned_points, SE3_transform, scores)
 
 
 def _score_ROCS_overlay_with_avoid_precomputed_jax(ref_points, fit_points, alpha,
@@ -937,10 +962,7 @@ def optimize_ROCS_overlay_jax(ref_points: Array,
     if verbose:
          print(f'Optimized score max: {scores.max():.3f} | mean: {scores.mean():.3f}')
 
-    best_idx = jnp.argmax(scores)
-    return (aligned_points.at[best_idx].get(),
-            SE3_transform.at[best_idx].get(),
-            scores.at[best_idx].get())
+    return _select_best_result(scores, aligned_points, SE3_transform, scores)
 
 
 def optimize_ROCS_overlay_jax_mask(ref_points: Array,
@@ -1028,10 +1050,7 @@ def optimize_ROCS_overlay_jax_mask(ref_points: Array,
     if verbose:
         print(f'Optimized score max: {scores.max():.3f} | mean: {scores.mean():.3f}')
 
-    best_idx = jnp.argmax(scores)
-    return (aligned_points.at[best_idx].get(),
-            SE3_transform.at[best_idx].get(),
-            scores.at[best_idx].get())
+    return _select_best_result(scores, aligned_points, SE3_transform, scores)
 
 
 def _per_pair_optimize_vol_mask_scan(
@@ -1498,10 +1517,7 @@ def optimize_ROCS_esp_overlay_jax(ref_points: Array,
     aligned_points = vmap_apply_SE3_transform_jax(fit_points, SE3_transform)
     scores = vmap_get_overlap_esp_jax(ref_points, aligned_points, ref_charges, fit_charges, alpha, lam)
 
-    best_idx = jnp.argmax(scores)
-    return (aligned_points.at[best_idx].get(),
-            SE3_transform.at[best_idx].get(),
-            scores.at[best_idx].get())
+    return _select_best_result(scores, aligned_points, SE3_transform, scores)
 
 
 def _objective_esp_combo_score_overlay_jax(se3_params,
@@ -1790,14 +1806,10 @@ def optimize_esp_combo_score_overlay_jax(ref_centers_w_H: Union[Array, np.ndarra
         alpha, lam, probe_radius, esp_weight
     )
 
-    best_idx = jnp.argmax(scores)
-
     if verbose:
          print(f'Optimized ShaEP inspired similarity score -- max: {scores.max():.3f} | mean: {scores.mean():.3f}')
 
-    return (aligned_points.at[best_idx].get(),
-            SE3_transform.at[best_idx].get(),
-            scores.at[best_idx].get())
+    return _select_best_result(scores, aligned_points, SE3_transform, scores)
 
 
 def _objective_pharm_overlay_jax(se3_params: Array,
