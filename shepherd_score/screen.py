@@ -1078,6 +1078,63 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
     raise ValueError(mode)
 
 
+def _use_arrays(mode: str) -> bool:
+    """Whether to take the array-native screen path. ``vol`` only for now, opt-in.
+
+    Round 1 established that a PARTIAL removal of the object model is worth exactly zero, so
+    this is deliberately all-or-nothing per mode rather than a gradual migration."""
+    from shepherd_score.accel.batch import _arrays
+    return mode == "vol" and _arrays.ENABLED
+
+
+def _build_fit_arrays_vol(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol``.
+
+    Returns ``(ids, fit_flat, fit_off)`` -- the store's ALREADY-contiguous coordinate buffer
+    uploaded once, plus its CSR offsets. No ``_FastPair``, no ``torch.split``, no K-iteration
+    anything: the object path manufactured K objects and K views out of data that was already
+    array-native, then ``cat``ed them back together downstream."""
+    import torch
+    return (arrs["ids"],
+            torch.as_tensor(arrs["atom_pos"], dtype=torch.float32, device=device),
+            torch.as_tensor(arrs["atom_off"], dtype=torch.long, device=device))
+
+
+def _align_fast_arrays(ref_xyz, fit_flat, fit_off, mode: str, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast`. Returns ``(scores, SE3)`` in shard order."""
+    from shepherd_score.accel.batch._arrays import align_batch_vol_arrays
+    return align_batch_vol_arrays(ref_xyz, fit_flat, fit_off,
+                                  alpha=batch_kw.get("alpha", 0.81),
+                                  steps_fine=batch_kw["steps_fine"])
+
+
+def _accumulate_arrays(heap, ids, scores, transforms, scores_out, qi, start):
+    """Array-native twin of :func:`_accumulate`.
+
+    Character-for-character the same reduce -- same block size, same ``threshold()``
+    pre-filter, same ascending-index offer order, same ``scores_out`` slice -- except the
+    survivor's transform is read from row ``i`` of the (K,4,4) array rather than from a pair
+    object. The exactness argument in :func:`_accumulate` carries over unchanged, because it
+    rests on ``threshold()`` monotonicity and on a rejected offer mutating nothing, neither of
+    which depends on where the transform came from."""
+    n = len(ids)
+    lo = 0
+    while lo < n:
+        hi = lo + _ACCUM_BLOCK
+        if hi > n:
+            hi = n
+        thr = heap.threshold()
+        if thr == float("-inf"):
+            cand = range(lo, hi)
+        else:
+            cand = (np.flatnonzero(scores[lo:hi] > thr) + lo).tolist()
+        for i in cand:
+            heap.offer_row(float(scores[i]), _id_to_py(ids[i]), transforms, i)
+        lo = hi
+    if scores_out is not None and scores_out[qi] is not None:
+        scores_out[qi][start:start + n] = scores
+
+
 def _align_fast(pairs, ref_tensors: dict, mode: str, batch_kw: dict):
     """Set the shared query ref tensors on the resident fit-pairs and run the batched
     aligner; return the per-pair scores (np). Transforms are NOT built here -- they are
@@ -1121,6 +1178,16 @@ class _TopK:
         still holds this query's pose (before the next query/shard re-aligns it)."""
         if len(self.heap) < self.k or score > self.heap[0][0]:
             self._push(score, id_, _transform_of(pair, tf_attr))
+
+    def offer_row(self, score, id_, transforms, i):
+        """Array-native twin of :meth:`offer_pair`: the transform comes from row ``i`` of a
+        (K,4,4) array instead of an attribute on a pair object.
+
+        Identical acceptance test, identical push, identical ``_c`` tie-break advance -- the
+        ONLY difference is where the transform is read from, so the heap state after a shard is
+        the same as the object path's down to ties."""
+        if len(self.heap) < self.k or score > self.heap[0][0]:
+            self._push(score, id_, transforms[i])
 
     def threshold(self):
         """Score a candidate must **strictly exceed** to change this heap at all, or
@@ -1241,12 +1308,23 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
             if fast:
                 # ``ids`` stays the raw store array: _accumulate applies ``_id_to_py`` to
                 # top-K survivors only, instead of converting every library molecule here.
-                ids, pairs = _build_fit_fast_pairs(arrs, mode, device)
                 start = sh["start"]
-                for qi, ra in enumerate(qs_ref):
-                    ref = _ref_tensors_from_arrays(ra, mode, device)
-                    scores = _align_fast(pairs, ref, mode, batch_kw)
-                    _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
+                if _use_arrays(mode):
+                    # ARRAY-NATIVE PATH (FSS_SCREEN_ARRAYS=1): no per-molecule Python objects
+                    # anywhere between the store and the heap. See accel/batch/_arrays.py.
+                    ids, fit_flat, fit_off = _build_fit_arrays_vol(arrs, device)
+                    for qi, ra in enumerate(qs_ref):
+                        ref_xyz = _ref_tensors_from_arrays(ra, mode, device)["_ref_xyz_t"]
+                        scores, se3 = _align_fast_arrays(ref_xyz, fit_flat, fit_off,
+                                                         mode, batch_kw)
+                        _accumulate_arrays(heaps[qi], ids, scores, se3,
+                                           scores_out, qi, start)
+                else:
+                    ids, pairs = _build_fit_fast_pairs(arrs, mode, device)
+                    for qi, ra in enumerate(qs_ref):
+                        ref = _ref_tensors_from_arrays(ra, mode, device)
+                        scores = _align_fast(pairs, ref, mode, batch_kw)
+                        _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
             else:
                 profiles = store._reconstruct(arrs, sh)   # == store.read_profiles(idx)
                 if center_profiles:
@@ -1520,6 +1598,14 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
             if idx is None:
                 break
             _sh, arrs = store.read_shard(idx)
+            if _use_arrays(mode):
+                ids, fit_flat, fit_off = _build_fit_arrays_vol(arrs, dev)
+                for qi, ref in enumerate(ref_tensors):
+                    scores, se3 = _align_fast_arrays(ref["_ref_xyz_t"], fit_flat, fit_off,
+                                                     mode, batch_kw)
+                    _accumulate_arrays(heaps[qi], ids, scores, se3, None, qi, 0)
+                torch.cuda.synchronize()
+                continue
             ids, pairs = _build_fit_fast_pairs(arrs, mode, dev)
             for qi, ref in enumerate(ref_tensors):
                 scores = _align_fast(pairs, ref, mode, batch_kw)
