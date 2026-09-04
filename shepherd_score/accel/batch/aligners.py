@@ -179,7 +179,13 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
         # tensor (the fast screen path sets one query ref on all pairs), the ref
         # self-overlap is identical for every row -- compute it once and broadcast
         # (bit-identical to the per-row kernel, but K-1 fewer self-overlaps).
-        if K > 1 and all(p._ref_xyz_t is bucket[0]._ref_xyz_t for p in bucket):
+        # Hoisted so the SAME guarantee feeds the self-overlap and the seed generator. Keyed on
+        # the tensor actually handed to both (``_ref_xyz_t`` fills ``ref_pad`` just above), by
+        # OBJECT IDENTITY: _scatter_fill is a pure copy, so one shared source object provably
+        # yields bitwise-identical rows, and MoleculePair builds a fresh ref tensor per pair, so
+        # this is false on the pairwise path by construction.
+        _ref_shared = K > 1 and all(p._ref_xyz_t is bucket[0]._ref_xyz_t for p in bucket)
+        if _ref_shared:
             VAA = _self_overlap_in_chunks(ref_pad[:1], N_real[:1], alpha).expand(K).contiguous()
         else:
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
@@ -187,7 +193,9 @@ def _align_batch_vol(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps_
 
         # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
         # memory-pressured chunking never re-pays the launch-bound seed-gen.
-        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds_for("vol"))
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
+                                               num_seeds=_seeds_for("vol"),
+                                               ref_shared=_ref_shared)
 
         # ---- coarse + fine alignment, in GPU-memory-safe sub-batches -------
         def _proc(_s, _k):
@@ -326,7 +334,10 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
         # ---- self-overlaps on surface point clouds ----------------------------
         # Screen query-reuse: a shared ref surface -> identical self-overlap per row;
         # compute once and broadcast (bit-identical). See _align_batch_vol.
-        if K > 1 and all(p._ref_surf_t is bucket[0]._ref_surf_t for p in bucket):
+        # Keyed on the SURFACE cloud, which is what fills ref_pad here and what the seeder
+        # eigensolves for this mode -- not on _ref_xyz_t. See _align_batch_vol.
+        _ref_shared = K > 1 and all(p._ref_surf_t is bucket[0]._ref_surf_t for p in bucket)
+        if _ref_shared:
             VAA = _self_overlap_in_chunks(ref_pad[:1], N_real[:1], alpha).expand(K).contiguous()
         else:
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
@@ -334,7 +345,9 @@ def _align_batch_surf(pairs: list["MoleculePair"], *, alpha: float = 0.81, steps
 
         # ---- seeds ONCE per band (hoisted out of the sub-batch loop) so
         # memory-pressured chunking never re-pays the launch-bound seed-gen.
-        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds_for("surf"))
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
+                                               num_seeds=_seeds_for("surf"),
+                                               ref_shared=_ref_shared)
 
         # ---- coarse + fine alignment (same engine as volumetric), processed in
         # GPU-memory-safe sub-batches sized per bucket (pairs are independent)
@@ -1234,13 +1247,16 @@ def _align_batch_vol_tversky(pairs: list["MoleculePair"], *, alpha: float = 0.81
         _scatter_fill(fit_pad, fit_ts, m_list)
 
         # Self-overlaps (reused shape kernel). AA/BB are pose-invariant Tversky inputs.
-        if K > 1 and all(p._ref_xyz_t is bucket[0]._ref_xyz_t for p in bucket):
+        # Same cloud as _align_batch_vol (_ref_xyz_t), so the two modes stay in step.
+        _ref_shared = K > 1 and all(p._ref_xyz_t is bucket[0]._ref_xyz_t for p in bucket)
+        if _ref_shared:
             VAA = _self_overlap_in_chunks(ref_pad[:1], N_real[:1], alpha).expand(K).contiguous()
         else:
             VAA = _self_overlap_in_chunks(ref_pad, N_real, alpha)
         VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
 
-        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real, num_seeds=_seeds)
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
+                                               num_seeds=_seeds, ref_shared=_ref_shared)
 
         def _proc(_s, _k):
             sl = slice(_s, _s + _k)

@@ -2,6 +2,7 @@
 # Common utilities shared across fast GPU-accelerated alignment methods.
 
 import math
+import os
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
@@ -282,7 +283,9 @@ def batched_seeds_torch(A_batch: torch.Tensor,
                         B_batch: torch.Tensor,
                         N_real: torch.Tensor,
                         M_real: torch.Tensor,
-                        num_seeds: int = 50) -> Tuple[torch.Tensor, torch.Tensor]:
+                        num_seeds: int = 50,
+                        *,
+                        ref_shared: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     """GPU-native, fully batched replacement for the per-pair seed loop.
 
     Seed set: identity + 4 principal-component-alignment quaternions + up to 6
@@ -311,6 +314,33 @@ def batched_seeds_torch(A_batch: torch.Tensor,
     A_batch, B_batch : (K, Npad, 3) / (K, Mpad, 3)  padded coordinates
     N_real, M_real   : (K,)  true point counts
     num_seeds        : int   number of base seeds per pair (default 50)
+    ref_shared       : bool  CALLER GUARANTEE that every row of ``A_batch`` (and of ``N_real``)
+        is identical -- a screen broadcasting ONE query across the bucket. The reference
+        principal axes are then solved on row 0 and expanded instead of being solved K times.
+        Default False, which is byte-identical to the pre-existing code path.
+
+        On CUDA this is NOT bit-identical to the K-row solve: ``_masked_principal_axes``
+        reduces over the batch dimension via ``torch.bmm``, whose accumulation order depends on
+        the batch size, so one row and K identical rows agree only to rounding. Measured on an
+        L40S over a 100,000-molecule ``vol`` screen: 8 scores of 100,000 moved, max |delta|
+        4.17e-07. The saving was 0.072 us/mol of a 2.55 us/mol screen.
+
+        On CPU it IS bitwise exact (measured 0.0 over a full screen and over K = 8..257 in
+        ``tests/test_seed_dedup.py``), so the batch-size sensitivity is a cuBLAS property, not
+        an arithmetic one, and the numba backend is unaffected.
+
+        Callers must establish the guarantee by OBJECT IDENTITY of the tensor they actually
+        pass here (``a is b``), not by value and not by mode. ``_scatter_fill`` is a pure copy,
+        so one shared source object provably yields bitwise-identical rows. A value-based check
+        would be self-validating but would force a host sync HERE, stalling the async prologue;
+        the identity check is free host-side. (Note the function already syncs once, at the
+        ``bool(valid.all())`` degenerate-pair guard near the end -- that is not a licence to add
+        an EARLIER one.)
+
+        Set ``FSS_SEED_REF_DEDUP=verify`` to make every firing also run the full K-row solve and
+        raise if the two disagree beyond ``FSS_SEED_REF_DEDUP_TOL`` (default 1e-6). That is the
+        only check that tests the CALLER'S PREDICATE rather than this function's handling of the
+        flag; a wrongly-broadcast reference shows up as O(1) axis disagreement, not rounding.
 
     Returns
     -------
@@ -349,12 +379,37 @@ def batched_seeds_torch(A_batch: torch.Tensor,
     # ---- 4 principal-component-alignment quaternions per pair ----
     # PCA runs in float64 for near-degenerate stability.
     _wd = torch.float64
-    A64 = torch.nan_to_num(A_batch.to(_wd))
+    # ---- reference axes: solved ONCE when the caller guarantees a shared query ----
+    # In a screen every row of A_batch is the same broadcast query, so the K-row eigensolve
+    # returns K copies of one answer. A_batch/mask_n reach the eigensolve at exactly this one
+    # site (A64 and mask_n64 have no other consumer), so slicing to row 0 here is complete and
+    # nothing downstream sees a shape change -- ref_axes is expanded back to (K,3,3) below.
+    _dedup = bool(ref_shared) and K > 1
+    A64 = torch.nan_to_num((A_batch[:1] if _dedup else A_batch).to(_wd))
     B64 = torch.nan_to_num(B_batch.to(_wd))
-    mask_n64 = mask_n.to(_wd)
+    mask_n64 = (mask_n[:1] if _dedup else mask_n).to(_wd)
     mask_m64 = mask_m.to(_wd)
 
-    ref_axes = _masked_principal_axes(A64, mask_n64)                 # (K,3,3)
+    ref_axes = _masked_principal_axes(A64, mask_n64)                 # (1,3,3) if _dedup else (K,3,3)
+    if _dedup:
+        if os.environ.get("FSS_SEED_REF_DEDUP") == "verify":
+            # Tests the CALLER'S guarantee, which no unit test can reach: the identity
+            # predicate lives in the aligners and MoleculePair builds a fresh ref tensor per
+            # pair, so a wrong predicate is only observable on a real screen. A legitimate
+            # firing differs from the full solve by rounding; a wrongly-broadcast reference
+            # differs by O(1).
+            _full = _masked_principal_axes(torch.nan_to_num(A_batch.to(_wd)), mask_n.to(_wd))
+            _tol = float(os.environ.get("FSS_SEED_REF_DEDUP_TOL", "1e-6"))
+            _dev = float((_full - ref_axes.expand(K, 3, 3)).abs().max())
+            if _dev > _tol:
+                raise RuntimeError(
+                    f"batched_seeds_torch(ref_shared=True): reference rows are NOT identical -- "
+                    f"row-0 axes disagree with the full {K}-row solve by {_dev:.6e} > {_tol:.1e}. "
+                    f"The caller's identity predicate is wrong. Unset FSS_SEED_REF_DEDUP to "
+                    f"silence this check; fix the caller to actually silence the bug.")
+        # .contiguous(): ref_axes is later re-dtyped and .view()ed for the structured seeds,
+        # and a stride-0 expanded tensor cannot serve a view. K*9 elements, so this is free.
+        ref_axes = ref_axes.expand(K, 3, 3).contiguous()             # (K,3,3)
     ref_axes4 = ref_axes.unsqueeze(1).repeat(1, 4, 1, 1)            # (K,4,3,3)
     ref_axes4[:, 1, 0] = -ref_axes4[:, 1, 0]                         # flip longest
     ref_axes4[:, 2, 1] = -ref_axes4[:, 2, 1]                         # flip 2nd-longest

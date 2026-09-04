@@ -194,8 +194,11 @@ def align_batch_vol_arrays(ref_xyz: torch.Tensor, fit_flat: torch.Tensor,
         VAA = _self_overlap_in_chunks(ref_pad[:1], N_real[:1], alpha).expand(k).contiguous()
         VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
 
+        # ref_shared is STRUCTURAL here, not a property of the data: ref_pad is built by
+        # broadcasting the single query cloud into all k rows a few lines above, exactly as the
+        # VAA call already assumes. No identity predicate is needed or possible.
         seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
-                                               num_seeds=n_seeds)
+                                               num_seeds=n_seeds, ref_shared=True)
 
         def _proc(_s, _k, _rp=ref_pad, _fp=fit_pad, _va=VAA, _vb=VBB,
                   _nr=N_real, _mr=M_real, _sq=seeds_q, _st=seeds_t):
