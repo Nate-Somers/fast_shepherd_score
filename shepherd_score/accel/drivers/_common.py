@@ -319,15 +319,23 @@ def batched_seeds_torch(A_batch: torch.Tensor,
         principal axes are then solved on row 0 and expanded instead of being solved K times.
         Default False, which is byte-identical to the pre-existing code path.
 
-        On CUDA this is NOT bit-identical to the K-row solve: ``_masked_principal_axes``
-        reduces over the batch dimension via ``torch.bmm``, whose accumulation order depends on
-        the batch size, so one row and K identical rows agree only to rounding. Measured on an
-        L40S over a 100,000-molecule ``vol`` screen: 8 scores of 100,000 moved, max |delta|
-        4.17e-07. The saving was 0.072 us/mol of a 2.55 us/mol screen.
+        On CUDA this is NOT bit-identical to the K-row solve. MEASURED on an L40S over a
+        100,000-molecule ``vol`` screen, twice, identically: 8 scores of 100,000 move, max
+        |delta| 4.1723e-07 (0.00006% of a score), top-1000 unchanged in membership AND
+        bit-identical in value. Throughput 2.542 -> 2.462 us/mol.
 
-        On CPU it IS bitwise exact (measured 0.0 over a full screen and over K = 8..257 in
-        ``tests/test_seed_dedup.py``), so the batch-size sensitivity is a cuBLAS property, not
-        an arithmetic one, and the numba backend is unaffected.
+        On CPU it IS bitwise exact -- 0.0 over a full screen and over K = 8..257 in
+        ``tests/test_seed_dedup.py`` -- so the numba backend and the CPU figure panels are
+        untouched.
+
+        THE MECHANISM IS NOT ESTABLISHED. Do not repeat the plausible story. A dedicated probe
+        (results/batchdep.json, job 21977539) recomputed every intermediate of
+        ``_masked_principal_axes`` on a real molecule row at K = 1 vs 300 / 3050 / 12200 /
+        96650 and found EVERY stage bitwise identical, and a second probe found all K output
+        rows equal to each other and to the K=1 solve at P = 32 and 40. So neither "batch size
+        changes the reduction order" nor "row position changes it" reproduces in isolation:
+        the effect is specific to some reference clouds and has not been isolated. What is
+        established is the magnitude, its reproducibility, and its absence on CPU.
 
         Callers must establish the guarantee by OBJECT IDENTITY of the tensor they actually
         pass here (``a is b``), not by value and not by mode. ``_scatter_fill`` is a pure copy,
