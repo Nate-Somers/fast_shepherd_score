@@ -11,14 +11,7 @@ from importlib.metadata import distributions
 
 import numpy as np
 import pandas as pd
-from rdkit import Chem
-
-if any(d.metadata["Name"] == 'rdkit' for d in distributions()):
-    from rdkit.Contrib.SA_Score import sascorer # type: ignore
-else:
-    sys.path.append(os.path.join(os.environ['CONDA_PREFIX'],'share','RDKit','Contrib'))
-    from SA_Score import sascorer # type: ignore
-
+from rdkit import Chem, RDConfig
 from rdkit.Chem import QED, Crippen, Lipinski, rdFingerprintGenerator
 from rdkit.Chem.rdMolAlign import GetBestRMS, AlignMol
 
@@ -33,6 +26,14 @@ from shepherd_score.container import Molecule, MoleculePair
 from shepherd_score.score.gaussian_overlap_np import get_overlap_np
 from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
 from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
+
+# necessary to handle conda-installed RDKit
+sa_path = os.path.join(RDConfig.RDContribDir, "SA_Score")
+if sa_path not in sys.path:
+    sys.path.append(sa_path)
+
+import sascorer # noqa: E402  # pyright: ignore[reportMissingImports]
+
 
 RNG = np.random.default_rng()
 morgan_fp_gen = rdFingerprintGenerator.GetMorganGenerator(radius=3, includeChirality=True)
