@@ -132,7 +132,7 @@ def gather_fill(out: torch.Tensor, src: torch.Tensor,
 
 def align_batch_vol_arrays(ref_xyz: torch.Tensor, fit_flat: torch.Tensor,
                            fit_off: torch.Tensor, *, alpha: float = 0.81,
-                           steps_fine: int = 100):
+                           steps_fine: int = 100, const_seeds=None):
     """Array-native equivalent of ``_align_batch_vol`` for the screen path.
 
     Parameters
@@ -197,8 +197,16 @@ def align_batch_vol_arrays(ref_xyz: torch.Tensor, fit_flat: torch.Tensor,
         # ref_shared is STRUCTURAL here, not a property of the data: ref_pad is built by
         # broadcasting the single query cloud into all k rows a few lines above, exactly as the
         # VAA call already assumes. No identity predicate is needed or possible.
-        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
-                                               num_seeds=n_seeds, ref_shared=True)
+        if const_seeds is not None:
+            # CANONICAL store: every molecule is already in its principal frame, so the seeds are
+            # one constant set broadcast over the bucket. This is the 44.1% of a vol screen that
+            # batched_seeds_torch was spending on a per-molecule float64 eigensolve.
+            # (k, S, 4) -- coarse_fine_align_many reads S from quats.size(1) and slices by PAIR
+            seeds_q = const_seeds.unsqueeze(0).expand(k, -1, -1).contiguous()
+            seeds_t = torch.zeros(k, n_seeds, 3, device=device, dtype=torch.float32)
+        else:
+            seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
+                                                   num_seeds=n_seeds, ref_shared=True)
 
         def _proc(_s, _k, _rp=ref_pad, _fp=fit_pad, _va=VAA, _vb=VBB,
                   _nr=N_real, _mr=M_real, _sq=seeds_q, _st=seeds_t):

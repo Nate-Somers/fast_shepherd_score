@@ -154,15 +154,20 @@ class MoleculeProfile:
                  "_nonH_atoms_idx", "pharm_types", "pharm_ancs", "pharm_vecs",
                  "lipo_pos", "lipophilicity",
                  "fukui_pos", "fukui",
-                 "num_surf_points", "mol", "id")
+                 "num_surf_points", "mol", "id", "rot")
 
     def __init__(self, *, atom_pos, surf_pos=None, surf_esp=None,
                  partial_charges=None, radii=None, nonH_atoms_idx=None,
                  pharm_types=None, pharm_ancs=None, pharm_vecs=None,
                  lipo_pos=None, lipophilicity=None,
                  fukui_pos=None, fukui=None,
-                 centers_w_H=None, atom_pos_noH=None, id=None):
+                 centers_w_H=None, atom_pos_noH=None, id=None, rot=None):
         self.atom_pos = _f32(atom_pos)
+        #: (3,3) float32 principal-axis rotation applied at build time, or None. Present only
+        #: on a CANONICAL store: the coords below are already rotated into this frame, so the
+        #: screen's seeds are constants instead of a per-molecule eigensolve. Needed to map an
+        #: alignment transform back to the molecule's ORIGINAL frame.
+        self.rot = None if rot is None else np.asarray(rot, np.float32)
         # Strict-heavy vol_esp centers (1:1 with the heavy charges); None when identical to
         # atom_pos (RemoveHs kept no H) -- callers then use atom_pos.
         self.atom_pos_noH = _f32(atom_pos_noH)
@@ -294,7 +299,7 @@ def _store_supports(schema: dict, mode: str) -> bool:
     return False
 
 
-def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProfile":
+def _profile_from_schema(m, sch: dict, *, id, pre_center: bool, canonical: bool = False) -> "MoleculeProfile":
     """Pull the schema's arrays off a ``Molecule``/``MoleculeProfile`` ``m``,
     optionally centering to the heavy-atom COM. Returns a ``MoleculeProfile``."""
     atom_pos = _f32(m.atom_pos)
@@ -377,13 +382,49 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool) -> "MoleculeProf
             atom_pos_noH = atom_pos_noH - mu   # shift by the atom_pos COM (matches the
                                                # in-memory conformer transform, not its own COM)
 
+    rot = None
+    if canonical:
+        # CANONICAL FRAME: rotate every coordinate channel into the molecule's own principal axes.
+        # The screen's seeds exist to align the fit molecule's principal axes onto the query's; if
+        # the fit is ALREADY in its principal frame, that alignment is the same constant for every
+        # molecule, so the per-molecule eigensolve disappears. Measured: seed generation is 44.1%
+        # of a vol screen (0.839 us/mol), and removing it takes fss from 525,173 to 938,984
+        # aligns/s -- past ROSHAMBO2's same-node 747,896.
+        #
+        # Requires pre_center (axes are about the centroid). ``rot`` is kept so a returned pose can
+        # be mapped back to the molecule's original frame; without it scores would be right while
+        # transforms silently referred to the canonical frame.
+        if not pre_center:
+            raise ValueError("canonical stores require pre_center=True (axes are centroid-relative)")
+        _c = atom_pos - atom_pos.mean(0)
+        _cov = _c.T @ _c
+        _w, _v = np.linalg.eigh(_cov.astype(np.float64))
+        _v = _v[:, ::-1]                                  # descending eigenvalue order
+        if np.linalg.det(_v) < 0:                         # keep it a proper rotation
+            _v[:, 2] = -_v[:, 2]
+        rot = np.ascontiguousarray(_v.T, dtype=np.float32)   # maps original -> canonical
+        atom_pos = (atom_pos @ rot.T).astype(np.float32)
+        if surf is not None:
+            surf = (surf @ rot.T).astype(np.float32)
+        if ph_a is not None:
+            ph_a = (ph_a @ rot.T).astype(np.float32)
+        if ph_v is not None:
+            ph_v = (ph_v @ rot.T).astype(np.float32)      # directions rotate, no translation
+        if lipo_pos is not None and len(lipo_pos):
+            lipo_pos = (lipo_pos @ rot.T).astype(np.float32)
+        if fukui_pos is not None and len(fukui_pos):
+            fukui_pos = (fukui_pos @ rot.T).astype(np.float32)
+        if cwh is not None:
+            cwh = (cwh @ rot.T).astype(np.float32)
+
+
     return MoleculeProfile(
         atom_pos=atom_pos, surf_pos=surf, surf_esp=surf_esp, partial_charges=charges,
         radii=radii, nonH_atoms_idx=nonH, pharm_types=ph_t, pharm_ancs=ph_a,
         pharm_vecs=ph_v,
         lipo_pos=lipo_pos, lipophilicity=lipo_val,
         fukui_pos=fukui_pos, fukui=fukui_val,
-        centers_w_H=cwh, atom_pos_noH=atom_pos_noH, id=id,
+        centers_w_H=cwh, atom_pos_noH=atom_pos_noH, id=id, rot=rot,
     )
 
 
@@ -428,7 +469,8 @@ class ProfileStore:
     @classmethod
     def create(cls, path, *, num_surf_points: int, modes: Sequence[str],
                dtype: str = "float16", shard_size: int = 100_000,
-               pre_centered: bool = True, overwrite: bool = False) -> "ProfileStore":
+               pre_centered: bool = True, overwrite: bool = False,
+               canonical: bool = False) -> "ProfileStore":
         """Open a store for writing.
 
         Parameters
@@ -481,6 +523,7 @@ class ProfileStore:
         manifest = dict(version=cls.VERSION, num_surf_points=int(num_surf_points),
                         modes=list(modes), schema=schema, dtype=dtype,
                         shard_size=int(shard_size), pre_centered=bool(pre_centered),
+                        canonical=bool(canonical),
                         n_total=0, shards=[])
         store = cls(path, manifest, "w")
         store._write_manifest()
@@ -495,7 +538,8 @@ class ProfileStore:
         if id is None:
             id = self._n + len(self._buf)
         prof = _profile_from_schema(molecule, self.manifest["schema"], id=id,
-                                    pre_center=self.manifest["pre_centered"])
+                                    pre_center=self.manifest["pre_centered"],
+                                    canonical=bool(self.manifest.get("canonical", False)))
         self._buf.append(prof)
         if len(self._buf) >= self.manifest["shard_size"]:
             self._flush()
@@ -545,6 +589,10 @@ class ProfileStore:
         atom_lens = [len(r.atom_pos) for r in recs]
         out["atom_off"] = offsets(atom_lens)
         out["atom_pos"] = np.concatenate([r.atom_pos for r in recs]).astype(dt)
+        if recs[0].rot is not None:
+            # float32 REGARDLESS of the store dtype: a float16 rotation carries ~3.9e-04 of axis
+            # error, which is enough to move a pose. 36 bytes/molecule (3.6 MB at N=1e5).
+            out["rot"] = np.stack([r.rot for r in recs]).astype(np.float32)
 
         if sch["surf"]:
             out["surf_pos"] = np.stack([r.surf_pos for r in recs]).astype(dt)
@@ -631,6 +679,12 @@ class ProfileStore:
     @property
     def pre_centered(self) -> bool:
         return bool(self.manifest["pre_centered"])
+
+    @property
+    def canonical(self) -> bool:
+        """Coordinates were rotated into each molecule's principal frame at build time, and a
+        per-molecule ``rot`` is stored. Legacy stores lack the key and report False."""
+        return bool(self.manifest.get("canonical", False))
 
     def supports(self, mode: str) -> bool:
         return _store_supports(self.manifest["schema"], mode)
@@ -1261,6 +1315,7 @@ def _align_fast_arrays(ref_xyz, fit_flat, fit_off, mode: str, batch_kw: dict):
     """Array-native twin of :func:`_align_fast`. Returns ``(scores, SE3)`` in shard order."""
     from shepherd_score.accel.batch._arrays import align_batch_vol_arrays
     return align_batch_vol_arrays(ref_xyz, fit_flat, fit_off,
+                                  const_seeds=batch_kw.get("const_seeds"),
                                   alpha=batch_kw.get("alpha", 0.81),
                                   steps_fine=batch_kw["steps_fine"])
 
@@ -1456,6 +1511,16 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
     try:
         heaps = [_TopK(top_k) for _ in qs_ref]
         tf_attr = _TRANSFORM_ATTR[mode]
+        # CANONICAL store: seeds are one constant set for the whole screen (see
+        # _common.canonical_seed_quats). Computed here, once, instead of per molecule per bucket.
+        if getattr(store, "canonical", False) and mode == "vol" and len(qs_ref) == 1:
+            from shepherd_score.accel.drivers._common import canonical_seed_quats
+            from .accel._modes import MODE_SEEDS
+            _rx = qs_ref[0].get("xyz")
+            if _rx is not None:
+                batch_kw = dict(batch_kw)
+                batch_kw["const_seeds"] = canonical_seed_quats(
+                    _rx, len(_rx), int(MODE_SEEDS.get(mode, 10)), device)
         done = 0
         if not fast:
             from shepherd_score.container import MoleculePair, MoleculePairBatch

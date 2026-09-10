@@ -619,3 +619,95 @@ def build_coarse_grid(A_batch: torch.Tensor,
     t_grid = t_base[:, None, :, :].expand(-1, n_rot, -1, -1).reshape(BATCH, -1, 3)
 
     return q_grid, t_grid
+
+
+# --------------------------------------------------------------------------------------------
+# Canonical-frame seeds: the same rotations for EVERY library molecule.
+# --------------------------------------------------------------------------------------------
+#: Proper sign-flip combinations of a principal frame. PCA fixes the axes only up to sign, which
+#: is exactly what batched_seeds_torch's "4 principal-component-alignment quaternions" enumerate.
+#: det = +1 for all four, so each is a rotation rather than a reflection.
+_SIGN_FLIPS = (
+    ((1, 1, 1)), ((1, -1, -1)), ((-1, 1, -1)), ((-1, -1, 1)),
+)
+#: +/-90 degree rotations about each canonical axis -- the axis SWAPS that sign flips alone miss.
+#: Same role as the "STRUCTURED seeds" in the per-molecule generator.
+_AXIS_SWAPS = (
+    (0, 90), (0, -90), (1, 90), (1, -90), (2, 90), (2, -90),
+)
+
+
+def canonical_seed_quats(ref_points, n_real, num_seeds: int, device):
+    """Constant seed rotations for a CANONICAL store, returned as ``(num_seeds, 4)``.
+
+    On a canonical store every library molecule is already expressed in its own principal frame,
+    so the rotation that carries a fit molecule's axes onto the query's is the SAME for all of
+    them: ``R_query^T`` composed with a sign-flip / axis-swap. The per-molecule eigensolve that
+    ``batched_seeds_torch`` performs -- measured at 44.1% of a vol screen, 0.839 us/mol -- is
+    therefore redundant, and these seeds cost one 3x3 solve per SCREEN instead of one per
+    molecule.
+
+    Seed ORDER and composition deliberately mirror the per-molecule generator: the four proper
+    sign flips first (its "4 PCA quaternions"), then the +/-90 axis swaps (its "STRUCTURED
+    seeds"), then a Fibonacci fill for any remaining budget. Same coverage, constant cost.
+
+    This is NOT bit-identical to the per-molecule seeds -- the frames differ by each molecule's
+    own rotation -- so scores move and enrichment has to be revalidated.
+    """
+    import numpy as np
+    import torch
+
+    pts = ref_points[:int(n_real)] if n_real is not None else ref_points
+    pts = np.asarray(pts, dtype=np.float64)
+    c = pts - pts.mean(0)
+    w, v = np.linalg.eigh(c.T @ c)
+    v = v[:, ::-1]                                   # descending eigenvalue order
+    if np.linalg.det(v) < 0:
+        v[:, 2] = -v[:, 2]                           # keep it a proper rotation
+    Rq = v.T                                         # query original -> query canonical
+
+    mats = []
+    for sx, sy, sz in _SIGN_FLIPS:
+        mats.append(np.diag([sx, sy, sz]).astype(np.float64))
+    for ax, deg in _AXIS_SWAPS:
+        th = np.deg2rad(deg)
+        ca, sa = np.cos(th), np.sin(th)
+        R = np.eye(3)
+        i, j = [(1, 2), (0, 2), (0, 1)][ax]
+        R[i, i] = ca; R[j, j] = ca
+        R[i, j] = -sa if ax != 1 else sa
+        R[j, i] = sa if ax != 1 else -sa
+        mats.append(R)
+    if len(mats) < num_seeds:                        # Fibonacci fill, same role as the generator
+        k = num_seeds - len(mats)
+        ga = np.pi * (3.0 - np.sqrt(5.0))
+        for t in range(k):
+            z = 1.0 - 2.0 * (t + 0.5) / k
+            r = np.sqrt(max(0.0, 1.0 - z * z))
+            a = ga * t
+            axis = np.array([r * np.cos(a), r * np.sin(a), z])
+            axis /= max(np.linalg.norm(axis), 1e-12)
+            th = np.pi * (t + 1) / (k + 1)
+            K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+            mats.append(np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * (K @ K))
+
+    quats = np.empty((num_seeds, 4), dtype=np.float64)
+    for i, M in enumerate(mats[:num_seeds]):
+        R = Rq.T @ M                                 # canonical fit axes -> query frame
+        tr = np.trace(R)
+        if tr > 0:
+            sq = np.sqrt(tr + 1.0) * 2
+            q = [0.25 * sq, (R[2, 1] - R[1, 2]) / sq, (R[0, 2] - R[2, 0]) / sq,
+                 (R[1, 0] - R[0, 1]) / sq]
+        else:
+            i0 = int(np.argmax(np.diag(R)))
+            i1, i2 = (i0 + 1) % 3, (i0 + 2) % 3
+            sq = np.sqrt(max(1e-12, 1.0 + R[i0, i0] - R[i1, i1] - R[i2, i2])) * 2
+            q = [0.0, 0.0, 0.0, 0.0]
+            q[0] = (R[i2, i1] - R[i1, i2]) / sq
+            q[i0 + 1] = 0.25 * sq
+            q[i1 + 1] = (R[i1, i0] + R[i0, i1]) / sq
+            q[i2 + 1] = (R[i2, i0] + R[i0, i2]) / sq
+        q = np.asarray(q, dtype=np.float64)
+        quats[i] = q / max(np.linalg.norm(q), 1e-12)
+    return torch.as_tensor(quats, dtype=torch.float32, device=device)
