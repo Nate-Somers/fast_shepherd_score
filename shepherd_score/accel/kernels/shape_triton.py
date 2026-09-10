@@ -23,6 +23,12 @@ _OVERLAP_CONFIGS = [
     for _b in (16, 32, 64) for _w in (1, 2, 4) for _s in (1, 2, 3, 4)
 ]
 
+# TESTED AND REVERTED: the 4-warp ceiling above is a single-pose observation, so a wider sweep
+# (num_warps up to 8) was tried for the multi-pose kernel, which does POSES times the work per
+# CTA. It changed NOTHING -- surf reproduced at 1.661/1.661/1.701 and vol was flat within run
+# variance -- while making the autotune sweep 33% larger (gate 5 went 6s -> 48.6s). The
+# autotuner selects the same config either way, so the ceiling was never the constraint.
+
 
 # --- shared SE(3) device functions (inlined at zero cost by @triton.jit) ------------------
 # The quaternion->rotation-matrix build and the overlap-force->quaternion-gradient tail were
