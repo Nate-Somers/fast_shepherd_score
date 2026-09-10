@@ -309,7 +309,11 @@ def _gauss_overlap_se3_multipose(
             pair_mask = mask_n[None, :, None] & mask_m[None, None, :]
             g = tl.where(pair_mask, g, 0.0)
 
-            Vab_acc += tl.sum(tl.sum(g, 2), 1)
+            # Reduce the (n, m) plane in ONE pass over a flattened row, matching the
+            # single-pose kernel's tl.sum(g) over a flat (BLOCK, BLOCK). The two-stage
+            # tl.sum(tl.sum(g,2),1) is a DIFFERENT summation tree, and float addition is not
+            # associative -- that, not the arithmetic, is why multi-pose was not bit-identical.
+            Vab_acc += tl.sum(tl.reshape(g, [POSES_PAD, BLOCK * BLOCK]), 1)
 
             if NEED_GRAD:
                 coeff = (2.0 * half_alpha) * g
