@@ -300,7 +300,9 @@ def coarse_fine_esp_align_many(
     N_k = N_real if _dedup else N_real.repeat_interleave(P)
     M_k = M_real if _dedup else M_real.repeat_interleave(P)
     S_fine = P if _dedup else 1
-    _ppc = int(_shapemod._POSES_PER_CTA)
+    # ESP modes measured NEGATIVE for multi-pose, so they take no per-mode default; only an
+    # explicit FSS_POSES_PER_CTA enables it here.
+    _ppc = int(_shapemod._POSES_PER_CTA or 1)
     P_cta = _ppc if (_dedup and _ppc > 1 and P % _ppc == 0) else 1
     VAA_rep = VAA.repeat_interleave(P)
     VBB_rep = VBB.repeat_interleave(P)

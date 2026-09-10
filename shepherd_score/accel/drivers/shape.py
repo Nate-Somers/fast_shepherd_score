@@ -30,7 +30,17 @@ _DEDUP_SEED_COORDS = os.environ.get("FSS_SEED_COORD_DEDUP", "0") == "1"
 #: the work, amortising the quaternion->rotmat build, the tile loads and the loop overhead. Needs
 #: the deduped layout (implies it below) and SEEDS % POSES == 0. 1 = the original one-CTA-per-pose
 #: kernel, untouched.
-_POSES_PER_CTA = int(os.environ.get("FSS_POSES_PER_CTA", "1"))
+_POSES_PER_CTA = (int(os.environ["FSS_POSES_PER_CTA"])
+                  if os.environ.get("FSS_POSES_PER_CTA") else None)
+
+#: Per-mode default poses-per-CTA, applied when FSS_POSES_PER_CTA is unset. ENABLED ONLY WHERE
+#: MEASURED TO PAY, and it is not free: multi-pose is NOT bit-identical (the 3-D reduction rounds
+#: differently), so this trades score stability for speed.
+#:   surf  POSES=8 -> 1.70x (21,072 -> 35,842 aligns/s), divergence 1.16e-03
+#:   vol   OMITTED: only 1.04-1.07x, for a LARGER 1.60e-02 divergence -- not worth it
+#: surf_esp / vol_esp are on the ESP kernel and measured NEGATIVE (0.92-0.94x), so they are not
+#: here either. Set FSS_POSES_PER_CTA=1 to force the legacy one-CTA-per-pose kernel everywhere.
+_MODE_POSES = {"surf": 8}
 
 
 @torch.no_grad()
@@ -199,7 +209,8 @@ def coarse_fine_align_many(
         early_stop_patience: int = 2,   # vol/surf converge fast; esp/pharm use 5
         early_stop_tol: float = 1e-5,
         seeds: tuple | None = None,
-        prune_after: int = 0, prune_keep: int = 0):
+        prune_after: int = 0, prune_keep: int = 0,
+        mode: str | None = None):
     """
     Vectorised padding-aware alignment over a batch of (A, B) pairs.
 
@@ -257,8 +268,12 @@ def coarse_fine_align_many(
     # ``pid // S``. The expand+reshape below MATERIALISES S copies of every molecule (and
     # :240 then calls .contiguous() again), which is the traffic this avoids. CUDA + fp32 only:
     # the CPU fused path and fp64 keep the replicated layout.
-    _dedup = (_DEDUP_SEED_COORDS and A_batch.is_cuda and A_batch.dtype == torch.float32
-              and S > 1)
+    # An explicit FSS_POSES_PER_CTA wins; otherwise the per-mode default applies. Multi-pose
+    # REQUIRES the deduped layout (the reuse is the shared molecule), so asking for poses turns
+    # dedup on rather than silently falling back to the slow path.
+    _want_poses = _POSES_PER_CTA if _POSES_PER_CTA is not None else _MODE_POSES.get(mode, 1)
+    _dedup = ((_DEDUP_SEED_COORDS or _want_poses > 1) and A_batch.is_cuda
+              and A_batch.dtype == torch.float32 and S > 1)
     if _dedup:
         A_k, B_k = A_batch, B_batch
     else:
@@ -273,8 +288,7 @@ def coarse_fine_align_many(
     S_fine = S if _dedup else 1
     # POSES needs the deduped layout AND must divide the seed count evenly, so that every pose a
     # CTA handles belongs to the same molecule -- that shared molecule is the reuse being bought.
-    P_cta = _POSES_PER_CTA if (_dedup and _POSES_PER_CTA > 1
-                               and S % _POSES_PER_CTA == 0) else 1
+    P_cta = _want_poses if (_dedup and _want_poses > 1 and S % _want_poses == 0) else 1
     VAA_plus_VBB = (VAA + VBB).repeat_interleave(S)        # invariant in loop
     P = q_seed.shape[0]
 
