@@ -34,6 +34,10 @@ from shepherd_score.screen import ProfileStore, screen          # noqa: E402
 
 _BAND = 16          # mirrors accel.batch._pad._BAND; asserted against the real one below
 
+#: the documented library defaults, matching aligners/fss.py::prepare_screen. vol_esp takes
+#: lam RAW (surf_esp scales it x207) and screen() refuses to run vol_esp without it.
+_MODE_KW = {"vol_esp": {"lam": 0.1}}
+
 
 def _require_fast_cuda():
     if not torch.cuda.is_available():
@@ -82,7 +86,7 @@ def molecules():
 @pytest.fixture(scope="module")
 def store_path(tmp_path_factory, molecules):
     p = os.path.join(tmp_path_factory.mktemp("arrays"), "lib.fss")
-    with ProfileStore.create(p, num_surf_points=64, modes=("vol", "vol_color"),
+    with ProfileStore.create(p, num_surf_points=64, modes=("vol", "vol_color", "pharm", "vol_esp"),
                              dtype="float32", pre_centered=True) as store:
         for i, m in enumerate(molecules):
             store.add(m, id=i)
@@ -102,18 +106,14 @@ def _screen_recording(monkeypatch, store_path, query, *, enabled, mode="vol", st
     monkeypatch.setattr(_arrays, "ENABLED", enabled, raising=True)
 
     seen = {"arrays": 0, "objects": 0, "buckets": 0}
-    real_arr = screenmod._build_fit_arrays_vol
-    real_arr_c = screenmod._build_fit_arrays_vol_color
     real_obj = screenmod._build_fit_fast_pairs
     real_spans = _arrays.plan_spans
 
-    def spy_arr(*a, **k):
-        seen["arrays"] += 1
-        return real_arr(*a, **k)
-
-    def spy_arr_c(*a, **k):
-        seen["arrays"] += 1
-        return real_arr_c(*a, **k)
+    def _count_arr(real):
+        def f(*a, **k):
+            seen["arrays"] += 1
+            return real(*a, **k)
+        return f
 
     def spy_obj(*a, **k):
         seen["objects"] += 1
@@ -126,15 +126,22 @@ def _screen_recording(monkeypatch, store_path, query, *, enabled, mode="vol", st
 
     # Both call sites resolve these as module globals (screen.py:1315/1322, _arrays.py:167),
     # so attribute patches genuinely intercept them.
-    monkeypatch.setattr(screenmod, "_build_fit_arrays_vol", spy_arr, raising=True)
-    monkeypatch.setattr(screenmod, "_build_fit_arrays_vol_color", spy_arr_c, raising=True)
+    # EVERY array builder is wrapped, and the _ARRAY_BUILDERS table is re-pointed at the
+    # wrapped versions -- the dispatch reads the table, so patching only the module globals
+    # would leave the table holding unwrapped functions and the spy would count zero.
+    for _name in ("_build_fit_arrays_vol", "_build_fit_arrays_vol_color",
+                  "_build_fit_arrays_pharm", "_build_fit_arrays_vol_esp"):
+        monkeypatch.setattr(screenmod, _name, _count_arr(getattr(screenmod, _name)), raising=True)
+    monkeypatch.setattr(screenmod, "_ARRAY_BUILDERS",
+                        {m: _count_arr(fn) for m, fn in screenmod._ARRAY_BUILDERS.items()},
+                        raising=True)
     monkeypatch.setattr(screenmod, "_build_fit_fast_pairs", spy_obj, raising=True)
     monkeypatch.setattr(_arrays, "plan_spans", spy_spans, raising=True)
 
     n = len(ProfileStore.open(store_path))
     scores = np.full(n, np.nan, dtype=float)
     hits = screen(query, ProfileStore.open(store_path), mode=mode, backend="triton",
-                  top_k=n, max_num_steps=steps, scores_out=scores)
+                  top_k=n, max_num_steps=steps, scores_out=scores, **_MODE_KW.get(mode, {}))
     return scores, hits, seen
 
 
@@ -154,7 +161,7 @@ def test_library_spans_multiple_pad_bands(molecules):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("mode", ["vol", "vol_color"])
+@pytest.mark.parametrize("mode", ["vol", "vol_color", "pharm", "vol_esp"])
 def test_array_path_is_bit_identical_to_object_path(monkeypatch, store_path, molecules, mode):
     """The array path is a re-expression of the object path, so scores must match EXACTLY."""
     _require_fast_cuda()
@@ -185,7 +192,7 @@ def test_array_path_is_bit_identical_to_object_path(monkeypatch, store_path, mol
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("mode", ["vol", "vol_color"])
+@pytest.mark.parametrize("mode", ["vol", "vol_color", "pharm", "vol_esp"])
 def test_array_path_recovers_the_self_copy(monkeypatch, store_path, molecules, mode):
     """Independent anchor: the array path must be a CORRECT screen, not merely a consistent one.
     Two paths agreeing on nonsense would satisfy parity by itself."""
@@ -218,7 +225,7 @@ def test_use_arrays_gates_on_mode_and_reads_enabled_live(monkeypatch):
     monkeypatch.setattr(_arrays, "ENABLED", True, raising=True)
     for mode in screenmod._ARRAY_MODES:
         assert screenmod._use_arrays(mode) is True
-    for mode in ("vol_esp", "surf", "surf_esp", "pharm", "vol_and_surf_esp"):
+    for mode in ("surf", "surf_esp", "vol_and_surf_esp"):
         assert mode not in screenmod._ARRAY_MODES
         assert screenmod._use_arrays(mode) is False, f"{mode} has no array-native aligner"
 

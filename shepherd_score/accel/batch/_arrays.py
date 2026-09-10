@@ -326,3 +326,161 @@ def align_batch_vol_color_arrays(ref_xyz: torch.Tensor, ref_types: torch.Tensor,
 
     SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
     return out_scores, SE3
+
+
+def align_batch_pharm_arrays(ref_types: torch.Tensor, ref_ancs: torch.Tensor,
+                             ref_vecs: torch.Tensor, fit_types_flat: torch.Tensor,
+                             fit_ancs_flat: torch.Tensor, fit_vecs_flat: torch.Tensor,
+                             ph_off: torch.Tensor, *, similarity="tanimoto",
+                             extended_points: bool = False, only_extended: bool = False,
+                             num_repeats=None, topk: int = 30, steps_fine: int = 100,
+                             lr: float = 0.075):
+    """Array-native equivalent of ``_align_batch_pharm`` for the screen path.
+
+    Three channels on ONE offset table: types, anchors and vectors all index by feature, so
+    ``ph_off`` serves all three. ``_align_batch_pharm`` bands on the ANCHOR count, not the atom
+    count, so that is what ``plan_spans`` bands here.
+
+    NOTE the pad value. pharm zero-fills its type slots and relies on ``N_real``/``M_real``
+    masking, where ``vol_color`` fills with ``_PHARM_PAD_TYPE``. Carrying vol_color's choice
+    over would be a silent scoring change, so this mirrors the object path exactly.
+    """
+    from shepherd_score.accel.drivers.pharm import fast_optimize_pharm_overlay_batch
+    from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
+    from ._pad import _subbatched_align
+    from .._modes import MODE_SEEDS
+
+    device = fit_ancs_flat.device
+    n_seeds = int(MODE_SEEDS["pharm"]) if num_repeats is None else int(num_repeats)
+    K = int(ph_off.shape[0]) - 1
+    if K == 0:
+        return np.empty(0, dtype=float), np.empty((0, 4, 4), dtype=np.float32)
+
+    cnt = ph_off[1:] - ph_off[:-1]
+    m_sizes = cnt.detach().cpu().numpy()
+    N = int(ref_ancs.shape[0])
+    order, buckets = plan_spans(m_sizes, N, n_seeds, device)
+    order_t = torch.as_tensor(order, device=device, dtype=torch.long)
+
+    out_scores = np.empty(K, dtype=float)
+    out_q = torch.empty(K, 4, device=device)
+    out_t = torch.empty(K, 3, device=device)
+
+    for bk in buckets:
+        N_pad, M_pad = int(bk.pad["ref"]), int(bk.pad["fit"])
+        k = bk.K
+        rows = order_t[bk.members.lo:bk.members.hi]
+        c = cnt.index_select(0, rows)
+        st = ph_off.index_select(0, rows)
+
+        r_types = torch.zeros(k, N_pad, device=device, dtype=torch.int64)
+        r_types[:, :N] = ref_types
+        f_types = torch.zeros(k, M_pad, device=device, dtype=torch.int64)
+        gather_fill(f_types, fit_types_flat, st, c)
+        r_ancs = torch.zeros(k, N_pad, 3, device=device, dtype=torch.float32)
+        r_ancs[:, :N] = ref_ancs
+        f_ancs = torch.zeros(k, M_pad, 3, device=device, dtype=torch.float32)
+        gather_fill(f_ancs, fit_ancs_flat, st, c)
+        r_vecs = torch.zeros(k, N_pad, 3, device=device, dtype=torch.float32)
+        r_vecs[:, :N] = ref_vecs
+        f_vecs = torch.zeros(k, M_pad, 3, device=device, dtype=torch.float32)
+        gather_fill(f_vecs, fit_vecs_flat, st, c)
+
+        N_real = torch.full((k,), N, dtype=torch.int32, device=device)
+        M_real = c.to(torch.int32)
+
+        def _proc(_s, _k, _rt=r_types, _ft=f_types, _ra=r_ancs, _fa=f_ancs,
+                  _rv=r_vecs, _fv=f_vecs, _nr=N_real, _mr=M_real):
+            sl = slice(_s, _s + _k)
+            _, _, q, t, sc = fast_optimize_pharm_overlay_batch(
+                _rt[sl], _ft[sl], _ra[sl], _fa[sl], _rv[sl], _fv[sl],
+                similarity=similarity, extended_points=extended_points,
+                only_extended=only_extended, num_repeats=n_seeds,
+                trans_centers_batch=None, trans_centers_real=None,
+                num_repeats_per_trans=10, N_real=_nr[sl], M_real=_mr[sl],
+                topk=topk, steps_fine=steps_fine, lr=lr)
+            return sc, q, t
+
+        sc, qb, tb = _subbatched_align(_proc, k, key=("pharm", N_pad, M_pad, n_seeds),
+                                       device=device)
+        out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
+        out_q.index_copy_(0, rows, qb)
+        out_t.index_copy_(0, rows, tb)
+
+    SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
+    return out_scores, SE3
+
+
+def align_batch_vol_esp_arrays(ref_pts: torch.Tensor, ref_chg: torch.Tensor,
+                               fit_pts_flat: torch.Tensor, fit_chg_flat: torch.Tensor,
+                               off: torch.Tensor, *, alpha: float = 0.81, lam: float,
+                               num_repeats_per_trans: int = 10, topk: int = 30,
+                               steps_fine: int = 100, lr: float = 0.075):
+    """Array-native equivalent of ``_esp_bucketed_align`` (``vol_esp``) for the screen path.
+
+    Two channels on one offset table: strict-heavy centers and the heavy partial charges that
+    are 1:1 with them. vol_esp reaches the shared ``_esp_bucketed_align``, whose PadSpec is the
+    same simple ref/fit pair that ``vol`` uses, so ``plan_spans`` applies directly.
+
+    ``lam`` is REQUIRED and passed RAW, matching the per-pair vol_esp path: vol_esp takes the
+    raw value where surf_esp scales it internally, and the two are not interchangeable.
+    """
+    from shepherd_score.accel.drivers.esp import fast_optimize_ROCS_esp_overlay_batch
+    from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
+    from ._pad import _subbatched_align
+    from .._modes import MODE_SEEDS
+
+    device = fit_pts_flat.device
+    n_seeds = int(MODE_SEEDS["vol_esp"])
+    K = int(off.shape[0]) - 1
+    if K == 0:
+        return np.empty(0, dtype=float), np.empty((0, 4, 4), dtype=np.float32)
+
+    cnt = off[1:] - off[:-1]
+    m_sizes = cnt.detach().cpu().numpy()
+    N = int(ref_pts.shape[0])
+    order, buckets = plan_spans(m_sizes, N, n_seeds, device)
+    order_t = torch.as_tensor(order, device=device, dtype=torch.long)
+
+    out_scores = np.empty(K, dtype=float)
+    out_q = torch.empty(K, 4, device=device)
+    out_t = torch.empty(K, 3, device=device)
+
+    for bk in buckets:
+        N_pad, M_pad = int(bk.pad["ref"]), int(bk.pad["fit"])
+        k = bk.K
+        rows = order_t[bk.members.lo:bk.members.hi]
+        c = cnt.index_select(0, rows)
+        st = off.index_select(0, rows)
+
+        ref_pad = torch.zeros(k, N_pad, 3, device=device, dtype=torch.float32)
+        ref_pad[:, :N] = ref_pts
+        fit_pad = torch.zeros(k, M_pad, 3, device=device, dtype=torch.float32)
+        gather_fill(fit_pad, fit_pts_flat, st, c)
+        ref_c = torch.zeros(k, N_pad, device=device, dtype=torch.float32)
+        ref_c[:, :N] = ref_chg
+        fit_c = torch.zeros(k, M_pad, device=device, dtype=torch.float32)
+        gather_fill(fit_c, fit_chg_flat, st, c)
+
+        N_real = torch.full((k,), N, dtype=torch.int32, device=device)
+        M_real = c.to(torch.int32)
+
+        def _proc(_s, _k, _rp=ref_pad, _fp=fit_pad, _rc=ref_c, _fc=fit_c,
+                  _nr=N_real, _mr=M_real):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_ROCS_esp_overlay_batch(
+                _rp[sl], _fp[sl], _rc[sl], _fc[sl], alpha=alpha, lam=lam,
+                N_real=_nr[sl], M_real=_mr[sl],
+                trans_centers_batch=None, trans_centers_real=None,
+                num_repeats_per_trans=num_repeats_per_trans, num_seeds=n_seeds,
+                topk=topk, steps_fine=steps_fine, lr=lr)
+            return sc, q, t
+
+        sc, qb, tb = _subbatched_align(_proc, k, key=("vol_esp", N_pad, M_pad, n_seeds),
+                                       device=device)
+        out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
+        out_q.index_copy_(0, rows, qb)
+        out_t.index_copy_(0, rows, tb)
+
+    SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
+    return out_scores, SE3

@@ -1080,7 +1080,7 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
 
 #: Modes with BOTH an array builder below and an array-native aligner in ``_arrays``. A mode
 #: joins this tuple only when both exist -- see ``_use_arrays``.
-_ARRAY_MODES = ("vol", "vol_color")
+_ARRAY_MODES = ("vol", "vol_color", "pharm", "vol_esp")
 
 
 def _use_arrays(mode: str) -> bool:
@@ -1141,6 +1141,81 @@ def _align_fast_arrays_vol_color(ref: dict, fit: tuple, batch_kw: dict):
         topk=batch_kw.get("topk", 30),
         steps_fine=batch_kw["steps_fine"],
         lr=batch_kw.get("lr", 0.075))
+
+
+def _build_fit_arrays_pharm(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``pharm``.
+
+    Three channels, ONE offset table: types, anchors and vectors all index by feature."""
+    import torch
+    f32 = torch.float32
+    return (arrs["ids"],
+            torch.as_tensor(arrs["pharm_types"], dtype=torch.int64, device=device),
+            torch.as_tensor(arrs["pharm_ancs"], dtype=f32, device=device),
+            torch.as_tensor(arrs["pharm_vecs"], dtype=f32, device=device),
+            torch.as_tensor(arrs["pharm_off"], dtype=torch.long, device=device))
+
+
+def _build_fit_arrays_vol_esp(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_esp``.
+
+    Strict-heavy centers plus the heavy partial charges that are 1:1 with them, on their own
+    ``heavy_off``. The with-H store case needs the same vectorised gather the object path uses
+    -- global heavy index = ``nonH`` plus each heavy atom's molecule start -- which is already
+    array-native there, so it is reproduced verbatim rather than reinvented."""
+    import torch
+    f32 = torch.float32
+    aoff = arrs["atom_off"]
+    hoff = arrs["heavy_off"] if "heavy_off" in arrs else aoff
+    xnoH = arrs["xyz_noH"] if "xyz_noH" in arrs else arrs["atom_pos"]
+    if "all_off" in arrs:                       # with-H store: heavy = charges[all_off][nonH]
+        alloff, nonH = arrs["all_off"], arrs["nonH"]
+        heavy = arrs["charges"][nonH + np.repeat(alloff[:-1], np.diff(hoff))]
+    else:                                       # heavy charges stored directly
+        heavy = arrs["charges"]
+    return (arrs["ids"],
+            torch.as_tensor(xnoH, dtype=f32, device=device),
+            torch.as_tensor(heavy, dtype=f32, device=device),
+            torch.as_tensor(hoff, dtype=torch.long, device=device))
+
+
+def _align_fast_arrays_pharm(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``pharm``."""
+    from shepherd_score.accel.batch._arrays import align_batch_pharm_arrays
+    ptypes, pancs, pvecs, poff = fit
+    return align_batch_pharm_arrays(
+        ref["_ref_pharm_types_t"], ref["_ref_pharm_ancs_t"], ref["_ref_pharm_vecs_t"],
+        ptypes, pancs, pvecs, poff,
+        similarity=batch_kw.get("similarity", "tanimoto"),
+        extended_points=batch_kw.get("extended_points", False),
+        only_extended=batch_kw.get("only_extended", False),
+        num_repeats=batch_kw.get("num_repeats"),
+        topk=batch_kw.get("topk", 30),
+        steps_fine=batch_kw["steps_fine"],
+        lr=batch_kw.get("lr", 0.075))
+
+
+def _align_fast_arrays_vol_esp(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``vol_esp``. ``lam`` is required and RAW."""
+    from shepherd_score.accel.batch._arrays import align_batch_vol_esp_arrays
+    pts, chg, off = fit
+    return align_batch_vol_esp_arrays(
+        ref["_ref_xyz_noH_t"], ref["_ref_xyz_esp_t"], pts, chg, off,
+        alpha=batch_kw.get("alpha", 0.81), lam=batch_kw["lam"],
+        num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
+        topk=batch_kw.get("topk", 30),
+        steps_fine=batch_kw["steps_fine"],
+        lr=batch_kw.get("lr", 0.075))
+
+
+#: mode -> (fit-array builder, array-native aligner). Keys MUST match ``_ARRAY_MODES`` minus
+#: ``vol``, whose branch is kept separate and byte-for-byte unchanged (it is gate-5 verified).
+_ARRAY_BUILDERS = {"vol_color": _build_fit_arrays_vol_color,
+                   "pharm": _build_fit_arrays_pharm,
+                   "vol_esp": _build_fit_arrays_vol_esp}
+_ARRAY_ALIGNERS = {"vol_color": _align_fast_arrays_vol_color,
+                   "pharm": _align_fast_arrays_pharm,
+                   "vol_esp": _align_fast_arrays_vol_esp}
 
 
 def _align_fast_arrays(ref_xyz, fit_flat, fit_off, mode: str, batch_kw: dict):
@@ -1365,11 +1440,12 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                                                              mode, batch_kw)
                             _accumulate_arrays(heaps[qi], ids, scores, se3,
                                                scores_out, qi, start)
-                    else:                                   # vol_color
-                        ids, *fit = _build_fit_arrays_vol_color(arrs, device)
+                    else:
+                        ids, *fit = _ARRAY_BUILDERS[mode](arrs, device)
+                        align = _ARRAY_ALIGNERS[mode]
                         for qi, ra in enumerate(qs_ref):
                             ref = _ref_tensors_from_arrays(ra, mode, device)
-                            scores, se3 = _align_fast_arrays_vol_color(ref, tuple(fit), batch_kw)
+                            scores, se3 = align(ref, tuple(fit), batch_kw)
                             _accumulate_arrays(heaps[qi], ids, scores, se3,
                                                scores_out, qi, start)
                 else:
