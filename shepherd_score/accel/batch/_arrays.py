@@ -484,3 +484,230 @@ def align_batch_vol_esp_arrays(ref_pts: torch.Tensor, ref_chg: torch.Tensor,
 
     SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
     return out_scores, SE3
+
+
+class IdxSet:
+    """Bucket members as an index ARRAY, for keys that are not one-dimensional.
+
+    :class:`Span` is cheaper but requires every merge to be ADJACENT, which holds only because a
+    1-D band key makes the emitted cell order identical to the order ``_merge_group`` sorts into.
+    Once the key has several dims, ``_merge_group`` re-sorts after each fold and that guarantee is
+    gone. ``IdxSet`` drops the requirement: ``__add__`` concatenates. The cost is one numpy concat
+    per MERGE, over the small occupied-cell set (tens to hundreds), never per molecule -- so the
+    "no per-molecule Python" property this module exists for is untouched.
+
+    Contract needed by the planner is exactly ``__len__`` (Bucket.K), ``__add__`` (_merge) and
+    slicing (_cap_upfront).
+    """
+
+    __slots__ = ("arr",)
+
+    def __init__(self, arr):
+        self.arr = np.asarray(arr, dtype=np.int64)
+
+    def __len__(self) -> int:
+        return int(self.arr.shape[0])
+
+    def __add__(self, other: "IdxSet") -> "IdxSet":
+        return IdxSet(np.concatenate([self.arr, other.arr]))
+
+    def __getitem__(self, sl: slice) -> "IdxSet":
+        return IdxSet(self.arr[sl])
+
+    def idx(self, order=None) -> np.ndarray:
+        """Absolute shard indices. ``order`` is accepted and ignored so a caller can treat this
+        interchangeably with :meth:`Span.idx`, which resolves through the ordering."""
+        return self.arr
+
+
+def plan_spans_multi(fit_dims: dict, const_dims: dict, spec, device, partition: dict = None):
+    """Multi-dimensional twin of :func:`plan_spans`, for modes whose PadSpec keys several dims.
+
+    ``fit_dims``  : name -> (K,) int array of per-molecule sizes (the dims that VARY).
+    ``const_dims``: name -> int, dims fixed for the whole screen (the single query's clouds, and
+                    anything the store stores at a fixed width, e.g. surface points).
+    ``partition`` : name -> exact value, uniform across the screen (``tc`` is 0 when trans_init
+                    is False, which is always true on the screen path).
+
+    Cells are keyed on the banded value of every merge dim, in ``spec.merge`` order, and merged
+    with the REAL policy: ``_merge_group`` then ``_cap_upfront``, unchanged. Only ``spec.seeds``
+    and the merge dim NAMES are consulted by that policy -- ``_should_merge`` is occupancy-only
+    and never calls the merge callables, so a spec built for this path does not need them to be
+    real accessors.
+    """
+    names = list(spec.merge)
+    K = int(next(iter(fit_dims.values())).shape[0]) if fit_dims else int(next(iter(const_dims.values())))
+    cols = []
+    for n in names:
+        if n in fit_dims:
+            cols.append(((np.asarray(fit_dims[n], dtype=np.int64) + 15) // 16) * 16)
+        else:
+            cols.append(np.full(K, _band_key(int(const_dims[n])), dtype=np.int64))
+    key = np.stack(cols, axis=1)                                  # (K, nm)
+    # lexsort takes the LAST key as primary, so reverse to sort by names order left-to-right --
+    # the same order _merge_group sorts buckets into.
+    order = np.lexsort(tuple(key[:, i] for i in range(len(names) - 1, -1, -1)))
+    sk = key[order]
+    cuts = np.flatnonzero((np.diff(sk, axis=0) != 0).any(axis=1)) + 1
+    starts = np.concatenate(([0], cuts, [K]))
+
+    cells = []
+    for i in range(len(starts) - 1):
+        lo, hi = int(starts[i]), int(starts[i + 1])
+        pad = {names[j]: int(sk[lo, j]) for j in range(len(names))}
+        for pn, pv in (partition or {}).items():
+            pad[pn] = pv
+        cells.append(Bucket(IdxSet(order[lo:hi]), pad))
+    return _cap_upfront(_merge_group(cells, spec, _min_wave(device)), spec, device)
+
+
+def align_batch_vol_and_surf_esp_arrays(ref: dict, fit: tuple, *, alpha: float,
+                                        lam: float = 0.001, probe_radius: float = 1.0,
+                                        esp_weight: float = 0.5,
+                                        num_repeats_per_trans: int = 10, topk: int = 30,
+                                        steps_fine: int = 100, lr: float = 0.075):
+    """Array-native equivalent of ``_align_batch_vol_and_surf_esp`` for the screen path.
+
+    The heaviest object-path branch in the tree: nine splits, six attribute stores, an
+    ``_ArrView`` AND a nested ``_MolShim`` per library molecule, for a measured 39.284 us/mol of
+    fixed cost -- the largest of any mode.
+
+    SIX cost dims, so :func:`plan_spans` (one banded fit dim) cannot reproduce the partition and
+    :func:`plan_spans_multi` is used instead. On the screen path only TWO of the six actually
+    vary: the ref is a single query, and the store writes surfaces at a FIXED width, so
+    ``n_wH``/``n_surf``/``n_cent``/``m_surf`` are constant and the key is (m_wH, m_cent).
+
+    Surfaces need no gather at all for the same reason -- they are already a dense ``(K, S, 3)``
+    block in the store, so a row ``index_select`` replaces the object path's ``torch.unbind``.
+
+    AT LIBRARY SCALE THIS MODE IS NOT BIT-IDENTICAL, AND NEITHER IS THE OBJECT PATH TO ITSELF.
+    Measured at N=1e5 on an L40S: array-vs-object differs on 171/100,000 scores (max 1.265e-02),
+    while the OBJECT path run twice against itself -- second run holding 12 GB of GPU memory --
+    differs on 513/100,000 (max 1.757e-02). Cause is ``_subbatched_align``, which sizes chunks
+    from ``mem_get_info()`` free memory: the schedule moved from (1024, 30326) to (22474, 8876)
+    under pressure, and this mode is multi-basin, so a different batch shifts seed generation
+    (``_masked_principal_axes`` is batch-size dependent) and a few molecules settle in a different
+    basin. vol_esp and pharm chunk differently between paths TOO and stay bit-identical, so the
+    sensitivity is this mode's, not the sub-batcher's. Top-1000 ids AND order were identical in
+    both comparisons -- the ranking a screen delivers is stable. The 12-molecule fixture below
+    fits one chunk, so it IS bit-identical there and the gate stays strict.
+    """
+    from shepherd_score.accel.drivers.esp_combo import fast_optimize_esp_combo_score_overlay_batch
+    from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
+    from ._bucket import PadSpec
+    from ._pad import _subbatched_align
+    from .._modes import MODE_SEEDS
+
+    (cwh_flat, partial_flat, radii_flat, all_off,
+     cent_flat, cent_off, surf_all, surf_esp_all) = fit
+    device = cwh_flat.device
+    n_seeds = int(MODE_SEEDS["vol_and_surf_esp"])
+    K = int(all_off.shape[0]) - 1
+    if K == 0:
+        return np.empty(0, dtype=float), np.empty((0, 4, 4), dtype=np.float32)
+
+    cnt_wH = all_off[1:] - all_off[:-1]
+    cnt_ct = cent_off[1:] - cent_off[:-1]
+    m_wH_sizes = cnt_wH.detach().cpu().numpy()
+    m_ct_sizes = cnt_ct.detach().cpu().numpy()
+
+    n_wH = int(ref["_ref_centers_w_H_t"].shape[0])
+    n_surf = int(ref["_ref_surf_t"].shape[0])
+    m_surf = int(surf_all.shape[1])
+    a0 = (alpha == 0.81)
+    n_cent = int(ref["_ref_xyz_t"].shape[0]) if a0 else n_surf
+
+    # Same six names, same order, same seeds as _align_batch_vol_and_surf_esp's PadSpec. The
+    # merge callables are never invoked on this path (see plan_spans_multi), so they are the
+    # identity placeholders rather than pair accessors.
+    spec = PadSpec(merge={"n_wH": None, "m_wH": None, "n_surf": None,
+                          "m_surf": None, "n_cent": None, "m_cent": None},
+                   seeds=n_seeds, partition={"tc": None})
+    buckets = plan_spans_multi(
+        fit_dims={"m_wH": m_wH_sizes, "m_cent": (m_ct_sizes if a0 else np.full(K, m_surf))},
+        const_dims={"n_wH": n_wH, "n_surf": n_surf, "m_surf": m_surf, "n_cent": n_cent},
+        spec=spec, device=device, partition={"tc": 0})
+
+    out_scores = np.empty(K, dtype=float)
+    out_q = torch.empty(K, 4, device=device)
+    out_t = torch.empty(K, 3, device=device)
+    z = torch.zeros
+
+    for bk in buckets:
+        rows_np = bk.members.idx()
+        rows = torch.as_tensor(rows_np, device=device, dtype=torch.long)
+        k = bk.K
+        n_wH_pad, m_wH_pad = int(bk.pad["n_wH"]), int(bk.pad["m_wH"])
+        n_surf_pad, m_surf_pad = int(bk.pad["n_surf"]), int(bk.pad["m_surf"])
+        n_cent_pad, m_cent_pad = int(bk.pad["n_cent"]), int(bk.pad["m_cent"])
+
+        c_wH = cnt_wH.index_select(0, rows)
+        s_wH = all_off.index_select(0, rows)
+        c_ct = cnt_ct.index_select(0, rows)
+        s_ct = cent_off.index_select(0, rows)
+
+        # ---- ref side: one query broadcast into k rows ---------------------------------
+        centers_w_H_1 = z(k, n_wH_pad, 3, device=device, dtype=torch.float32)
+        centers_w_H_1[:, :n_wH] = ref["_ref_centers_w_H_t"]
+        partial_1 = z(k, n_wH_pad, device=device, dtype=torch.float32)
+        partial_1[:, :n_wH] = ref["_ref_partial_t"]
+        radii_1 = z(k, n_wH_pad, device=device, dtype=torch.float32)
+        radii_1[:, :n_wH] = ref["_ref_radii_t"]
+        points_1 = z(k, n_surf_pad, 3, device=device, dtype=torch.float32)
+        points_1[:, :n_surf] = ref["_ref_surf_t"]
+        point_charges_1 = z(k, n_surf_pad, device=device, dtype=torch.float32)
+        point_charges_1[:, :n_surf] = ref["_ref_surf_esp_t"]
+        centers_1 = z(k, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_1[:, :n_cent] = ref["_ref_xyz_t"] if a0 else ref["_ref_surf_t"]
+
+        # ---- fit side: CSR gathers for the ragged channels, row-select for the dense ----
+        centers_w_H_2 = z(k, m_wH_pad, 3, device=device, dtype=torch.float32)
+        gather_fill(centers_w_H_2, cwh_flat, s_wH, c_wH)
+        partial_2 = z(k, m_wH_pad, device=device, dtype=torch.float32)
+        gather_fill(partial_2, partial_flat, s_wH, c_wH)
+        radii_2 = z(k, m_wH_pad, device=device, dtype=torch.float32)
+        gather_fill(radii_2, radii_flat, s_wH, c_wH)
+
+        points_2 = z(k, m_surf_pad, 3, device=device, dtype=torch.float32)
+        points_2[:, :m_surf] = surf_all.index_select(0, rows)
+        point_charges_2 = z(k, m_surf_pad, device=device, dtype=torch.float32)
+        point_charges_2[:, :m_surf] = surf_esp_all.index_select(0, rows)
+
+        centers_2 = z(k, m_cent_pad, 3, device=device, dtype=torch.float32)
+        if a0:
+            gather_fill(centers_2, cent_flat, s_ct, c_ct)
+        else:
+            centers_2[:, :m_surf] = surf_all.index_select(0, rows)
+
+        i32 = torch.int32
+        N_wH = torch.full((k,), n_wH, dtype=i32, device=device)
+        M_wH = c_wH.to(i32)
+        N_sf = torch.full((k,), n_surf, dtype=i32, device=device)
+        M_sf = torch.full((k,), m_surf, dtype=i32, device=device)
+        N_ct = torch.full((k,), n_cent, dtype=i32, device=device)
+        M_ct = c_ct.to(i32) if a0 else M_sf
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_esp_combo_score_overlay_batch(
+                centers_w_H_1[sl], centers_w_H_2[sl], centers_1[sl], centers_2[sl],
+                points_1[sl], points_2[sl], partial_1[sl], partial_2[sl],
+                point_charges_1[sl], point_charges_2[sl], radii_1[sl], radii_2[sl],
+                alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight,
+                N_real_atoms_w_H_1=N_wH[sl], M_real_atoms_w_H_2=M_wH[sl],
+                N_real_centers=N_ct[sl], M_real_centers=M_ct[sl],
+                N_real_surf_1=N_sf[sl], M_real_surf_2=M_sf[sl],
+                trans_centers_batch=None, trans_centers_real=None,
+                num_repeats_per_trans=num_repeats_per_trans, topk=topk,
+                steps_fine=steps_fine, lr=lr, num_seeds=n_seeds)
+            return sc, q, t
+
+        sc, qb, tb = _subbatched_align(
+            _proc, k, key=("vol_and_surf_esp", n_wH_pad, m_wH_pad, n_cent_pad,
+                           m_cent_pad, n_surf_pad, m_surf_pad, n_seeds), device=device)
+        out_scores[rows_np] = sc.detach().cpu().numpy().astype(float)
+        out_q.index_copy_(0, rows, qb)
+        out_t.index_copy_(0, rows, tb)
+
+    SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
+    return out_scores, SE3

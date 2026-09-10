@@ -1080,7 +1080,7 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
 
 #: Modes with BOTH an array builder below and an array-native aligner in ``_arrays``. A mode
 #: joins this tuple only when both exist -- see ``_use_arrays``.
-_ARRAY_MODES = ("vol", "vol_color", "pharm", "vol_esp")
+_ARRAY_MODES = ("vol", "vol_color", "pharm", "vol_esp", "vol_and_surf_esp")
 
 
 def _use_arrays(mode: str) -> bool:
@@ -1208,14 +1208,53 @@ def _align_fast_arrays_vol_esp(ref: dict, fit: tuple, batch_kw: dict):
         lr=batch_kw.get("lr", 0.075))
 
 
+def _build_fit_arrays_vol_and_surf_esp(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_and_surf_esp``.
+
+    The heaviest branch in that function -- nine splits, six stores, an ``_ArrView`` and a nested
+    ``_MolShim`` per molecule -- becomes six whole-buffer uploads.
+
+    THREE ragged channels on ``all_off`` (atoms-with-H coordinates, their partial charges, their
+    radii), ONE on ``atom_off`` (the heavy shape centers), and TWO that are not ragged at all:
+    the store writes surfaces at a fixed width, so ``surf_pos``/``surf_esp`` upload as dense
+    ``(K, S, *)`` blocks and the aligner row-selects them instead of gathering."""
+    import torch
+    f32 = torch.float32
+    return (arrs["ids"],
+            torch.as_tensor(arrs["cwh"], dtype=f32, device=device),
+            torch.as_tensor(arrs["charges"], dtype=f32, device=device),
+            torch.as_tensor(arrs["radii"], dtype=f32, device=device),
+            torch.as_tensor(arrs["all_off"], dtype=torch.long, device=device),
+            torch.as_tensor(arrs["atom_pos"], dtype=f32, device=device),
+            torch.as_tensor(arrs["atom_off"], dtype=torch.long, device=device),
+            torch.as_tensor(arrs["surf_pos"], dtype=f32, device=device),
+            torch.as_tensor(arrs["surf_esp"], dtype=f32, device=device))
+
+
+def _align_fast_arrays_vol_and_surf_esp(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``vol_and_surf_esp``."""
+    from shepherd_score.accel.batch._arrays import align_batch_vol_and_surf_esp_arrays
+    return align_batch_vol_and_surf_esp_arrays(
+        ref, fit,
+        alpha=batch_kw["alpha"], lam=batch_kw.get("lam", 0.001),
+        probe_radius=batch_kw.get("probe_radius", 1.0),
+        esp_weight=batch_kw.get("esp_weight", 0.5),
+        num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
+        topk=batch_kw.get("topk", 30),
+        steps_fine=batch_kw["steps_fine"],
+        lr=batch_kw.get("lr", 0.075))
+
+
 #: mode -> (fit-array builder, array-native aligner). Keys MUST match ``_ARRAY_MODES`` minus
 #: ``vol``, whose branch is kept separate and byte-for-byte unchanged (it is gate-5 verified).
 _ARRAY_BUILDERS = {"vol_color": _build_fit_arrays_vol_color,
                    "pharm": _build_fit_arrays_pharm,
-                   "vol_esp": _build_fit_arrays_vol_esp}
+                   "vol_esp": _build_fit_arrays_vol_esp,
+                   "vol_and_surf_esp": _build_fit_arrays_vol_and_surf_esp}
 _ARRAY_ALIGNERS = {"vol_color": _align_fast_arrays_vol_color,
                    "pharm": _align_fast_arrays_pharm,
-                   "vol_esp": _align_fast_arrays_vol_esp}
+                   "vol_esp": _align_fast_arrays_vol_esp,
+                   "vol_and_surf_esp": _align_fast_arrays_vol_and_surf_esp}
 
 
 def _align_fast_arrays(ref_xyz, fit_flat, fit_off, mode: str, batch_kw: dict):
