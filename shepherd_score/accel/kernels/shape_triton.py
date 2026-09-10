@@ -78,16 +78,21 @@ def _gauss_overlap_se3_tiled(
     half_alpha, k_const,          # scalars
     S_ptr, dQ_ptr, dT_ptr,        # outputs (S: (B,), dQ: (B*4), dT: (B*3))
     BLOCK: tl.constexpr,          # tile edge (chosen by autotune)
-    NEED_GRAD: tl.constexpr
+    NEED_GRAD: tl.constexpr,
+    SEEDS: tl.constexpr           # poses per molecule; 1 == one molecule per CTA (legacy)
 ):
     # -------- which alignment (one CTA per pair) --------
     pid = tl.program_id(0)
-    realN = tl.load(Nreal_ptr + pid)
-    realM = tl.load(Mreal_ptr + pid)
+    # One CTA per POSE, but coordinates belong to a MOLECULE. With SEEDS > 1 the caller passes
+    # the molecule blocks UNREPLICATED and the SEEDS consecutive CTAs of a molecule all read its
+    # one copy; with SEEDS == 1 this is pid, i.e. the original one-molecule-per-CTA layout.
+    mol = pid // SEEDS
+    realN = tl.load(Nreal_ptr + mol)
+    realM = tl.load(Mreal_ptr + mol)
 
-    # -------- base pointers for this pair ---------------
-    A_ptr  = A_ptr  + pid * N_pad * 3
-    B_ptr  = B_ptr  + pid * M_pad * 3
+    # -------- base pointers: coords by molecule, pose state by CTA ---------
+    A_ptr  = A_ptr  + mol * N_pad * 3
+    B_ptr  = B_ptr  + mol * M_pad * 3
     Q_ptr  = Q_ptr  + pid * 4
     T_ptr  = T_ptr  + pid * 3
     dQ_ptr = dQ_ptr + pid * 4
@@ -197,28 +202,42 @@ def overlap_score_grad_se3_batch(
     BLOCK: int | None = None,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    seeds_per_mol: int = 1,
 ):
     """
-    One CTA per alignment (pair). Internal tile loops over A,B.
-    Shapes:
+    One CTA per POSE. Internal tile loops over A,B.
+    Shapes (``seeds_per_mol == 1``, the default and the legacy layout):
       A : (K, N_pad, 3)
       B : (K, M_pad, 3)
       q : (K, 4)
       t : (K, 3)
 
+    With ``seeds_per_mol = S > 1`` the coordinate blocks are UNREPLICATED and the pose tensors
+    carry every pose:
+      A : (K // S, N_pad, 3)      N_real, M_real : (K // S,)
+      q : (K, 4)                  t : (K, 3)
+    CTA ``i`` then reads molecule ``i // S``. Identical arithmetic on identical values -- only
+    the address changes -- so results are bit-identical to the replicated layout.
+
     If BLOCK is None, an optimal block size is auto-selected based on N_pad and M_pad.
     """
-    K, N_pad, _ = A.shape
+    K = q.shape[0]                       # POSES == CTAs
+    S = int(seeds_per_mol)
+    n_mol, N_pad, _ = A.shape
     _, M_pad, _ = B.shape
+    if S < 1 or K % S != 0 or n_mol != K // S:
+        raise ValueError(
+            f"seeds_per_mol={S} inconsistent: q has {K} poses, A has {n_mol} molecules "
+            f"(expected {K // S if S else 0})")
     device = A.device
     dtype  = A.dtype
 
     if N_real is None:
-        N_real = torch.full((K,), N_pad, device=device, dtype=torch.int32)
+        N_real = torch.full((n_mol,), N_pad, device=device, dtype=torch.int32)
     else:
         N_real = N_real.to(device=device, dtype=torch.int32, copy=False)
     if M_real is None:
-        M_real = torch.full((K,), M_pad, device=device, dtype=torch.int32)
+        M_real = torch.full((n_mol,), M_pad, device=device, dtype=torch.int32)
     else:
         M_real = M_real.to(device=device, dtype=torch.int32, copy=False)
 
@@ -245,6 +264,7 @@ def overlap_score_grad_se3_batch(
         half_alpha, k_const,
         out_S, out_dQ.view(-1), out_dT.view(-1),
         NEED_GRAD=NEED_GRAD,
+        SEEDS=S,
     )
     return out_S, out_dQ, out_dT
 

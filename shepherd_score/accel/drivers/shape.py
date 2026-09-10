@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import torch
 # Kernels are dispatched per-call by tensor device (Triton on CUDA, numba on CPU), so one
 # process can run both -- e.g. backend="numba" runs CPU tensors through the numba kernels
@@ -16,11 +17,19 @@ from .._stats import record as _record_steps
 torch.backends.cuda.matmul.allow_tf32 = True
 
 
+#: Read each molecule's coordinates ONCE instead of once per seed. The fine loop expands
+#: (K, N_pad, 3) -> (K*S, N_pad, 3) and materialises it, so a 100k x 10-seed screen holds ~384 MB
+#: per coordinate buffer of ten identical copies and re-reads all of it every step; the kernel can
+#: index molecule ``pid // S`` instead. Same bytes, same arithmetic, different address --
+#: bit-identical by construction. Opt-in so it is trivial to A/B and revert.
+_DEDUP_SEED_COORDS = os.environ.get("FSS_SEED_COORD_DEDUP", "0") == "1"
+
+
 @torch.no_grad()
 def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81,
                        N_real: torch.Tensor | None = None,
                        M_real: torch.Tensor | None = None,
-                       NEED_GRAD = True):
+                       NEED_GRAD = True, seeds_per_mol: int = 1):
     """
     Evaluate the fused overlap kernel on an arbitrary-long list of
     orientations, slicing the list so that each launch respects the
@@ -37,7 +46,7 @@ def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81,
     -------
     VAB : (K,)    dQ : (K,4)    dT : (K,3)     — all contiguous on GPU
     """
-    K = A.shape[0]
+    K = q.shape[0]                       # POSES; A has K // seeds_per_mol molecules
     if N_real is not None:
         N_real = N_real.to(torch.float32).contiguous()
     if M_real is not None:
@@ -47,18 +56,23 @@ def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81,
     out_dQ = torch.empty_like(q)
     out_dT = torch.empty_like(t)
 
-    CHUNK = 65_535                         # CUDA grid-z hard limit
+    S = int(seeds_per_mol)
+    # Chunk on POSE index, but keep every molecule's seed group whole: a boundary mid-group
+    # would make ``pid // S`` inside the launch address the wrong molecule.
+    CHUNK = 65_535 if S == 1 else max(S, (65_535 // S) * S)
 
     for start in range(0, K, CHUNK):
         end = min(start + CHUNK, K)
+        ms, me = start // S, end // S          # molecule slice for this pose slice
 
+        extra = {} if S == 1 else {"seeds_per_mol": S}   # CPU kernels take no such kwarg
         V, dQ, dT = overlap_score_grad_se3_batch(
-            A[start:end], B[start:end],
+            A[ms:me], B[ms:me],
             q[start:end], t[start:end],
             alpha=alpha,
-            N_real=N_real[start:end],
-            M_real=M_real[start:end],
-            NEED_GRAD=NEED_GRAD)
+            N_real=N_real[ms:me],
+            M_real=M_real[ms:me],
+            NEED_GRAD=NEED_GRAD, **extra)
 
         out_V[start:end]  = V
         out_dQ[start:end] = dQ
@@ -91,12 +105,15 @@ class _GraphedFineSurf(_GraphedFineBase):
     from _GraphedFineBase.
     """
 
-    def __init__(self, N_pad, M_pad, P, steps, alpha, lr, device):
+    def __init__(self, N_pad, M_pad, P, steps, alpha, lr, device, seeds=1):
         self.alpha = float(alpha); self.lr = float(lr)
         f = lambda *s: torch.empty(*s, device=device, dtype=torch.float32)
-        self.A = f(P, N_pad, 3); self.B = f(P, M_pad, 3)
-        self.Nr = torch.empty(P, device=device, dtype=torch.int32)
-        self.Mr = torch.empty(P, device=device, dtype=torch.int32)
+        # Coordinate + real-count buffers are per MOLECULE; pose state stays per pose.
+        self.S = max(1, int(seeds))
+        nm = P // self.S
+        self.A = f(nm, N_pad, 3); self.B = f(nm, M_pad, 3)
+        self.Nr = torch.empty(nm, device=device, dtype=torch.int32)
+        self.Mr = torch.empty(nm, device=device, dtype=torch.int32)
         self.norm = f(P)
         self.qs = f(P, 4); self.ts = f(P, 3)            # seeds (replay start state)
         self.q = f(P, 4); self.t = f(P, 3)
@@ -108,8 +125,10 @@ class _GraphedFineSurf(_GraphedFineBase):
         super().__init__(steps)
 
     def _step(self):
+        extra = {} if self.S == 1 else {"seeds_per_mol": self.S}
         VAB, dQ, dT = overlap_score_grad_se3_batch(
-            self.A, self.B, self.q, self.t, alpha=self.alpha, N_real=self.Nr, M_real=self.Mr)
+            self.A, self.B, self.q, self.t, alpha=self.alpha, N_real=self.Nr, M_real=self.Mr,
+            **extra)
         self._tanimoto_adam_tail(VAB, dQ, dT)
 
     def _tanimoto_adam_tail(self, VAB, dQ, dT):
@@ -145,10 +164,11 @@ class _GraphedFineSurf(_GraphedFineBase):
 
 
 def _run_graphed_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps, N_pad, M_pad, P,
-                      es_patience=0, es_tol=1e-5, es_seeds=0):
-    key = (A_k.device.index, "surf", N_pad, M_pad, P, steps, round(float(alpha), 4), round(float(lr), 5))
+                      es_patience=0, es_tol=1e-5, es_seeds=0, seeds=1):
+    key = (A_k.device.index, "surf", N_pad, M_pad, P, steps, round(float(alpha), 4),
+           round(float(lr), 5), int(seeds))
     return run_graphed(
-        lambda: _GraphedFineSurf(N_pad, M_pad, P, steps, alpha, lr, A_k.device),
+        lambda: _GraphedFineSurf(N_pad, M_pad, P, steps, alpha, lr, A_k.device, seeds=seeds),
         key, (A_k, B_k, N_k, M_k, norm, q_seed, t_seed),
         es_patience=es_patience, es_tol=es_tol, es_seeds=es_seeds)
 
@@ -218,13 +238,24 @@ def coarse_fine_align_many(
     # ------------------------------------------------------------------
     # 2) fine polishing (Adam-like) on EVERY seed
     # ------------------------------------------------------------------
-    A_k = A_batch.unsqueeze(1).expand(-1, S, -1, -1).reshape(-1, N_pad, 3)
-    B_k = B_batch.unsqueeze(1).expand(-1, S, -1, -1).reshape(-1, M_pad, 3)
+    # DEDUP: hand the kernel the molecule blocks as they already are and let it index
+    # ``pid // S``. The expand+reshape below MATERIALISES S copies of every molecule (and
+    # :240 then calls .contiguous() again), which is the traffic this avoids. CUDA + fp32 only:
+    # the CPU fused path and fp64 keep the replicated layout.
+    _dedup = (_DEDUP_SEED_COORDS and A_batch.is_cuda and A_batch.dtype == torch.float32
+              and S > 1)
+    if _dedup:
+        A_k, B_k = A_batch, B_batch
+    else:
+        A_k = A_batch.unsqueeze(1).expand(-1, S, -1, -1).reshape(-1, N_pad, 3)
+        B_k = B_batch.unsqueeze(1).expand(-1, S, -1, -1).reshape(-1, M_pad, 3)
     q_seed = quats.reshape(-1, 4).contiguous()
     t_seed = t_seeds.reshape(-1, 3).contiguous()
 
-    N_k = N_real.repeat_interleave(S)
-    M_k = M_real.repeat_interleave(S)
+    # real-counts follow the coordinates: per molecule when deduped, per pose otherwise
+    N_k = N_real if _dedup else N_real.repeat_interleave(S)
+    M_k = M_real if _dedup else M_real.repeat_interleave(S)
+    S_fine = S if _dedup else 1
     VAA_plus_VBB = (VAA + VBB).repeat_interleave(S)        # invariant in loop
     P = q_seed.shape[0]
 
@@ -240,7 +271,7 @@ def coarse_fine_align_many(
                 A_k.contiguous(), B_k.contiguous(), q_seed, t_seed, N_k, M_k,
                 VAA_plus_VBB, alpha, lr, steps_fine, N_pad, M_pad, P,
                 es_patience=early_stop_patience, es_tol=early_stop_tol,
-                es_seeds=S)
+                es_seeds=S, seeds=S_fine)
         except Exception:
             best_score = None                              # capture failed -> eager
 
@@ -279,7 +310,7 @@ def coarse_fine_align_many(
         for step in range(steps_fine):
             VAB, dQ, dT = _overlap_in_chunks(
                 A_k, B_k, q_k, t_k,
-                alpha=alpha, N_real=N_k, M_real=M_k)
+                alpha=alpha, N_real=N_k, M_real=M_k, seeds_per_mol=S_fine)
 
             denom = VAA_plus_VBB - VAB
             score = VAB / denom
