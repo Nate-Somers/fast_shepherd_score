@@ -20,6 +20,7 @@ from ._common import (
     apply_se3_transform,
     quaternion_to_rotation_matrix
 )
+from . import shape as _shapemod    # read flags LIVE off the module, see below
 from ._graphed import run_graphed, graph_cap
 from .shape import _GraphedFineSurf
 from .._stats import record as _record_steps
@@ -29,7 +30,9 @@ def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float,
                            N_real: torch.Tensor,
                            M_real: torch.Tensor,
                            NEED_GRAD: bool = True,
-                           BLOCK: int | None = None):   # None -> kernel auto: BLOCK=16, 1 warp/CTA
+                           BLOCK: int | None = None,    # None -> kernel auto: BLOCK=16, 1 warp/CTA
+                           seeds_per_mol: int = 1,
+                           poses_per_cta: int = 1):
     """
     Evaluate the fused ESP overlap kernel in chunks respecting CUDA grid limits.
 
@@ -58,7 +61,7 @@ def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float,
     dQ : torch.Tensor (K, 4)
     dT : torch.Tensor (K, 3)
     """
-    K = A.shape[0]
+    K = q.shape[0]                      # POSES; A/CA hold K // seeds_per_mol molecules
     N_real = N_real.to(torch.int32).contiguous()
     M_real = M_real.to(torch.int32).contiguous()
 
@@ -66,21 +69,27 @@ def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float,
     out_dQ = torch.empty_like(q)
     out_dT = torch.empty_like(t)
 
-    CHUNK = 65_535  # CUDA grid-z hard limit
+    S = int(seeds_per_mol)
+    # keep each molecule's seed group whole in a chunk, else pid // S addresses the wrong molecule
+    CHUNK = 65_535 if S == 1 else max(S, (65_535 // S) * S)
 
     for start in range(0, K, CHUNK):
         end = min(start + CHUNK, K)
+        ms, me = start // S, end // S
 
+        extra = {} if S == 1 else {"seeds_per_mol": S}
+        if int(poses_per_cta) > 1:
+            extra["poses_per_cta"] = int(poses_per_cta)
         V, dQ, dT = overlap_score_grad_esp_se3_batch(
-            A[start:end], B[start:end],
-            CA[start:end], CB[start:end],
+            A[ms:me], B[ms:me],
+            CA[ms:me], CB[ms:me],
             q[start:end], t[start:end],
             alpha=alpha,
             lam=lam,
-            N_real=N_real[start:end],
-            M_real=M_real[start:end],
+            N_real=N_real[ms:me],
+            M_real=M_real[ms:me],
             NEED_GRAD=NEED_GRAD,
-            BLOCK=BLOCK)
+            BLOCK=BLOCK, **extra)
 
         out_V[start:end] = V
         out_dQ[start:end] = dQ
@@ -110,16 +119,20 @@ class _GraphedFineEsp(_GraphedFineSurf):
     _GraphedFineSurf's score/best/Adam tail verbatim and only swaps the overlap kernel,
     adding persistent charge buffers (CA/CB) and the lam scalar."""
 
-    def __init__(self, N_pad, M_pad, P, steps, alpha, lam, lr, device):
+    def __init__(self, N_pad, M_pad, P, steps, alpha, lam, lr, device, seeds=1, poses=1):
         self.lam = float(lam)
-        self.CA = torch.empty(P, N_pad, device=device, dtype=torch.float32)
-        self.CB = torch.empty(P, M_pad, device=device, dtype=torch.float32)
-        super().__init__(N_pad, M_pad, P, steps, alpha, lr, device)
+        _S = max(1, int(seeds))
+        self.CA = torch.empty(P // _S, N_pad, device=device, dtype=torch.float32)
+        self.CB = torch.empty(P // _S, M_pad, device=device, dtype=torch.float32)
+        super().__init__(N_pad, M_pad, P, steps, alpha, lr, device, seeds=seeds, poses=poses)
 
     def _step(self):
+        extra = {} if self.S == 1 else {"seeds_per_mol": self.S}
+        if self.P_cta > 1:
+            extra["poses_per_cta"] = self.P_cta
         VAB, dQ, dT = overlap_score_grad_esp_se3_batch(
             self.A, self.B, self.CA, self.CB, self.q, self.t,
-            alpha=self.alpha, lam=self.lam, N_real=self.Nr, M_real=self.Mr)
+            alpha=self.alpha, lam=self.lam, N_real=self.Nr, M_real=self.Mr, **extra)
         self._tanimoto_adam_tail(VAB, dQ, dT)
 
     def _load(self, A, B, CA, CB, Nr, Mr, norm, qs, ts):
@@ -129,11 +142,13 @@ class _GraphedFineEsp(_GraphedFineSurf):
 
 def _run_graphed_esp(A_k, B_k, CA_k, CB_k, q_seed, t_seed, N_k, M_k, norm,
                      alpha, lam, lr, steps, N_pad, M_pad, P,
-                     es_patience=0, es_tol=1e-5, es_seeds=0):
+                     es_patience=0, es_tol=1e-5, es_seeds=0, seeds=1, poses=1):
     key = (A_k.device.index, "esp", N_pad, M_pad, P, steps,
-           round(float(alpha), 4), round(float(lam), 6), round(float(lr), 5))
+           round(float(alpha), 4), round(float(lam), 6), round(float(lr), 5),
+           int(seeds), int(poses))
     return run_graphed(
-        lambda: _GraphedFineEsp(N_pad, M_pad, P, steps, alpha, lam, lr, A_k.device),
+        lambda: _GraphedFineEsp(N_pad, M_pad, P, steps, alpha, lam, lr, A_k.device,
+                                seeds=seeds, poses=poses),
         key, (A_k, B_k, CA_k, CB_k, N_k, M_k, norm, q_seed, t_seed),
         es_patience=es_patience, es_tol=es_tol, es_seeds=es_seeds)
 
@@ -265,15 +280,28 @@ def coarse_fine_esp_align_many(
     # ------------------------------------------------------------------
     # 2) Fine optimization with Adam over ALL P poses
     # ------------------------------------------------------------------
-    A_k = A_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad, 3)
-    B_k = B_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad, 3)
-    CA_k = CA_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, N_pad)
-    CB_k = CB_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, M_pad)
+    # DEDUP: hand the kernel the molecule blocks unreplicated and let it index pid // P.
+    # CUDA + fp32 only; the CPU fused path and fp64 keep the replicated layout.
+    # Flags are read off the shape MODULE at call time, not imported by value: a
+    # `from .shape import _DEDUP_SEED_COORDS` binds once at import, so any later toggle (a test,
+    # an A/B harness) silently would not reach this driver and the object path would run.
+    _dedup = (_shapemod._DEDUP_SEED_COORDS and A_batch.is_cuda
+              and A_batch.dtype == torch.float32 and P > 1)
+    if _dedup:
+        A_k, B_k, CA_k, CB_k = A_batch, B_batch, CA_batch, CB_batch
+    else:
+        A_k = A_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad, 3)
+        B_k = B_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad, 3)
+        CA_k = CA_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, N_pad)
+        CB_k = CB_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, M_pad)
     q_k = q_best.reshape(-1, 4).contiguous()
     t_k = t_best.reshape(-1, 3).contiguous()
 
-    N_k = N_real.repeat_interleave(P)
-    M_k = M_real.repeat_interleave(P)
+    N_k = N_real if _dedup else N_real.repeat_interleave(P)
+    M_k = M_real if _dedup else M_real.repeat_interleave(P)
+    S_fine = P if _dedup else 1
+    _ppc = int(_shapemod._POSES_PER_CTA)
+    P_cta = _ppc if (_dedup and _ppc > 1 and P % _ppc == 0) else 1
     VAA_rep = VAA.repeat_interleave(P)
     VBB_rep = VBB.repeat_interleave(P)
     VAA_plus_VBB = VAA_rep + VBB_rep
@@ -292,7 +320,7 @@ def coarse_fine_esp_align_many(
                 q_k, t_k, N_k, M_k, VAA_plus_VBB, alpha, lam, lr,
                 steps_fine, N_pad, M_pad, PK,
                 es_patience=early_stop_patience, es_tol=early_stop_tol,
-                es_seeds=P)
+                es_seeds=P, seeds=S_fine, poses=P_cta)
         except Exception:
             best_score = None                              # capture failed -> eager
 
@@ -332,7 +360,8 @@ def coarse_fine_esp_align_many(
         for step in range(steps_fine):
             VAB, dQ, dT = _overlap_in_chunks_esp(
                 A_k, B_k, CA_k, CB_k, q_k, t_k,
-                alpha=alpha, lam=lam, N_real=N_k, M_real=M_k)
+                alpha=alpha, lam=lam, N_real=N_k, M_real=M_k,
+                seeds_per_mol=S_fine, poses_per_cta=P_cta)
 
             denom = VAA_plus_VBB - VAB
             score = VAB / denom

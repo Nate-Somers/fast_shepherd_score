@@ -220,6 +220,7 @@ def _gauss_overlap_se3_multipose(
     NEED_GRAD: tl.constexpr,
     SEEDS: tl.constexpr,
     POSES: tl.constexpr,
+    POSES_PAD: tl.constexpr,      # next power of two >= POSES (tl.arange extent)
 ):
     """POSES poses of ONE molecule per CTA, vectorised over the pose axis.
 
@@ -249,22 +250,30 @@ def _gauss_overlap_se3_multipose(
     B_ptr = B_ptr + mol * M_pad * 3
 
     # -------- pose state: (POSES,) vectors, built once --------
-    p_off = tl.arange(0, POSES)
+    # tl.arange demands a power-of-two extent, so run POSES_PAD lanes and mask the tail. That
+    # is what lets POSES be 5 or 10 -- vol has 10 seeds, so without this the only testable value
+    # was 2, which is too little extra work per CTA to decide anything.
+    p_off = tl.arange(0, POSES_PAD)
+    mask_p = p_off < POSES
     qo = (base + p_off) * 4
     to = (base + p_off) * 3
-    qr = tl.load(Q_ptr + qo + 0); qi = tl.load(Q_ptr + qo + 1)
-    qj = tl.load(Q_ptr + qo + 2); qk = tl.load(Q_ptr + qo + 3)
-    tx = tl.load(T_ptr + to + 0); ty = tl.load(T_ptr + to + 1); tz = tl.load(T_ptr + to + 2)
+    qr = tl.load(Q_ptr + qo + 0, mask=mask_p, other=0.0)
+    qi = tl.load(Q_ptr + qo + 1, mask=mask_p, other=0.0)
+    qj = tl.load(Q_ptr + qo + 2, mask=mask_p, other=0.0)
+    qk = tl.load(Q_ptr + qo + 3, mask=mask_p, other=0.0)
+    tx = tl.load(T_ptr + to + 0, mask=mask_p, other=0.0)
+    ty = tl.load(T_ptr + to + 1, mask=mask_p, other=0.0)
+    tz = tl.load(T_ptr + to + 2, mask=mask_p, other=0.0)
     r00, r01, r02, r10, r11, r12, r20, r21, r22 = _quat_to_rotmat(qr, qi, qj, qk)
 
-    Vab_acc = tl.zeros([POSES], dtype=tl.float32)
-    dTx = tl.zeros([POSES], dtype=tl.float32)
-    dTy = tl.zeros([POSES], dtype=tl.float32)
-    dTz = tl.zeros([POSES], dtype=tl.float32)
-    dQw = tl.zeros([POSES], dtype=tl.float32)
-    dQx = tl.zeros([POSES], dtype=tl.float32)
-    dQy = tl.zeros([POSES], dtype=tl.float32)
-    dQz = tl.zeros([POSES], dtype=tl.float32)
+    Vab_acc = tl.zeros([POSES_PAD], dtype=tl.float32)
+    dTx = tl.zeros([POSES_PAD], dtype=tl.float32)
+    dTy = tl.zeros([POSES_PAD], dtype=tl.float32)
+    dTz = tl.zeros([POSES_PAD], dtype=tl.float32)
+    dQw = tl.zeros([POSES_PAD], dtype=tl.float32)
+    dQx = tl.zeros([POSES_PAD], dtype=tl.float32)
+    dQy = tl.zeros([POSES_PAD], dtype=tl.float32)
+    dQz = tl.zeros([POSES_PAD], dtype=tl.float32)
 
     inv_ln2 = 1.4426950408889634
 
@@ -322,15 +331,15 @@ def _gauss_overlap_se3_multipose(
                 dQy += tl.sum(tl.where(mm, dyq, 0.0), 1)
                 dQz += tl.sum(tl.where(mm, dzq, 0.0), 1)
 
-    tl.store(S_ptr + base + p_off, Vab_acc)
+    tl.store(S_ptr + base + p_off, Vab_acc, mask=mask_p)
     if NEED_GRAD:
-        tl.store(dT_ptr + to + 0, dTx)
-        tl.store(dT_ptr + to + 1, dTy)
-        tl.store(dT_ptr + to + 2, dTz)
-        tl.store(dQ_ptr + qo + 0, dQw)
-        tl.store(dQ_ptr + qo + 1, dQx)
-        tl.store(dQ_ptr + qo + 2, dQy)
-        tl.store(dQ_ptr + qo + 3, dQz)
+        tl.store(dT_ptr + to + 0, dTx, mask=mask_p)
+        tl.store(dT_ptr + to + 1, dTy, mask=mask_p)
+        tl.store(dT_ptr + to + 2, dTz, mask=mask_p)
+        tl.store(dQ_ptr + qo + 0, dQw, mask=mask_p)
+        tl.store(dQ_ptr + qo + 1, dQx, mask=mask_p)
+        tl.store(dQ_ptr + qo + 2, dQy, mask=mask_p)
+        tl.store(dQ_ptr + qo + 3, dQz, mask=mask_p)
 
 
 def overlap_score_grad_se3_batch(
@@ -393,17 +402,18 @@ def overlap_score_grad_se3_batch(
     if POSES > 1:
         # POSES poses of ONE molecule per CTA. Every pose in a CTA must share a molecule, so
         # SEEDS must divide evenly by POSES; K % POSES follows from that.
-        if S <= 1 or S % POSES != 0 or K % POSES != 0 or (POSES & (POSES - 1)) != 0:
+        if S <= 1 or S % POSES != 0 or K % POSES != 0:
             raise ValueError(
-                f"poses_per_cta={POSES} needs the deduped layout, SEEDS % POSES == 0 and a "
-                f"POWER-OF-TWO POSES (it is a tl.arange extent) -- got seeds_per_mol={S}, K={K}")
+                f"poses_per_cta={POSES} needs the deduped layout and SEEDS % POSES == 0 "
+                f"(got seeds_per_mol={S}, K={K})")
+        POSES_PAD = 1 << (POSES - 1).bit_length()      # tl.arange extent; tail lanes masked
         _gauss_overlap_se3_multipose[(K // POSES,)](
             A.contiguous().view(-1), B.contiguous().view(-1),
             q.contiguous().view(-1), t.contiguous().view(-1),
             N_real.contiguous(), M_real.contiguous(),
             K, M_pad, N_pad, half_alpha, k_const,
             out_S, out_dQ.view(-1), out_dT.view(-1),
-            NEED_GRAD=NEED_GRAD, SEEDS=S, POSES=POSES,
+            NEED_GRAD=NEED_GRAD, SEEDS=S, POSES=POSES, POSES_PAD=POSES_PAD,
         )
         return out_S, out_dQ, out_dT
 
