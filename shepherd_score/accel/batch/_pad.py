@@ -2,6 +2,7 @@
 """Size bucketing, GPU-memory-safe sub-batching, and batched scatter-fill
 primitives shared by the batched aligners."""
 from __future__ import annotations
+import os
 import torch
 
 
@@ -19,6 +20,12 @@ def _band_key(n: int) -> int:
 # Measured fine-loop footprint (bytes per pair) keyed by (mode, N_pad, M_pad,
 # num_seeds). Lets the sub-batcher size each bucket's chunk to the GPU.
 _PAIR_FOOTPRINT_BYTES: dict[tuple, int] = {}
+
+
+#: Fixed sub-batch size, in pairs. 0 (default) keeps the adaptive memory-derived schedule.
+#: Set FSS_SUBBATCH_CHUNK=<n> to make the chunk boundaries deterministic -- see the comment in
+#: _subbatched_align for why vol_and_surf_esp needs it.
+_FIXED_CHUNK = int(os.environ.get("FSS_SUBBATCH_CHUNK", "0"))
 
 
 def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
@@ -56,7 +63,18 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
 
     fp = _PAIR_FOOTPRINT_BYTES.get(key)
     need_resize = fp is None
-    K_sub = max(1, min(K, int(_budget() // fp))) if fp else min(K, init_cap)
+    if _FIXED_CHUNK > 0:
+        # DETERMINISTIC chunking: the schedule no longer depends on free memory, so a run is
+        # reproducible across machines and memory states. Measured motivation: vol_and_surf_esp
+        # is chunk-sensitive (it is multi-basin, and seed generation is batch-size dependent via
+        # _masked_principal_axes), so the adaptive schedule made the SHIPPING object path diverge
+        # from ITSELF -- 513 of 100,000 scores under a 12 GB memory hog, more than the array path
+        # differed from it. An OOM still halves and retries below, so this bounds the
+        # nondeterminism to genuine OOM rather than removing the safety net.
+        K_sub = max(1, min(K, _FIXED_CHUNK))
+        need_resize = False
+    else:
+        K_sub = max(1, min(K, int(_budget() // fp))) if fp else min(K, init_cap)
 
     sc_parts, q_parts, t_parts = [], [], []
     s = 0
