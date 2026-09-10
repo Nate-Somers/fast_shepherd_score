@@ -24,12 +24,21 @@ torch.backends.cuda.matmul.allow_tf32 = True
 #: bit-identical by construction. Opt-in so it is trivial to A/B and revert.
 _DEDUP_SEED_COORDS = os.environ.get("FSS_SEED_COORD_DEDUP", "0") == "1"
 
+#: Poses of ONE molecule per CTA. The single-pose kernel is latency/occupancy-bound -- ~5% of an
+#: L40S fp32 peak, ~17% of its SFU, ~1024 pair-evals per CTA with <= 4 warps -- and removing its
+#: coordinate traffic was worth only 1.01x, which ruled memory out. This gives each CTA POSES times
+#: the work, amortising the quaternion->rotmat build, the tile loads and the loop overhead. Needs
+#: the deduped layout (implies it below) and SEEDS % POSES == 0. 1 = the original one-CTA-per-pose
+#: kernel, untouched.
+_POSES_PER_CTA = int(os.environ.get("FSS_POSES_PER_CTA", "1"))
+
 
 @torch.no_grad()
 def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81,
                        N_real: torch.Tensor | None = None,
                        M_real: torch.Tensor | None = None,
-                       NEED_GRAD = True, seeds_per_mol: int = 1):
+                       NEED_GRAD = True, seeds_per_mol: int = 1,
+                       poses_per_cta: int = 1):
     """
     Evaluate the fused overlap kernel on an arbitrary-long list of
     orientations, slicing the list so that each launch respects the
@@ -66,6 +75,8 @@ def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81,
         ms, me = start // S, end // S          # molecule slice for this pose slice
 
         extra = {} if S == 1 else {"seeds_per_mol": S}   # CPU kernels take no such kwarg
+        if int(poses_per_cta) > 1:
+            extra["poses_per_cta"] = int(poses_per_cta)
         V, dQ, dT = overlap_score_grad_se3_batch(
             A[ms:me], B[ms:me],
             q[start:end], t[start:end],
@@ -105,11 +116,12 @@ class _GraphedFineSurf(_GraphedFineBase):
     from _GraphedFineBase.
     """
 
-    def __init__(self, N_pad, M_pad, P, steps, alpha, lr, device, seeds=1):
+    def __init__(self, N_pad, M_pad, P, steps, alpha, lr, device, seeds=1, poses=1):
         self.alpha = float(alpha); self.lr = float(lr)
         f = lambda *s: torch.empty(*s, device=device, dtype=torch.float32)
         # Coordinate + real-count buffers are per MOLECULE; pose state stays per pose.
         self.S = max(1, int(seeds))
+        self.P_cta = max(1, int(poses))
         nm = P // self.S
         self.A = f(nm, N_pad, 3); self.B = f(nm, M_pad, 3)
         self.Nr = torch.empty(nm, device=device, dtype=torch.int32)
@@ -126,6 +138,8 @@ class _GraphedFineSurf(_GraphedFineBase):
 
     def _step(self):
         extra = {} if self.S == 1 else {"seeds_per_mol": self.S}
+        if self.P_cta > 1:
+            extra["poses_per_cta"] = self.P_cta
         VAB, dQ, dT = overlap_score_grad_se3_batch(
             self.A, self.B, self.q, self.t, alpha=self.alpha, N_real=self.Nr, M_real=self.Mr,
             **extra)
@@ -164,11 +178,12 @@ class _GraphedFineSurf(_GraphedFineBase):
 
 
 def _run_graphed_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps, N_pad, M_pad, P,
-                      es_patience=0, es_tol=1e-5, es_seeds=0, seeds=1):
+                      es_patience=0, es_tol=1e-5, es_seeds=0, seeds=1, poses=1):
     key = (A_k.device.index, "surf", N_pad, M_pad, P, steps, round(float(alpha), 4),
-           round(float(lr), 5), int(seeds))
+           round(float(lr), 5), int(seeds), int(poses))
     return run_graphed(
-        lambda: _GraphedFineSurf(N_pad, M_pad, P, steps, alpha, lr, A_k.device, seeds=seeds),
+        lambda: _GraphedFineSurf(N_pad, M_pad, P, steps, alpha, lr, A_k.device, seeds=seeds,
+                                 poses=poses),
         key, (A_k, B_k, N_k, M_k, norm, q_seed, t_seed),
         es_patience=es_patience, es_tol=es_tol, es_seeds=es_seeds)
 
@@ -256,6 +271,10 @@ def coarse_fine_align_many(
     N_k = N_real if _dedup else N_real.repeat_interleave(S)
     M_k = M_real if _dedup else M_real.repeat_interleave(S)
     S_fine = S if _dedup else 1
+    # POSES needs the deduped layout AND must divide the seed count evenly, so that every pose a
+    # CTA handles belongs to the same molecule -- that shared molecule is the reuse being bought.
+    P_cta = _POSES_PER_CTA if (_dedup and _POSES_PER_CTA > 1
+                               and S % _POSES_PER_CTA == 0) else 1
     VAA_plus_VBB = (VAA + VBB).repeat_interleave(S)        # invariant in loop
     P = q_seed.shape[0]
 
@@ -271,7 +290,7 @@ def coarse_fine_align_many(
                 A_k.contiguous(), B_k.contiguous(), q_seed, t_seed, N_k, M_k,
                 VAA_plus_VBB, alpha, lr, steps_fine, N_pad, M_pad, P,
                 es_patience=early_stop_patience, es_tol=early_stop_tol,
-                es_seeds=S, seeds=S_fine)
+                es_seeds=S, seeds=S_fine, poses=P_cta)
         except Exception:
             best_score = None                              # capture failed -> eager
 
@@ -310,7 +329,8 @@ def coarse_fine_align_many(
         for step in range(steps_fine):
             VAB, dQ, dT = _overlap_in_chunks(
                 A_k, B_k, q_k, t_k,
-                alpha=alpha, N_real=N_k, M_real=M_k, seeds_per_mol=S_fine)
+                alpha=alpha, N_real=N_k, M_real=M_k, seeds_per_mol=S_fine,
+                poses_per_cta=P_cta)
 
             denom = VAA_plus_VBB - VAB
             score = VAB / denom

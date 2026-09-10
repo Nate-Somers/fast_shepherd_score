@@ -193,6 +193,146 @@ def _gauss_overlap_se3_tiled(
         tl.store(dQ_ptr + 3, dQz)
 
 
+# ---------------------------------------------------------------------------------------
+# Multi-pose variant: POSES poses of ONE molecule per CTA.
+#
+# The single-pose kernel above is latency/occupancy-bound, not bandwidth- or compute-bound:
+# measured at ~5% of an L40S's fp32 peak and ~17% of its SFU throughput, doing only ~N_pad*M_pad
+# (~1024) pair-evals per CTA with <= 4 warps. Removing the coordinate replication was worth 1.01x,
+# which ruled out memory traffic; what is left is simply too little work per CTA to hide latency.
+#
+# This does the same arithmetic with POSES times more of it per CTA. The A and B tiles are loaded
+# ONCE per (n-tile, m-tile) and reused across POSES poses, so the quaternion->rotmat build, the
+# tile loads and the loop overhead amortise over POSES instead of being paid per pose.
+#
+
+
+@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'])
+@triton.jit
+def _gauss_overlap_se3_multipose(
+    A_ptr, B_ptr,
+    Q_ptr, T_ptr,
+    Nreal_ptr, Mreal_ptr,
+    BATCH, M_pad, N_pad,
+    half_alpha, k_const,
+    S_ptr, dQ_ptr, dT_ptr,
+    BLOCK: tl.constexpr,
+    NEED_GRAD: tl.constexpr,
+    SEEDS: tl.constexpr,
+    POSES: tl.constexpr,
+):
+    """POSES poses of ONE molecule per CTA, vectorised over the pose axis.
+
+    The single-pose kernel is latency/occupancy-bound, not bandwidth- or compute-bound: measured
+    at ~5% of an L40S fp32 peak and ~17% of its SFU, doing only ~N_pad*M_pad (~1024) pair-evals
+    per CTA with <= 4 warps. Deduplicating its coordinate traffic was worth 1.008x, which ruled
+    memory out; what remains is too little work per CTA to hide latency.
+
+    Here the A and B tiles load ONCE and the pose axis broadcasts over them, so every tile load,
+    the quaternion->rotmat build and the loop overhead amortise over POSES poses, and each CTA
+    carries POSES times the arithmetic.
+
+    Poses are a TENSOR dimension rather than an unrolled Python loop -- Triton has no
+    ``__setitem__``, so list accumulators are not expressible. That makes POSES a ``tl.arange``
+    extent, hence power-of-two, and it must divide SEEDS so a CTA never straddles two molecules.
+
+    Identical arithmetic and identical per-pose accumulation order to the single-pose kernel,
+    so results are bit-identical; only which CTA performs them changes.
+    """
+    pid = tl.program_id(0)
+    base = pid * POSES
+    mol = base // SEEDS                    # SEEDS % POSES == 0 => all POSES share this molecule
+
+    realN = tl.load(Nreal_ptr + mol)
+    realM = tl.load(Mreal_ptr + mol)
+    A_ptr = A_ptr + mol * N_pad * 3
+    B_ptr = B_ptr + mol * M_pad * 3
+
+    # -------- pose state: (POSES,) vectors, built once --------
+    p_off = tl.arange(0, POSES)
+    qo = (base + p_off) * 4
+    to = (base + p_off) * 3
+    qr = tl.load(Q_ptr + qo + 0); qi = tl.load(Q_ptr + qo + 1)
+    qj = tl.load(Q_ptr + qo + 2); qk = tl.load(Q_ptr + qo + 3)
+    tx = tl.load(T_ptr + to + 0); ty = tl.load(T_ptr + to + 1); tz = tl.load(T_ptr + to + 2)
+    r00, r01, r02, r10, r11, r12, r20, r21, r22 = _quat_to_rotmat(qr, qi, qj, qk)
+
+    Vab_acc = tl.zeros([POSES], dtype=tl.float32)
+    dTx = tl.zeros([POSES], dtype=tl.float32)
+    dTy = tl.zeros([POSES], dtype=tl.float32)
+    dTz = tl.zeros([POSES], dtype=tl.float32)
+    dQw = tl.zeros([POSES], dtype=tl.float32)
+    dQx = tl.zeros([POSES], dtype=tl.float32)
+    dQy = tl.zeros([POSES], dtype=tl.float32)
+    dQz = tl.zeros([POSES], dtype=tl.float32)
+
+    inv_ln2 = 1.4426950408889634
+
+    for n0 in range(0, N_pad, BLOCK):
+        offs_n = n0 + tl.arange(0, BLOCK)
+        mask_n = offs_n < realN
+        a_idx = tl.where(mask_n, offs_n, 0)
+        ax = tl.load(A_ptr + a_idx * 3 + 0, mask=mask_n, other=0.0)
+        ay = tl.load(A_ptr + a_idx * 3 + 1, mask=mask_n, other=0.0)
+        az = tl.load(A_ptr + a_idx * 3 + 2, mask=mask_n, other=0.0)
+
+        for m0 in range(0, M_pad, BLOCK):
+            offs_m = m0 + tl.arange(0, BLOCK)
+            mask_m = offs_m < realM
+            b_idx = tl.where(mask_m, offs_m, 0)
+            # ONE load, reused by every pose via the broadcast below
+            bx0 = tl.load(B_ptr + b_idx * 3 + 0, mask=mask_m, other=0.0)
+            by0 = tl.load(B_ptr + b_idx * 3 + 1, mask=mask_m, other=0.0)
+            bz0 = tl.load(B_ptr + b_idx * 3 + 2, mask=mask_m, other=0.0)
+
+            # (POSES, BLOCK): each pose's rotation applied to the shared body-frame tile
+            bx = r00[:, None]*bx0[None, :] + r01[:, None]*by0[None, :] + r02[:, None]*bz0[None, :] + tx[:, None]
+            by = r10[:, None]*bx0[None, :] + r11[:, None]*by0[None, :] + r12[:, None]*bz0[None, :] + ty[:, None]
+            bz = r20[:, None]*bx0[None, :] + r21[:, None]*by0[None, :] + r22[:, None]*bz0[None, :] + tz[:, None]
+
+            # (POSES, BLOCK_n, BLOCK_m)
+            dx = ax[None, :, None] - bx[:, None, :]
+            dy = ay[None, :, None] - by[:, None, :]
+            dz = az[None, :, None] - bz[:, None, :]
+            r2 = dx*dx + dy*dy + dz*dz
+
+            g = tl.exp2((-half_alpha * r2) * inv_ln2) * k_const
+            pair_mask = mask_n[None, :, None] & mask_m[None, None, :]
+            g = tl.where(pair_mask, g, 0.0)
+
+            Vab_acc += tl.sum(tl.sum(g, 2), 1)
+
+            if NEED_GRAD:
+                coeff = (2.0 * half_alpha) * g
+                fx = tl.sum(coeff * dx, 1)            # (POSES, BLOCK_m): sum over i
+                fy = tl.sum(coeff * dy, 1)
+                fz = tl.sum(coeff * dz, 1)
+
+                dTx += tl.sum(fx, 1)
+                dTy += tl.sum(fy, 1)
+                dTz += tl.sum(fz, 1)
+
+                dw, dxq, dyq, dzq = _quat_grad_tail(
+                    fx, fy, fz,
+                    bx0[None, :], by0[None, :], bz0[None, :],
+                    qr[:, None], qi[:, None], qj[:, None], qk[:, None])
+                mm = mask_m[None, :]
+                dQw += tl.sum(tl.where(mm, dw, 0.0), 1)
+                dQx += tl.sum(tl.where(mm, dxq, 0.0), 1)
+                dQy += tl.sum(tl.where(mm, dyq, 0.0), 1)
+                dQz += tl.sum(tl.where(mm, dzq, 0.0), 1)
+
+    tl.store(S_ptr + base + p_off, Vab_acc)
+    if NEED_GRAD:
+        tl.store(dT_ptr + to + 0, dTx)
+        tl.store(dT_ptr + to + 1, dTy)
+        tl.store(dT_ptr + to + 2, dTz)
+        tl.store(dQ_ptr + qo + 0, dQw)
+        tl.store(dQ_ptr + qo + 1, dQx)
+        tl.store(dQ_ptr + qo + 2, dQy)
+        tl.store(dQ_ptr + qo + 3, dQz)
+
+
 def overlap_score_grad_se3_batch(
     A, B, q, t, *,
     alpha: float = 0.81,
@@ -203,6 +343,7 @@ def overlap_score_grad_se3_batch(
     num_warps: int | None = None,
     num_stages: int | None = None,
     seeds_per_mol: int = 1,
+    poses_per_cta: int = 1,
 ):
     """
     One CTA per POSE. Internal tile loops over A,B.
@@ -247,6 +388,24 @@ def overlap_score_grad_se3_batch(
     out_S  = torch.zeros(K, device=device, dtype=dtype)
     out_dQ = torch.zeros_like(q)
     out_dT = torch.zeros_like(t)
+
+    POSES = int(poses_per_cta)
+    if POSES > 1:
+        # POSES poses of ONE molecule per CTA. Every pose in a CTA must share a molecule, so
+        # SEEDS must divide evenly by POSES; K % POSES follows from that.
+        if S <= 1 or S % POSES != 0 or K % POSES != 0 or (POSES & (POSES - 1)) != 0:
+            raise ValueError(
+                f"poses_per_cta={POSES} needs the deduped layout, SEEDS % POSES == 0 and a "
+                f"POWER-OF-TWO POSES (it is a tl.arange extent) -- got seeds_per_mol={S}, K={K}")
+        _gauss_overlap_se3_multipose[(K // POSES,)](
+            A.contiguous().view(-1), B.contiguous().view(-1),
+            q.contiguous().view(-1), t.contiguous().view(-1),
+            N_real.contiguous(), M_real.contiguous(),
+            K, M_pad, N_pad, half_alpha, k_const,
+            out_S, out_dQ.view(-1), out_dT.view(-1),
+            NEED_GRAD=NEED_GRAD, SEEDS=S, POSES=POSES,
+        )
+        return out_S, out_dQ, out_dT
 
     grid = (K,)    # 1-D launch: one CTA per alignment
 
