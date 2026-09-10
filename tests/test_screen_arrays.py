@@ -259,3 +259,132 @@ def test_use_arrays_gates_on_mode_and_reads_enabled_live(monkeypatch):
     monkeypatch.setattr(_arrays, "ENABLED", False, raising=True)
     for mode in screenmod._ARRAY_MODES:
         assert screenmod._use_arrays(mode) is False, "ENABLED is read at call time, not import"
+
+
+# ------------------------------------------------------------------------------------------------
+# Canonical-frame stores: the transform must come back in the MOLECULE's frame, not the store's.
+# ------------------------------------------------------------------------------------------------
+# A canonical store rotates every library molecule into its own principal frame at build time, so
+# the pose the optimizer finds is expressed against those rotated coordinates. Scores and RANKING
+# are correct either way -- which is exactly why this needs its own test: every score-based check
+# in this file passes on a canonical store whose transforms are silently in the wrong frame.
+#
+# The check does not compare against the legacy store's transform. It cannot: the two stores seed
+# the optimizer differently, so they reach different optima and their poses legitimately differ.
+# Instead it re-scores: apply the returned transform to the molecule's OWN centred coordinates and
+# recompute the Tanimoto directly. A pose in the wrong frame does not reproduce its own score.
+
+
+def _canonical_store(tmp_path, molecules):
+    p = os.path.join(tmp_path, "canon.fss")
+    with ProfileStore.create(p, num_surf_points=64, modes=("vol",), dtype="float32",
+                             pre_centered=True, canonical=True) as store:
+        for i, m in enumerate(molecules):
+            store.add(m, id=i)
+    return p
+
+
+def _plain_store(tmp_path, molecules):
+    """Same library, same modes, canonical OFF -- the control leg."""
+    p = os.path.join(tmp_path, "plain.fss")
+    with ProfileStore.create(p, num_surf_points=64, modes=("vol",), dtype="float32",
+                             pre_centered=True) as store:
+        for i, m in enumerate(molecules):
+            store.add(m, id=i)
+    return p
+
+
+def test_canonical_store_records_its_rotation(tmp_path, molecules):
+    """The store must carry ``rot``, and it must be a PROPER rotation.
+
+    Without this the composition below is a no-op that the re-scoring test would still pass on a
+    store that quietly fell back to non-canonical -- the same vacuity the spies guard elsewhere.
+    """
+    store = ProfileStore.open(_canonical_store(str(tmp_path), molecules))
+    assert store.canonical is True
+    _, arrs = store.read_shard(0)
+    R = np.asarray(arrs["rot"])
+    assert R.shape == (len(molecules), 3, 3)
+    assert R.dtype == np.float32                       # float32 regardless of store dtype
+    assert np.allclose(np.matmul(R, np.transpose(R, (0, 2, 1))),
+                       np.eye(3)[None], atol=2e-5), "rot is not orthogonal"
+    assert np.all(np.linalg.det(R) > 0), "rot contains a reflection"
+
+
+def _rescore_hits(hits, molecules, query):
+    """``(reported, re-scored)`` for each hit: apply its own transform, recompute the Tanimoto.
+
+    The store is pre-centred and ``screen`` centres the query (``_centered_copy``), so both sides
+    are centred here to match. ``points @ R.T + t`` is the repo's convention
+    (``alignment/utils/se3.py::apply_SE3_transform``).
+    """
+    from shepherd_score.score.gaussian_overlap import shape_tanimoto
+    q = np.asarray(query.atom_pos, dtype=np.float64)
+    qt = torch.as_tensor(q - q.mean(0), dtype=torch.float64)
+    out = []
+    for h in hits:
+        fit = np.asarray(molecules[h.id].atom_pos, dtype=np.float64)
+        fit = fit - fit.mean(0)
+        T = np.asarray(h.transform, dtype=np.float64)
+        posed = fit @ T[:3, :3].T + T[:3, 3]
+        out.append((h.id, h.score, float(shape_tanimoto(qt, torch.as_tensor(posed), 0.81))))
+    return out
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+def test_transform_is_in_the_molecule_frame_cpu(tmp_path, molecules, canonical):
+    """A returned pose must reproduce its own score -- on BOTH store kinds, on the CPU route.
+
+    This is the test that fails if ``_compose_rot`` is removed: the canonical store's pose would
+    be expressed against the rotated coordinates, so re-scoring it in the molecule's own frame
+    gives a different Tanimoto than the one reported. Measured with the composition disabled:
+    the canonical leg drifts up to 0.22 while the legacy leg stays at 1.7e-07 -- so this also
+    pins the composition as a genuine no-op on non-canonical stores rather than a global fudge.
+
+    Running BOTH legs matters. Score-based checks cannot see this defect at all: with the
+    composition disabled the self-copy still REPORTS 1.000000 while its pose re-scores to 0.9068.
+
+    CPU (``backend="torch"``, the non-fast object route) so it runs everywhere; the GPU routes
+    are covered by the ``cuda``-marked twin below.
+    """
+    path = _canonical_store(str(tmp_path), molecules) if canonical         else _plain_store(str(tmp_path), molecules)
+    hits = screen(molecules[0], ProfileStore.open(path), mode="vol", backend="torch", top_k=4)
+    assert hits, "screen returned nothing"
+    for mol_id, reported, rescored in _rescore_hits(hits, molecules, molecules[0]):
+        assert abs(reported - rescored) < 2e-3, (
+            f"id={mol_id} reported {reported:.6f} but its own pose re-scores to {rescored:.6f} "
+            f"-- the transform is not in the molecule's frame (canonical={canonical})")
+
+
+def test_canonical_store_screens_without_the_array_path(monkeypatch, tmp_path, molecules):
+    """A canonical store must not REQUIRE ``FSS_SCREEN_ARRAYS``.
+
+    ``const_seeds`` is a parameter of ``align_batch_vol_arrays`` alone; the object path's
+    ``_align_batch_vol`` has no such keyword. Before the gate, a canonical store raised
+    ``TypeError: _align_batch_vol() got an unexpected keyword argument 'const_seeds'`` on every
+    route but the array one -- caught only because this suite exercises the CPU route, since the
+    benchmarks always run with the array path enabled.
+    """
+    from shepherd_score.accel.batch import _arrays
+    monkeypatch.setattr(_arrays, "ENABLED", False, raising=True)
+    hits = screen(molecules[0], ProfileStore.open(_canonical_store(str(tmp_path), molecules)),
+                  mode="vol", backend="torch", top_k=3)
+    assert len(hits) == 3
+
+
+@pytest.mark.cuda
+def test_canonical_transform_is_in_the_molecule_frame(tmp_path, molecules):
+    """Applying the returned transform to the molecule's own coords must reproduce its score.
+
+    GPU twin of ``test_transform_is_in_the_molecule_frame_cpu``. Same invariant, but over the
+    triton route, where the pose comes from the array path's batched SE(3) epilogue rather than
+    from a pair object -- a different composition site (``offer_row`` vs ``offer_pair``).
+    """
+    _require_fast_cuda()
+    path = _canonical_store(str(tmp_path), molecules)
+    hits = screen(molecules[0], ProfileStore.open(path), mode="vol", backend="triton", top_k=5)
+    assert hits, "screen returned nothing"
+    for mol_id, reported, rescored in _rescore_hits(hits, molecules, molecules[0]):
+        assert abs(reported - rescored) < 2e-3, (
+            f"id={mol_id} reported {reported:.6f} but its own pose re-scores to {rescored:.6f} "
+            f"-- the transform is not in the molecule's frame")

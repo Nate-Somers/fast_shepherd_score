@@ -1320,7 +1320,45 @@ def _align_fast_arrays(ref_xyz, fit_flat, fit_off, mode: str, batch_kw: dict):
                                   steps_fine=batch_kw["steps_fine"])
 
 
-def _accumulate_arrays(heap, ids, scores, transforms, scores_out, qi, start):
+def _canonical_rot(store, arrs):
+    """The per-molecule rotation a CANONICAL store applies at build time, or ``None``.
+
+    ``None`` for a legacy or ``canonical=False`` store, which is what makes every composition
+    below a no-op on those -- the returned pose is already in the molecule's own frame there.
+    """
+    if not getattr(store, "canonical", False):
+        return None
+    return arrs.get("rot") if hasattr(arrs, "get") else None
+
+
+def _compose_rot(T, R):
+    """Map one pose out of the CANONICAL frame and back into the molecule's own.
+
+    A canonical store holds ``x_canon = (x_orig - mu) @ R.T`` (``_profile_from_schema`` centres
+    first, and refuses ``canonical`` without ``pre_center``), so a transform solved against
+    ``x_canon`` satisfies
+
+        x_aligned = x_canon @ T_R.T + T_t = (x_orig - mu) @ (T_R @ R).T + T_t
+
+    -- the rotation composes as ``T_R @ R`` and the translation is unchanged, because both store
+    kinds share the same centred origin. Convention is ``points @ R.T + t``, matching
+    ``alignment/utils/se3.py::apply_SE3_transform``.
+
+    Without this the SCORES and the RANKING are still right while ``Hit.transform`` silently
+    refers to the canonical frame -- a failure no score-based test can see, which is why
+    ``tests/test_screen_arrays.py`` re-scores a returned pose instead.
+
+    Called per SURVIVOR, not per molecule: a screen keeps ~k of K, so composing here costs ~1000
+    3x3 products instead of one (K,3,3) batched product per shard.
+    """
+    if R is None or T is None:
+        return T
+    T = np.array(T, copy=True)
+    T[:3, :3] = T[:3, :3] @ np.asarray(R, dtype=T.dtype)
+    return T
+
+
+def _accumulate_arrays(heap, ids, scores, transforms, scores_out, qi, start, rot=None):
     """Array-native twin of :func:`_accumulate`.
 
     Character-for-character the same reduce -- same block size, same ``threshold()``
@@ -1341,7 +1379,7 @@ def _accumulate_arrays(heap, ids, scores, transforms, scores_out, qi, start):
         else:
             cand = (np.flatnonzero(scores[lo:hi] > thr) + lo).tolist()
         for i in cand:
-            heap.offer_row(float(scores[i]), _id_to_py(ids[i]), transforms, i)
+            heap.offer_row(float(scores[i]), _id_to_py(ids[i]), transforms, i, rot)
         lo = hi
     if scores_out is not None and scores_out[qi] is not None:
         scores_out[qi][start:start + n] = scores
@@ -1383,15 +1421,15 @@ class _TopK:
         elif score > self.heap[0][0]:
             heapq.heapreplace(self.heap, item)
 
-    def offer_pair(self, score, id_, pair, tf_attr):
+    def offer_pair(self, score, id_, pair, tf_attr, rot=None):
         """Offer a candidate, materializing its transform from ``pair`` ONLY if the
         score makes the top-K. A screen keeps ~k of K, so this builds ~k transforms
         instead of K (the dominant per-shard overhead). Must be called while ``pair``
         still holds this query's pose (before the next query/shard re-aligns it)."""
         if len(self.heap) < self.k or score > self.heap[0][0]:
-            self._push(score, id_, _transform_of(pair, tf_attr))
+            self._push(score, id_, _compose_rot(_transform_of(pair, tf_attr), rot))
 
-    def offer_row(self, score, id_, transforms, i):
+    def offer_row(self, score, id_, transforms, i, rot=None):
         """Array-native twin of :meth:`offer_pair`: the transform comes from row ``i`` of a
         (K,4,4) array instead of an attribute on a pair object.
 
@@ -1399,7 +1437,8 @@ class _TopK:
         ONLY difference is where the transform is read from, so the heap state after a shard is
         the same as the object path's down to ties."""
         if len(self.heap) < self.k or score > self.heap[0][0]:
-            self._push(score, id_, transforms[i])
+            self._push(score, id_, _compose_rot(transforms[i],
+                                                None if rot is None else rot[i]))
 
     def threshold(self):
         """Score a candidate must **strictly exceed** to change this heap at all, or
@@ -1513,7 +1552,14 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
         tf_attr = _TRANSFORM_ATTR[mode]
         # CANONICAL store: seeds are one constant set for the whole screen (see
         # _common.canonical_seed_quats). Computed here, once, instead of per molecule per bucket.
-        if getattr(store, "canonical", False) and mode == "vol" and len(qs_ref) == 1:
+        # Gated on ``fast and _use_arrays`` because ``const_seeds`` is a parameter of
+        # ``align_batch_vol_arrays`` ALONE -- the object path's ``_align_batch_vol`` has no such
+        # keyword and raises TypeError on it, so an ungated canonical store crashed outright with
+        # FSS_SCREEN_ARRAYS unset. Those routes simply keep the per-molecule PCA seeds, which stay
+        # CORRECT on a canonical store (they are derived from whatever coordinates the store
+        # holds) -- they just forgo the speedup.
+        if (fast and _use_arrays(mode) and getattr(store, "canonical", False)
+                and mode == "vol" and len(qs_ref) == 1):
             from shepherd_score.accel.drivers._common import canonical_seed_quats
             from .accel._modes import MODE_SEEDS
             _rx = qs_ref[0].get("xyz")
@@ -1527,6 +1573,10 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
         # Shards arrive in order from the read-ahead reader; ``arrs`` is exactly what
         # ``store.read_shard(idx)`` returned, just read one shard earlier.
         for sh, arrs in _iter_shards_prefetched(store, shard_idxs):
+            # A canonical store's coordinates are rotated into each molecule's principal frame,
+            # so every pose below is solved in THAT frame and has to be composed back. ``None``
+            # for every other store, which makes each composition a no-op there. See _compose_rot.
+            rot = _canonical_rot(store, arrs)
             if fast:
                 # ``ids`` stays the raw store array: _accumulate applies ``_id_to_py`` to
                 # top-K survivors only, instead of converting every library molecule here.
@@ -1543,7 +1593,7 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                             scores, se3 = _align_fast_arrays(ref_xyz, fit_flat, fit_off,
                                                              mode, batch_kw)
                             _accumulate_arrays(heaps[qi], ids, scores, se3,
-                                               scores_out, qi, start)
+                                               scores_out, qi, start, rot)
                     else:
                         ids, *fit = _ARRAY_BUILDERS[mode](arrs, device)
                         align = _ARRAY_ALIGNERS[mode]
@@ -1551,13 +1601,14 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                             ref = _ref_tensors_from_arrays(ra, mode, device)
                             scores, se3 = align(ref, tuple(fit), batch_kw)
                             _accumulate_arrays(heaps[qi], ids, scores, se3,
-                                               scores_out, qi, start)
+                                               scores_out, qi, start, rot)
                 else:
                     ids, pairs = _build_fit_fast_pairs(arrs, mode, device)
                     for qi, ra in enumerate(qs_ref):
                         ref = _ref_tensors_from_arrays(ra, mode, device)
                         scores = _align_fast(pairs, ref, mode, batch_kw)
-                        _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
+                        _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi,
+                                    start, rot)
             else:
                 profiles = store._reconstruct(arrs, sh)   # == store.read_profiles(idx)
                 if center_profiles:
@@ -1570,7 +1621,8 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                     result = getattr(MoleculePairBatch(pairs), "align_with_" + mode)(
                         backend=backend, **align_kwargs)
                     scores = np.asarray(result[0], dtype=float)
-                    _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi, start)
+                    _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi,
+                                start, rot)
             done += sh["n"]
             if progress:
                 print(f"[screen] {done}/{n_total} library molecules aligned "
@@ -1588,7 +1640,7 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
 _ACCUM_BLOCK = 4096
 
 
-def _accumulate(heap, ids, scores, pairs, tf_attr, scores_out, qi, start):
+def _accumulate(heap, ids, scores, pairs, tf_attr, scores_out, qi, start, rot=None):
     """Reduce one shard's scores for one query: full score vector out, top-K heap in.
 
     ``scores_out`` still receives EVERY score, in library order, via the same single
@@ -1628,7 +1680,8 @@ def _accumulate(heap, ids, scores, pairs, tf_attr, scores_out, qi, start):
         for i in cand:
             # ``_id_to_py`` is applied HERE rather than to the whole shard up front, so the
             # numpy-scalar -> python conversion only runs for candidates that survive.
-            heap.offer_pair(float(scores[i]), _id_to_py(ids[i]), pairs[i], tf_attr)
+            heap.offer_pair(float(scores[i]), _id_to_py(ids[i]), pairs[i], tf_attr,
+                            None if rot is None else rot[i])
         lo = hi
     if scores_out is not None and scores_out[qi] is not None:
         scores_out[qi][start:start + n] = scores
@@ -1831,12 +1884,13 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
             if idx is None:
                 break
             _sh, arrs = store.read_shard(idx)
+            rot = _canonical_rot(store, arrs)      # canonical-frame stores; None otherwise
             if _use_arrays(mode):
                 ids, fit_flat, fit_off = _build_fit_arrays_vol(arrs, dev)
                 for qi, ref in enumerate(ref_tensors):
                     scores, se3 = _align_fast_arrays(ref["_ref_xyz_t"], fit_flat, fit_off,
                                                      mode, batch_kw)
-                    _accumulate_arrays(heaps[qi], ids, scores, se3, None, qi, 0)
+                    _accumulate_arrays(heaps[qi], ids, scores, se3, None, qi, 0, rot)
                 torch.cuda.synchronize()
                 continue
             ids, pairs = _build_fit_fast_pairs(arrs, mode, dev)
@@ -1846,7 +1900,7 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
                 # supported with ndev>1, hence the None). No read-ahead here on purpose:
                 # a worker pulls its shards off a shared queue, and grabbing the next
                 # index early would unbalance the pool's work stealing.
-                _accumulate(heaps[qi], ids, scores, pairs, tf_attr, None, qi, 0)
+                _accumulate(heaps[qi], ids, scores, pairs, tf_attr, None, qi, 0, rot)
             torch.cuda.synchronize()
         out_q.put((rank, [h.raw() for h in heaps]))
     except Exception:                            # noqa: BLE001 - relayed to parent
