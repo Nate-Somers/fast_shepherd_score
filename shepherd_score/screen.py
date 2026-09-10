@@ -1078,13 +1078,21 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
     raise ValueError(mode)
 
 
+#: Modes with BOTH an array builder below and an array-native aligner in ``_arrays``. A mode
+#: joins this tuple only when both exist -- see ``_use_arrays``.
+_ARRAY_MODES = ("vol", "vol_color")
+
+
 def _use_arrays(mode: str) -> bool:
-    """Whether to take the array-native screen path. ``vol`` only for now, opt-in.
+    """Whether to take the array-native screen path. Opt-in, and per-mode.
 
     Round 1 established that a PARTIAL removal of the object model is worth exactly zero, so
-    this is deliberately all-or-nothing per mode rather than a gradual migration."""
+    this is deliberately all-or-nothing per mode rather than a gradual migration: a mode is
+    listed in ``_ARRAY_MODES`` only once its whole path -- builder AND aligner -- is array
+    native. ``vol_color`` was added because it was the most host-bound mode measured (53.0% of
+    its screen inside ``_build_fit_fast_pairs``, in situ at N=1e5)."""
     from shepherd_score.accel.batch import _arrays
-    return mode == "vol" and _arrays.ENABLED
+    return mode in _ARRAY_MODES and _arrays.ENABLED
 
 
 def _build_fit_arrays_vol(arrs: dict, device):
@@ -1098,6 +1106,41 @@ def _build_fit_arrays_vol(arrs: dict, device):
     return (arrs["ids"],
             torch.as_tensor(arrs["atom_pos"], dtype=torch.float32, device=device),
             torch.as_tensor(arrs["atom_off"], dtype=torch.long, device=device))
+
+
+def _build_fit_arrays_vol_color(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_color``.
+
+    TWO channels, TWO offset tables. Heavy-atom centers use ``atom_off``; the directionless
+    pharmacophore features (types + anchors) share their own ``pharm_off``. They are independent
+    -- a molecule's feature count is unrelated to its atom count -- which is exactly why the
+    object path needed six per-molecule splits here and why this needs none.
+
+    Uploads each of the store's already-contiguous buffers ONCE. No ``_FastPair``, no
+    ``_ArrView``, no ``torch.split``/``np.split``, no per-molecule Python."""
+    import torch
+    f32, i64 = torch.float32, torch.int64
+    return (arrs["ids"],
+            torch.as_tensor(arrs["atom_pos"], dtype=f32, device=device),
+            torch.as_tensor(arrs["atom_off"], dtype=torch.long, device=device),
+            torch.as_tensor(arrs["pharm_types"], dtype=i64, device=device),
+            torch.as_tensor(arrs["pharm_ancs"], dtype=f32, device=device),
+            torch.as_tensor(arrs["pharm_off"], dtype=torch.long, device=device))
+
+
+def _align_fast_arrays_vol_color(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``vol_color``. Returns ``(scores, SE3)``."""
+    from shepherd_score.accel.batch._arrays import align_batch_vol_color_arrays
+    fit_flat, fit_off, ptypes, pancs, poff = fit
+    return align_batch_vol_color_arrays(
+        ref["_ref_xyz_t"], ref["_ref_pharm_types_t"], ref["_ref_pharm_ancs_t"],
+        fit_flat, fit_off, ptypes, pancs, poff,
+        alpha=batch_kw.get("alpha", 0.81),
+        color_weight=batch_kw.get("color_weight", 0.5),
+        num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
+        topk=batch_kw.get("topk", 30),
+        steps_fine=batch_kw["steps_fine"],
+        lr=batch_kw.get("lr", 0.075))
 
 
 def _align_fast_arrays(ref_xyz, fit_flat, fit_off, mode: str, batch_kw: dict):
@@ -1312,13 +1355,23 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                 if _use_arrays(mode):
                     # ARRAY-NATIVE PATH (FSS_SCREEN_ARRAYS=1): no per-molecule Python objects
                     # anywhere between the store and the heap. See accel/batch/_arrays.py.
-                    ids, fit_flat, fit_off = _build_fit_arrays_vol(arrs, device)
-                    for qi, ra in enumerate(qs_ref):
-                        ref_xyz = _ref_tensors_from_arrays(ra, mode, device)["_ref_xyz_t"]
-                        scores, se3 = _align_fast_arrays(ref_xyz, fit_flat, fit_off,
-                                                         mode, batch_kw)
-                        _accumulate_arrays(heaps[qi], ids, scores, se3,
-                                           scores_out, qi, start)
+                    # Split per mode rather than generalised: vol's branch is gate-5 verified
+                    # bit-identical and is deliberately left byte-for-byte alone.
+                    if mode == "vol":
+                        ids, fit_flat, fit_off = _build_fit_arrays_vol(arrs, device)
+                        for qi, ra in enumerate(qs_ref):
+                            ref_xyz = _ref_tensors_from_arrays(ra, mode, device)["_ref_xyz_t"]
+                            scores, se3 = _align_fast_arrays(ref_xyz, fit_flat, fit_off,
+                                                             mode, batch_kw)
+                            _accumulate_arrays(heaps[qi], ids, scores, se3,
+                                               scores_out, qi, start)
+                    else:                                   # vol_color
+                        ids, *fit = _build_fit_arrays_vol_color(arrs, device)
+                        for qi, ra in enumerate(qs_ref):
+                            ref = _ref_tensors_from_arrays(ra, mode, device)
+                            scores, se3 = _align_fast_arrays_vol_color(ref, tuple(fit), batch_kw)
+                            _accumulate_arrays(heaps[qi], ids, scores, se3,
+                                               scores_out, qi, start)
                 else:
                     ids, pairs = _build_fit_fast_pairs(arrs, mode, device)
                     for qi, ra in enumerate(qs_ref):

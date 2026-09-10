@@ -219,3 +219,110 @@ def align_batch_vol_arrays(ref_xyz: torch.Tensor, fit_flat: torch.Tensor,
     # ---- epilogue: one D2H, one batched SE(3), numpy out (see aligners.py:18) ----------
     SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
     return out_scores, SE3
+
+
+def align_batch_vol_color_arrays(ref_xyz: torch.Tensor, ref_types: torch.Tensor,
+                                 ref_ancs: torch.Tensor, fit_flat: torch.Tensor,
+                                 fit_off: torch.Tensor, fit_types_flat: torch.Tensor,
+                                 fit_ancs_flat: torch.Tensor, ph_off: torch.Tensor,
+                                 *, alpha: float = 0.81, color_weight: float = 0.5,
+                                 num_repeats_per_trans: int = 10, topk: int = 30,
+                                 steps_fine: int = 100, lr: float = 0.075):
+    """Array-native equivalent of ``_align_batch_vol_color`` for the screen path.
+
+    vol_color was the most host-bound mode measured: 53.0% of its screen is spent inside
+    ``_build_fit_fast_pairs`` (in situ, N=1e5), because its object-path branch runs a 7-way zip
+    doing three ``torch.split`` plus three ``np.split``, four attribute stores and one
+    ``_ArrView`` allocation PER LIBRARY MOLECULE. None of that exists here.
+
+    Two channels instead of vol's one: heavy-atom centers (CSR ``fit_off``) and directionless
+    pharmacophore features -- types + anchors sharing their own CSR ``ph_off``. The two offset
+    tables are independent on purpose; a molecule's feature count has no relation to its atom
+    count.
+
+    WHY ``plan_spans`` IS THE RIGHT PARTITIONER HERE. ``_align_batch_vol_color`` buckets with
+    ``PadSpec(merge={ref,fit centers}, seeds=16, partition={"tc": ...})``. On the screen path
+    ``trans_init`` is False, so ``tc`` is 0 for every pair and the partition never splits; and
+    the ref is ONE query, so its band is constant too. ``plan_buckets`` keys on
+    ``(banded-merge-dims, exact-partition-dims)`` (_bucket.py:199), so that key collapses to the
+    fit band -- precisely what ``plan_spans`` computes. Seeds are passed as 16, not vol's 10,
+    because ``_cap_upfront`` sizes the occupancy floor from ``K * seeds``.
+
+    Anchor padding is NOT keyed, matching the object path: it pads to the bucket's max feature
+    band and relies on Dummy-typed (``_PHARM_PAD_TYPE``) slots plus ``N_real_pharm`` masking, so
+    two molecules sharing a shape bucket but differing in feature count stay together.
+
+    Returns ``(scores, SE3)`` in SHARD order, like :func:`align_batch_vol_arrays`.
+    """
+    from shepherd_score.accel.drivers.vol_color import (
+        fast_optimize_vol_color_overlay_batch, _PHARM_PAD_TYPE)
+    from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
+    from .._modes import MODE_SEEDS
+
+    device = fit_flat.device
+    n_seeds = int(MODE_SEEDS["vol_color"])
+    K = int(fit_off.shape[0]) - 1
+    if K == 0:
+        return np.empty(0, dtype=float), np.empty((0, 4, 4), dtype=np.float32)
+
+    cnt_c = fit_off[1:] - fit_off[:-1]                   # (K,) heavy-atom counts
+    cnt_p = ph_off[1:] - ph_off[:-1]                     # (K,) pharmacophore counts
+    m_sizes = cnt_c.detach().cpu().numpy()
+    N = int(ref_xyz.shape[0])
+    n_ph = int(ref_ancs.shape[0])
+    order, buckets = plan_spans(m_sizes, N, n_seeds, device)
+    order_t = torch.as_tensor(order, device=device, dtype=torch.long)
+
+    out_scores = np.empty(K, dtype=float)
+    out_q = torch.empty(K, 4, device=device)
+    out_t = torch.empty(K, 3, device=device)
+
+    # One query for the whole screen, so its feature band is fixed across every bucket -- the
+    # object path recomputes max(n_ph_list) per bucket over k copies of that same query.
+    n_ph_pad = _band_key(n_ph)
+
+    for bk in buckets:
+        N_pad, M_pad = int(bk.pad["ref"]), int(bk.pad["fit"])
+        k = bk.K
+        rows = order_t[bk.members.lo:bk.members.hi]
+        c_cnt = cnt_c.index_select(0, rows)
+        c_start = fit_off.index_select(0, rows)
+        p_cnt = cnt_p.index_select(0, rows)
+        p_start = ph_off.index_select(0, rows)
+        m_ph_pad = _band_key(int(p_cnt.max()))
+
+        # ---- shape channel: ref broadcast, fit gathered from the store's own buffer --------
+        centers_1 = torch.zeros(k, N_pad, 3, device=device, dtype=torch.float32)
+        centers_1[:, :N] = ref_xyz
+        centers_2 = torch.zeros(k, M_pad, 3, device=device, dtype=torch.float32)
+        gather_fill(centers_2, fit_flat, c_start, c_cnt)
+
+        # ---- colour channel: pad slots stay Dummy-typed so they are never scored -----------
+        r_types = torch.full((k, n_ph_pad), _PHARM_PAD_TYPE, device=device, dtype=torch.int64)
+        r_types[:, :n_ph] = ref_types
+        f_types = torch.full((k, m_ph_pad), _PHARM_PAD_TYPE, device=device, dtype=torch.int64)
+        gather_fill(f_types, fit_types_flat, p_start, p_cnt)
+
+        r_ancs = torch.zeros(k, n_ph_pad, 3, device=device, dtype=torch.float32)
+        r_ancs[:, :n_ph] = ref_ancs
+        f_ancs = torch.zeros(k, m_ph_pad, 3, device=device, dtype=torch.float32)
+        gather_fill(f_ancs, fit_ancs_flat, p_start, p_cnt)
+
+        N_real_c = torch.full((k,), N, dtype=torch.int32, device=device)
+        N_real_p = torch.full((k,), n_ph, dtype=torch.int32, device=device)
+
+        _, qb, tb, sc = fast_optimize_vol_color_overlay_batch(
+            centers_1, centers_2, r_types, f_types, r_ancs, f_ancs,
+            alpha=alpha, color_weight=color_weight,
+            N_real_centers=N_real_c, M_real_centers=c_cnt.to(torch.int32),
+            N_real_pharm=N_real_p, M_real_pharm=p_cnt.to(torch.int32),
+            trans_centers_batch=None, trans_centers_real=None,     # trans_init is False here
+            num_repeats_per_trans=num_repeats_per_trans,
+            topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=n_seeds)
+
+        out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
+        out_q.index_copy_(0, rows, qb)
+        out_t.index_copy_(0, rows, tb)
+
+    SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
+    return out_scores, SE3

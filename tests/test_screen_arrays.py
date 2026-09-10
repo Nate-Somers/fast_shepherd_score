@@ -6,9 +6,10 @@ until the gates pass". This is that gate: the array path must produce byte-for-b
 scores as the object path it replaces, or it is not the re-expression it claims to be.
 
 WHY THE SPIES. A parity test here can pass while proving nothing. ``_use_arrays`` gates on
-``mode == "vol"`` AND ``_arrays.ENABLED``, so a mistake in either silently compares the object
-path against itself and reports success. These tests therefore assert WHICH BUILDER RAN, not
-merely that two vectors matched.
+``mode in _ARRAY_MODES`` AND ``_arrays.ENABLED``, so a mistake in either silently compares the
+object path against itself and reports success. These tests therefore assert WHICH BUILDER RAN,
+not merely that two vectors matched -- and each mode has its own builder, so the spy set has to
+cover ``_build_fit_arrays_vol``, ``_build_fit_arrays_vol_color`` and ``_build_fit_fast_pairs``.
 
 WHY THE SIZES ARE WHAT THEY ARE. The array path re-derives bucket membership as spans over an
 index array rather than Python lists of pair objects, and ``_pad._band_key`` bands molecules by
@@ -81,7 +82,7 @@ def molecules():
 @pytest.fixture(scope="module")
 def store_path(tmp_path_factory, molecules):
     p = os.path.join(tmp_path_factory.mktemp("arrays"), "lib.fss")
-    with ProfileStore.create(p, num_surf_points=64, modes=("vol",),
+    with ProfileStore.create(p, num_surf_points=64, modes=("vol", "vol_color"),
                              dtype="float32", pre_centered=True) as store:
         for i, m in enumerate(molecules):
             store.add(m, id=i)
@@ -101,12 +102,18 @@ def _screen_recording(monkeypatch, store_path, query, *, enabled, mode="vol", st
     monkeypatch.setattr(_arrays, "ENABLED", enabled, raising=True)
 
     seen = {"arrays": 0, "objects": 0, "buckets": 0}
-    real_arr, real_obj = screenmod._build_fit_arrays_vol, screenmod._build_fit_fast_pairs
+    real_arr = screenmod._build_fit_arrays_vol
+    real_arr_c = screenmod._build_fit_arrays_vol_color
+    real_obj = screenmod._build_fit_fast_pairs
     real_spans = _arrays.plan_spans
 
     def spy_arr(*a, **k):
         seen["arrays"] += 1
         return real_arr(*a, **k)
+
+    def spy_arr_c(*a, **k):
+        seen["arrays"] += 1
+        return real_arr_c(*a, **k)
 
     def spy_obj(*a, **k):
         seen["objects"] += 1
@@ -120,6 +127,7 @@ def _screen_recording(monkeypatch, store_path, query, *, enabled, mode="vol", st
     # Both call sites resolve these as module globals (screen.py:1315/1322, _arrays.py:167),
     # so attribute patches genuinely intercept them.
     monkeypatch.setattr(screenmod, "_build_fit_arrays_vol", spy_arr, raising=True)
+    monkeypatch.setattr(screenmod, "_build_fit_arrays_vol_color", spy_arr_c, raising=True)
     monkeypatch.setattr(screenmod, "_build_fit_fast_pairs", spy_obj, raising=True)
     monkeypatch.setattr(_arrays, "plan_spans", spy_spans, raising=True)
 
@@ -146,15 +154,16 @@ def test_library_spans_multiple_pad_bands(molecules):
 
 
 @pytest.mark.cuda
-def test_array_path_is_bit_identical_to_object_path(monkeypatch, store_path, molecules):
+@pytest.mark.parametrize("mode", ["vol", "vol_color"])
+def test_array_path_is_bit_identical_to_object_path(monkeypatch, store_path, molecules, mode):
     """The array path is a re-expression of the object path, so scores must match EXACTLY."""
     _require_fast_cuda()
     query = molecules[1]
 
     with monkeypatch.context() as mp:
-        s_on, h_on, seen_on = _screen_recording(mp, store_path, query, enabled=True)
+        s_on, h_on, seen_on = _screen_recording(mp, store_path, query, enabled=True, mode=mode)
     with monkeypatch.context() as mp:
-        s_off, h_off, seen_off = _screen_recording(mp, store_path, query, enabled=False)
+        s_off, h_off, seen_off = _screen_recording(mp, store_path, query, enabled=False, mode=mode)
 
     # --- the two runs really took different paths -------------------------------------------
     assert seen_on["arrays"] > 0, "ENABLED=True did not reach the array builder"
@@ -176,12 +185,14 @@ def test_array_path_is_bit_identical_to_object_path(monkeypatch, store_path, mol
 
 
 @pytest.mark.cuda
-def test_array_path_recovers_the_self_copy(monkeypatch, store_path, molecules):
+@pytest.mark.parametrize("mode", ["vol", "vol_color"])
+def test_array_path_recovers_the_self_copy(monkeypatch, store_path, molecules, mode):
     """Independent anchor: the array path must be a CORRECT screen, not merely a consistent one.
     Two paths agreeing on nonsense would satisfy parity by itself."""
     _require_fast_cuda()
     with monkeypatch.context() as mp:
-        scores, hits, seen = _screen_recording(mp, store_path, molecules[1], enabled=True)
+        scores, hits, seen = _screen_recording(mp, store_path, molecules[1],
+                                               enabled=True, mode=mode)
     assert seen["arrays"] > 0
     assert hits[0].id == 1, "query is in the library at id=1 and must rank first"
     assert hits[0].score == pytest.approx(1.0, abs=1e-2), "self-copy must score ~1.0"
@@ -194,16 +205,23 @@ def test_array_path_is_off_by_default():
     assert _arrays.ENABLED == (os.environ.get("FSS_SCREEN_ARRAYS") == "1")
 
 
-def test_use_arrays_is_vol_only_and_reads_enabled_live(monkeypatch):
+def test_use_arrays_gates_on_mode_and_reads_enabled_live(monkeypatch):
     """``_use_arrays`` must gate on BOTH the mode and the live flag -- the two ways this file
-    could silently stop testing anything."""
+    could silently stop testing anything.
+
+    The mode list is asserted against ``_ARRAY_MODES`` rather than hardcoded, but every mode
+    NOT in it is checked explicitly: adding a mode to the tuple without an array-native aligner
+    would otherwise route it into a function that does not exist."""
     from shepherd_score.accel.batch import _arrays
     import shepherd_score.screen as screenmod
 
     monkeypatch.setattr(_arrays, "ENABLED", True, raising=True)
-    assert screenmod._use_arrays("vol") is True
-    for mode in ("vol_color", "vol_esp", "surf", "surf_esp", "pharm", "vol_and_surf_esp"):
+    for mode in screenmod._ARRAY_MODES:
+        assert screenmod._use_arrays(mode) is True
+    for mode in ("vol_esp", "surf", "surf_esp", "pharm", "vol_and_surf_esp"):
+        assert mode not in screenmod._ARRAY_MODES
         assert screenmod._use_arrays(mode) is False, f"{mode} has no array-native aligner"
 
     monkeypatch.setattr(_arrays, "ENABLED", False, raising=True)
-    assert screenmod._use_arrays("vol") is False, "ENABLED is read at call time, not import time"
+    for mode in screenmod._ARRAY_MODES:
+        assert screenmod._use_arrays(mode) is False, "ENABLED is read at call time, not import"
