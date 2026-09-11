@@ -470,7 +470,9 @@ class ProfileStore:
     def create(cls, path, *, num_surf_points: int, modes: Sequence[str],
                dtype: str = "float16", shard_size: int = 100_000,
                pre_centered: bool = True, overwrite: bool = False,
-               canonical: bool = False) -> "ProfileStore":
+               canonical: bool = False,
+               shard_format: str = os.environ.get("FSS_STORE_SHARD_FORMAT", "npy"),
+               ) -> "ProfileStore":
         """Open a store for writing.
 
         Parameters
@@ -514,16 +516,18 @@ class ProfileStore:
             raise FileExistsError(
                 f"{manifest_path} already exists; pass overwrite=True to replace it")
         if overwrite:
-            # Remove only THIS store's own files (its manifest + ``shard_NNNNN.npz``
-            # sequence), never every ``.npz`` in the directory -- the target may hold
+            # Remove only THIS store's own files (its manifest + its shard sequence, in
+            # either format), never every ``.npz`` in the directory -- the target may hold
             # unrelated data the caller did not mean to lose.
             for f in os.listdir(path):
-                if f == cls.MANIFEST or re.fullmatch(r"shard_\d{5}\.npz", f):
+                if (f == cls.MANIFEST or re.fullmatch(r"shard_\d{5}\.npz", f)
+                        or re.fullmatch(r"shard_\d{5}__\w+\.npy", f)):
                     os.remove(os.path.join(path, f))
         manifest = dict(version=cls.VERSION, num_surf_points=int(num_surf_points),
                         modes=list(modes), schema=schema, dtype=dtype,
                         shard_size=int(shard_size), pre_centered=bool(pre_centered),
                         canonical=bool(canonical),
+                        shard_format=str(shard_format),
                         n_total=0, shards=[])
         store = cls(path, manifest, "w")
         store._write_manifest()
@@ -568,10 +572,25 @@ class ProfileStore:
     def _flush(self) -> None:
         if not self._buf:
             return
-        name = f"shard_{self._shard_id:05d}.npz"
         arrs = self._concat(self._buf)
-        np.savez(os.path.join(self.path, name), **arrs)
-        self.manifest["shards"].append(dict(name=name, n=len(self._buf), start=self._n))
+        if self.manifest.get("shard_format") == "npy":
+            # One .npy per array instead of one .npz per shard, so the reader can memory-map
+            # them. An .npz is a ZIP, and Python's zipfile CRC-checks every member as it is
+            # read: measured on an L40S (job 22596303), a 20.9 MB shard costs 13.30 ms to read
+            # with the check and 5.08 ms without, i.e. **62% of the read is CRC** -- and at
+            # N=100,000 the store is a single shard, so the read-ahead thread has nothing to
+            # overlap it with and the whole 0.133 us/mol sits on the critical path. np.save
+            # pads its header so the data begins 64-byte aligned, which is what lets np.load
+            # hand back a real mmap rather than a copy.
+            name = f"shard_{self._shard_id:05d}"
+            for k, v in arrs.items():
+                np.save(os.path.join(self.path, f"{name}__{k}.npy"), v)
+            entry = dict(name=name, n=len(self._buf), start=self._n, keys=sorted(arrs))
+        else:
+            name = f"shard_{self._shard_id:05d}.npz"
+            np.savez(os.path.join(self.path, name), **arrs)
+            entry = dict(name=name, n=len(self._buf), start=self._n)
+        self.manifest["shards"].append(entry)
         self._n += len(self._buf)
         self.manifest["n_total"] = self._n
         self._buf = []
@@ -697,7 +716,20 @@ class ProfileStore:
         """Materialize one shard's arrays into a plain ``{name: np.ndarray}`` dict
         (npz closed before return). Cheaper than :meth:`iter_shards` -- it skips the
         per-molecule ``MoleculeProfile`` split, which the fast screen path does on
-        the GPU/device side instead."""
+        the GPU/device side instead.
+
+        A ``shard_format="npy"`` store is MEMORY-MAPPED instead of unzipped, which skips both
+        the ZIP CRC (62% of a 20.9 MB shard read, measured) and the copy into fresh arrays.
+        The returned arrays are copy-on-write mappings of the page cache; every consumer here
+        (the array builders' uploads, ``_reconstruct``'s slicing, ``_canonical_rot``) only
+        reads, so nothing is ever copied back. Stores written before this format are still ``.npz`` and take the branch below,
+        so nothing on disk is invalidated."""
+        if sh.get("keys") is not None:
+            base = os.path.join(self.path, sh["name"])
+            # mmap_mode="c" (copy-on-write), not "r": a read-only mapping makes numpy hand back
+            # a non-writable array, and ``torch.from_numpy`` warns on those every call. Nothing
+            # here writes, so "c" costs nothing and reads come straight from the page cache.
+            return {k: np.load(f"{base}__{k}.npy", mmap_mode="c") for k in sh["keys"]}
         with np.load(os.path.join(self.path, sh["name"])) as data:
             return {k: data[k] for k in data.files}
 
@@ -923,7 +955,9 @@ def _query_ref_arrays(q, mode: str) -> dict:
 def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
     import torch
     def f(a):
-        return torch.as_tensor(a, dtype=torch.float32, device=device)
+        # Same pinned-staging upload the array builders use, so the modes with no array
+        # builder (surf, surf_esp, vol_lipo, the Tversky family, ...) get it too.
+        return _to_device(a, device, dtype=torch.float32)
     if mode == "vol":
         return {"_ref_xyz_t": f(ra["xyz"])}
     if mode == "surf":
@@ -978,7 +1012,9 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
     K = len(ids)
     pairs = [_FastPair(device) for _ in range(K)]
     def f(a):
-        return torch.as_tensor(a, dtype=torch.float32, device=device)
+        # Same pinned-staging upload the array builders use, so the modes with no array
+        # builder (surf, surf_esp, vol_lipo, the Tversky family, ...) get it too.
+        return _to_device(a, device, dtype=torch.float32)
     def splitT(big, off):                      # K variable device views
         return torch.split(big, np.diff(off).tolist())
     def splitN(arr, off):                      # K variable numpy views
@@ -996,7 +1032,7 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
             p._fit_surf_esp_t = e
     elif mode == "pharm":
         off = arrs["pharm_off"]
-        bt = torch.as_tensor(arrs["pharm_types"], dtype=torch.int64, device=device)
+        bt = _to_device(arrs["pharm_types"], device, dtype=torch.int64)
         for p, t, a, v in zip(pairs, torch.split(bt, np.diff(off).tolist()),
                               splitT(f(arrs["pharm_ancs"]), off), splitT(f(arrs["pharm_vecs"]), off)):
             p._fit_pharm_types_t = t
@@ -1004,7 +1040,7 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device):
             p._fit_pharm_vecs_t = v
     elif mode == "vol_color":
         aoff, poff = arrs["atom_off"], arrs["pharm_off"]
-        bt = torch.as_tensor(arrs["pharm_types"], dtype=torch.int64, device=device)
+        bt = _to_device(arrs["pharm_types"], device, dtype=torch.int64)
         np_atom, np_pt, np_pa = arrs["atom_pos"], arrs["pharm_types"], arrs["pharm_ancs"]
         for p, at, pt, pa, an, ptn, pan in zip(
                 pairs, splitT(f(arrs["atom_pos"]), aoff),
@@ -1149,6 +1185,66 @@ def _use_arrays(mode: str) -> bool:
     return mode in _ARRAY_MODES and _arrays.ENABLED
 
 
+#: Persistent pinned staging buffers for the shard upload, keyed by (dtype, device index).
+#: One per dtype, grown to the largest shard seen; each carries the event that says when the
+#: last copy out of it landed, so it can be reused without a blanket stream sync.
+_PIN_STAGE: dict = {}
+
+
+def _to_device(a, device, *, dtype=None):
+    """Upload one store array, staged through PINNED host memory, asynchronously.
+
+    Two things, both measured on an L40S vol screen:
+
+    * **stage through pinned memory.** ``torch.as_tensor(numpy_array, device="cuda")`` copies
+      from PAGEABLE memory, which the driver must bounce through its own staging buffers while
+      the calling thread waits. ``_build_fit_arrays_vol`` measured 0.149 us/mol = 12.1% of the
+      wall at N=1,000,000 (job 22594805) doing exactly that, at an effective ~1.2 GB/s. A copy
+      out of a pinned buffer is a real asynchronous DMA, so the host hands it to the copy
+      engine and goes straight on to enqueue the alignment kernels behind it.
+    * **retype on the DEVICE.** A store holds coordinates as float16
+      (``ProfileStore.create(dtype="float16")``, the default), so asking for float32 here would
+      widen on the host first and push twice the bytes. float16 -> float32 is exact, so doing
+      it on the GPU is bit-identical.
+
+    This is deliberately on the CALLING thread. The obvious-looking alternative -- upload the
+    next shard from the read-ahead thread -- was built and measured SLOWER twice (0.688x
+    pageable, then 0.849x and 0.921x pinned, against 1.02x for the same configuration without
+    it), and it cannot be made safe: ``cudaStreamSynchronize`` from a second thread raises
+    "operation not permitted when stream is capturing" whenever the main thread is capturing a
+    fine-loop CUDA graph, and ``coarse_fine_align_many`` swallows that into a silent fall back
+    to the eager loop. See :func:`_iter_shards_prefetched`, which stays I/O-only.
+    """
+    import torch
+    if device.type != "cuda":
+        t = torch.as_tensor(a, device=device)
+        return t if dtype is None or t.dtype == dtype else t.to(dtype)
+    src = torch.from_numpy(np.asarray(a))
+    # Key on the RESOLVED device index: torch.device("cuda") carries index None, and two
+    # devices must not share one event (pinned host memory is shareable, a CUDA event is not).
+    _idx = getattr(device, "index", None)
+    key = (src.dtype, torch.cuda.current_device() if _idx is None else int(_idx))
+    ent = _PIN_STAGE.get(key)
+    if ent is None or ent[0].numel() < src.numel():
+        ent = (torch.empty(src.numel(), dtype=src.dtype, pin_memory=True), torch.cuda.Event())
+        _PIN_STAGE[key] = ent
+    else:
+        ent[1].synchronize()          # the previous copy OUT of this buffer has landed
+    buf, ev = ent
+    flat = buf[:src.numel()]
+    flat.copy_(src.reshape(-1))
+    out = torch.empty(tuple(src.shape), dtype=src.dtype, device=device)
+    out.view(-1).copy_(flat, non_blocking=True)
+    ev.record()
+    return out if dtype is None or out.dtype == dtype else out.to(dtype)
+
+
+def _up_f32(a, device):
+    """:func:`_to_device` fixed to float32 -- the coordinate channels' contract."""
+    import torch
+    return _to_device(a, device, dtype=torch.float32)
+
+
 def _build_fit_arrays_vol(arrs: dict, device):
     """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol``.
 
@@ -1158,8 +1254,8 @@ def _build_fit_arrays_vol(arrs: dict, device):
     array-native, then ``cat``ed them back together downstream."""
     import torch
     return (arrs["ids"],
-            torch.as_tensor(arrs["atom_pos"], dtype=torch.float32, device=device),
-            torch.as_tensor(arrs["atom_off"], dtype=torch.long, device=device))
+            _to_device(arrs["atom_pos"], device, dtype=torch.float32),
+            _to_device(arrs["atom_off"], device, dtype=torch.long))
 
 
 def _build_fit_arrays_vol_color(arrs: dict, device):
@@ -1175,11 +1271,11 @@ def _build_fit_arrays_vol_color(arrs: dict, device):
     import torch
     f32, i64 = torch.float32, torch.int64
     return (arrs["ids"],
-            torch.as_tensor(arrs["atom_pos"], dtype=f32, device=device),
-            torch.as_tensor(arrs["atom_off"], dtype=torch.long, device=device),
-            torch.as_tensor(arrs["pharm_types"], dtype=i64, device=device),
-            torch.as_tensor(arrs["pharm_ancs"], dtype=f32, device=device),
-            torch.as_tensor(arrs["pharm_off"], dtype=torch.long, device=device))
+            _to_device(arrs["atom_pos"], device, dtype=f32),
+            _to_device(arrs["atom_off"], device, dtype=torch.long),
+            _to_device(arrs["pharm_types"], device, dtype=i64),
+            _to_device(arrs["pharm_ancs"], device, dtype=f32),
+            _to_device(arrs["pharm_off"], device, dtype=torch.long))
 
 
 def _align_fast_arrays_vol_color(ref: dict, fit: tuple, batch_kw: dict):
@@ -1204,10 +1300,10 @@ def _build_fit_arrays_pharm(arrs: dict, device):
     import torch
     f32 = torch.float32
     return (arrs["ids"],
-            torch.as_tensor(arrs["pharm_types"], dtype=torch.int64, device=device),
-            torch.as_tensor(arrs["pharm_ancs"], dtype=f32, device=device),
-            torch.as_tensor(arrs["pharm_vecs"], dtype=f32, device=device),
-            torch.as_tensor(arrs["pharm_off"], dtype=torch.long, device=device))
+            _to_device(arrs["pharm_types"], device, dtype=torch.int64),
+            _to_device(arrs["pharm_ancs"], device, dtype=f32),
+            _to_device(arrs["pharm_vecs"], device, dtype=f32),
+            _to_device(arrs["pharm_off"], device, dtype=torch.long))
 
 
 def _build_fit_arrays_vol_esp(arrs: dict, device):
@@ -1228,9 +1324,9 @@ def _build_fit_arrays_vol_esp(arrs: dict, device):
     else:                                       # heavy charges stored directly
         heavy = arrs["charges"]
     return (arrs["ids"],
-            torch.as_tensor(xnoH, dtype=f32, device=device),
-            torch.as_tensor(heavy, dtype=f32, device=device),
-            torch.as_tensor(hoff, dtype=torch.long, device=device))
+            _to_device(xnoH, device, dtype=f32),
+            _to_device(heavy, device, dtype=f32),
+            _to_device(hoff, device, dtype=torch.long))
 
 
 def _align_fast_arrays_pharm(ref: dict, fit: tuple, batch_kw: dict):
@@ -1275,14 +1371,14 @@ def _build_fit_arrays_vol_and_surf_esp(arrs: dict, device):
     import torch
     f32 = torch.float32
     return (arrs["ids"],
-            torch.as_tensor(arrs["cwh"], dtype=f32, device=device),
-            torch.as_tensor(arrs["charges"], dtype=f32, device=device),
-            torch.as_tensor(arrs["radii"], dtype=f32, device=device),
-            torch.as_tensor(arrs["all_off"], dtype=torch.long, device=device),
-            torch.as_tensor(arrs["atom_pos"], dtype=f32, device=device),
-            torch.as_tensor(arrs["atom_off"], dtype=torch.long, device=device),
-            torch.as_tensor(arrs["surf_pos"], dtype=f32, device=device),
-            torch.as_tensor(arrs["surf_esp"], dtype=f32, device=device))
+            _to_device(arrs["cwh"], device, dtype=f32),
+            _to_device(arrs["charges"], device, dtype=f32),
+            _to_device(arrs["radii"], device, dtype=f32),
+            _to_device(arrs["all_off"], device, dtype=torch.long),
+            _to_device(arrs["atom_pos"], device, dtype=f32),
+            _to_device(arrs["atom_off"], device, dtype=torch.long),
+            _to_device(arrs["surf_pos"], device, dtype=f32),
+            _to_device(arrs["surf_esp"], device, dtype=f32))
 
 
 def _align_fast_arrays_vol_and_surf_esp(ref: dict, fit: tuple, batch_kw: dict):
@@ -1375,11 +1471,20 @@ def _accumulate_arrays(heap, ids, scores, transforms, scores_out, qi, start, rot
             hi = n
         thr = heap.threshold()
         if thr == float("-inf"):
-            cand = range(lo, hi)
+            sel = np.arange(lo, hi)
         else:
-            cand = (np.flatnonzero(scores[lo:hi] > thr) + lo).tolist()
-        for i in cand:
-            heap.offer_row(float(scores[i]), _id_to_py(ids[i]), transforms, i, rot)
+            sel = np.flatnonzero(scores[lo:hi] > thr) + lo
+        # Convert the surviving candidates' scores and ids in ONE vectorised call each,
+        # instead of a numpy-scalar access plus ``float()``/``_id_to_py()`` per candidate.
+        # ``ndarray.tolist()`` is elementwise ``.item()``, which is exactly what ``_id_to_py``
+        # does for a numpy scalar and a no-op for anything else, so the values handed to the
+        # heap are unchanged. This is the hot loop: the accumulate is 17.4% of a vol screen's
+        # wall at N=100,000 once the canonical composition is deferred (job 22596802), and it
+        # runs ~5,200 times for a 1,000-entry heap.
+        cs = scores[sel].tolist()
+        cid = ids[sel].tolist()
+        for j, i in enumerate(sel.tolist()):
+            heap.offer_row(cs[j], cid[j], transforms, i, rot)
         lo = hi
     if scores_out is not None and scores_out[qi] is not None:
         scores_out[qi][start:start + n] = scores
@@ -1425,9 +1530,14 @@ class _TopK:
         """Offer a candidate, materializing its transform from ``pair`` ONLY if the
         score makes the top-K. A screen keeps ~k of K, so this builds ~k transforms
         instead of K (the dominant per-shard overhead). Must be called while ``pair``
-        still holds this query's pose (before the next query/shard re-aligns it)."""
+        still holds this query's pose (before the next query/shard re-aligns it).
+
+        The MATERIALIZATION has to happen now -- the pair is about to be re-aligned -- but the
+        canonical-frame COMPOSITION does not, so it is deferred to :meth:`_materialize` for the
+        same reason as :meth:`offer_row`: acceptance into the heap is not survival, and ~4 of
+        every 5 accepted candidates are evicted before the screen ends."""
         if len(self.heap) < self.k or score > self.heap[0][0]:
-            self._push(score, id_, _compose_rot(_transform_of(pair, tf_attr), rot))
+            self._push(score, id_, (_transform_of(pair, tf_attr), rot))
 
     def offer_row(self, score, id_, transforms, i, rot=None):
         """Array-native twin of :meth:`offer_pair`: the transform comes from row ``i`` of a
@@ -1435,10 +1545,28 @@ class _TopK:
 
         Identical acceptance test, identical push, identical ``_c`` tie-break advance -- the
         ONLY difference is where the transform is read from, so the heap state after a shard is
-        the same as the object path's down to ties."""
+        the same as the object path's down to ties.
+
+        The canonical-frame composition is DEFERRED to :meth:`_materialize`, not done here.
+        Acceptance into the heap is not survival: a vol screen at N=100,000 for top_k=1000
+        accepts 5,238 candidates, so ~4 of every 5 compositions were being done for a molecule
+        evicted before the screen ended. ``_compose_rot`` is a numpy copy plus a 3x3 matmul,
+        ~2.7 us of interpreter and allocator time, and it measured at 0.1405 us/mol = **9.7% of
+        the whole vol screen's wall clock** (job 22594805, L40S, N=100,000) -- the single
+        largest host item in the screen. Storing the pending ``(row, rot_row)`` pair costs two
+        numpy views. The rows are views into the shard's arrays, which is exactly what a
+        non-canonical store already stores here (``_compose_rot`` returns ``T`` unchanged when
+        ``rot`` is None), so this changes nothing about lifetime that was not already true."""
         if len(self.heap) < self.k or score > self.heap[0][0]:
-            self._push(score, id_, _compose_rot(transforms[i],
-                                                None if rot is None else rot[i]))
+            self._push(score, id_, (transforms[i], None if rot is None else rot[i]))
+
+    @staticmethod
+    def _materialize(t):
+        """Compose a deferred ``(transform, rot)`` pair; pass anything else through.
+
+        ``offer_pair`` (the object path) pushes a real array, and ``merge_raw`` receives
+        already-composed transforms from another worker, so both stay untouched."""
+        return _compose_rot(t[0], t[1]) if type(t) is tuple else t
 
     def threshold(self):
         """Score a candidate must **strictly exceed** to change this heap at all, or
@@ -1461,10 +1589,13 @@ class _TopK:
             self._push(s, i, t)
 
     def raw(self):
-        return [(s, i, t) for (s, _, i, t) in self.heap]
+        # Composed on the way OUT, so what crosses a process boundary (multi_gpu merges heaps
+        # through raw()/merge_raw) is a plain (4,4) array, never a view that would drag its
+        # whole shard along through pickle.
+        return [(s, i, self._materialize(t)) for (s, _, i, t) in self.heap]
 
     def sorted(self):
-        return [Hit(score=s, id=i, transform=t)
+        return [Hit(score=s, id=i, transform=self._materialize(t))
                 for (s, _, i, t) in sorted(self.heap, key=lambda x: x[0], reverse=True)]
 
 
@@ -1495,16 +1626,22 @@ def _resolve_screen(store, mode, alpha, align_kwargs):
 
 
 def _iter_shards_prefetched(store, shard_idxs):
-    """Yield ``(shard_meta, arrays)`` for ``shard_idxs`` **in order**, reading the next
-    shard on a single background thread so the disk read overlaps the current shard's
-    alignment.
+    """Yield ``(shard_meta, arrays)`` for ``shard_idxs`` **in order**, reading the next shard
+    on a single background thread so the disk read overlaps the current shard's alignment.
 
-    Pure I/O overlap: the worker only calls :meth:`ProfileStore.read_shard`, which opens
-    its own file handle and returns fresh arrays, touching no shared mutable state, and
-    the consumer still sees shards strictly in ``shard_idxs`` order. A read that raises
-    is re-raised in the caller's thread by ``Future.result()`` before the shard is yielded,
-    and the executor is shut down (joining the in-flight read) on any exit path, including
-    the generator being closed early.
+    Pure I/O overlap, and deliberately ONLY that: the obvious extension -- have this thread do
+    the host-to-device upload as well -- was built and measured SLOWER twice (0.688x pageable,
+    0.849x/0.921x pinned, against 1.02x without it), and it cannot be made safe. A second
+    thread calling ``cudaStreamSynchronize`` raises "operation not permitted when stream is
+    capturing" whenever the main thread is capturing a fine-loop CUDA graph, and
+    ``coarse_fine_align_many`` swallows that into a silent fall back to the eager loop. The
+    upload stays on the calling thread; see :func:`_to_device`.
+
+    The worker touches no shared mutable state: :meth:`ProfileStore.read_shard` opens its own
+    file handle and returns fresh arrays. The consumer still sees shards strictly in
+    ``shard_idxs`` order; a read that raises is re-raised in the caller's thread by
+    ``Future.result()`` before the shard is yielded, and the executor is shut down (joining the
+    in-flight read) on any exit path, including the generator being closed early.
 
     Costs one extra resident shard. ``FSS_SCREEN_PREFETCH=0`` disables the read-ahead and
     restores strictly-one-shard residency.
@@ -1673,14 +1810,17 @@ def _accumulate(heap, ids, scores, pairs, tf_attr, scores_out, qi, start, rot=No
             hi = n
         thr = heap.threshold()
         if thr == float("-inf"):
-            cand = range(lo, hi)                     # heap not full: every offer is taken
+            sel = np.arange(lo, hi)                  # heap not full: every offer is taken
         else:
-            # ``.tolist()`` so the offers below index with Python ints, not numpy scalars.
-            cand = (np.flatnonzero(scores[lo:hi] > thr) + lo).tolist()
-        for i in cand:
-            # ``_id_to_py`` is applied HERE rather than to the whole shard up front, so the
-            # numpy-scalar -> python conversion only runs for candidates that survive.
-            heap.offer_pair(float(scores[i]), _id_to_py(ids[i]), pairs[i], tf_attr,
+            sel = np.flatnonzero(scores[lo:hi] > thr) + lo
+        # One vectorised conversion per BLOCK instead of a numpy-scalar access plus
+        # ``float()``/``_id_to_py()`` per candidate. ``ndarray.tolist()`` is elementwise
+        # ``.item()``, which is exactly what ``_id_to_py`` does for a numpy scalar, so the
+        # values reaching the heap are unchanged. Same change as in _accumulate_arrays.
+        cs = scores[sel].tolist()
+        cid = np.asarray(ids)[sel].tolist()
+        for j, i in enumerate(sel.tolist()):
+            heap.offer_pair(cs[j], cid[j], pairs[i], tf_attr,
                             None if rot is None else rot[i])
         lo = hi
     if scores_out is not None and scores_out[qi] is not None:

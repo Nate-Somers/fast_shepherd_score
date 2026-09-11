@@ -152,7 +152,7 @@ def align_batch_vol_arrays(ref_xyz: torch.Tensor, fit_flat: torch.Tensor,
     from shepherd_score.accel.drivers.shape import coarse_fine_align_many, _self_overlap_in_chunks
     from shepherd_score.accel.drivers._common import batched_seeds_torch
     from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
-    from ._pad import _subbatched_align
+    from ._pad import _subbatched_align, _FINE_CHUNK_POSES
     from .._modes import MODE_SEEDS
 
     device = fit_flat.device
@@ -217,8 +217,15 @@ def align_batch_vol_arrays(ref_xyz: torch.Tensor, fit_flat: torch.Tensor,
                 seeds=(_sq[sl], _st[sl]))
 
         # same workspace/footprint key as the object path -> identical chunking
+        # ``pose_cap`` keeps every sub-batch
+        # inside graph_cap so the fine loop is ALWAYS the CUDA-graph one. Without it the chunk
+        # is sized from free memory alone and a big band silently falls back to the eager loop
+        # -- a path that scores differently (it skips the graph's early-stop margin), so the
+        # screen's results depended on allocator state. Opt-in per call site: every other
+        # aligner keeps the schedule it has today.
         sc, qb, tb = _subbatched_align(_proc, k, key=("vol", N_pad, M_pad, n_seeds),
-                                        device=device)
+                                        device=device,
+                                        pose_cap=_FINE_CHUNK_POSES, seeds=n_seeds)
         idx = rows
         out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
         out_q.index_copy_(0, idx, qb)
@@ -319,6 +326,11 @@ def align_batch_vol_color_arrays(ref_xyz: torch.Tensor, ref_types: torch.Tensor,
         N_real_c = torch.full((k,), N, dtype=torch.int32, device=device)
         N_real_p = torch.full((k,), n_ph, dtype=torch.int32, device=device)
 
+        # NOT sub-batched, and that is measured, not an omission. vol_color's driver graphs only
+        # below ``graph_cap(N*M, budget=30e6)`` = 29,296 poses (1,831 molecules at 16 seeds), so
+        # chunking a screen-sized bucket small enough to reach the graph costs more in chunks
+        # than the graph returns: wired up, it measured **0.6523x** at N=20,000 (job 22599113),
+        # the same way pharm measured 0.6496x. One big call is the right shape here.
         _, qb, tb, sc = fast_optimize_vol_color_overlay_batch(
             centers_1, centers_2, r_types, f_types, r_ancs, f_ancs,
             alpha=alpha, color_weight=color_weight,
@@ -409,6 +421,9 @@ def align_batch_pharm_arrays(ref_types: torch.Tensor, ref_ancs: torch.Tensor,
                 topk=topk, steps_fine=steps_fine, lr=lr)
             return sc, q, t
 
+        # NO pose cap here: armed, pharm measured 0.6496x (job 22598857). Its driver graphs
+        # only below graph_cap(N*M, budget=1e7) = 9,765 poses, so any cap loose enough to be
+        # worth setting still never reaches a graph and only multiplies the chunk count.
         sc, qb, tb = _subbatched_align(_proc, k, key=("pharm", N_pad, M_pad, n_seeds),
                                        device=device)
         out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
@@ -484,6 +499,8 @@ def align_batch_vol_esp_arrays(ref_pts: torch.Tensor, ref_chg: torch.Tensor,
                 topk=topk, steps_fine=steps_fine, lr=lr)
             return sc, q, t
 
+        # NO pose cap here: armed, vol_esp measured 0.9981x (job 22598857) -- the graph does
+        # engage, but its per-step ESP kernel is heavy enough that the launch saving vanishes.
         sc, qb, tb = _subbatched_align(_proc, k, key=("vol_esp", N_pad, M_pad, n_seeds),
                                        device=device)
         out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)

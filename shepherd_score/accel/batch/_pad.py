@@ -27,9 +27,41 @@ _PAIR_FOOTPRINT_BYTES: dict[tuple, int] = {}
 #: _subbatched_align for why vol_and_surf_esp needs it.
 _FIXED_CHUNK = int(os.environ.get("FSS_SUBBATCH_CHUNK", "0"))
 
+#: Default upper bound, in POSES, on one fine-loop sub-batch. Applied only where a caller
+#: passes ``pose_cap``, so every other call site keeps the purely memory-derived schedule.
+#:
+#: THE CAP IS PER MODE, NOT GLOBAL, and that is measured: each driver graphs below its own
+#: ``graph_cap`` work budget (vol/vol_esp 3e8, vol_color 3e7, pharm 1e7), and the amount of
+#: launch overhead a graph removes is tiny next to a heavy per-step kernel. Armed on every array
+#: mode at N=20,000 (job 22598857) the answer differed by mode:
+#:      vol       1.2985x     <- kept
+#:      vol_esp   0.9981x     <- neutral; the ESP step is too heavy for launches to matter
+#:      pharm     0.6496x     <- REGRESSION: its graph threshold is 9,765 poses, so this cap
+#:                               only multiplied the chunk count without ever reaching a graph
+#: So callers pass a cap they have measured, and most pass none.
+#:
+#: This is not a tuning knob, it is a CORRECTNESS-OF-MEASUREMENT one. The memory-derived chunk
+#: decides WHICH FINE LOOP RUNS: ``drivers/_graphed.graph_cap`` refuses to capture past 262,144
+#: poses, so a bucket that fits in one memory-sized chunk (a 96,850-molecule band at 10 seeds is
+#: 968,500 poses) silently runs the eager loop instead of the CUDA graph. Profiling the same
+#: N=100,000 vol screen twice showed both outcomes, because the answer depends on what the
+#: allocator happened to be holding. The two paths are not equivalent: the graph replay adds
+#: ``_GRAPH_ES_MARGIN`` blocks of early-stop patience, so it runs longer and scores differently
+#: (measured: 71,736 of 100,000 scores move, max 6.5e-03, when the same screen takes the eager
+#: path instead). Capping poses makes the graph path unconditional and the result reproducible.
+#:
+#: 81,920 = the measured optimum on an L40S, at BOTH library sizes and for all of vol's shapes
+#: (job 22595747, aligns/s vs chunk in molecules at 10 seeds):
+#:      N=1e5   4096:885,682  6144:939,470  8192:964,248  12288:903,760  24576:903,640
+#:      N=1e6   4096:887,968  6144:940,391  8192:951,602  12288:903,819  24576:891,175
+#: Every all-graphed setting above is BIT-IDENTICAL to every other (verified over all 100,000
+#: and all 1,000,000 scores), so the size is free to choose on speed alone.
+_FINE_CHUNK_POSES = int(os.environ.get("FSS_FINE_CHUNK_POSES", "81920"))
+
 
 def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
-                      safety: float = 0.7, init_cap: int = 1024):
+                      safety: float = 0.7, init_cap: int = 1024, pose_cap: int = 0,
+                      seeds: int = 1):
     """Drive ``process(start, count) -> (scores, q, t)`` over ``K`` independent
     pairs in GPU-memory-safe sub-batches and concatenate the per-pair results.
 
@@ -61,6 +93,10 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
         reusable = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
         return safety * (free + max(0, reusable))
 
+    # Pose cap: only ever SHRINKS a chunk, so the memory safety below is untouched. Applied
+    # before the memory sizing so ``need_resize``'s later growth respects it too.
+    cap_pairs = max(1, int(pose_cap) // max(1, int(seeds))) if pose_cap > 0 else K
+
     fp = _PAIR_FOOTPRINT_BYTES.get(key)
     need_resize = fp is None
     if _FIXED_CHUNK > 0:
@@ -75,6 +111,7 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
         need_resize = False
     else:
         K_sub = max(1, min(K, int(_budget() // fp))) if fp else min(K, init_cap)
+    K_sub = max(1, min(K_sub, cap_pairs))
 
     sc_parts, q_parts, t_parts = [], [], []
     s = 0
@@ -101,7 +138,7 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
                 fp = _PAIR_FOOTPRINT_BYTES[key]
                 remaining = K - s
                 if remaining > 0:
-                    K_sub = max(1, min(remaining, int(_budget() // fp)))
+                    K_sub = max(1, min(remaining, int(_budget() // fp), cap_pairs))
                 need_resize = False
         except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
             # Some OOMs surface as a plain RuntimeError; only treat those as OOM.
