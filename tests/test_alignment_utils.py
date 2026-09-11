@@ -210,5 +210,8 @@ class TestPCA:
 
         m = Chem.AddHs(Chem.MolFromSmiles("[H][H]"))
         AllChem.EmbedMolecule(m, randomSeed=0)
+        # Charges are generated LAZILY (see Molecule._partial_charges), so CONSTRUCTION is fine --
+        # a molecule nobody scores for ESP never needs them. The guard fires on first access.
+        mol = Molecule(m)
         with pytest.raises(ValueError, match="MMFF94 could not parameterize"):
-            Molecule(m)
+            _ = mol.partial_charges

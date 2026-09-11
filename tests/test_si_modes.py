@@ -208,7 +208,11 @@ def test_vol_and_surf_esp_tversky_deterministic_synthetic():
 def test_surf_modes_self_overlap(mode):
     pytest.importorskip("open3d")
     m = _mol("CC(=O)Oc1ccccc1C(=O)O", surface=True)
-    pair = MoleculePair(m, m, do_center=True, device=torch.device("cpu"))
+    # num_surf_points is a MoleculePair attribute, and align_with_surf_* guards on IT, not on
+    # whether the molecules carry surfaces -- so building the pair without it made every surface
+    # mode raise "initialized with no surface points" on molecules that had them.
+    pair = MoleculePair(m, m, do_center=True, num_surf_points=100,
+                        device=torch.device("cpu"))
     getattr(pair, f"align_with_{mode}")(**_KW)
     s = float(getattr(pair, SURF_MODES[mode]))
     assert np.isclose(s, 1.0, atol=5e-3), f"{mode} self-overlap {s} != 1.000"

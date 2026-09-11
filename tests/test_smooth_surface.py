@@ -76,11 +76,15 @@ def test_fast_alias_matches_smooth_sdf():
 def test_smooth_sdf_no_open3d_and_exact_count():
     import sys
     c, r = _geom(_embed("CC(=O)Oc1ccccc1C(=O)O"))  # aspirin
+    # Whether open3d is ALREADY imported depends on which tests ran before this one (several
+    # importorskip it), so the claim to check is that THIS CALL does not import it -- not that
+    # the module is absent from the whole process.
+    had_open3d = "open3d" in sys.modules
     surf = get_molecular_surface(c, r, num_points=200, method="smooth_sdf", seed=1)
     assert surf.shape == (200, 3)
     assert surf.dtype == np.float32
     assert np.all(np.isfinite(surf))
-    assert "open3d" not in sys.modules  # the smooth path never imports Open3D
+    assert ("open3d" in sys.modules) == had_open3d  # the smooth path never imports Open3D
 
 
 def test_molecule_smooth_sdf_end_to_end():
