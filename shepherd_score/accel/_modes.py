@@ -13,7 +13,7 @@ To add a new mode, register it here (attrs + seeds + steps, and PROCESS_MODES if
 """
 
 # Canonical mode id -> (transform_attr, score_attr) written in-place on a MoleculePair by
-# ``MoleculePairBatch.align_with_<mode>``. This is the full set of the 10 canonical modes; the
+# ``MoleculePairBatch.align_with_<mode>``. This is the full set of the 21 canonical modes; the
 # tuple order is the public mode order (preserved from screen.py's historical _VALID_MODES).
 MODE_ATTRS = {
     "vol":              ("transform_vol_noH",          "sim_aligned_vol_noH"),
@@ -43,7 +43,7 @@ MODE_ATTRS = {
     "vol_avoid":                ("transform_vol_avoid",                "sim_aligned_vol_avoid"),
 }
 
-# The 10 canonical mode ids, in public order.
+# The 21 canonical mode ids, in public order.
 CANONICAL_MODES = tuple(MODE_ATTRS)
 
 # Legacy (pre-rename) mode names -> canonical. The old public API keeps working through this:
