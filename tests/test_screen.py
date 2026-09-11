@@ -354,8 +354,10 @@ def test_vol_esp_tversky_stream_matches_object(tmp_path, molecules):
     assert store.schema["charges"]
     # the heavy partial charges actually reached disk (a mode that stored nothing would still
     # "pass" a score compare when every molecule's charges are empty -- this catches that).
-    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
-        assert "charges" in d.files
+    # Read through the STORE, not by globbing a file name: a test that re-derives
+    # the on-disk layout is what let the .npy format break iter_shards.
+    d = store.read_shard(0)[1]
+    assert "charges" in d
 
     query = molecules[1]                                 # also stored at id=1
     hits = screen(query, store, mode="vol_esp_tversky", backend="numba", lam=0.1,
@@ -392,8 +394,10 @@ def test_vol_lipo_stream_matches_object(tmp_path, molecules):
     assert store.supports("vol_lipo") and store.supports("vol")
     assert store.schema["lipophilicity"]
     # the variable-length lipo set made it to disk (offset table + centres + scalar arrays)
-    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
-        assert {"lipo_off", "lipo_pos", "lipophilicity"} <= set(d.files)
+    # Read through the STORE, not by globbing a file name: a test that re-derives
+    # the on-disk layout is what let the .npy format break iter_shards.
+    d = store.read_shard(0)[1]
+    assert {"lipo_off", "lipo_pos", "lipophilicity"} <= set(d)
 
     query = molecules[1]
     hits = screen(query, store, mode="vol_lipo", backend="numba",
@@ -481,8 +485,10 @@ def test_vol_esp_stream_retained_h(tmp_path):
 
     # The store gained the heavy offset + strict-heavy centers (a clean store would not).
     import glob
-    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
-        assert "heavy_off" in d.files and "xyz_noH" in d.files
+    # Read through the STORE, not by globbing a file name: a test that re-derives
+    # the on-disk layout is what let the .npy format break iter_shards.
+    d = store.read_shard(0)[1]
+    assert "heavy_off" in d and "xyz_noH" in d
 
     query = mols[0]                                  # clean query
     hits = screen(query, ProfileStore.open(store_path), mode="vol_esp", backend="numba",
@@ -523,11 +529,13 @@ def test_vol_lipo_stream_retained_h(tmp_path):
 
     # The lipo set reached disk, and its offset table diverges from atom_off on the retained-H
     # molecule (proving the two bases are stored independently, not desynced).
-    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
-        assert {"lipo_off", "lipo_pos", "lipophilicity"} <= set(d.files)
-        atom_lens = np.diff(d["atom_off"])
-        lipo_lens = np.diff(d["lipo_off"])
-        assert (atom_lens != lipo_lens).any(), "retained-H molecule should diverge atom_off vs lipo_off"
+    # Read through the STORE, not by globbing a file name: a test that re-derives
+    # the on-disk layout is what let the .npy format break iter_shards.
+    d = store.read_shard(0)[1]
+    assert {"lipo_off", "lipo_pos", "lipophilicity"} <= set(d)
+    atom_lens = np.diff(d["atom_off"])
+    lipo_lens = np.diff(d["lipo_off"])
+    assert (atom_lens != lipo_lens).any(), "retained-H molecule should diverge atom_off vs lipo_off"
 
     query = mols[0]                                  # clean query
     hits = screen(query, ProfileStore.open(store_path), mode="vol_lipo", backend="numba",
@@ -589,8 +597,10 @@ def test_vol_fukui_stream_matches_object(tmp_path):
     assert store.supports("vol_fukui") and store.supports("vol")
     assert store.schema["fukui"]
     # the variable-length Fukui set made it to disk (offset table + centres + scalar arrays)
-    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
-        assert {"fukui_off", "fukui_pos", "fukui"} <= set(d.files)
+    # Read through the STORE, not by globbing a file name: a test that re-derives
+    # the on-disk layout is what let the .npy format break iter_shards.
+    d = store.read_shard(0)[1]
+    assert {"fukui_off", "fukui_pos", "fukui"} <= set(d)
 
     query = mols[1]
     hits = screen(query, store, mode="vol_fukui", backend="numba",
@@ -633,11 +643,13 @@ def test_vol_fukui_stream_retained_h(tmp_path):
 
     # The Fukui set reached disk, and its offset table diverges from atom_off on the retained-H
     # molecule (proving the two bases are stored independently, not desynced).
-    with np.load(glob.glob(os.path.join(store_path, "shard_*.npz"))[0]) as d:
-        assert {"fukui_off", "fukui_pos", "fukui"} <= set(d.files)
-        atom_lens = np.diff(d["atom_off"])
-        fukui_lens = np.diff(d["fukui_off"])
-        assert (atom_lens != fukui_lens).any(), "retained-H molecule should diverge atom_off vs fukui_off"
+    # Read through the STORE, not by globbing a file name: a test that re-derives
+    # the on-disk layout is what let the .npy format break iter_shards.
+    d = store.read_shard(0)[1]
+    assert {"fukui_off", "fukui_pos", "fukui"} <= set(d)
+    atom_lens = np.diff(d["atom_off"])
+    fukui_lens = np.diff(d["fukui_off"])
+    assert (atom_lens != fukui_lens).any(), "retained-H molecule should diverge atom_off vs fukui_off"
 
     query = mols[0]                                  # clean query
     hits = screen(query, ProfileStore.open(store_path), mode="vol_fukui", backend="numba",
