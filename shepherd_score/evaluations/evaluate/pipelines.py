@@ -13,13 +13,7 @@ from importlib.metadata import distributions
 
 import numpy as np
 import pandas as pd
-from rdkit import Chem
-
-if any(d.metadata["Name"] == 'rdkit' for d in distributions()):
-    from rdkit.Contrib.SA_Score import sascorer  # type: ignore
-else:
-    sys.path.append(os.path.join(os.environ['CONDA_PREFIX'],'share','RDKit','Contrib'))
-    from SA_Score import sascorer  # type: ignore
+from rdkit import Chem, RDConfig
 
 from rdkit.Chem import QED, Crippen, Lipinski, rdFingerprintGenerator
 from rdkit.DataStructs import TanimotoSimilarity
@@ -40,6 +34,14 @@ from shepherd_score.evaluations.evaluate._pipeline_eval_single import _eval_unco
 from shepherd_score.evaluations.evaluate._pipeline_eval_single import _eval_conditional_single, _create_conditional_failed_result
 from shepherd_score.evaluations.evaluate._pipeline_eval_single import _eval_consistency_single, _create_consistency_failed_result
 from shepherd_score.evaluations.evaluate._pipeline_eval_single import _compute_consistency_upper_bounds
+
+# necessary to handle conda-installed RDKit
+sa_path = os.path.join(RDConfig.RDContribDir, "SA_Score")
+if sa_path not in sys.path:
+    sys.path.append(sa_path)
+
+import sascorer # noqa: E402  # pyright: ignore[reportMissingImports]
+
 
 RNG = np.random.default_rng()
 morgan_fp_gen = rdFingerprintGenerator.GetMorganGenerator(radius=3, includeChirality=True)

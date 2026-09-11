@@ -138,6 +138,21 @@ def update_mol_coordinates(mol: Chem.Mol, coordinates: Union[List, np.ndarray]) 
     return mol_new
 
 
+def _with_bonded_hydrogens(mol: Chem.Mol, atom_indices: np.ndarray) -> np.ndarray:
+    """
+    Return ``atom_indices`` unioned with the directly-bonded hydrogen neighbor
+    of every atom in ``atom_indices``.
+    """
+    h_idx = set()
+    for i in atom_indices.tolist():
+        for nbr in mol.GetAtomWithIdx(int(i)).GetNeighbors():
+            if nbr.GetAtomicNum() == 1:
+                h_idx.add(nbr.GetIdx())
+    if not h_idx:
+        return atom_indices
+    return np.array(sorted(set(atom_indices.tolist()) | h_idx), dtype=np.int64)
+
+
 class Molecule:
     """
     Molecule contains ways to hold/generate molecule geometries
@@ -687,12 +702,33 @@ class Molecule:
         return Z
 
 
-    def get_pc(self, use_density=False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def get_pc(self,
+              use_density=False,
+              atom_indices: Optional[Iterable[int]] = None,
+              radial_buffer: float = 0.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Gets the point cloud positions.
+
+        Parameters
+        ----------
+        use_density : bool, optional
+            Whether to sample at a fixed point density instead of a fixed count. Default ``False``.
+        atom_indices : Optional[Iterable[int]]
+            If given, restricts surface generation to only these atom indices
+            (original-mol atom-index space, same as ``partial_charges``).
+            ``None`` (default) uses all atoms, preserving prior behavior.
+        radial_buffer : float, optional
+            Flat padding (in Angstroms) added to every atom's vdW radius before
+            surface generation. Default ``0.0`` (no change).
         """
         self.mol, centers = get_atom_coords(self.mol, MMFF_optimize=False)
         surface_method = self.surface_method
+        radii = self.radii
+        if atom_indices is not None:
+            idx = np.asarray(sorted({int(i) for i in atom_indices}), dtype=np.int64)
+            centers, radii = centers[idx], radii[idx]
+        if radial_buffer:
+            radii = radii + radial_buffer
         if use_density:
             if surface_method != 'mesh':
                 raise ValueError(
@@ -701,7 +737,7 @@ class Molecule:
                     "or pass num_surf_points instead of density."
                 )
             positions = get_molecular_surface_const_density(centers,
-                                                            self.radii,
+                                                            radii,
                                                             self.density,
                                                             probe_radius=self.probe_radius,
                                                             num_samples_per_atom=25)
@@ -709,21 +745,40 @@ class Molecule:
             # num_samples_per_atom left to each method's default: 25 for 'mesh' (unchanged),
             # the sparser SMOOTH_SDF_NSPA for 'smooth_sdf'.
             positions = get_molecular_surface(centers,
-                                              self.radii,
+                                              radii,
                                               num_points=self.num_surf_points,
                                               probe_radius=self.probe_radius,
                                               method=surface_method)
         return positions.astype(np.float32)
 
 
-    def get_electrostatic_potential(self) -> np.ndarray:
+    def get_electrostatic_potential(self,
+                                    atom_indices: Optional[Iterable[int]] = None,
+                                    surf_pos: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Get the electrostatic potential at each surface point.
+
+        Parameters
+        ----------
+        atom_indices : Optional[Iterable[int]]
+            If given, restricts the atoms (and their charges) contributing to
+            the potential to only these indices (original-mol atom-index
+            space, same as ``partial_charges``). ``None`` (default) uses all
+            atoms, preserving prior behavior.
+        surf_pos : Optional[np.ndarray]
+            Surface points to evaluate the potential at. Defaults to
+            ``self.surf_pos``; pass an explicit array when evaluating against
+            a freshly regenerated surface not yet assigned to ``self``.
         """
         centers = self.mol.GetConformer().GetPositions()
-        distances = np.linalg.norm(self.surf_pos[:, np.newaxis] - centers, axis=2)
+        charges = self.partial_charges
+        if atom_indices is not None:
+            idx = np.asarray(sorted({int(i) for i in atom_indices}), dtype=np.int64)
+            centers, charges = centers[idx], charges[idx]
+        surf_pos = self.surf_pos if surf_pos is None else surf_pos
+        distances = np.linalg.norm(surf_pos[:, np.newaxis] - centers, axis=2)
         # Calculate the potentials
-        E_pot = np.dot(self.partial_charges, 1 / distances.T) * COULOMB_SCALING
+        E_pot = np.dot(charges, 1 / distances.T) * COULOMB_SCALING
         # Ensure that invalid distances (where distance is 0) are handled
         E_pot[np.isinf(E_pot)] = 0
         return E_pot.astype(np.float32)
@@ -799,6 +854,114 @@ class Molecule:
             return_atom_ids=return_atom_ids,
             priority_atoms=priority_atoms,
             min_ring_priority_atoms=min_ring_priority_atoms,
+        )
+
+
+    def select_atoms(self,
+                     atom_indices: Iterable[int],
+                     surface_atom_indices: Optional[Iterable[int]] = None,
+                     expand_pharm_consistent: bool = True,
+                     min_ring_priority_atoms: int = 1,
+                     restrict_esp: bool = True,
+                     radial_buffer: float = 0.0,
+                     include_h: bool = False) -> 'Molecule':
+        """
+        Return a new :class:`Molecule` whose surface, ESP, and pharmacophore
+        data are restricted to a chosen atom subset.
+
+        Parameters
+        ----------
+        atom_indices : Iterable[int]
+            Seed atom indices (original-mol atom-index space, same as
+            ``partial_charges`` and ``Pharmacophore.atom_ids``) that drive the
+            pharmacophore subselection. Also used for the surface/ESP
+            restriction when ``surface_atom_indices`` is ``None``.
+        surface_atom_indices : Optional[Iterable[int]]
+            If given, used in place of ``atom_indices`` to restrict the
+            surface/ESP -- decoupling which atoms define the retained
+            pharmacophores from which atoms the surface/ESP are regenerated
+            over. Expanded via ``expand_pharm_consistent`` the same way
+            ``atom_indices`` is independently.
+        expand_pharm_consistent : bool, optional
+            Whether to expand ``atom_indices`` (and, independently,
+            ``surface_atom_indices`` when given) to the pharmacophore-consistent
+            superset via
+            :meth:`~shepherd_score.pharm_utils.pharmacophore.Pharmacophore.expand_atom_selection`
+            before restricting the pharmacophore / surface / ESP.
+            Default ``True``.
+        min_ring_priority_atoms : int, optional
+            Forwarded to the underlying :class:`Pharmacophore` expansion/filtering
+            calls. Default ``1`` (see
+            :meth:`~shepherd_score.pharm_utils.pharmacophore.Pharmacophore.expand_atom_selection`).
+        restrict_esp : bool, optional
+            If ``True`` (default), the electrostatic potential is recomputed
+            using only the selected atoms' charges. If ``False``, ESP is still
+            recomputed at the restricted surface but using all atoms' charges.
+        radial_buffer : float, optional
+            Flat padding (in Angstroms) added to every retained atom's vdW
+            radius before regenerating the surface. Default ``0.0`` (no change).
+        include_h : bool, optional
+            If ``True``, the directly-bonded hydrogen neighbors of every atom
+            in the surface/ESP atom set are added before regenerating the
+            surface/ESP. Default ``False``.
+
+        Returns
+        -------
+        Molecule
+            A new ``Molecule`` instance; ``self`` is not modified.
+        """
+        pharm_idx = np.asarray(sorted({int(i) for i in atom_indices}), dtype=np.int64)
+
+        pharm = self.pharmacophore
+        if pharm is not None and pharm.atom_ids is None:
+            self.get_pharmacophore(multi_vector=self.pharm_multi_vector, return_atom_ids=True)
+            pharm = self.pharmacophore
+
+        if expand_pharm_consistent and pharm is not None:
+            pharm_idx = pharm.expand_atom_selection(pharm_idx, min_ring_priority_atoms=min_ring_priority_atoms)
+
+        if surface_atom_indices is None:
+            surf_idx = pharm_idx
+        else:
+            surf_idx = np.asarray(sorted({int(i) for i in surface_atom_indices}), dtype=np.int64)
+            if expand_pharm_consistent and pharm is not None:
+                surf_idx = pharm.expand_atom_selection(surf_idx, min_ring_priority_atoms=min_ring_priority_atoms)
+
+        if include_h:
+            surf_idx = _with_bonded_hydrogens(self.mol, surf_idx)
+
+        new_surf_pos = None
+        if self.surf_pos is not None:
+            new_surf_pos = self.get_pc(atom_indices=surf_idx, radial_buffer=radial_buffer)
+
+        new_esp = None
+        if self.surf_esp is not None and new_surf_pos is not None:
+            esp_idx = surf_idx if restrict_esp else None
+            new_esp = self.get_electrostatic_potential(atom_indices=esp_idx, surf_pos=new_surf_pos)
+
+        new_pharm = (
+            pharm.subset_to_atoms(pharm_idx, min_ring_priority_atoms=min_ring_priority_atoms)
+            if pharm is not None else None
+        )
+
+        return Molecule(
+            mol=self.mol,
+            probe_radius=self.probe_radius,
+            surface_points=new_surf_pos,
+            partial_charges=self.partial_charges,
+            electrostatics=new_esp,
+            pharm_multi_vector=self.pharm_multi_vector,
+            pharm_types=None if new_pharm is None else new_pharm.types,
+            pharm_ancs=None if new_pharm is None else new_pharm.positions,
+            pharm_vecs=None if new_pharm is None else new_pharm.vectors,
+            # fork-only instance state; without these the subset silently reverts to the
+            # defaults (xtb charges, mesh surface) and any regeneration on the returned
+            # Molecule would no longer match the one it came from. feature_set/directionless
+            # are deliberately absent: the fork keeps those call-time on get_pharmacophore(),
+            # not as instance state, so there is nothing here to carry over.
+            charge_model=self._charge_model,
+            surface_method=self.surface_method,
+            fukui=self._fukui,
         )
 
 
