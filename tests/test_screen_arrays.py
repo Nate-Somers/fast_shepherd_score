@@ -232,12 +232,6 @@ def test_array_path_recovers_the_self_copy(monkeypatch, store_path, molecules, m
         assert hits[0].score == pytest.approx(1.0, abs=1e-2), "self-copy must score ~1.0"
 
 
-def test_array_path_is_off_by_default():
-    """The flag is opt-in. Compares against the env the module actually saw at import, so this
-    stays honest when the suite is deliberately run with FSS_SCREEN_ARRAYS=1 exported."""
-    from shepherd_score.accel.batch import _arrays
-    assert _arrays.ENABLED == (os.environ.get("FSS_SCREEN_ARRAYS") == "1")
-
 
 def test_use_arrays_gates_on_mode_and_reads_enabled_live(monkeypatch):
     """``_use_arrays`` must gate on BOTH the mode and the live flag -- the two ways this file

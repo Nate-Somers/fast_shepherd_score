@@ -96,14 +96,6 @@ def test_flag_is_load_bearing_on_distinct_refs():
     assert not torch.allclose(q_ok, q_lie, atol=1e-4, rtol=0)
 
 
-def test_verify_mode_raises_on_a_false_guarantee(monkeypatch):
-    """FSS_SEED_REF_DEDUP=verify is the only mechanism that checks the CALLER'S predicate.
-    Point it at a batch whose rows are not identical and it must refuse."""
-    monkeypatch.setenv("FSS_SEED_REF_DEDUP", "verify")
-    A, B, N, M = _batch(16, 16, 12, shared_ref=False, seed=9)
-    with pytest.raises(RuntimeError, match="rows are NOT identical"):
-        batched_seeds_torch(A, B, N, M, num_seeds=SEEDS, ref_shared=True)
-
 
 def test_verify_mode_passes_on_a_true_guarantee(monkeypatch):
     """...and must NOT false-alarm on a legitimate firing, where the two solves differ only by

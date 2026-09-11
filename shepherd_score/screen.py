@@ -744,10 +744,14 @@ class ProfileStore:
         return sh, self._load_raw(sh)
 
     def iter_shards(self) -> Iterator[List["MoleculeProfile"]]:
-        """Yield one shard at a time as a ``list[MoleculeProfile]``."""
+        """Yield one shard at a time as a ``list[MoleculeProfile]``.
+
+        Goes through :meth:`_load_raw` rather than opening the shard itself: that is the ONE
+        place that knows how a shard is stored, and duplicating the path arithmetic here is
+        what broke every ``.npy``-format store (a second reader kept opening ``shard_00000``
+        with the ``.npz`` reader's assumptions and got FileNotFoundError)."""
         for sh in self.manifest["shards"]:
-            with np.load(os.path.join(self.path, sh["name"])) as data:
-                yield self._reconstruct(data, sh)
+            yield self._reconstruct(self._load_raw(sh), sh)
 
     def read_profiles(self, idx: int) -> List["MoleculeProfile"]:
         """Reconstruct shard ``idx`` as ``list[MoleculeProfile]`` (random access)."""
