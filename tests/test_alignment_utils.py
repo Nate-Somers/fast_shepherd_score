@@ -210,8 +210,10 @@ class TestPCA:
 
         m = Chem.AddHs(Chem.MolFromSmiles("[H][H]"))
         AllChem.EmbedMolecule(m, randomSeed=0)
-        # Charges are generated LAZILY (see Molecule._partial_charges), so CONSTRUCTION is fine --
-        # a molecule nobody scores for ESP never needs them. The guard fires on first access.
-        mol = Molecule(m)
+        # TWO things moved since this test was written. Charges are generated LAZILY, so
+        # CONSTRUCTION no longer raises -- a molecule nobody scores for ESP never needs them --
+        # and the default charge model is now 'xtb', which parameterizes H2 happily and never
+        # reaches MMFF. Force the MMFF path and touch the lazy property to exercise the guard.
+        mol = Molecule(m, charge_model="mmff")
         with pytest.raises(ValueError, match="MMFF94 could not parameterize"):
             _ = mol.partial_charges
