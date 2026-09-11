@@ -7,7 +7,7 @@ through the **existing** :class:`~shepherd_score.container.MoleculePairBatch` /
 :func:`~shepherd_score.accel.multi_gpu.align_multi_gpu` API, reducing scores on
 the fly. Host RAM never holds the whole library: the screen keeps the shard it is
 aligning plus (by default) one shard being read ahead on a background thread, so
-residency is bounded at two shards. Set ``FSS_SCREEN_PREFETCH=0`` to disable the
+residency is bounded at two shards. See ``_iter_shards_prefetched`` for the
 read-ahead and hold exactly one.
 
 Three pieces:
@@ -471,8 +471,7 @@ class ProfileStore:
                dtype: str = "float16", shard_size: int = 100_000,
                pre_centered: bool = True, overwrite: bool = False,
                canonical: bool = False,
-               shard_format: str = os.environ.get("FSS_STORE_SHARD_FORMAT", "npy"),
-               ) -> "ProfileStore":
+               shard_format: str = "npy") -> "ProfileStore":
         """Open a store for writing.
 
         Parameters
@@ -1239,12 +1238,6 @@ def _to_device(a, device, *, dtype=None):
     return out if dtype is None or out.dtype == dtype else out.to(dtype)
 
 
-def _up_f32(a, device):
-    """:func:`_to_device` fixed to float32 -- the coordinate channels' contract."""
-    import torch
-    return _to_device(a, device, dtype=torch.float32)
-
-
 def _build_fit_arrays_vol(arrs: dict, device):
     """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol``.
 
@@ -1643,11 +1636,10 @@ def _iter_shards_prefetched(store, shard_idxs):
     ``Future.result()`` before the shard is yielded, and the executor is shut down (joining the
     in-flight read) on any exit path, including the generator being closed early.
 
-    Costs one extra resident shard. ``FSS_SCREEN_PREFETCH=0`` disables the read-ahead and
-    restores strictly-one-shard residency.
+    Costs one extra resident shard.
     """
     idxs = list(shard_idxs)
-    if len(idxs) < 2 or os.environ.get("FSS_SCREEN_PREFETCH", "1") == "0":
+    if len(idxs) < 2:
         for i in idxs:
             yield store.read_shard(i)
         return
@@ -1692,7 +1684,7 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
         # Gated on ``fast and _use_arrays`` because ``const_seeds`` is a parameter of
         # ``align_batch_vol_arrays`` ALONE -- the object path's ``_align_batch_vol`` has no such
         # keyword and raises TypeError on it, so an ungated canonical store crashed outright with
-        # FSS_SCREEN_ARRAYS unset. Those routes simply keep the per-molecule PCA seeds, which stay
+        # the object path. Those routes simply keep the per-molecule PCA seeds, which stay
         # CORRECT on a canonical store (they are derived from whatever coordinates the store
         # holds) -- they just forgo the speedup.
         if (fast and _use_arrays(mode) and getattr(store, "canonical", False)
@@ -1719,7 +1711,7 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                 # top-K survivors only, instead of converting every library molecule here.
                 start = sh["start"]
                 if _use_arrays(mode):
-                    # ARRAY-NATIVE PATH (FSS_SCREEN_ARRAYS=1): no per-molecule Python objects
+                    # ARRAY-NATIVE PATH: no per-molecule Python objects
                     # anywhere between the store and the heap. See accel/batch/_arrays.py.
                     # Split per mode rather than generalised: vol's branch is gate-5 verified
                     # bit-identical and is deliberately left byte-for-byte alone.

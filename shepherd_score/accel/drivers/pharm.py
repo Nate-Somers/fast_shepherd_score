@@ -36,7 +36,6 @@ from ...score.analytical_gradients import (
     project_grad_R_to_quaternion,
     _rotation_matrix_from_unit_quat,
 )
-from .._stats import record as _record_steps
 
 _PHARM_SIGMA_MAP = {'tversky': 0.95, 'tversky_ref': 1.0, 'tversky_fit': 0.05}
 
@@ -514,12 +513,6 @@ def coarse_fine_pharm_align_many(
         # Adam update (using fused kernel for efficiency)
         fused_adam_qt(q_param, t_param, dQ_tan.detach(), dT.detach(), m_q, v_q, m_t, v_t, lr)
 
-    if _graphed is None:
-        # One record per eager fine-loop invocation: value+grad evaluations actually
-        # executed (the loop breaks AFTER an evaluation, before that step's Adam update)
-        # against the configured budget. No-op unless _stats recording was enabled.
-        _ran = (step + 1) if steps_fine else 0
-        _record_steps(_ran, steps_fine, _ran < steps_fine)
 
     # ------------------------------------------------------------------
     # 5) Gather final results

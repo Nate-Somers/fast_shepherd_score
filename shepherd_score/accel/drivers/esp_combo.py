@@ -27,7 +27,6 @@ from ._common import (
     _update_best,
 )
 from ._graphed import _GraphedFineBase, run_graphed, graph_cap
-from .._stats import record as _record_steps
 
 # Sparse ESP scoring. vol_and_surf_esp steers the pose by the SHAPE gradient ONLY (the ESP
 # enters just the TRACKED combo score, never the SE(3) derivative), so the optimisation
@@ -44,7 +43,7 @@ def _overlap_in_chunks_volumetric(A, B, q, t, *, alpha: float,
                                    N_real: torch.Tensor,
                                    M_real: torch.Tensor,
                                    NEED_GRAD: bool = True,
-                                   BLOCK: int | None = None):   # None -> kernel auto: BLOCK=16, 1 warp/CTA
+                                   ):
     """Evaluate volumetric overlap kernel in chunks."""
     K = A.shape[0]
     N_real = N_real.to(torch.int32).contiguous()
@@ -66,7 +65,7 @@ def _overlap_in_chunks_volumetric(A, B, q, t, *, alpha: float,
             N_real=N_real[start:end],
             M_real=M_real[start:end],
             NEED_GRAD=NEED_GRAD,
-            BLOCK=BLOCK)
+            )
 
         out_V[start:end] = V
         out_dQ[start:end] = dQ
@@ -602,13 +601,6 @@ def coarse_fine_esp_combo_align_many(
             -dQ * scale.unsqueeze(1) * (1 - esp_weight),
             -dT * scale.unsqueeze(1) * (1 - esp_weight),
             m_q, v_q, m_t, v_t, lr)
-
-    if _graphed is None:
-        # One record per eager fine-loop invocation: value+grad evaluations actually
-        # executed (the loop breaks AFTER an evaluation, before that step's Adam update)
-        # against the configured budget. No-op unless _stats recording was enabled.
-        _ran = (step + 1) if steps_fine else 0
-        _record_steps(_ran, steps_fine, _ran < steps_fine)
 
     # ------------------------------------------------------------------
     # 5) Gather final results

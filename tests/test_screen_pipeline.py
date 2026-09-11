@@ -143,18 +143,19 @@ def test_raw_and_merge_raw_round_trip_composed_transforms():
 # 2) device-side float16 widening
 # ---------------------------------------------------------------------------------------
 
-def test_up_f32_matches_host_widening_exactly():
+def test_to_device_matches_host_widening_exactly():
     """float16 -> float32 is exact, so widening on the device must give the same bits."""
     rng = np.random.default_rng(3)
     a = (rng.standard_normal((257, 3)) * 10).astype(np.float16)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    got = scr._up_f32(a, dev)
+    got = scr._to_device(a, dev, dtype=torch.float32)
     want = torch.as_tensor(a, dtype=torch.float32, device=dev)
     assert got.dtype == torch.float32
     assert torch.equal(got, want)
     # already float32 -> passed straight through, not re-cast
     b = a.astype(np.float32)
-    assert torch.equal(scr._up_f32(b, dev), torch.as_tensor(b, device=dev))
+    assert torch.equal(scr._to_device(b, dev, dtype=torch.float32),
+                       torch.as_tensor(b, device=dev))
 
 
 # ---------------------------------------------------------------------------------------

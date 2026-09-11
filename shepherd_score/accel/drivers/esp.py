@@ -20,17 +20,14 @@ from ._common import (
     apply_se3_transform,
     quaternion_to_rotation_matrix
 )
-from . import shape as _shapemod    # read flags LIVE off the module, see below
 from ._graphed import run_graphed, graph_cap
 from .shape import _GraphedFineSurf
-from .._stats import record as _record_steps
 
 @torch.no_grad()
 def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float,
                            N_real: torch.Tensor,
                            M_real: torch.Tensor,
                            NEED_GRAD: bool = True,
-                           BLOCK: int | None = None,    # None -> kernel auto: BLOCK=16, 1 warp/CTA
                            seeds_per_mol: int = 1,
                            poses_per_cta: int = 1):
     """
@@ -52,8 +49,6 @@ def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float,
         True point counts
     NEED_GRAD : bool
         Whether to compute gradients
-    BLOCK : int
-        Tile size
 
     Returns
     -------
@@ -89,7 +84,7 @@ def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float,
             N_real=N_real[ms:me],
             M_real=M_real[ms:me],
             NEED_GRAD=NEED_GRAD,
-            BLOCK=BLOCK, **extra)
+            **extra)
 
         out_V[start:end] = V
         out_dQ[start:end] = dQ
@@ -280,30 +275,21 @@ def coarse_fine_esp_align_many(
     # ------------------------------------------------------------------
     # 2) Fine optimization with Adam over ALL P poses
     # ------------------------------------------------------------------
-    # DEDUP: hand the kernel the molecule blocks unreplicated and let it index pid // P.
-    # CUDA + fp32 only; the CPU fused path and fp64 keep the replicated layout.
-    # Flags are read off the shape MODULE at call time, not imported by value: a
-    # `from .shape import _DEDUP_SEED_COORDS` binds once at import, so any later toggle (a test,
-    # an A/B harness) silently would not reach this driver and the object path would run.
-    _dedup = (_shapemod._DEDUP_SEED_COORDS and A_batch.is_cuda
-              and A_batch.dtype == torch.float32 and P > 1)
-    if _dedup:
-        A_k, B_k, CA_k, CB_k = A_batch, B_batch, CA_batch, CB_batch
-    else:
-        A_k = A_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad, 3)
-        B_k = B_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad, 3)
-        CA_k = CA_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, N_pad)
-        CB_k = CB_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, M_pad)
+    # Coordinates are REPLICATED per pose. The deduped layout the shape driver uses -- hand the
+    # kernel one copy per molecule and let it index ``pid // S`` -- was ported here and measured:
+    # it is worth 1.01x, and the multi-pose kernel it exists to feed is NEGATIVE on the ESP
+    # kernel (surf_esp 0.92-0.94x), so there is nothing to feed and nothing to gain.
+    A_k = A_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad, 3)
+    B_k = B_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad, 3)
+    CA_k = CA_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, N_pad)
+    CB_k = CB_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, M_pad)
     q_k = q_best.reshape(-1, 4).contiguous()
     t_k = t_best.reshape(-1, 3).contiguous()
 
-    N_k = N_real if _dedup else N_real.repeat_interleave(P)
-    M_k = M_real if _dedup else M_real.repeat_interleave(P)
-    S_fine = P if _dedup else 1
-    # ESP modes measured NEGATIVE for multi-pose, so they take no per-mode default; only an
-    # explicit FSS_POSES_PER_CTA enables it here.
-    _ppc = int(_shapemod._POSES_PER_CTA or 1)
-    P_cta = _ppc if (_dedup and _ppc > 1 and P % _ppc == 0) else 1
+    N_k = N_real.repeat_interleave(P)
+    M_k = M_real.repeat_interleave(P)
+    S_fine = 1
+    P_cta = 1
     VAA_rep = VAA.repeat_interleave(P)
     VBB_rep = VBB.repeat_interleave(P)
     VAA_plus_VBB = VAA_rep + VBB_rep
@@ -406,11 +392,6 @@ def coarse_fine_esp_align_many(
                 -dT * scale.unsqueeze(1),
                 m_q, v_q, m_t, v_t, lr)
 
-        # One record per eager fine-loop invocation: value+grad evaluations actually
-        # executed (the loop breaks AFTER an evaluation, before that step's Adam update)
-        # against the configured budget. No-op unless _stats recording was enabled.
-        _ran = (step + 1) if steps_fine else 0
-        _record_steps(_ran, steps_fine, _ran < steps_fine)
 
     # ------------------------------------------------------------------
     # 5) Gather final results

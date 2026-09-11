@@ -42,7 +42,6 @@ from ._common import (
     _update_best,
 )
 from .esp_combo import _self_overlap_chunks
-from .._stats import record as _record_steps
 
 
 def coarse_fine_vol_avoid_align_many(
@@ -166,11 +165,6 @@ def coarse_fine_vol_avoid_align_many(
 
         fused_adam_qt_with_tangent_proj(q_k, t_k, g_q, g_t, m_q, v_q, m_t, v_t, lr)
 
-    # One record per eager fine-loop invocation: value+grad evaluations actually
-    # executed (the loop breaks AFTER an evaluation, before that step's Adam update)
-    # against the configured budget. No-op unless _stats recording was enabled.
-    _ran = (step + 1) if steps_fine else 0
-    _record_steps(_ran, steps_fine, _ran < steps_fine)
 
     final_score = best_score.view(BATCH, P)
     best = final_score.argmax(dim=1)

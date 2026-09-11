@@ -31,11 +31,11 @@ BIT-IDENTITY. Every step below is a re-expression, not a re-derivation:
   * the ref side is broadcast rather than replicated, which is what the existing VAA fast path
     already does for the identical reason (every screen pair shares one query tensor).
 
-Enabled by FSS_SCREEN_ARRAYS=1. Default OFF until the gates pass.
+ON by default. The gates are tests/test_screen_arrays.py and tests/test_screen_pipeline.py
+(26 tests); ``ENABLED`` survives only as the seam those parity tests flip to force the
+object path for comparison -- it is not a runtime switch and nothing reads the environment.
 """
 from __future__ import annotations
-
-import os
 
 import numpy as np
 import torch
@@ -43,7 +43,8 @@ import torch
 from ._bucket import Bucket, _cap_upfront, _merge_group, _min_wave, PadSpec
 from ._pad import _band_key
 
-ENABLED = os.environ.get("FSS_SCREEN_ARRAYS", "0") == "1"
+#: Test seam only -- see the module docstring. Production always takes this path.
+ENABLED = True
 
 
 class Span:

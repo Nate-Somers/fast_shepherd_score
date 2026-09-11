@@ -18,7 +18,6 @@ from __future__ import annotations
 import numpy as np
 from numba import njit, prange
 
-from .._stats import record as _record_steps
 
 # Adam constants — must match fused_adam_qt_with_tangent_proj in cpu.py / the Triton tail.
 _B1 = 0.9
@@ -232,11 +231,6 @@ def fine_loop_cpu(overlap_fn, q_seed, t_seed, norm, *, lr, steps,
             # case, but NOT provably never-earlier: per-check gains that straddle es_tol can
             # spend a baseline reset the global rule still holds, costing one 5-step block.
             prev = np.where(improved, cur, prev)
-    # Value+grad evaluations executed vs the configured budget. Unlike the eager loops
-    # this one applies its Adam tail BEFORE the check, so an N-iteration run here is N
-    # evaluations AND N updates. No-op unless _stats recording was enabled.
-    _ran = (step + 1) if steps else 0
-    _record_steps(_ran, steps, _ran < steps)
     return best, bq, bt
 
 

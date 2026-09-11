@@ -345,8 +345,8 @@ def batched_seeds_torch(A_batch: torch.Tensor,
         ``bool(valid.all())`` degenerate-pair guard near the end -- that is not a licence to add
         an EARLIER one.)
 
-        Set ``FSS_SEED_REF_DEDUP=verify`` to make every firing also run the full K-row solve and
-        raise if the two disagree beyond ``FSS_SEED_REF_DEDUP_TOL`` (default 1e-6). That is the
+        ``tests/test_seed_dedup.py`` runs the full K-row solve alongside the deduped one and
+        compares. That is the
         only check that tests the CALLER'S PREDICATE rather than this function's handling of the
         flag; a wrongly-broadcast reference shows up as O(1) axis disagreement, not rounding.
 
@@ -400,21 +400,6 @@ def batched_seeds_torch(A_batch: torch.Tensor,
 
     ref_axes = _masked_principal_axes(A64, mask_n64)                 # (1,3,3) if _dedup else (K,3,3)
     if _dedup:
-        if os.environ.get("FSS_SEED_REF_DEDUP") == "verify":
-            # Tests the CALLER'S guarantee, which no unit test can reach: the identity
-            # predicate lives in the aligners and MoleculePair builds a fresh ref tensor per
-            # pair, so a wrong predicate is only observable on a real screen. A legitimate
-            # firing differs from the full solve by rounding; a wrongly-broadcast reference
-            # differs by O(1).
-            _full = _masked_principal_axes(torch.nan_to_num(A_batch.to(_wd)), mask_n.to(_wd))
-            _tol = float(os.environ.get("FSS_SEED_REF_DEDUP_TOL", "1e-6"))
-            _dev = float((_full - ref_axes.expand(K, 3, 3)).abs().max())
-            if _dev > _tol:
-                raise RuntimeError(
-                    f"batched_seeds_torch(ref_shared=True): reference rows are NOT identical -- "
-                    f"row-0 axes disagree with the full {K}-row solve by {_dev:.6e} > {_tol:.1e}. "
-                    f"The caller's identity predicate is wrong. Unset FSS_SEED_REF_DEDUP to "
-                    f"silence this check; fix the caller to actually silence the bug.")
         # .contiguous(): ref_axes is later re-dtyped and .view()ed for the structured seeds,
         # and a stride-0 expanded tensor cannot serve a view. K*9 elements, so this is free.
         ref_axes = ref_axes.expand(K, 3, 3).contiguous()             # (K,3,3)

@@ -318,9 +318,6 @@ def overlap_score_grad_esp_se3_batch(
     N_real: torch.Tensor | None = None,
     M_real: torch.Tensor | None = None,
     NEED_GRAD: bool = True,
-    BLOCK: int | None = None,
-    num_warps: int | None = None,
-    num_stages: int | None = None,
     seeds_per_mol: int = 1,
     poses_per_cta: int = 1,
 ):
@@ -397,8 +394,7 @@ def overlap_score_grad_esp_se3_batch(
 
     grid = (K,)    # 1-D launch: one CTA per alignment
 
-    # BLOCK + num_warps chosen by triton.autotune per (N_pad, M_pad) on the actual
-    # device; legacy BLOCK/num_warps/num_stages kwargs accepted but ignored.
+    # BLOCK + num_warps chosen by triton.autotune per (N_pad, M_pad) on the actual device.
     _gauss_overlap_esp_se3_tiled[grid](
         A.contiguous().view(-1),
         B.contiguous().view(-1),
@@ -509,9 +505,6 @@ def esp_comparison_batch(
     M_real: torch.Tensor | None = None,
     probe_radius: float = 1.0,
     lam: float = 0.001,
-    BLOCK: int | None = None,
-    num_warps: int | None = None,
-    num_stages: int | None = None,
 ):
     """Fused ShaEP ESP surface comparison (value-only). One CTA per pair.
 

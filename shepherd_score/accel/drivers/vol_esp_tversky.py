@@ -37,7 +37,6 @@ from ._graphed import run_graphed, graph_cap
 from .vol_tversky import _GraphedFineTversky
 # Reuse vol_esp's padding-safe chunked ESP kernel wrappers + ESP self-overlap verbatim (no new kernel).
 from .esp import _overlap_in_chunks_esp, _self_overlap_esp_chunks  # noqa: F401  (re-export for callers)
-from .._stats import record as _record_steps
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -219,11 +218,6 @@ def coarse_fine_esp_tversky_align_many(
                 m_q, v_q, m_t, v_t, lr
             )
 
-        # One record per eager fine-loop invocation: value+grad evaluations actually
-        # executed (the loop breaks AFTER an evaluation, before that step's Adam update)
-        # against the configured budget. No-op unless _stats recording was enabled.
-        _ran = (step + 1) if steps_fine else 0
-        _record_steps(_ran, steps_fine, _ran < steps_fine)
 
     # --- gather per-pair best over seeds ---
     final_score = best_score.view(BATCH, S)
