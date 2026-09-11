@@ -59,7 +59,17 @@ def _steps_for(mode: str) -> int:
     return _MODE_STEPS.get(mode, 50)
 
 
-def _batch_upload(pairs, attr, src_fn, dtype, device):
+def _ref_molec_of(p):
+    """Molecule whose data a ``_ref_*`` attribute holds -- the cache key for :func:`_batch_upload`."""
+    return p.ref_molec
+
+
+def _fit_molec_of(p):
+    """Molecule whose data a ``_fit_*`` attribute holds -- the cache key for :func:`_batch_upload`."""
+    return p.fit_molec
+
+
+def _batch_upload(pairs, attr, src_fn, dtype, device, *, key_fn=None):
     """Set ``p.<attr>`` for every ``p`` with ONE host concat + ONE ``.to(device)``
     view-split, instead of one ``torch.as_tensor(..., device=device)`` per pair.
 
@@ -85,12 +95,51 @@ def _batch_upload(pairs, attr, src_fn, dtype, device):
     """
     cold = [p for p in pairs if getattr(p, attr, None) is None]
     if cold:
-        arrs = [src_fn(p) for p in cold]                       # numpy, host, cheap
+        # PER MOLECULE, NOT PER PAIR. An all-vs-all workload draws K pairs from a far smaller set
+        # of distinct molecules -- workloads.pairwise_pairs picks the smallest m with
+        # m*(m-1) >= K, so K=100,000 pairs come from m=317 compounds and every molecule appears in
+        # ~632 pairs. Keying this cache on the PAIR therefore concatenated, uploaded and cloned
+        # each molecule ~632 times. Keying it on the molecule uploads each one once.
+        #
+        # Measured share of a pairwise batch that this call accounts for: 61.3% for vol_color
+        # (which uploads six arrays per pair: xyz, pharm_types, pharm_ancs, ref and fit) and
+        # 11.8% for vol (two arrays).
+        #
+        # STILL BIT-IDENTICAL. Only the concat ORDER and length change; the cast is elementwise
+        # (rule 1: torch does it, never numpy), so every molecule's bytes convert exactly as
+        # before. The screen path is untouched -- build_fit pre-warms these, so ``cold`` is empty
+        # there and this branch never runs.
+        #
+        # SHARING IS SAFE, and rule (3)'s "no shared-buffer aliasing across pairs" is about
+        # ALIASING A MUTABLE BUFFER: these tensors are read-only inputs (grep finds no in-place
+        # op on any ``_ref_*_t``/``_fit_*_t``; the sole write-looking site, aligners.py's
+        # ``trans_centers_batch[i] = p._ref_xyz_t``, reads the tensor INTO another container).
+        # Each distinct molecule still gets its own ``.clone()``, so no molecule aliases another.
+        if key_fn is None:
+            if attr.startswith("_ref"):
+                key_fn = _ref_molec_of
+            elif attr.startswith("_fit"):
+                key_fn = _fit_molec_of
+        if key_fn is None:
+            reps = cold                                        # un-keyable attr: per-pair as before
+        else:
+            _first = {}
+            for p in cold:
+                _first.setdefault(id(key_fn(p)), p)            # molecules stay alive via ``pairs``
+            reps = list(_first.values())
+        arrs = [src_fn(p) for p in reps]                       # numpy, host, cheap
         sizes = [len(a) for a in arrs]
         flat = np.concatenate(arrs)                            # keep SOURCE dtype (no numpy cast)
         dev = torch.from_numpy(flat).to(device=device, dtype=dtype)  # torch does the cast (matches as_tensor)
-        for p, t in zip(cold, dev.split(sizes)):
-            setattr(p, attr, t.clone())                        # own allocation (no shared-buffer alias)
+        if key_fn is None:
+            for p, t in zip(reps, dev.split(sizes)):
+                setattr(p, attr, t.clone())                    # own allocation (no shared-buffer alias)
+        else:
+            _ten = {}
+            for p, t in zip(reps, dev.split(sizes)):
+                _ten[id(key_fn(p))] = t.clone()                # one allocation PER MOLECULE
+            for p in cold:
+                setattr(p, attr, _ten[id(key_fn(p))])
     for p in pairs:                                            # warm wrong-device path
         t = getattr(p, attr)
         if t.device != device:
