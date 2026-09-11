@@ -188,10 +188,16 @@ def vol_color_score_grad_se3_batch(
     half_alpha = 0.5 * alpha
     k_const = math.pi ** 1.5 / ((2.0 * alpha) ** 1.5)
 
-    Vs = torch.zeros(P, device=dev, dtype=dtype)
-    Oc = torch.zeros(P, device=dev, dtype=dtype)
-    dQs = torch.zeros(P, 4, device=dev, dtype=dtype); dTs = torch.zeros(P, 3, device=dev, dtype=dtype)
-    dQc = torch.zeros(P, 4, device=dev, dtype=dtype); dTc = torch.zeros(P, 3, device=dev, dtype=dtype)
+    # Every kernel below STORES its score for each pose unconditionally, and its gradients
+    # whenever NEED_GRAD, so pre-zeroing is a memset per fine step over buffers about to be
+    # overwritten -- 0.0159 us/mol of device time on a vol screen at N=100,000 (job
+    # 22593930), and this kernel has more outputs than that one. Without NEED_GRAD the
+    # gradient buffers ARE left unwritten, so those keep their zeros.
+    Vs = torch.empty(P, device=dev, dtype=dtype)
+    Oc = torch.empty(P, device=dev, dtype=dtype)
+    _g = torch.empty if NEED_GRAD else torch.zeros
+    dQs = _g(P, 4, device=dev, dtype=dtype); dTs = _g(P, 3, device=dev, dtype=dtype)
+    dQc = _g(P, 4, device=dev, dtype=dtype); dTc = _g(P, 3, device=dev, dtype=dtype)
 
     _vol_color_fused_kernel[(P,)](
         centers_1.contiguous().view(-1), centers_2.contiguous().view(-1),

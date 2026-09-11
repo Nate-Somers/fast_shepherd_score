@@ -85,7 +85,8 @@ def _gauss_overlap_se3_tiled(
     S_ptr, dQ_ptr, dT_ptr,        # outputs (S: (B,), dQ: (B*4), dT: (B*3))
     BLOCK: tl.constexpr,          # tile edge (chosen by autotune)
     NEED_GRAD: tl.constexpr,
-    SEEDS: tl.constexpr           # poses per molecule; 1 == one molecule per CTA (legacy)
+    SEEDS: tl.constexpr,          # poses per molecule; 1 == one molecule per CTA (legacy)
+    SOA: tl.constexpr = False,    # coordinate layout: (K,3,P_pad) instead of (K,P_pad,3)
 ):
     # -------- which alignment (one CTA per pair) --------
     pid = tl.program_id(0)
@@ -126,20 +127,36 @@ def _gauss_overlap_se3_tiled(
         offs_n = n0 + tl.arange(0, BLOCK)
         mask_n = offs_n < realN
 
-        # load A tile (x,y,z) into registers
+        # load A tile (x,y,z) into registers.
+        # SOA: the three coordinate planes are contiguous, so a tile load is BLOCK adjacent
+        # floats. In the AoS layout each of these is a stride-3 gather, which Nsight Compute
+        # measured at 8.9 of 32 bytes used per sector (L40S, job 22595748) -- ~3x the sectors
+        # for the same data, on a kernel whose L1/TEX pipe is already 91% busy while DRAM sits
+        # at 5%. Values, arithmetic and reduction order are untouched, so the two layouts are
+        # bit-identical; only the address changes.
         a_idx = tl.where(mask_n, offs_n, 0)
-        ax = tl.load(A_ptr + a_idx * 3 + 0, mask=mask_n, other=0.0)
-        ay = tl.load(A_ptr + a_idx * 3 + 1, mask=mask_n, other=0.0)
-        az = tl.load(A_ptr + a_idx * 3 + 2, mask=mask_n, other=0.0)
+        if SOA:
+            ax = tl.load(A_ptr + 0 * N_pad + a_idx, mask=mask_n, other=0.0)
+            ay = tl.load(A_ptr + 1 * N_pad + a_idx, mask=mask_n, other=0.0)
+            az = tl.load(A_ptr + 2 * N_pad + a_idx, mask=mask_n, other=0.0)
+        else:
+            ax = tl.load(A_ptr + a_idx * 3 + 0, mask=mask_n, other=0.0)
+            ay = tl.load(A_ptr + a_idx * 3 + 1, mask=mask_n, other=0.0)
+            az = tl.load(A_ptr + a_idx * 3 + 2, mask=mask_n, other=0.0)
 
         for m0 in range(0, M_pad, BLOCK):
             offs_m = m0 + tl.arange(0, BLOCK)
             mask_m = offs_m < realM
 
             b_idx = tl.where(mask_m, offs_m, 0)
-            bx0 = tl.load(B_ptr + b_idx * 3 + 0, mask=mask_m, other=0.0)
-            by0 = tl.load(B_ptr + b_idx * 3 + 1, mask=mask_m, other=0.0)
-            bz0 = tl.load(B_ptr + b_idx * 3 + 2, mask=mask_m, other=0.0)
+            if SOA:
+                bx0 = tl.load(B_ptr + 0 * M_pad + b_idx, mask=mask_m, other=0.0)
+                by0 = tl.load(B_ptr + 1 * M_pad + b_idx, mask=mask_m, other=0.0)
+                bz0 = tl.load(B_ptr + 2 * M_pad + b_idx, mask=mask_m, other=0.0)
+            else:
+                bx0 = tl.load(B_ptr + b_idx * 3 + 0, mask=mask_m, other=0.0)
+                by0 = tl.load(B_ptr + b_idx * 3 + 1, mask=mask_m, other=0.0)
+                bz0 = tl.load(B_ptr + b_idx * 3 + 2, mask=mask_m, other=0.0)
 
             # rotate + translate B tile
             bx = r00*bx0 + r01*by0 + r02*bz0 + tx
@@ -363,6 +380,7 @@ def overlap_score_grad_se3_batch(
     num_stages: int | None = None,
     seeds_per_mol: int = 1,
     poses_per_cta: int = 1,
+    soa: bool = False,
 ):
     """
     One CTA per POSE. Internal tile loops over A,B.
@@ -383,8 +401,14 @@ def overlap_score_grad_se3_batch(
     """
     K = q.shape[0]                       # POSES == CTAs
     S = int(seeds_per_mol)
-    n_mol, N_pad, _ = A.shape
-    _, M_pad, _ = B.shape
+    # SoA hands the kernel (K, 3, P_pad) -- the three coordinate planes contiguous -- so the
+    # point count is the LAST axis there and the middle one in the default AoS layout.
+    if soa:
+        n_mol, _, N_pad = A.shape
+        _, _, M_pad = B.shape
+    else:
+        n_mol, N_pad, _ = A.shape
+        _, M_pad, _ = B.shape
     if S < 1 or K % S != 0 or n_mol != K // S:
         raise ValueError(
             f"seeds_per_mol={S} inconsistent: q has {K} poses, A has {n_mol} molecules "
@@ -404,9 +428,19 @@ def overlap_score_grad_se3_batch(
     half_alpha = 0.5 * alpha
     k_const    = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
 
-    out_S  = torch.zeros(K, device=device, dtype=dtype)
-    out_dQ = torch.zeros_like(q)
-    out_dT = torch.zeros_like(t)
+    # Both kernels below STORE every element of out_S, and every element of out_dQ/out_dT when
+    # NEED_GRAD (the multi-pose variant's mask only hides the tl.arange padding lanes, which
+    # address no real pose), so pre-zeroing is three memset kernels per fine step writing
+    # buffers that are about to be overwritten -- 0.0159 us/mol of device time on a vol screen
+    # at N=100,000 (job 22593930). Without NEED_GRAD the gradient buffers ARE left unwritten,
+    # so those keep their zeros rather than handing a caller uninitialised memory.
+    out_S  = torch.empty(K, device=device, dtype=dtype)
+    if NEED_GRAD:
+        out_dQ = torch.empty_like(q)
+        out_dT = torch.empty_like(t)
+    else:
+        out_dQ = torch.zeros_like(q)
+        out_dT = torch.zeros_like(t)
 
     POSES = int(poses_per_cta)
     if POSES > 1:
@@ -444,6 +478,7 @@ def overlap_score_grad_se3_batch(
         out_S, out_dQ.view(-1), out_dT.view(-1),
         NEED_GRAD=NEED_GRAD,
         SEEDS=S,
+        SOA=bool(soa),
     )
     return out_S, out_dQ, out_dT
 
@@ -645,3 +680,407 @@ def _batch_self_overlap(P_pad: torch.Tensor,
         N_real=N_real, M_real=N_real,
         NEED_GRAD=False)
     return V
+
+
+# =======================================================================================
+# FUSED FINE STEP: overlap + Tanimoto + best-pose tracking + Adam, in ONE kernel
+# =======================================================================================
+# MEASURED MOTIVATION (job 22593930, L40S, vol screen N=100,000, CUPTI per-kernel):
+# a fine step was 17 CUDA kernels -- the overlap kernel, three output memsets (the
+# ``torch.zeros`` for S/dQ/dT), the twelve elementwise ops of
+# ``_GraphedFineSurf._tanimoto_adam_tail``, and ``_adam_qt``. The overlap kernel is
+# 0.4977 us/mol of device time; everything else in the step adds 0.143 us/mol (elementwise
+# 0.0901 + Adam 0.0366 + memset 0.0159), i.e. 22% of the step's GPU time spent on work that
+# touches seven scalars per pose. dQ/dT make a full HBM round trip purely to be multiplied
+# by a scalar and negated -- the overlap kernel already holds them in registers.
+#
+# One CTA owns one POSE, so the whole tail is a per-CTA SCALAR epilogue: load this pose's
+# norm / best / best-pose / Adam moments, finish the step, store back. Nothing leaves
+# registers between the gradient and the parameter update, and a step becomes ONE launch.
+#
+# The arithmetic is copied operation-for-operation from ``_tanimoto_adam_tail`` plus
+# ``_adam_qt`` (PROJECT=True), in the same order, on the same values. The one place the two
+# could legitimately differ is float division: torch divides with IEEE rounding, Triton's
+# ``/`` does not promise to. So the two Tanimoto divides below pin ``ieee_rounding=True``
+# while the Adam divide keeps the plain ``/`` that ``_adam_qt`` already ships. Bit-identity
+# is therefore a MEASURED claim, not a structural one -- see ``benchmarks/fused_step_parity.py``.
+
+
+@triton.jit
+def _overlap_accum_tile(A_ptr, B_ptr, realN, realM,
+                        qr, qi, qj, qk, tx, ty, tz,
+                        half_alpha, k_const, N_pad, M_pad,
+                        BLOCK: tl.constexpr, NEED_GRAD: tl.constexpr):
+    """Tiled Gaussian-overlap value + SE(3) gradient for ONE pose, as a device function.
+
+    Lifted verbatim out of :func:`_gauss_overlap_se3_tiled` so the fused-step kernel and the
+    standalone kernel share one copy of the arithmetic. ``@triton.jit`` callees are inlined,
+    which is what makes that sharing free -- and bit-identical to the inline block it
+    replaces (the same argument the file already relies on for ``_quat_to_rotmat``).
+    """
+    r00, r01, r02, r10, r11, r12, r20, r21, r22 = _quat_to_rotmat(qr, qi, qj, qk)
+
+    Vab_acc = 0.0
+    dTx = 0.0; dTy = 0.0; dTz = 0.0
+    dQw = 0.0; dQx = 0.0; dQy = 0.0; dQz = 0.0
+
+    inv_ln2 = 1.4426950408889634
+
+    for n0 in range(0, N_pad, BLOCK):
+        offs_n = n0 + tl.arange(0, BLOCK)
+        mask_n = offs_n < realN
+
+        a_idx = tl.where(mask_n, offs_n, 0)
+        ax = tl.load(A_ptr + a_idx * 3 + 0, mask=mask_n, other=0.0)
+        ay = tl.load(A_ptr + a_idx * 3 + 1, mask=mask_n, other=0.0)
+        az = tl.load(A_ptr + a_idx * 3 + 2, mask=mask_n, other=0.0)
+
+        for m0 in range(0, M_pad, BLOCK):
+            offs_m = m0 + tl.arange(0, BLOCK)
+            mask_m = offs_m < realM
+
+            b_idx = tl.where(mask_m, offs_m, 0)
+            bx0 = tl.load(B_ptr + b_idx * 3 + 0, mask=mask_m, other=0.0)
+            by0 = tl.load(B_ptr + b_idx * 3 + 1, mask=mask_m, other=0.0)
+            bz0 = tl.load(B_ptr + b_idx * 3 + 2, mask=mask_m, other=0.0)
+
+            bx = r00*bx0 + r01*by0 + r02*bz0 + tx
+            by = r10*bx0 + r11*by0 + r12*bz0 + ty
+            bz = r20*bx0 + r21*by0 + r22*bz0 + tz
+
+            dx = ax[:, None] - bx[None, :]
+            dy = ay[:, None] - by[None, :]
+            dz = az[:, None] - bz[None, :]
+            r2 = dx*dx + dy*dy + dz*dz
+
+            g = tl.exp2((-half_alpha * r2) * inv_ln2) * k_const
+            pair_mask = mask_n[:, None] & mask_m[None, :]
+            g = tl.where(pair_mask, g, 0.0)
+
+            Vab_acc += tl.sum(g)
+
+            if NEED_GRAD:
+                coeff = (2.0 * half_alpha) * g
+                fx = tl.sum(coeff * dx, 0)
+                fy = tl.sum(coeff * dy, 0)
+                fz = tl.sum(coeff * dz, 0)
+
+                dTx += tl.sum(fx)
+                dTy += tl.sum(fy)
+                dTz += tl.sum(fz)
+
+                dw, dxq, dyq, dzq = _quat_grad_tail(fx, fy, fz, bx0, by0, bz0, qr, qi, qj, qk)
+
+                dw  = tl.where(mask_m, dw,  0.0)
+                dxq = tl.where(mask_m, dxq, 0.0)
+                dyq = tl.where(mask_m, dyq, 0.0)
+                dzq = tl.where(mask_m, dzq, 0.0)
+
+                dQw += tl.sum(dw)
+                dQx += tl.sum(dxq)
+                dQy += tl.sum(dyq)
+                dQz += tl.sum(dzq)
+
+    return Vab_acc, dTx, dTy, dTz, dQw, dQx, dQy, dQz
+
+
+# This kernel MUTATES q / t / best / best-pose / Adam moments in place, and the autotuner runs
+# each candidate config several times on the real buffers -- without ``restore_value`` a tuning
+# sweep would silently advance the optimiser by ~100 steps before the first real one. The list
+# names the ARGUMENTS to snapshot and roll back between trials.
+@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True,
+                 restore_value=['Q_ptr', 'T_ptr', 'Best_ptr', 'Bq_ptr', 'Bt_ptr',
+                                'Mq_ptr', 'Vq_ptr', 'Mt_ptr', 'Vt_ptr'])
+@triton.jit
+def _gauss_overlap_se3_fused_step(
+    A_ptr, B_ptr,                       # (nmol*N_pad*3), (nmol*M_pad*3)
+    Q_ptr, T_ptr,                       # (P*4), (P*3)  -- read AND written
+    Nreal_ptr, Mreal_ptr,               # (nmol,)
+    Norm_ptr,                           # (P,)  VAA+VBB per pose
+    Best_ptr, Bq_ptr, Bt_ptr,           # (P,), (P*4), (P*3)  best score + pose so far
+    Mq_ptr, Vq_ptr, Mt_ptr, Vt_ptr,     # Adam moments
+    BATCH, M_pad, N_pad,
+    half_alpha, k_const, lr,
+    BLOCK: tl.constexpr,
+    SEEDS: tl.constexpr,
+    beta1: tl.constexpr = 0.9,
+    beta2: tl.constexpr = 0.999,
+    eps:   tl.constexpr = 1e-8,
+):
+    pid = tl.program_id(0)
+    mol = pid // SEEDS                  # SEEDS>1: coordinates are per MOLECULE, poses per CTA
+    realN = tl.load(Nreal_ptr + mol)
+    realM = tl.load(Mreal_ptr + mol)
+
+    A_ptr = A_ptr + mol * N_pad * 3
+    B_ptr = B_ptr + mol * M_pad * 3
+    qo = pid * 4
+    to = pid * 3
+
+    qr = tl.load(Q_ptr + qo + 0); qi = tl.load(Q_ptr + qo + 1)
+    qj = tl.load(Q_ptr + qo + 2); qk = tl.load(Q_ptr + qo + 3)
+    tx = tl.load(T_ptr + to + 0); ty = tl.load(T_ptr + to + 1); tz = tl.load(T_ptr + to + 2)
+
+    Vab, dTx, dTy, dTz, dQw, dQx, dQy, dQz = _overlap_accum_tile(
+        A_ptr, B_ptr, realN, realM, qr, qi, qj, qk, tx, ty, tz,
+        half_alpha, k_const, N_pad, M_pad, BLOCK, True)
+
+    # ---- Tanimoto score + d(score)/d(VAB) scale   (== _tanimoto_adam_tail ops 1-4) ------
+    norm  = tl.load(Norm_ptr + pid)
+    denom = norm - Vab
+    score = tl.fdiv(Vab, denom, ieee_rounding=True)
+    d2    = denom * denom
+    scale = tl.fdiv(norm, d2, ieee_rounding=True)
+
+    # ---- best-pose tracking   (== the gt + three where's) -------------------------------
+    bst = tl.load(Best_ptr + pid)
+    better = score > bst
+    tl.store(Best_ptr + pid, tl.where(better, score, bst))
+    tl.store(Bq_ptr + qo + 0, tl.where(better, qr, tl.load(Bq_ptr + qo + 0)))
+    tl.store(Bq_ptr + qo + 1, tl.where(better, qi, tl.load(Bq_ptr + qo + 1)))
+    tl.store(Bq_ptr + qo + 2, tl.where(better, qj, tl.load(Bq_ptr + qo + 2)))
+    tl.store(Bq_ptr + qo + 3, tl.where(better, qk, tl.load(Bq_ptr + qo + 3)))
+    tl.store(Bt_ptr + to + 0, tl.where(better, tx, tl.load(Bt_ptr + to + 0)))
+    tl.store(Bt_ptr + to + 1, tl.where(better, ty, tl.load(Bt_ptr + to + 1)))
+    tl.store(Bt_ptr + to + 2, tl.where(better, tz, tl.load(Bt_ptr + to + 2)))
+
+    # ---- ascent direction: -(grad * scale)   (== the two mul + neg_ pairs) --------------
+    dq0 = -(dQw * scale); dq1 = -(dQx * scale)
+    dq2 = -(dQy * scale); dq3 = -(dQz * scale)
+    dt0 = -(dTx * scale); dt1 = -(dTy * scale); dt2 = -(dTz * scale)
+
+    # ---- tangent projection + Adam + renormalise   (== _adam_qt, PROJECT=True) ----------
+    radial = dq0*qr + dq1*qi + dq2*qj + dq3*qk
+    dq0 = dq0 - qr * radial
+    dq1 = dq1 - qi * radial
+    dq2 = dq2 - qj * radial
+    dq3 = dq3 - qk * radial
+
+    mq0 = tl.load(Mq_ptr + qo + 0); mq1 = tl.load(Mq_ptr + qo + 1)
+    mq2 = tl.load(Mq_ptr + qo + 2); mq3 = tl.load(Mq_ptr + qo + 3)
+    vq0 = tl.load(Vq_ptr + qo + 0); vq1 = tl.load(Vq_ptr + qo + 1)
+    vq2 = tl.load(Vq_ptr + qo + 2); vq3 = tl.load(Vq_ptr + qo + 3)
+    mt0 = tl.load(Mt_ptr + to + 0); mt1 = tl.load(Mt_ptr + to + 1)
+    mt2 = tl.load(Mt_ptr + to + 2)
+    vt0 = tl.load(Vt_ptr + to + 0); vt1 = tl.load(Vt_ptr + to + 1)
+    vt2 = tl.load(Vt_ptr + to + 2)
+
+    mq0 = beta1*mq0 + (1-beta1)*dq0;  vq0 = beta2*vq0 + (1-beta2)*dq0*dq0
+    mq1 = beta1*mq1 + (1-beta1)*dq1;  vq1 = beta2*vq1 + (1-beta2)*dq1*dq1
+    mq2 = beta1*mq2 + (1-beta1)*dq2;  vq2 = beta2*vq2 + (1-beta2)*dq2*dq2
+    mq3 = beta1*mq3 + (1-beta1)*dq3;  vq3 = beta2*vq3 + (1-beta2)*dq3*dq3
+
+    qr = qr - lr * mq0 / tl.sqrt(vq0 + eps)
+    qi = qi - lr * mq1 / tl.sqrt(vq1 + eps)
+    qj = qj - lr * mq2 / tl.sqrt(vq2 + eps)
+    qk = qk - lr * mq3 / tl.sqrt(vq3 + eps)
+
+    mt0 = beta1*mt0 + (1-beta1)*dt0; vt0 = beta2*vt0 + (1-beta2)*dt0*dt0
+    mt1 = beta1*mt1 + (1-beta1)*dt1; vt1 = beta2*vt1 + (1-beta2)*dt1*dt1
+    mt2 = beta1*mt2 + (1-beta1)*dt2; vt2 = beta2*vt2 + (1-beta2)*dt2*dt2
+
+    tx = tx - lr * mt0 / tl.sqrt(vt0 + eps)
+    ty = ty - lr * mt1 / tl.sqrt(vt1 + eps)
+    tz = tz - lr * mt2 / tl.sqrt(vt2 + eps)
+
+    inv_norm = 1.0 / tl.sqrt(qr*qr + qi*qi + qj*qj + qk*qk)
+    qr *= inv_norm; qi *= inv_norm; qj *= inv_norm; qk *= inv_norm
+
+    tl.store(Q_ptr + qo + 0, qr); tl.store(Q_ptr + qo + 1, qi)
+    tl.store(Q_ptr + qo + 2, qj); tl.store(Q_ptr + qo + 3, qk)
+    tl.store(Mq_ptr + qo + 0, mq0); tl.store(Mq_ptr + qo + 1, mq1)
+    tl.store(Mq_ptr + qo + 2, mq2); tl.store(Mq_ptr + qo + 3, mq3)
+    tl.store(Vq_ptr + qo + 0, vq0); tl.store(Vq_ptr + qo + 1, vq1)
+    tl.store(Vq_ptr + qo + 2, vq2); tl.store(Vq_ptr + qo + 3, vq3)
+    tl.store(T_ptr + to + 0, tx); tl.store(T_ptr + to + 1, ty)
+    tl.store(T_ptr + to + 2, tz)
+    tl.store(Mt_ptr + to + 0, mt0); tl.store(Mt_ptr + to + 1, mt1)
+    tl.store(Mt_ptr + to + 2, mt2)
+    tl.store(Vt_ptr + to + 0, vt0); tl.store(Vt_ptr + to + 1, vt1)
+    tl.store(Vt_ptr + to + 2, vt2)
+
+
+def fused_fine_step(A, B, q, t, norm, best, bq, bt, mq, vq, mt, vt, *,
+                    alpha: float = 0.81, N_real, M_real, lr: float,
+                    seeds_per_mol: int = 1):
+    """One complete fine-optimiser step for every pose, in a single kernel launch.
+
+    Replaces ``overlap_score_grad_se3_batch`` + the twelve-op Tanimoto/best/gradient tail +
+    ``fused_adam_qt_with_tangent_proj``. ``q, t, best, bq, bt, mq, vq, mt, vt`` are all
+    updated IN PLACE; nothing is returned and nothing is allocated, which is also what makes
+    it capture cleanly into a CUDA graph.
+
+    ``A``/``B`` follow the same convention as :func:`overlap_score_grad_se3_batch`: with
+    ``seeds_per_mol = S > 1`` they hold ``P // S`` UNREPLICATED molecules and CTA ``i`` reads
+    molecule ``i // S``.
+    """
+    K = q.shape[0]
+    S = int(seeds_per_mol)
+    n_mol, N_pad, _ = A.shape
+    _, M_pad, _ = B.shape
+    if S < 1 or K % S != 0 or n_mol != K // S:
+        raise ValueError(
+            f"seeds_per_mol={S} inconsistent: q has {K} poses, A has {n_mol} molecules "
+            f"(expected {K // S if S else 0})")
+
+    half_alpha = 0.5 * alpha
+    k_const = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
+    # Same int32 coercion the standalone wrapper does -- the kernel compares the tile offsets
+    # against these directly, so an int64 count would read the wrong stride.
+    N_real = N_real.to(device=A.device, dtype=torch.int32, copy=False)
+    M_real = M_real.to(device=A.device, dtype=torch.int32, copy=False)
+
+    _gauss_overlap_se3_fused_step[(K,)](
+        A.contiguous().view(-1), B.contiguous().view(-1),
+        q.view(-1), t.view(-1),
+        N_real.contiguous(), M_real.contiguous(),
+        norm,
+        best, bq.view(-1), bt.view(-1),
+        mq.view(-1), vq.view(-1), mt.view(-1), vt.view(-1),
+        K, M_pad, N_pad, half_alpha, k_const, float(lr),
+        SEEDS=S,
+    )
+
+
+# =======================================================================================
+# FUSED TANIMOTO + BEST-POSE + ADAM TAIL: thirteen elementwise launches -> one
+# =======================================================================================
+# The fine step's tail is, per pose, seven scalars of arithmetic. It shipped as twelve torch
+# elementwise ops plus ``_adam_qt``, each of which reads its inputs from HBM and writes its
+# output back: ``denom``, ``score``, ``d2``, ``scale``, ``better``, then three ``where``s and
+# two mul+neg pairs, and only then the Adam kernel. Measured on an L40S vol screen at
+# N=100,000 (job 22593930, CUPTI): elementwise 0.0901 + Adam 0.0366 + the three output memsets
+# 0.0159 = 0.143 us/mol of device time, against 0.4977 for the overlap kernel itself.
+#
+# This does the same arithmetic with ONE thread per pose and one launch, so every intermediate
+# stays in registers. It is the pose-parallel counterpart of ``_gauss_overlap_se3_fused_step``:
+# that one folded the same work into the overlap CTA and measured 1.004x (the tail was never
+# launch-bound -- 128 threads redundantly doing one pose's scalars costs what it saves). Here
+# the parallelism matches the work.
+#
+# BIT-IDENTITY: the operations, their order, and their inputs are unchanged, and every one is
+# elementwise, so there is no reduction whose order could shift. The one place torch and Triton
+# can legitimately disagree is float division, so the two Tanimoto divides pin
+# ``ieee_rounding=True`` and the Adam divide keeps the plain ``/`` that ``_adam_qt`` ships.
+
+
+@triton.jit
+def _tanimoto_best_adam_kernel(
+    V_ptr, dQ_ptr, dT_ptr,              # (P,), (P*4), (P*3)   this step's value + gradient
+    Norm_ptr,                           # (P,)                 VAA+VBB per pose
+    Q_ptr, T_ptr,                       # (P*4), (P*3)         parameters, updated in place
+    Best_ptr, Bq_ptr, Bt_ptr,           # (P,), (P*4), (P*3)   best score + pose so far
+    Mq_ptr, Vq_ptr, Mt_ptr, Vt_ptr,     # Adam moments
+    P, lr,
+    BLOCK: tl.constexpr,
+    beta1: tl.constexpr = 0.9,
+    beta2: tl.constexpr = 0.999,
+    eps:   tl.constexpr = 1e-8,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < P
+    qo = offs * 4
+    to = offs * 3
+
+    Vab  = tl.load(V_ptr + offs, mask=m)
+    norm = tl.load(Norm_ptr + offs, mask=m)
+
+    # ---- torch.sub / div / mul / div  ---------------------------------------------------
+    denom = norm - Vab
+    score = tl.fdiv(Vab, denom, ieee_rounding=True)
+    d2    = denom * denom
+    scale = tl.fdiv(norm, d2, ieee_rounding=True)
+
+    # ---- torch.gt + three where's (best score, best q, best t) --------------------------
+    qr = tl.load(Q_ptr + qo + 0, mask=m); qi = tl.load(Q_ptr + qo + 1, mask=m)
+    qj = tl.load(Q_ptr + qo + 2, mask=m); qk = tl.load(Q_ptr + qo + 3, mask=m)
+    tx = tl.load(T_ptr + to + 0, mask=m); ty = tl.load(T_ptr + to + 1, mask=m)
+    tz = tl.load(T_ptr + to + 2, mask=m)
+
+    bst = tl.load(Best_ptr + offs, mask=m)
+    better = score > bst
+    tl.store(Best_ptr + offs, tl.where(better, score, bst), mask=m)
+    tl.store(Bq_ptr + qo + 0, tl.where(better, qr, tl.load(Bq_ptr + qo + 0, mask=m)), mask=m)
+    tl.store(Bq_ptr + qo + 1, tl.where(better, qi, tl.load(Bq_ptr + qo + 1, mask=m)), mask=m)
+    tl.store(Bq_ptr + qo + 2, tl.where(better, qj, tl.load(Bq_ptr + qo + 2, mask=m)), mask=m)
+    tl.store(Bq_ptr + qo + 3, tl.where(better, qk, tl.load(Bq_ptr + qo + 3, mask=m)), mask=m)
+    tl.store(Bt_ptr + to + 0, tl.where(better, tx, tl.load(Bt_ptr + to + 0, mask=m)), mask=m)
+    tl.store(Bt_ptr + to + 1, tl.where(better, ty, tl.load(Bt_ptr + to + 1, mask=m)), mask=m)
+    tl.store(Bt_ptr + to + 2, tl.where(better, tz, tl.load(Bt_ptr + to + 2, mask=m)), mask=m)
+
+    # ---- the two mul + neg_ pairs: gq = -(dQ*scale), gt = -(dT*scale) --------------------
+    dq0 = -(tl.load(dQ_ptr + qo + 0, mask=m) * scale)
+    dq1 = -(tl.load(dQ_ptr + qo + 1, mask=m) * scale)
+    dq2 = -(tl.load(dQ_ptr + qo + 2, mask=m) * scale)
+    dq3 = -(tl.load(dQ_ptr + qo + 3, mask=m) * scale)
+    dt0 = -(tl.load(dT_ptr + to + 0, mask=m) * scale)
+    dt1 = -(tl.load(dT_ptr + to + 1, mask=m) * scale)
+    dt2 = -(tl.load(dT_ptr + to + 2, mask=m) * scale)
+
+    # ---- _adam_qt with PROJECT=True, verbatim -------------------------------------------
+    radial = dq0*qr + dq1*qi + dq2*qj + dq3*qk
+    dq0 = dq0 - qr * radial
+    dq1 = dq1 - qi * radial
+    dq2 = dq2 - qj * radial
+    dq3 = dq3 - qk * radial
+
+    mq0 = tl.load(Mq_ptr + qo + 0, mask=m); mq1 = tl.load(Mq_ptr + qo + 1, mask=m)
+    mq2 = tl.load(Mq_ptr + qo + 2, mask=m); mq3 = tl.load(Mq_ptr + qo + 3, mask=m)
+    vq0 = tl.load(Vq_ptr + qo + 0, mask=m); vq1 = tl.load(Vq_ptr + qo + 1, mask=m)
+    vq2 = tl.load(Vq_ptr + qo + 2, mask=m); vq3 = tl.load(Vq_ptr + qo + 3, mask=m)
+    mt0 = tl.load(Mt_ptr + to + 0, mask=m); mt1 = tl.load(Mt_ptr + to + 1, mask=m)
+    mt2 = tl.load(Mt_ptr + to + 2, mask=m)
+    vt0 = tl.load(Vt_ptr + to + 0, mask=m); vt1 = tl.load(Vt_ptr + to + 1, mask=m)
+    vt2 = tl.load(Vt_ptr + to + 2, mask=m)
+
+    mq0 = beta1*mq0 + (1-beta1)*dq0;  vq0 = beta2*vq0 + (1-beta2)*dq0*dq0
+    mq1 = beta1*mq1 + (1-beta1)*dq1;  vq1 = beta2*vq1 + (1-beta2)*dq1*dq1
+    mq2 = beta1*mq2 + (1-beta1)*dq2;  vq2 = beta2*vq2 + (1-beta2)*dq2*dq2
+    mq3 = beta1*mq3 + (1-beta1)*dq3;  vq3 = beta2*vq3 + (1-beta2)*dq3*dq3
+
+    qr = qr - lr * mq0 / tl.sqrt(vq0 + eps)
+    qi = qi - lr * mq1 / tl.sqrt(vq1 + eps)
+    qj = qj - lr * mq2 / tl.sqrt(vq2 + eps)
+    qk = qk - lr * mq3 / tl.sqrt(vq3 + eps)
+
+    mt0 = beta1*mt0 + (1-beta1)*dt0; vt0 = beta2*vt0 + (1-beta2)*dt0*dt0
+    mt1 = beta1*mt1 + (1-beta1)*dt1; vt1 = beta2*vt1 + (1-beta2)*dt1*dt1
+    mt2 = beta1*mt2 + (1-beta1)*dt2; vt2 = beta2*vt2 + (1-beta2)*dt2*dt2
+
+    tx = tx - lr * mt0 / tl.sqrt(vt0 + eps)
+    ty = ty - lr * mt1 / tl.sqrt(vt1 + eps)
+    tz = tz - lr * mt2 / tl.sqrt(vt2 + eps)
+
+    inv_norm = 1.0 / tl.sqrt(qr*qr + qi*qi + qj*qj + qk*qk)
+    qr *= inv_norm; qi *= inv_norm; qj *= inv_norm; qk *= inv_norm
+
+    tl.store(Q_ptr + qo + 0, qr, mask=m); tl.store(Q_ptr + qo + 1, qi, mask=m)
+    tl.store(Q_ptr + qo + 2, qj, mask=m); tl.store(Q_ptr + qo + 3, qk, mask=m)
+    tl.store(Mq_ptr + qo + 0, mq0, mask=m); tl.store(Mq_ptr + qo + 1, mq1, mask=m)
+    tl.store(Mq_ptr + qo + 2, mq2, mask=m); tl.store(Mq_ptr + qo + 3, mq3, mask=m)
+    tl.store(Vq_ptr + qo + 0, vq0, mask=m); tl.store(Vq_ptr + qo + 1, vq1, mask=m)
+    tl.store(Vq_ptr + qo + 2, vq2, mask=m); tl.store(Vq_ptr + qo + 3, vq3, mask=m)
+    tl.store(T_ptr + to + 0, tx, mask=m); tl.store(T_ptr + to + 1, ty, mask=m)
+    tl.store(T_ptr + to + 2, tz, mask=m)
+    tl.store(Mt_ptr + to + 0, mt0, mask=m); tl.store(Mt_ptr + to + 1, mt1, mask=m)
+    tl.store(Mt_ptr + to + 2, mt2, mask=m)
+    tl.store(Vt_ptr + to + 0, vt0, mask=m); tl.store(Vt_ptr + to + 1, vt1, mask=m)
+    tl.store(Vt_ptr + to + 2, vt2, mask=m)
+
+
+def tanimoto_best_adam(VAB, dQ, dT, norm, q, t, best, bq, bt, mq, vq, mt, vt, lr,
+                       BLOCK: int = 256):
+    """Single-channel Tanimoto + best-pose tracking + tangent-projected Adam, in one launch.
+
+    Drop-in for ``_GraphedFineSurf._tanimoto_adam_tail``'s twelve torch ops followed by
+    ``fused_adam_qt_with_tangent_proj``. Everything is updated in place and nothing is
+    allocated, so it captures into a CUDA graph on the same terms the ops it replaces did.
+    """
+    P = q.shape[0]
+    _tanimoto_best_adam_kernel[(triton.cdiv(P, BLOCK),)](
+        VAB, dQ.view(-1), dT.view(-1), norm,
+        q.view(-1), t.view(-1),
+        best, bq.view(-1), bt.view(-1),
+        mq.view(-1), vq.view(-1), mt.view(-1), vt.view(-1),
+        P, float(lr), BLOCK=BLOCK,
+    )

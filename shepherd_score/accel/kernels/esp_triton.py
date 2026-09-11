@@ -368,9 +368,14 @@ def overlap_score_grad_esp_se3_batch(
     k_const    = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
     inv_lam    = 1.0 / lam
 
-    out_S  = torch.zeros(K, device=device, dtype=dtype)
-    out_dQ = torch.zeros_like(q)
-    out_dT = torch.zeros_like(t)
+    # Every kernel below STORES its score for each pose unconditionally, and its gradients
+    # whenever NEED_GRAD, so pre-zeroing is a memset per fine step over buffers about to be
+    # overwritten -- 0.0159 us/mol of device time on a vol screen at N=100,000 (job
+    # 22593930), and this kernel has more outputs than that one. Without NEED_GRAD the
+    # gradient buffers ARE left unwritten, so those keep their zeros.
+    out_S  = torch.empty(K, device=device, dtype=dtype)
+    out_dQ = torch.empty_like(q) if NEED_GRAD else torch.zeros_like(q)
+    out_dT = torch.empty_like(t) if NEED_GRAD else torch.zeros_like(t)
 
     POSES = int(poses_per_cta)
     if POSES > 1:

@@ -42,6 +42,87 @@ _POSES_PER_CTA = (int(os.environ["FSS_POSES_PER_CTA"])
 #: here either. Set FSS_POSES_PER_CTA=1 to force the legacy one-CTA-per-pose kernel everywhere.
 _MODE_POSES = {"surf": 8}
 
+#: Run the whole fine step -- overlap, Tanimoto, best-pose tracking and the tangent-projected
+#: Adam -- as ONE kernel launch instead of seventeen, by giving the overlap kernel a scalar
+#: epilogue. MEASURED AND REJECTED; kept DEFAULT OFF because the null result is the useful part.
+#:
+#: L40S, vol screen N=100,000, same process, alternating A/B (job 22594730):
+#:     launches   5,938 -> 508        (the fusion does what it says)
+#:     device     87.7 ms -> 88.8 ms  (the fused kernel alone is 83.2 ms vs 76 ms for the
+#:                                     seventeen it replaces)
+#:     wall       723,077 -> 726,211 aligns/s = 1.004x
+#:     parity     74,180 / 100,000 scores move, max|d| 6.5e-03, one molecule past 1%
+#:
+#: So the fine step was NEVER LAUNCH-BOUND: its 0.143 us/mol of tail was real, well-parallelised
+#: bandwidth work, and moving it inside the overlap CTA makes ~128 threads redundantly execute a
+#: per-pose scalar epilogue (7 sqrt, 3 divides, 20 loads/stores) that one thread per pose used to
+#: do. The launch count fell 12x and bought nothing, which is the measurement worth keeping.
+#: ``_tanimoto_best_adam`` (kernels/shape_triton.py) is the version that DOES pay: same fusion,
+#: one thread per pose, no redundancy.
+_FUSED_STEP = os.environ.get("FSS_FUSED_STEP", "0") == "1"
+
+#: Run the fine step's TAIL -- Tanimoto, best-pose tracking, tangent-projected Adam -- as one
+#: pose-parallel kernel instead of twelve torch elementwise ops plus ``_adam_qt``. Unlike
+#: ``_FUSED_STEP`` above this keeps one thread per pose, so it adds no redundant work; it only
+#: stops seven per-pose intermediates making a round trip to HBM.
+#:
+#: DEFAULT OFF, and the reason is not speed. It works -- 1.012x alone and ~1.045x once the
+#: sub-batch pose cap raises the launch count (L40S, vol screen; jobs 22595396/22596016) -- but
+#: it is NOT bit-identical: 2,412 of 100,000 scores move by up to 2.1e-04 on its own, and with
+#: the pose cap on, 74,148 move by up to 6.5e-03. The arithmetic is the same operations in the
+#: same order, so the cause is a last-place rounding difference between torch's and Triton's
+#: float divide; what turns 1 ulp into 6.5e-03 is that 30 Adam steps from a marginally different
+#: gradient can land a seed in a different local optimum, and the per-pair best is a max over
+#: seeds. Everything else in this campaign is bit-identical, so this stays opt-in rather than
+#: spending that property for 4%.
+_FUSED_TAIL = os.environ.get("FSS_FUSED_TAIL", "0") == "1"
+
+#: Hand the overlap kernel its coordinates as (K, 3, P_pad) -- the three coordinate planes
+#: contiguous -- instead of the interleaved (K, P_pad, 3). Nsight Compute on the shipped kernel
+#: (L40S, job 22595748) reports the L1/TEX pipe 91.1% busy while DRAM sits at 5.0%, and names
+#: the cause outright: "only 8.9 of the 32 bytes transmitted per sector are utilized by each
+#: thread ... caused by a stride between threads", estimated speedup 65%. A tile load of BLOCK
+#: interleaved points touches BLOCK*3 floats' worth of sectors to use BLOCK of them; the same
+#: load on a coordinate plane is contiguous.
+#:
+#: MEASURED AND REJECTED (job 22596016); DEFAULT OFF, kept because the null is informative.
+#: Bit-identical as predicted -- V, dQ and dT all matched to 0.000e+00 over 81,920 poses -- and
+#: SLOWER: 0.902x at 32x32 (0.132 -> 0.146 ms) and 0.974x at 32x48. So the sector-utilisation
+#: figure ncu reports does NOT translate into time here: at BLOCK=16 a tile's 16 interleaved
+#: points are 192 contiguous bytes that L1 serves at an 86.5% hit rate, while the three
+#: coordinate planes of the SoA layout are three separate 128-byte lines. The "wasted" bytes
+#: per sector are bytes the very next lane consumes.
+#:
+#: The transpose is paid ONCE per bucket, in the graph's ``_load``, against 30 fine steps that
+#: read the result -- so the cost is the kernel's, not the layout change's.
+_SOA_COORDS = os.environ.get("FSS_SOA_COORDS", "0") == "1"
+
+_FUSED_FN = None
+_FUSED_TAIL_FN = None
+
+
+def _fused_tail_fn():
+    """Resolve the fused Tanimoto/best/Adam tail lazily (Triton/CUDA only, like below)."""
+    global _FUSED_TAIL_FN
+    if _FUSED_TAIL_FN is None:
+        from ..kernels.shape_triton import tanimoto_best_adam
+        _FUSED_TAIL_FN = tanimoto_best_adam
+    return _FUSED_TAIL_FN
+
+
+def _fused_step_fn():
+    """Resolve the fused single-launch fine step lazily.
+
+    ``kernels.dispatch`` deliberately routes by tensor device and has no CPU twin for this
+    one (the numba fine loop is already fully fused -- see ``cpu_fused.cpu_fused_shape``), so
+    importing it here rather than at module scope keeps this module importable on a box with
+    no Triton, exactly as the dispatch indirection does for every other kernel."""
+    global _FUSED_FN
+    if _FUSED_FN is None:
+        from ..kernels.shape_triton import fused_fine_step
+        _FUSED_FN = fused_fine_step
+    return _FUSED_FN
+
 
 @torch.no_grad()
 def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81,
@@ -126,14 +207,22 @@ class _GraphedFineSurf(_GraphedFineBase):
     from _GraphedFineBase.
     """
 
-    def __init__(self, N_pad, M_pad, P, steps, alpha, lr, device, seeds=1, poses=1):
+    def __init__(self, N_pad, M_pad, P, steps, alpha, lr, device, seeds=1, poses=1,
+                 fused=False, soa=False):
         self.alpha = float(alpha); self.lr = float(lr)
+        self.fused = bool(fused)
+        # SoA is a property of the OVERLAP kernel only: the multi-pose variant and the fused
+        # single-launch step both read the interleaved layout, so they keep it.
+        self.soa = bool(soa) and not self.fused and max(1, int(poses)) == 1
         f = lambda *s: torch.empty(*s, device=device, dtype=torch.float32)
         # Coordinate + real-count buffers are per MOLECULE; pose state stays per pose.
         self.S = max(1, int(seeds))
         self.P_cta = max(1, int(poses))
         nm = P // self.S
-        self.A = f(nm, N_pad, 3); self.B = f(nm, M_pad, 3)
+        if self.soa:
+            self.A = f(nm, 3, N_pad); self.B = f(nm, 3, M_pad)
+        else:
+            self.A = f(nm, N_pad, 3); self.B = f(nm, M_pad, 3)
         self.Nr = torch.empty(nm, device=device, dtype=torch.int32)
         self.Mr = torch.empty(nm, device=device, dtype=torch.int32)
         self.norm = f(P)
@@ -147,9 +236,21 @@ class _GraphedFineSurf(_GraphedFineBase):
         super().__init__(steps)
 
     def _step(self):
+        if self.fused:
+            # ONE launch: the overlap kernel's own epilogue does the Tanimoto, the best-pose
+            # update and the Adam step, so dQ/dT never reach memory. Same buffers, same
+            # order of operations -- see _gauss_overlap_se3_fused_step.
+            _fused_step_fn()(
+                self.A, self.B, self.q, self.t, self.norm,
+                self.best, self.bq, self.bt, self.mq, self.vq, self.mt, self.vt,
+                alpha=self.alpha, N_real=self.Nr, M_real=self.Mr, lr=self.lr,
+                seeds_per_mol=self.S)
+            return
         extra = {} if self.S == 1 else {"seeds_per_mol": self.S}
         if self.P_cta > 1:
             extra["poses_per_cta"] = self.P_cta
+        if self.soa:
+            extra["soa"] = True
         VAB, dQ, dT = overlap_score_grad_se3_batch(
             self.A, self.B, self.q, self.t, alpha=self.alpha, N_real=self.Nr, M_real=self.Mr,
             **extra)
@@ -159,6 +260,15 @@ class _GraphedFineSurf(_GraphedFineBase):
         """Single-channel Tanimoto score + best-pose tracking + tangent-projected Adam, all
         in-place into persistent buffers. Shared by surf/vol and the ESP subclass (whose
         only difference is the fused shape+ESP overlap kernel that produces VAB/dQ/dT)."""
+        if _FUSED_TAIL and VAB.is_cuda:
+            # Same twelve ops plus the Adam, one thread per pose, one launch. Every
+            # intermediate below (denom/score/d2/scale/better/gq/gt) is a full (P,) or (P,4)
+            # HBM round trip in the unfused form; measured at 0.143 us/mol of device time on
+            # a vol screen at N=100,000 against 0.4977 for the overlap kernel itself.
+            _fused_tail_fn()(VAB, dQ, dT, self.norm, self.q, self.t,
+                             self.best, self.bq, self.bt,
+                             self.mq, self.vq, self.mt, self.vt, self.lr)
+            return
         torch.sub(self.norm, VAB, out=self.denom)
         torch.div(VAB, self.denom, out=self.score)
         torch.mul(self.denom, self.denom, out=self.d2)
@@ -174,7 +284,12 @@ class _GraphedFineSurf(_GraphedFineBase):
                                         self.mq, self.vq, self.mt, self.vt, self.lr)
 
     def _load(self, A, B, Nr, Mr, norm, qs, ts):
-        self.A.copy_(A); self.B.copy_(B)
+        # One transposing copy per BUCKET against 30 fine steps that read the result; the
+        # driver keeps handing us (K, P_pad, 3) so nothing upstream has to know about SoA.
+        if self.soa:
+            self.A.copy_(A.transpose(1, 2)); self.B.copy_(B.transpose(1, 2))
+        else:
+            self.A.copy_(A); self.B.copy_(B)
         self.Nr.copy_(Nr.to(torch.int32)); self.Mr.copy_(Mr.to(torch.int32))
         self.norm.copy_(norm); self.qs.copy_(qs); self.ts.copy_(ts)
 
@@ -188,12 +303,19 @@ class _GraphedFineSurf(_GraphedFineBase):
 
 
 def _run_graphed_fine(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps, N_pad, M_pad, P,
-                      es_patience=0, es_tol=1e-5, es_seeds=0, seeds=1, poses=1):
+                      es_patience=0, es_tol=1e-5, es_seeds=0, seeds=1, poses=1, fused=False,
+                      soa=False):
+    # ``fused`` joins the key: the two variants capture DIFFERENT graphs (one kernel vs
+    # seventeen) into the same process-wide cache, so a run that toggles the flag must not
+    # replay the other one's graph.
+    # ``_FUSED_TAIL`` joins it too: the tail variant is baked in at CAPTURE time, so a cached
+    # graph would keep replaying whichever one was live when it was captured.
     key = (A_k.device.index, "surf", N_pad, M_pad, P, steps, round(float(alpha), 4),
-           round(float(lr), 5), int(seeds), int(poses))
+           round(float(lr), 5), int(seeds), int(poses), bool(fused), bool(_FUSED_TAIL),
+           bool(soa))
     return run_graphed(
         lambda: _GraphedFineSurf(N_pad, M_pad, P, steps, alpha, lr, A_k.device, seeds=seeds,
-                                 poses=poses),
+                                 poses=poses, fused=fused, soa=soa),
         key, (A_k, B_k, N_k, M_k, norm, q_seed, t_seed),
         es_patience=es_patience, es_tol=es_tol, es_seeds=es_seeds)
 
@@ -304,7 +426,9 @@ def coarse_fine_align_many(
                 A_k.contiguous(), B_k.contiguous(), q_seed, t_seed, N_k, M_k,
                 VAA_plus_VBB, alpha, lr, steps_fine, N_pad, M_pad, P,
                 es_patience=early_stop_patience, es_tol=early_stop_tol,
-                es_seeds=S, seeds=S_fine, poses=P_cta)
+                es_seeds=S, seeds=S_fine, poses=P_cta,
+                fused=(_FUSED_STEP and P_cta == 1),
+                soa=(_SOA_COORDS and P_cta == 1 and not _FUSED_STEP))
         except Exception:
             best_score = None                              # capture failed -> eager
 
@@ -340,17 +464,34 @@ def coarse_fine_align_many(
         prev_best = torch.full((BATCH,), -float('inf'), device=device)
         no_improve_count = 0
 
+        # The fused kernel does overlap + best-update + Adam in one launch, so this loop's
+        # per-step torch tail and its ``fused_adam_qt_with_tangent_proj`` are both skipped.
+        # The early-stop check still sees exactly the eager value: the Adam update the fused
+        # kernel folds in cannot change ``best_score``, which is written before it.
+        _eager_fused = (_FUSED_STEP and P_cta == 1 and A_batch.is_cuda
+                        and A_batch.dtype == torch.float32)
+        _fstep = _fused_step_fn() if _eager_fused else None
+        if _eager_fused:
+            best_score = best_score.contiguous()
+            q_k = q_k.contiguous(); t_k = t_k.contiguous()
+
         for step in range(steps_fine):
-            VAB, dQ, dT = _overlap_in_chunks(
-                A_k, B_k, q_k, t_k,
-                alpha=alpha, N_real=N_k, M_real=M_k, seeds_per_mol=S_fine,
-                poses_per_cta=P_cta)
+            if _eager_fused:
+                _fstep(A_k, B_k, q_k, t_k, VAA_plus_VBB,
+                       best_score, best_q, best_t, m_q, v_q, m_t, v_t,
+                       alpha=alpha, N_real=N_k, M_real=M_k, lr=lr, seeds_per_mol=S_fine)
+            else:
+                VAB, dQ, dT = _overlap_in_chunks(
+                    A_k, B_k, q_k, t_k,
+                    alpha=alpha, N_real=N_k, M_real=M_k, seeds_per_mol=S_fine,
+                    poses_per_cta=P_cta)
 
-            denom = VAA_plus_VBB - VAB
-            score = VAB / denom
-            scale = VAA_plus_VBB / (denom * denom)
+                denom = VAA_plus_VBB - VAB
+                score = VAB / denom
+                scale = VAA_plus_VBB / (denom * denom)
 
-            best_score, best_q, best_t = _update_best(score, q_k, t_k, best_score, best_q, best_t)
+                best_score, best_q, best_t = _update_best(
+                    score, q_k, t_k, best_score, best_q, best_t)
 
             # Early-stop check every 5 steps, so the host sync it needs costs one sync per
             # 5 steps, not one per step. Gating only makes the early stop LESS aggressive.
@@ -378,12 +519,13 @@ def coarse_fine_align_many(
                 # stop one check block (5 steps) sooner. Never seen on real molecules.
                 prev_best = torch.where(improved, cur, prev_best)
 
-            fused_adam_qt_with_tangent_proj(
-                q_k, t_k,
-                -dQ * scale.unsqueeze(1),
-                -dT * scale.unsqueeze(1),
-                m_q, v_q, m_t, v_t, lr
-            )
+            if not _eager_fused:
+                fused_adam_qt_with_tangent_proj(
+                    q_k, t_k,
+                    -dQ * scale.unsqueeze(1),
+                    -dT * scale.unsqueeze(1),
+                    m_q, v_q, m_t, v_t, lr
+                )
 
         # One record per eager fine-loop invocation: value+grad evaluations actually
         # executed (the loop breaks AFTER an evaluation, before that step's Adam update)

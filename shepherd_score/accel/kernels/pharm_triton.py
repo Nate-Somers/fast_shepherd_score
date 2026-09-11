@@ -269,9 +269,15 @@ def pharm_color_score_grad_se3_batch(
     if M_real is None:
         M_real = torch.full((P,), M_pad, device=dev, dtype=torch.int32)
 
-    O = torch.zeros(P, device=dev, dtype=A.dtype)
-    dQ = torch.zeros(P, 4, device=dev, dtype=A.dtype)
-    dT = torch.zeros(P, 3, device=dev, dtype=A.dtype)
+    # Every kernel below STORES its score for each pose unconditionally, and its gradients
+    # whenever NEED_GRAD, so pre-zeroing is a memset per fine step over buffers about to be
+    # overwritten -- 0.0159 us/mol of device time on a vol screen at N=100,000 (job
+    # 22593930), and this kernel has more outputs than that one. Without NEED_GRAD the
+    # gradient buffers ARE left unwritten, so those keep their zeros.
+    O = torch.empty(P, device=dev, dtype=A.dtype)
+    _g = torch.empty if NEED_GRAD else torch.zeros
+    dQ = _g(P, 4, device=dev, dtype=A.dtype)
+    dT = _g(P, 3, device=dev, dtype=A.dtype)
 
     _pharm_color_grad_kernel[(P,)](
         A.contiguous().view(-1), B.contiguous().view(-1),
@@ -415,9 +421,15 @@ def pharm_grad_dq_se3_batch(
         N_real = torch.full((P,), N_pad, device=dev, dtype=torch.int32)
     if M_real is None:
         M_real = torch.full((P,), M_pad, device=dev, dtype=torch.int32)
-    O = torch.zeros(P, device=dev, dtype=ref_anchors.dtype)
-    dQ = torch.zeros(P, 4, device=dev, dtype=ref_anchors.dtype)
-    dT = torch.zeros(P, 3, device=dev, dtype=ref_anchors.dtype)
+    # Every kernel below STORES its score for each pose unconditionally, and its gradients
+    # whenever NEED_GRAD, so pre-zeroing is a memset per fine step over buffers about to be
+    # overwritten -- 0.0159 us/mol of device time on a vol screen at N=100,000 (job
+    # 22593930), and this kernel has more outputs than that one. Without NEED_GRAD the
+    # gradient buffers ARE left unwritten, so those keep their zeros.
+    O = torch.empty(P, device=dev, dtype=ref_anchors.dtype)
+    _g = torch.empty if NEED_GRAD else torch.zeros
+    dQ = _g(P, 4, device=dev, dtype=ref_anchors.dtype)
+    dT = _g(P, 3, device=dev, dtype=ref_anchors.dtype)
     _pharm_grad_dq_kernel[(P,)](
         ref_anchors.contiguous().view(-1), fit_anchors.contiguous().view(-1),
         ref_vectors.contiguous().view(-1), fit_vectors.contiguous().view(-1),
@@ -449,9 +461,15 @@ def pharm_score_grad_se3_batch(
     if M_real is None:
         M_real = torch.full((P,), M_pad, device=dev, dtype=torch.int32)
 
-    O = torch.zeros(P, device=dev, dtype=ref_anchors.dtype)
-    gR = torch.zeros(P, 3, 3, device=dev, dtype=ref_anchors.dtype)
-    gt = torch.zeros(P, 3, device=dev, dtype=ref_anchors.dtype)
+    # Every kernel below STORES its score for each pose unconditionally, and its gradients
+    # whenever NEED_GRAD, so pre-zeroing is a memset per fine step over buffers about to be
+    # overwritten -- 0.0159 us/mol of device time on a vol screen at N=100,000 (job
+    # 22593930), and this kernel has more outputs than that one. Without NEED_GRAD the
+    # gradient buffers ARE left unwritten, so those keep their zeros.
+    O = torch.empty(P, device=dev, dtype=ref_anchors.dtype)
+    _g = torch.empty if NEED_GRAD else torch.zeros
+    gR = _g(P, 3, 3, device=dev, dtype=ref_anchors.dtype)
+    gt = _g(P, 3, device=dev, dtype=ref_anchors.dtype)
 
     _pharm_score_grad_kernel[(P,)](
         ref_anchors.contiguous().view(-1), fit_anchors.contiguous().view(-1),
