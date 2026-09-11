@@ -323,6 +323,58 @@ class Molecule:
                 )
 
 
+    def __setstate__(self, state):
+        """
+        Restore a pickled Molecule, upgrading the pre-refactor flat layout.
+
+        Molecules pickled before the Surface/Pharmacophore refactor carry
+        ``surf_pos`` / ``surf_esp`` / ``probe_radius`` / ``pharm_types`` /
+        ``pharm_ancs`` / ``pharm_vecs`` directly in ``__dict__``. Those names are
+        now data descriptors, so they take precedence over the instance dict and
+        forward to ``self._surface`` / ``self._pharmacophore``. Without this hook
+        every one of those reads raises AttributeError on an old pickle, which
+        silently strands any on-disk store written by a prior release.
+
+        (``MoleculePair`` has the same hazard for ``transform_esp`` /
+        ``sim_aligned_esp``; see WHATS_NEW B3. ORCHARD only pickles ``Molecule``,
+        so only this class is shimmed here.)
+        """
+        state = dict(state)
+
+        if "_surface" not in state:
+            state["_surface"] = Surface(
+                positions=state.pop("surf_pos", None),
+                esp=state.pop("surf_esp", None),
+                probe_radius=state.pop("probe_radius", 1.2),
+            )
+        else:
+            for _k in ("surf_pos", "surf_esp", "probe_radius"):
+                state.pop(_k, None)
+
+        if "_pharmacophore" not in state:
+            _t = state.pop("pharm_types", None)
+            _a = state.pop("pharm_ancs", None)
+            _v = state.pop("pharm_vecs", None)
+            state["_pharmacophore"] = (
+                None if _t is None and _a is None and _v is None
+                else Pharmacophore(types=_t, positions=_a, vectors=_v)
+            )
+        else:
+            for _k in ("pharm_types", "pharm_ancs", "pharm_vecs"):
+                state.pop(_k, None)
+
+        # Added after the flat layout; get_pc() reads it.
+        state.setdefault("surface_method", "mesh")
+
+        # Same hazard, fork side: state this fork added after the flat layout, each read
+        # unguarded by a lazy accessor. _charge_model is read by partial_charges whenever
+        # the pickle carried no charges, and _fukui by the fukui property. Default them to
+        # the constructor's values rather than letting an old pickle AttributeError.
+        state.setdefault("_charge_model", "xtb")
+        state.setdefault("_fukui", None)
+
+        self.__dict__.update(state)
+
     # Interaction-profile accessors (backwards-compatible with the loose
     # ``surf_pos``/``surf_esp``/``probe_radius`` and ``pharm_*`` attributes)
     @property
@@ -1060,6 +1112,44 @@ class MoleculePair:
         # One AlignmentResult per mode (score defaults to None, transform to identity).
         # transform_<mode>/sim_aligned_<mode> are properties delegating to this dict.
         self._alignments = {key: AlignmentResult() for key in _ALIGN_KEYS}
+
+
+    def __setstate__(self, state):
+        """
+        Restore a pickled MoleculePair, upgrading the pre-refactor flat layout.
+
+        Same hazard as :meth:`Molecule.__setstate__` and the one WHATS_NEW B3 documents:
+        ``transform_<mode>`` / ``sim_aligned_<mode>`` were plain attributes and are now data
+        descriptors delegating to ``self._alignments``. Data descriptors take precedence over
+        the instance dict, so an old pickle restores its flat keys and then raises
+        ``AttributeError: 'MoleculePair' object has no attribute '_alignments'`` on the first
+        read of any of them.
+
+        Remap the flat keys into AlignmentResult entries, honouring the renamed-mode aliases
+        (``esp`` -> ``surf_esp``, ``esp_combo`` -> ``vol_and_surf_esp``) that a pickle written
+        before the rename would carry. New-format pickles are untouched: the remap only fires
+        when ``_alignments`` is absent, and stale flat duplicates are stripped either way so a
+        shadowed copy cannot drift from the canonical entry.
+        """
+        state = dict(state)
+        aliases = {'esp': 'surf_esp', 'esp_combo': 'vol_and_surf_esp'}
+
+        if '_alignments' not in state:
+            alignments = {key: AlignmentResult() for key in _ALIGN_KEYS}
+            for flat, canon in [(k, k) for k in _ALIGN_KEYS] + list(aliases.items()):
+                t = state.get(f'transform_{flat}')
+                sc = state.get(f'sim_aligned_{flat}')
+                if t is not None:
+                    alignments[canon].transform = t
+                if sc is not None:
+                    alignments[canon].score = sc
+            state['_alignments'] = alignments
+
+        for flat in list(_ALIGN_KEYS) + list(aliases):
+            state.pop(f'transform_{flat}', None)
+            state.pop(f'sim_aligned_{flat}', None)
+
+        self.__dict__.update(state)
 
 
     def _to_tensor(self, arr: np.ndarray) -> torch.Tensor:

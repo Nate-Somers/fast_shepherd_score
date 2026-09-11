@@ -969,19 +969,32 @@ vars(pair)                          # now shows transform_surf_esp
 Code that introspects `MoleculePair.__dict__` — rather than naming the attribute — will see the
 new names.
 
-### B3. Unpickling old `MoleculePair` objects
+### B3. Unpickling old `Molecule` / `MoleculePair` objects — fixed
 
-A `MoleculePair` pickled by the previous release carries `transform_esp` / `sim_aligned_esp` in
-its `__dict__` and *not* the canonical keys. Because the legacy names are now data descriptors,
-they take precedence over the instance dict and forward to a canonical attribute that the old
-pickle does not have:
+Objects pickled by a previous release carry the pre-refactor *flat* layout in `__dict__` and not
+the canonical keys. Those flat names are now data descriptors, which take precedence over the
+instance dict and forward to canonical storage the old pickle does not have:
 
 ```
-AttributeError: 'MoleculePair' object has no attribute 'transform_surf_esp'
+AttributeError: 'Molecule' object has no attribute '_surface'
+AttributeError: 'MoleculePair' object has no attribute '_alignments'
 ```
 
-**Old pickles do not round-trip.** Re-run the alignment, or add a `__setstate__` that remaps the
-legacy keys.
+For `Molecule` that is six attributes (`surf_pos`, `surf_esp`, `probe_radius`, `pharm_types`,
+`pharm_ancs`, `pharm_vecs`); for `MoleculePair`, every `transform_<mode>` / `sim_aligned_<mode>`.
+Left alone it silently strands any on-disk store a prior release wrote.
+
+**Both classes now define `__setstate__`, so old pickles round-trip.** The hook remaps the flat
+keys into `Surface` / `Pharmacophore` / `AlignmentResult`, honours the renamed-mode aliases
+(`esp` → `surf_esp`, `esp_combo` → `vol_and_surf_esp`), and defaults the state that was
+introduced *after* the flat layout and so cannot be present in an old pickle — `surface_method`
+(read by `get_pc()`), `_charge_model` (read by `partial_charges` when the pickle carried no
+charges) and `_fukui`. New-format pickles are unaffected: the remap only fires when the
+canonical key is absent, and stale flat duplicates are stripped either way so a shadowed copy
+cannot drift from the canonical entry.
+
+Covered by `tests/test_container_core.py::test_legacy_pickle_*` and
+`::test_legacy_molecule_pair_pickle_restores_alignments`.
 
 ### B4. `apply_SE3_transform` collapses a singleton batch
 

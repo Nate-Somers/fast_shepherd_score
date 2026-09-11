@@ -272,3 +272,118 @@ def test_single_pair_align_vol_jax():
     assert aligned.shape[1] == 3
     assert mp.sim_aligned_vol_noH is not None
     assert mp.transform_vol_noH.shape == (4, 4)
+
+
+# ---------------------------------------------------------------------------
+# Legacy-pickle upgrade (Molecule.__setstate__)
+# ---------------------------------------------------------------------------
+
+# Every name a Molecule pickled before the Surface/Pharmacophore refactor carried flat in
+# __dict__ and that is now a data descriptor. Data descriptors win over the instance dict,
+# so without __setstate__ each of these raises AttributeError on an old pickle -- silently
+# stranding any on-disk store a prior release wrote.
+_LEGACY_FLAT = ('surf_pos', 'surf_esp', 'probe_radius',
+                'pharm_types', 'pharm_ancs', 'pharm_vecs')
+
+# State added AFTER the flat layout, so absent from any such pickle. surface_method is read
+# by get_pc(); _charge_model by partial_charges when the pickle carried no charges; _fukui
+# by the fukui property. None of the three is guarded by its reader.
+_POST_FLAT = ('surface_method', '_charge_model', '_fukui')
+
+
+def _legacy_pickle_bytes(mol, drop=()):
+    """Re-shape a live Molecule into the pre-refactor on-disk layout, then pickle it."""
+    import pickle
+    state = {k: v for k, v in mol.__dict__.items()
+             if k not in ('_surface', '_pharmacophore') and k not in _POST_FLAT
+             and k not in drop}
+    state.update(surf_pos=mol.surf_pos, surf_esp=mol.surf_esp,
+                 probe_radius=mol.probe_radius, pharm_types=mol.pharm_types,
+                 pharm_ancs=mol.pharm_ancs, pharm_vecs=mol.pharm_vecs)
+    old = Molecule.__new__(Molecule)
+    old.__dict__.update(state)
+    return pickle.dumps(old)
+
+
+def test_legacy_pickle_restores_flat_attributes():
+    import pickle
+    mol = _mol('CCO', num_surf_points=50)
+    back = pickle.loads(_legacy_pickle_bytes(mol))
+
+    assert back.surf_pos.shape == mol.surf_pos.shape
+    np.testing.assert_allclose(back.surf_pos, mol.surf_pos)
+    np.testing.assert_allclose(back.surf_esp, mol.surf_esp)
+    assert back.probe_radius == mol.probe_radius
+    # the flat duplicates must be gone, not shadowed -- a stale copy would diverge from
+    # the Surface on the first center_to()/write through the property
+    assert not set(_LEGACY_FLAT) & set(back.__dict__)
+    assert isinstance(back._surface, Surface)
+
+
+def test_legacy_pickle_defaults_post_refactor_state():
+    """Attributes introduced after the flat layout must come back at the ctor default."""
+    import pickle
+    mol = _mol('CCO', num_surf_points=50)
+    blob = _legacy_pickle_bytes(mol, drop=('partial_charges',))
+    assert b'_charge_model' not in blob and b'surface_method' not in blob
+    back = pickle.loads(blob)
+
+    assert back.surface_method == 'mesh'
+    assert back.__dict__['_charge_model'] == 'xtb'
+    assert back.__dict__['_fukui'] is None
+    # the point of the default: the lazy charge generator reads _charge_model, so without
+    # it this raises AttributeError instead of generating charges
+    back._charge_model = 'mmff'
+    assert back.partial_charges.shape == (mol.mol.GetNumAtoms(),)
+
+
+def test_new_format_pickle_round_trips_unchanged():
+    """The hook only fires for the legacy layout; a current pickle must be untouched."""
+    import pickle
+    mol = _mol('CCO', num_surf_points=50)
+    back = pickle.loads(pickle.dumps(mol))
+
+    np.testing.assert_allclose(back.surf_pos, mol.surf_pos)
+    np.testing.assert_allclose(back.surf_esp, mol.surf_esp)
+    assert back.surface_method == mol.surface_method
+    assert back.__dict__['_charge_model'] == mol.__dict__['_charge_model']
+    assert not set(_LEGACY_FLAT) & set(back.__dict__)
+
+
+def test_legacy_molecule_pair_pickle_restores_alignments():
+    """MoleculePair has the same descriptor hazard -- WHATS_NEW B3, now shimmed."""
+    import pickle
+    mp = _pair()
+    mp.transform_vol = np.eye(4) * 2.0
+    mp.sim_aligned_vol = np.float32(0.75)
+    mp.transform_esp = np.eye(4) * 3.0          # legacy alias -> surf_esp
+    mp.sim_aligned_esp = np.float32(0.5)
+
+    # the pre-refactor layout: flat transform_*/sim_aligned_*, no _alignments
+    state = {k: v for k, v in mp.__dict__.items() if k != '_alignments'}
+    state.update(transform_vol=mp.transform_vol, sim_aligned_vol=mp.sim_aligned_vol,
+                 transform_esp=mp.transform_esp, sim_aligned_esp=mp.sim_aligned_esp)
+    old = MoleculePair.__new__(MoleculePair)
+    old.__dict__.update(state)
+
+    back = pickle.loads(pickle.dumps(old))
+    np.testing.assert_allclose(back.transform_vol, np.eye(4) * 2.0)
+    assert back.sim_aligned_vol == np.float32(0.75)
+    # the legacy name must land on the canonical entry, reachable under both spellings
+    np.testing.assert_allclose(back.transform_surf_esp, np.eye(4) * 3.0)
+    np.testing.assert_allclose(back.transform_esp, np.eye(4) * 3.0)
+    assert back.sim_aligned_surf_esp == np.float32(0.5)
+    # untouched modes come back at the AlignmentResult defaults, not missing
+    assert back.sim_aligned_pharm is None
+    np.testing.assert_allclose(back.transform_pharm, np.eye(4))
+    assert 'transform_vol' not in back.__dict__ and 'transform_esp' not in back.__dict__
+
+
+def test_new_format_molecule_pair_pickle_round_trips():
+    import pickle
+    mp = _pair()
+    mp.sim_aligned_vol = np.float32(0.9)
+    back = pickle.loads(pickle.dumps(mp))
+    assert back.sim_aligned_vol == np.float32(0.9)
+    assert back.sim_aligned_pharm is None
+    assert 'transform_vol' not in back.__dict__
