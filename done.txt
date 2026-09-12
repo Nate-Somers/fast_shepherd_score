@@ -1,0 +1,41 @@
+done
+
+fast_shepherd_score @ c0075a3
+
+Two defects fixed, both measured on an L40S before and after:
+
+  1. screen(ndev>1) returned vol answers for every mode. The multi-GPU worker called
+     _build_fit_arrays_vol unconditionally, and _align_fast_arrays accepted a `mode`
+     argument it never read. vol_color/vol_esp/vol_and_surf_esp scored as vol; pharm
+     raised KeyError. Confirmed against the pristine tree on 2 GPUs: ndev=2 vol_color
+     returned exactly the ndev=1 vol answer, 46 of 50 ids wrong. Fixed; all four array
+     modes now match ndev=1 bit-for-bit.
+
+     ANY PUBLISHED ndev>1 NUMBER FOR A NON-VOL MODE IS INVALID AND MUST BE RE-RUN.
+
+  2. The sub-batch footprint calibration billed a chunk for memory other objects held.
+     With 44.98 GB resident elsewhere it recorded 45 GB/pair, collapsing K_sub to 1 and
+     producing 47,249 one-pair chunks. Charging only the call's own growth recovers
+     144.9x at 2 GB free (0.34 s vs 49.64 s), with 0 of 100,000 scores moved and no
+     regression at idle.
+
+Plus four documentation claims the code refutes, corrected in place, and the effort
+recorder reinstated (its own commit, 0a580bc, revert that alone to undo).
+
+Tests: 415 passed, 83 skipped, 0 failed on an L40S (job 22630239).
+Baseline on the same node before these changes: 408 passed, 82 skipped, 0 failed.
+
+Three proposed fixes were REFUTED by measurement and deliberately not made:
+  - free-memory -> total-memory budgets: implemented, then measured harmful (chunk
+    variation survived; 1 GB free OOMed 3 of 3). The defect was never the budget.
+  - device-gating the array path: on CPU it is bit-identical and 1.01-1.14x FASTER.
+  - lowering the default shard_size for read-ahead: on GPU one shard beat two by 5-6%.
+
+Still open, measured but not acted on:
+  - P5_cpu's pharm collapse has no established cause. The array path was cleared.
+  - The vol curve's N=1e5 "base" came from a different panel (P1.canon 699,556) than
+    the other six points (P5.canon, whose own cell reads 770,602). Corrected, the
+    regression at that size is -26.7%, not -19.2%.
+  - env.shepherd_score_version is the constant 0.1.dev324+g410af8836 in 431 of 432
+    cells, so it has never discriminated a commit. Panel provenance is unrecoverable
+    from the files; only a re-run fixes it.
