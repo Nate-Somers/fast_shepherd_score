@@ -18,6 +18,8 @@ from __future__ import annotations
 import numpy as np
 from numba import njit, prange
 
+from .._stats import record as _record_steps
+
 
 # Adam constants — must match fused_adam_qt_with_tangent_proj in cpu.py / the Triton tail.
 _B1 = 0.9
@@ -231,6 +233,16 @@ def fine_loop_cpu(overlap_fn, q_seed, t_seed, norm, *, lr, steps,
             # case, but NOT provably never-earlier: per-check gains that straddle es_tol can
             # spend a baseline reset the global rule still holds, costing one 5-step block.
             prev = np.where(improved, cur, prev)
+    # Value+grad evaluations executed vs the configured budget. Unlike the eager driver loops
+    # this one applies its Adam tail BEFORE the check, so an N-iteration run here is N
+    # evaluations AND N updates. No-op unless recording was enabled.
+    #
+    # This site is why the fused CPU path reported NOTHING: it was the one call site the
+    # recorder's reinstatement missed, so shape/vol+surf, surf_esp, pharm and vol_color all
+    # returned an empty summary on the CPU float32 route -- exactly the fig2 CPU/SVML legs --
+    # and the paper harness's try/except degrades a missing key to silence rather than an error.
+    _ran = (step + 1) if steps else 0
+    _record_steps(_ran, steps, _ran < steps)
     return best, bq, bt
 
 

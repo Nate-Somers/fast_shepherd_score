@@ -37,6 +37,7 @@ from ._common import batched_seeds_torch, _update_best
 from ._graphed import _GraphedFineBase, run_graphed, graph_cap
 # Reuse the shape driver's padding-safe chunked kernel wrappers verbatim (no new kernel).
 from .shape import _overlap_in_chunks, _self_overlap_in_chunks  # noqa: F401  (re-export for callers)
+from .._stats import record as _record_steps
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -253,6 +254,11 @@ def coarse_fine_align_many_tversky(
                 m_q, v_q, m_t, v_t, lr
             )
 
+        # One record per eager fine-loop invocation: value+grad evaluations actually
+        # executed (the loop breaks AFTER an evaluation, before that step's Adam update)
+        # against the configured budget. No-op unless _stats recording was enabled.
+        _ran = (step + 1) if steps_fine else 0
+        _record_steps(_ran, steps_fine, _ran < steps_fine)
 
     # --- gather per-pair best over seeds ---
     final_score = best_score.view(BATCH, S)

@@ -28,6 +28,8 @@ from __future__ import annotations
 from collections import OrderedDict
 import torch
 
+from .._stats import record as _record_steps
+
 
 # --- compute-aware P-cap ----------------------------------------------------------------
 # The graph's win is launch-bound: its per-step launch savings are ~fixed, while its cost
@@ -185,6 +187,14 @@ class _GraphedFineBase:
         else:
             for _ in range(self.steps):
                 self.graph.replay()
+            done = self.steps
+        # Replays executed == value+grad evaluations, against the configured budget. One
+        # record per bucket run, tagged graphed=True: this is the ONLY site that can say a
+        # bucket took the replay loop rather than the eager fall-back, and the two run
+        # different early-stop schedules (eager patience vs patience + _GRAPH_ES_MARGIN), so
+        # a rate change is not attributable without knowing which one ran. No-op unless
+        # _stats recording was enabled.
+        _record_steps(done, self.steps, done < self.steps, graphed=True)
         return self._result()
 
 

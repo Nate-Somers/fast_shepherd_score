@@ -1260,10 +1260,32 @@ Every previously-truncated case now equals its own full-budget reference exactly
   stop one check block (5 steps) sooner. It fired in 0 of 40,000 randomized trajectories and 0 of the
   696 real scores above, and in ~2.5% of draws from a generator built specifically to provoke it.
 
-The `shepherd_score.accel._stats` effort recorder that measured all of this was **removed before
-publication** — it was development scaffolding, process-local and not thread-safe, so it reported
-nothing from a forked or spawned worker and was easy to misread as "full effort" when it simply had
-not been enabled. To measure executed steps now, instrument the driver loop directly.
+To see what a run actually executed, `shepherd_score.accel._stats` records it. It is a no-op
+until armed, so the library pays nothing by default:
+
+```python
+from shepherd_score.accel import _stats
+_stats.reset()                      # clear + enable
+batch.align_with_vol()
+_stats.summary()                    # {'calls':…, 'graphed':…, 'steps_min':…, 'steps_max':…,
+                                    #  'steps_mean':…, 'steps_configured':…, 'early_stop_frac':…}
+_stats.disable()
+```
+
+`graphed` counts how many of those fine-loop calls ran the CUDA-graph path rather than the eager
+one — the field that separates the two schedules described in [B11](#7-behavior-changes-read-this),
+and the one whose absence made the graphed-vs-eager question unanswerable from a results file.
+
+This recorder was cut before publication as development scaffolding and then **reinstated**, because
+the partition it measures turned out to be the quantity that predicts throughput: across six modes
+measured twice at N=1e5 on the same node and library, fine-loop `calls`/rep tracked throughput
+6-for-6 — matching calls gave rates within 1%, while 20–50× different calls gave 1.13–3.14×
+different rates. `overlap_score`, by contrast, stayed bit-identical through a 51.6× partition
+change. Without this recorder a benchmark re-run records nothing about the schedule it ran.
+
+It is process-local and not thread-safe, so a forked or spawned worker (`accel/cpu_pool.py`,
+`accel/screen_parallel.py`, `screen(..., ndev>1)`) records only in its own process and reports
+nothing to the parent — an empty summary means *unmeasured*, not *full effort*.
 
 ### B10. Screening host path is faster; results are bit-identical
 

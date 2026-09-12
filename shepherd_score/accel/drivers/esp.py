@@ -22,6 +22,7 @@ from ._common import (
 )
 from ._graphed import run_graphed, graph_cap
 from .shape import _GraphedFineSurf
+from .._stats import record as _record_steps
 
 @torch.no_grad()
 def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float,
@@ -392,6 +393,11 @@ def coarse_fine_esp_align_many(
                 -dT * scale.unsqueeze(1),
                 m_q, v_q, m_t, v_t, lr)
 
+        # One record per eager fine-loop invocation: value+grad evaluations actually
+        # executed (the loop breaks AFTER an evaluation, before that step's Adam update)
+        # against the configured budget. No-op unless _stats recording was enabled.
+        _ran = (step + 1) if steps_fine else 0
+        _record_steps(_ran, steps_fine, _ran < steps_fine)
 
     # ------------------------------------------------------------------
     # 5) Gather final results
