@@ -9,8 +9,9 @@ which is exactly why it needs a test: before it, a sub-batch was sized from free
 alone, so a bucket that happened to fit in one chunk exceeded ``graph_cap`` and silently took
 the eager loop instead of the CUDA graph. The two paths do not agree (the graph replay carries
 ``_GRAPH_ES_MARGIN`` extra blocks of early-stop patience), so the screen's scores depended on
-what the allocator was holding. ``test_pose_cap_makes_the_graph_path_unconditional`` is the
-assertion that this is no longer true.
+what the allocator was holding. ``test_pose_cap_graphs_every_chunk_on_a_narrow_fixture`` is the
+assertion that the choice is now a function of the band alone -- note it is NOT an assertion that
+everything graphs, which is false above N_pad*M_pad = 3,662; see that test's docstring.
 
 The CPU-only tests here run everywhere; the rest need CUDA + Triton and skip without them.
 """
@@ -199,12 +200,21 @@ def test_pose_cap_bounds_the_subbatch_and_only_when_asked():
 
 
 @pytest.mark.cuda
-def test_pose_cap_makes_the_graph_path_unconditional(monkeypatch, canon_store, molecules):
-    """Every fine-loop call must reach the CUDA graph, and the scores must not depend on it.
+def test_pose_cap_graphs_every_chunk_on_a_narrow_fixture(monkeypatch, canon_store, molecules):
+    """With the cap, every fine-loop call of THIS fixture reaches the CUDA graph.
 
-    This is the regression the cap exists for: with the memory-derived schedule alone, whether
-    a bucket graphs or falls back to eager depends on free GPU memory at that moment, and the
-    two paths score differently.
+    The regression the cap exists for: with the memory-derived schedule alone, whether a bucket
+    graphs or falls back to eager depends on free GPU memory at that moment, and the two paths
+    score differently (the graph replay carries the early-stop margin).
+
+    READ THE PRECONDITION. This does NOT show that the cap makes graphing unconditional -- that
+    is false and was measured false: a capped chunk is 81,920 poses, graph_cap(work) =
+    max(2000, min(262144, 300_000_000 // work)), so it fits only while N_pad*M_pad <= 3,662.
+    Band 48 graphs; band 64 (work 4,096) and band 112 both run EAGER under the same cap.
+    This fixture's molecules are all narrow enough to pad to band 48, which is the ONLY reason
+    graphed == calls holds here -- so the precondition is asserted below rather than assumed.
+    Widen the fixture past 48 heavy atoms and this test SHOULD go red; that is the signal, not
+    a bug.
     """
     _require_fast_cuda()
     from shepherd_score.accel.batch import _arrays
@@ -229,6 +239,16 @@ def test_pose_cap_makes_the_graph_path_unconditional(monkeypatch, canon_store, m
 
     store = ProfileStore.open(canon_store)
     q = molecules[0]
+
+    # The precondition this test rests on, asserted rather than assumed: every molecule must
+    # pad to band 48 (work 2,304 <= 3,662) or a capped chunk legitimately runs eager and the
+    # graphed == calls assertion below would be testing a false claim.
+    _heavy = max(int((m.atom_pos_noH if hasattr(m, "atom_pos_noH") else m.atom_pos).shape[0])
+                 for m in molecules + [q])
+    assert _heavy <= 48, (
+        f"fixture has a {_heavy}-heavy-atom molecule; above 48 the band exceeds graph_cap and "
+        "eager chunks are CORRECT. Re-derive the expectation instead of widening this bound.")
+
     reset_graph_cache()
     hits = screen(q, store, mode="vol", backend="triton", top_k=5)
     assert seen["calls"] > 0, "the fine loop never ran -- the spy missed the call site"

@@ -50,8 +50,12 @@ _MERGE_MAX_WAVES = 2.0
 # never splits a full same-size cell, so at large N one cell can become a single giant bucket.
 # Its hoisted pad+seeds stay resident across the WHOLE fine loop, which inflates the per-pair
 # footprint _subbatched_align measures and shrinks every chunk it takes. Splitting an oversized
-# bucket into cap-sized pieces is result-identical (pairs are independent, exactly as in the
-# sub-batcher).
+# bucket into cap-sized pieces is result-identical as far as the KERNELS go -- they mask padding
+# and seed off the real counts, as the docstring above argues -- but it carries the same caveat
+# the sub-batcher does: the fine loop's early-stop break is CHUNK-GLOBAL (see _subbatched_align),
+# so in principle a split can hand a pair's neighbours a different step count. The evidence here
+# is weaker than there, and it points the reassuring way: nobody has measured a BUCKET split
+# moving a score, and forced 4- and 11-bucket splits came back 0 of 100,000.
 #
 # The cap is a fraction (_UPFRONT_FRAC) of the device's FREE memory, read at call time via
 # mem_get_info -- it must NOT become a fixed byte literal: buckets have to shrink on a smaller

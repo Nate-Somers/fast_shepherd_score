@@ -217,12 +217,25 @@ def align_batch_vol_arrays(ref_xyz: torch.Tensor, fit_flat: torch.Tensor,
                 N_real=_nr[sl], M_real=_mr[sl], alpha=alpha, steps_fine=steps_fine,
                 seeds=(_sq[sl], _st[sl]))
 
-        # same workspace/footprint key as the object path -> identical chunking
-        # ``pose_cap`` keeps every sub-batch
-        # inside graph_cap so the fine loop is ALWAYS the CUDA-graph one. Without it the chunk
-        # is sized from free memory alone and a big band silently falls back to the eager loop
-        # -- a path that scores differently (it skips the graph's early-stop margin), so the
-        # screen's results depended on allocator state. Opt-in per call site: every other
+        # same workspace/footprint key as the object path -> identical chunking.
+        #
+        # ``pose_cap`` makes the graph/eager DECISION DETERMINISTIC, not uniformly graphed.
+        # The earlier claim here -- that the cap keeps every sub-batch inside graph_cap so the
+        # fine loop is ALWAYS the CUDA-graph one -- is false, and measured false at this exact
+        # call site (this is the only caller that passes pose_cap). A capped chunk is
+        # P = 81,920 // seeds * seeds = 81,920 poses at vol's 10 seeds, while
+        # graph_cap(work) = max(2000, min(262144, 300_000_000 // work)), so the capped chunk
+        # fits only while N_pad*M_pad <= 3,662:
+        #     band 48 (work 2,304)  -> cap 130,208  GRAPHS
+        #     band 64 (work 4,096)  -> cap  73,242  EAGER
+        #     band 112 (work 12,544)-> cap  23,915  EAGER
+        # Verified by execution, 12 of 12 chunks over three bands, including the band-64 case
+        # that straddles the boundary.
+        #
+        # What the cap DOES buy is the thing that mattered: without it the chunk is sized from
+        # free memory alone, so whether a given bucket graphed depended on allocator state, and
+        # the two paths score differently (the graph replay carries the early-stop margin). The
+        # cap makes that choice a function of the band alone. Opt-in per call site: every other
         # aligner keeps the schedule it has today.
         sc, qb, tb = _subbatched_align(_proc, k, key=("vol", N_pad, M_pad, n_seeds),
                                         device=device,

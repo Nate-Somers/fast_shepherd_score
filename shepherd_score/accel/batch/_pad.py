@@ -42,7 +42,15 @@ _PAIR_FOOTPRINT_BYTES: dict[tuple, int] = {}
 #: allocator happened to be holding. The two paths are not equivalent: the graph replay adds
 #: ``_GRAPH_ES_MARGIN`` blocks of early-stop patience, so it runs longer and scores differently
 #: (measured: 71,736 of 100,000 scores move, max 6.5e-03, when the same screen takes the eager
-#: path instead). Capping poses makes the graph path unconditional and the result reproducible.
+#: path instead). What the cap actually buys is REPRODUCIBILITY, not an unconditional graph, and
+#: the arithmetic says so. The cap pins P at 81,920 poses (8,192 pairs x vol's 10 seeds) while
+#: ``_graphed.graph_cap(work) = max(2000, min(262144, 300_000_000 // work))``, so a capped chunk
+#: graphs only where N_pad*M_pad <= 3,662. Worked against the constants at HEAD: 48x48 -> cap
+#: 130,208 (GRAPHS); 48x80 -> 78,125, 64x64 -> 73,242, 112x112 -> 23,915 (all EAGER). Wide
+#: buckets keep taking the eager loop. The cap is also only an UPPER bound on P -- ``_budget() //
+#: fp`` can shrink a chunk further on a busy device, which flips a bucket the other way, into the
+#: graph. What the cap removes is the unbounded-P case that made a big band's path swing on
+#: allocator state; it does not make the choice unconditional.
 #:
 #: 81,920 = the measured optimum on an L40S, at BOTH library sizes and for all of vol's shapes
 #: (job 22595747, aligns/s vs chunk in molecules at 10 seeds):
@@ -59,9 +67,17 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
     """Drive ``process(start, count) -> (scores, q, t)`` over ``K`` independent
     pairs in GPU-memory-safe sub-batches and concatenate the per-pair results.
 
-    Because pairs are independent (each result is its own max over seeds),
-    chunking + concatenation is *exactly equivalent* to one big call -- it only
-    bounds peak memory, so it never changes a score.
+    Chunking + concatenation bounds peak memory. It is score-identical only when
+    every chunk runs the SAME number of fine steps. Pairs are independent WITHIN a
+    step (each result is its own max over its own seeds), but the early-stop break
+    is CHUNK-GLOBAL -- the ``if not improved.any(): ... break`` in drivers/shape.py,
+    kernels/cpu_fused.py and drivers/_graphed.py all break only once every pair IN
+    THE CHUNK has stalled -- so re-cutting the chunks can hand a pair a different
+    step count. MEASURED over 100,000 vol pairs:
+    0 of 100,000 scores move at chunks of 4 pairs and up; 19 of 100,000 move at ONE
+    PAIR PER CHUNK (L40S, max 2.338e-02, all downward), and on CPU up to 2.203e-02 at
+    a split boundary. ``early_stop_patience=0`` makes the two schedules bit-identical,
+    which pins the cause on the early-stop break and nothing else.
 
     Sizing is dynamic and per-bucket: bytes-per-pair is measured from the fine
     loop's peak allocation and cached per ``key=(mode, N_pad, M_pad, num_seeds)``
@@ -102,18 +118,41 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
         k = min(K_sub, K - s)
         try:
             torch.cuda.reset_peak_memory_stats()
+            base = int(torch.cuda.memory_allocated())
             sc, q, t = process(s, k)
             peak = int(torch.cuda.max_memory_allocated())
+            # Charge the chunk for ITS OWN GROWTH, never for the device-wide high-water
+            # mark. reset_peak_memory_stats() rebases the peak to whatever is ALREADY
+            # resident, so without ``- base`` a chunk is billed for every byte any
+            # unrelated object holds. MEASURED: with 4.495e10 B held elsewhere the same
+            # shape recorded 1,879,004,971 B/pair against 112,631-173,764 B/pair on an
+            # idle GPU -- 1.1e4x high. That collapses K_sub to 1 (predicted vs observed
+            # chunk counts reconcile to three digits: 33.3 vs 33, and 159 vs 156), costs
+            # ~100x throughput (0.227 s -> 21.96 s -> 60.1 s), and is the ONLY regime in
+            # which any score moved (19 of 100,000, deterministic, all downward -- via
+            # the chunk-global early stop the function docstring describes).
+            growth = max(0, peak - base)
             # Fold a chunk into the per-pair footprint only when it is large enough
             # that the fixed workspace overhead (seed/autotune scratch -- tens of MB,
-            # independent of k) is amortised. peak/k = fixed/k + per_pair, so a tiny
+            # independent of k) is amortised. growth/k = fixed/k + per_pair, so a tiny
             # trailing remainder (e.g. k=7) yields a wildly inflated bytes/pair that
             # max() would lock in, collapsing every later chunk to a fraction of its
             # right size (pharm was observed going 2 -> 16 -> 82 chunks this way). The
             # first chunk has k == K_sub so it always qualifies; calibration is never
             # starved.
             if k >= max(1, K_sub // 4):
-                fp_meas = max(1, -(-peak // k))                  # ceil bytes/pair
+                fp_meas = max(1, -(-growth // k))                # ceil bytes/pair
+                # The max() fold STAYS, even though ``- base`` removes the dominant source
+                # of a poisoned reading. (a) Growth is legitimately non-stationary DOWNWARD:
+                # the first chunk of a shape pays for the captured graph's persistent
+                # buffers, which later chunks of the same P reuse out of
+                # ``_graphed._FINE_GRAPH_CACHE``, so letting a later reading overwrite would
+                # grow the chunk on a measurement that never paid for the buffers it is still
+                # using. (b) No run has been measured WITHOUT the fold, and the failure it
+                # would trade into -- an under-estimate sizing a chunk into an OOM -- costs
+                # the halve-and-retry path below. Residual risk, unchanged by this fix: the
+                # fold is monotone and the cache is never invalidated, so one over-estimate
+                # from fixed in-call workspace is still permanent for the process.
                 _PAIR_FOOTPRINT_BYTES[key] = max(_PAIR_FOOTPRINT_BYTES.get(key, 0), fp_meas)
             sc_parts.append(sc); q_parts.append(q); t_parts.append(t)
             s += k

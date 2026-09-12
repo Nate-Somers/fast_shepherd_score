@@ -1255,6 +1255,24 @@ def _build_fit_arrays_vol(arrs: dict, device):
             _to_device(arrs["atom_off"], device, dtype=torch.long))
 
 
+def _align_fast_arrays_vol(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``vol``. Returns ``(scores, SE3)``.
+
+    Takes the same ``(ref dict, fit tuple, batch_kw)`` shape as its four siblings so that one
+    table entry serves it too -- see :func:`_array_dispatch`. It previously sat outside the
+    tables as ``_align_fast_arrays(ref_xyz, fit_flat, fit_off, mode, batch_kw)``, whose ``mode``
+    argument was never read: it called ``align_batch_vol_arrays`` whatever was passed. The
+    tensors and the kwargs reaching that kernel are unchanged, so the gate-5 bit-identity of the
+    vol path is untouched; only the unpacking above it moved.
+    """
+    from shepherd_score.accel.batch._arrays import align_batch_vol_arrays
+    fit_flat, fit_off = fit
+    return align_batch_vol_arrays(ref["_ref_xyz_t"], fit_flat, fit_off,
+                                  const_seeds=batch_kw.get("const_seeds"),
+                                  alpha=batch_kw.get("alpha", 0.81),
+                                  steps_fine=batch_kw["steps_fine"])
+
+
 def _build_fit_arrays_vol_color(arrs: dict, device):
     """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_color``.
 
@@ -1392,25 +1410,37 @@ def _align_fast_arrays_vol_and_surf_esp(ref: dict, fit: tuple, batch_kw: dict):
         lr=batch_kw.get("lr", 0.075))
 
 
-#: mode -> (fit-array builder, array-native aligner). Keys MUST match ``_ARRAY_MODES`` minus
-#: ``vol``, whose branch is kept separate and byte-for-byte unchanged (it is gate-5 verified).
-_ARRAY_BUILDERS = {"vol_color": _build_fit_arrays_vol_color,
+#: mode -> (fit-array builder, array-native aligner). Keys MUST cover ``_ARRAY_MODES`` exactly;
+#: ``vol`` is in here too now rather than in an inline branch of its own -- see _array_dispatch.
+_ARRAY_BUILDERS = {"vol": _build_fit_arrays_vol,
+                   "vol_color": _build_fit_arrays_vol_color,
                    "pharm": _build_fit_arrays_pharm,
                    "vol_esp": _build_fit_arrays_vol_esp,
                    "vol_and_surf_esp": _build_fit_arrays_vol_and_surf_esp}
-_ARRAY_ALIGNERS = {"vol_color": _align_fast_arrays_vol_color,
+_ARRAY_ALIGNERS = {"vol": _align_fast_arrays_vol,
+                   "vol_color": _align_fast_arrays_vol_color,
                    "pharm": _align_fast_arrays_pharm,
                    "vol_esp": _align_fast_arrays_vol_esp,
                    "vol_and_surf_esp": _align_fast_arrays_vol_and_surf_esp}
 
 
-def _align_fast_arrays(ref_xyz, fit_flat, fit_off, mode: str, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast`. Returns ``(scores, SE3)`` in shard order."""
-    from shepherd_score.accel.batch._arrays import align_batch_vol_arrays
-    return align_batch_vol_arrays(ref_xyz, fit_flat, fit_off,
-                                  const_seeds=batch_kw.get("const_seeds"),
-                                  alpha=batch_kw.get("alpha", 0.81),
-                                  steps_fine=batch_kw["steps_fine"])
+def _array_dispatch(mode: str):
+    """The ``(builder, aligner)`` pair the array-native path uses for ``mode``.
+
+    The SINGLE selector for both drivers -- :func:`_run_shards_inproc` and
+    :func:`_screen_worker`. It exists because they used to select independently and the
+    worker's copy did not select at all: it called ``_build_fit_arrays_vol`` and the vol
+    aligner for EVERY mode, so ``screen(ndev>1)`` silently returned vol answers under another
+    mode's name. Replaying those two lines on CPU for ``vol_color`` gave max|delta| 3.0654e-01
+    against a real vol_color screen, a completely different top-10, and results bit-identical
+    to a real vol screen; ``pharm`` raised KeyError instead, its ref dict carrying no
+    ``_ref_xyz_t``. ``_arrays.ENABLED`` is True in production and nothing reads the
+    environment, so that was every multi-GPU screen in the four non-vol array modes.
+
+    Keep it one function over one pair of tables. A second copy of the dispatch is exactly how
+    the worker drifted out of agreement with the driver in the first place.
+    """
+    return _ARRAY_BUILDERS[mode], _ARRAY_ALIGNERS[mode]
 
 
 def _canonical_rot(store, arrs):
@@ -1717,24 +1747,18 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                 if _use_arrays(mode):
                     # ARRAY-NATIVE PATH: no per-molecule Python objects
                     # anywhere between the store and the heap. See accel/batch/_arrays.py.
-                    # Split per mode rather than generalised: vol's branch is gate-5 verified
-                    # bit-identical and is deliberately left byte-for-byte alone.
-                    if mode == "vol":
-                        ids, fit_flat, fit_off = _build_fit_arrays_vol(arrs, device)
-                        for qi, ra in enumerate(qs_ref):
-                            ref_xyz = _ref_tensors_from_arrays(ra, mode, device)["_ref_xyz_t"]
-                            scores, se3 = _align_fast_arrays(ref_xyz, fit_flat, fit_off,
-                                                             mode, batch_kw)
-                            _accumulate_arrays(heaps[qi], ids, scores, se3,
-                                               scores_out, qi, start, rot)
-                    else:
-                        ids, *fit = _ARRAY_BUILDERS[mode](arrs, device)
-                        align = _ARRAY_ALIGNERS[mode]
-                        for qi, ra in enumerate(qs_ref):
-                            ref = _ref_tensors_from_arrays(ra, mode, device)
-                            scores, se3 = align(ref, tuple(fit), batch_kw)
-                            _accumulate_arrays(heaps[qi], ids, scores, se3,
-                                               scores_out, qi, start, rot)
+                    # vol used to be an inline branch here so its gate-5 bit-identity stayed
+                    # visibly untouched; it is a table entry like the rest now, which moves no
+                    # arithmetic (same builder, same tensors, same kwargs into
+                    # align_batch_vol_arrays) and leaves _array_dispatch as the one selector
+                    # this driver and the multi-GPU worker share.
+                    build, align = _array_dispatch(mode)
+                    ids, *fit = build(arrs, device)
+                    for qi, ra in enumerate(qs_ref):
+                        ref = _ref_tensors_from_arrays(ra, mode, device)
+                        scores, se3 = align(ref, tuple(fit), batch_kw)
+                        _accumulate_arrays(heaps[qi], ids, scores, se3,
+                                           scores_out, qi, start, rot)
                 else:
                     ids, pairs = _build_fit_fast_pairs(arrs, mode, device)
                     for qi, ra in enumerate(qs_ref):
@@ -2022,10 +2046,15 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
             _sh, arrs = store.read_shard(idx)
             rot = _canonical_rot(store, arrs)      # canonical-frame stores; None otherwise
             if _use_arrays(mode):
-                ids, fit_flat, fit_off = _build_fit_arrays_vol(arrs, dev)
+                # THE SAME selector the in-process driver uses, deliberately: this branch was
+                # hardwired to the vol builder and the vol aligner, so every non-vol mode
+                # screened here came back with vol answers under its own name (vol_color
+                # measured max|delta| 3.07e-01 and a different top-10; pharm raised KeyError).
+                # See _array_dispatch.
+                build, align = _array_dispatch(mode)
+                ids, *fit = build(arrs, dev)
                 for qi, ref in enumerate(ref_tensors):
-                    scores, se3 = _align_fast_arrays(ref["_ref_xyz_t"], fit_flat, fit_off,
-                                                     mode, batch_kw)
+                    scores, se3 = align(ref, tuple(fit), batch_kw)
                     _accumulate_arrays(heaps[qi], ids, scores, se3, None, qi, 0, rot)
                 torch.cuda.synchronize()
                 continue
