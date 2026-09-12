@@ -172,6 +172,10 @@ def coarse_fine_vol_lipo_tversky_align_many(
     PK = q_k.shape[0]
     best_score = best_q = best_t = None
 
+    # INHERITED CONSTANT, NOT MEASURED: this 3e7 was copied from vol_color/vol_lipo.
+    # vol_lipo_tversky was never run in the graph-budget campaign (jobs 22637452 / 22637626
+    # covered vol_color, vol_lipo, pharm and vol_and_surf_esp only), and the screen cannot reach
+    # it -- the store reports supports=False for this mode (job 22637463). Not a measured value.
     if (centers_1_k.is_cuda
             and PK <= graph_cap(N_pad_cent * M_pad_cent, budget=30_000_000)
             and centers_1_k.dtype == torch.float32):

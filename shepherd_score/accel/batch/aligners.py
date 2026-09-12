@@ -1087,6 +1087,10 @@ def _align_batch_vol_color(
     alpha: float = 0.81,
     color_weight: float = 0.5,
     trans_init: bool = False,
+    # ACCEPTED AND IGNORED, exactly as in ``_align_batch_vol_lipo`` (see the note there). The seed
+    # count comes from ``_seeds_for("vol_color")`` -> _modes.MODE_SEEDS below, never from this
+    # kwarg: on a 4,000-pair screen, num_repeats 4 vs 16 moved 0 of 4,000 scores (job 22637761).
+    # ``num_repeats_per_trans`` below IS read. Left as is -- changing it is a behaviour decision.
     num_repeats: int = 50,
     num_repeats_per_trans: int = 10,
     topk: int = 30,
@@ -1339,6 +1343,12 @@ def _align_batch_vol_lipo(
     lipo_weight: float = 0.5,
     alpha: float = 0.81,
     lam: float = 0.1,
+    # ACCEPTED AND IGNORED. Nothing in this body reads ``num_repeats``; the seed count comes from
+    # ``_seeds_for("vol_lipo")`` -> _modes.MODE_SEEDS at the call sites below, so the default of
+    # 50 is not the seed count and reads like a step count. Measured on a 4,000-pair screen (job
+    # 22637761): num_repeats 4, 16 and 32 return the SAME score vector (0 of 4,000 moved), while
+    # moving MODE_SEEDS 16 -> 4 moves 2,604 of 4,000 (max 1.401e-01) -- the positive control.
+    # LEFT AS IS DELIBERATELY: wiring the kwarg through is a behaviour change, not a comment fix.
     num_repeats: int = 50,
     topk: int = 30,
     steps_fine: int = 100,

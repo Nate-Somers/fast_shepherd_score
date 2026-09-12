@@ -157,6 +157,8 @@ def _vol_color_fused_kernel(
 # channels' BLOCKxBLOCK accumulators in registers, so tiles above 32 blow occupancy and the two
 # separate kernels are faster. The driver must only take the fused path when every pad is <= this
 # value, and fall back to the separate shape + color kernels otherwise.
+# NO JOB ID: the 32 records no measurement, so the occupancy claim above cannot be re-checked.
+# Same gap as drivers/shape.py:_MODE_POSES -- cite the job id when you change it.
 VOL_COLOR_FUSED_MAX_PAD = 32
 
 

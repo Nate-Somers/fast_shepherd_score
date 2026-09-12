@@ -364,8 +364,22 @@ def coarse_fine_pharm_align_many(
     # tanimoto branch is graphed (extended_points/tversky/padded-autograd keep the eager
     # loop). Greenfield (no prior graph path). See drivers/_graphed. ---
     _graphed = None
-    # pharm's directional kernel is heavier per anchor-pair than the gaussian, so it crosses
-    # over sooner (~P=40k) -> a lower work budget than the shape/esp modes.
+    # THERE IS NO ~P=40k CROSSOVER. Forced graph-vs-eager at identical P, pharm's graph still
+    # wins at 6.5x that P: 1.420x at P=32,768, 1.081x at 131,072 and 1.075x at 262,144 on the
+    # drug-like pool (work 256, job 22637452), and 1.408x / 1.108x / 1.107x at the same three P
+    # on the peptide pool (work 1024, job 22637626). The graph never lost at any P measured. 1e7
+    # therefore costs reach on the PAIRWISE path, and no measurement supports the number. Scores
+    # are bit-identical on both paths for this mode (same jobs).
+    #
+    # BUT DO NOT RAISE IT FOR THE SCREEN -- measured, and it inverts the pairwise result.
+    # On a 100k streaming screen: 112,983 -> 107,821 aligns/s (-4.6%, disjoint arm ranges,
+    # Welch t = -7.24, n=9/arm, job 22638766), replicated -4.8% on a second node (22638544);
+    # only +0.9% once the graph is cached. Same mechanism as vol_color: the bucket holding
+    # 94.5% of the library (work=256, P=3,021,952) stays eager either way because
+    # _GRAPH_CAP_CEIL clips the cap, and the raise buys exactly one extra capture at
+    # work=512 / P=177,536, which does not pay for itself inside one screen. Scores stay
+    # bit-identical through the flip (0 of 99,984 moved, 23 full-vector comparisons).
+    # 1e7 vs 3e8 is a PAIRWISE-vs-SCREEN TRADE, not a free win in either direction.
     if (use_kernel and similarity == 'tanimoto'
             and anchors_1_k.is_cuda and anchors_1_k.dtype == torch.float32
             and anchors_1_k.shape[0] <= graph_cap(N_pad * M_pad, budget=10_000_000)):

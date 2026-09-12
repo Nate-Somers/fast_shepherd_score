@@ -36,6 +36,10 @@ from .._stats import record as _record_steps
 # step) and the best among those is tracked, skipping the ESP work on the off-steps. The pose
 # path, gradient, and shape early-stop are unchanged; only best-pose *selection* is sampled
 # more coarsely. Setting this to 1 reproduces the dense baseline exactly.
+# NO JOB ID: the value 5 records no measurement (same gap as drivers/shape.py:_MODE_POSES). It is
+# also not the only schedule in this file -- the CUDA-graph step ignores it and runs stride 1, so
+# the graph returns the dense-baseline scores and the eager loop the sampled ones (jobs 22637452 /
+# 22637626). See the budget note in fast_optimize_esp_combo_score_overlay_batch.
 _ESP_STRIDE = 5
 
 
@@ -225,8 +229,11 @@ class _GraphedFineEspCombo(_GraphedFineBase):
     """CUDA-graph fine loop for vol_and_surf_esp -- the heaviest mode (per step: 1 shape
     value+grad kernel + 2 value-only ESP-comparison kernels + 2 SE(3) cloud transforms).
     The pose is steered purely by the shape gradient (scaled by 1-esp_weight); the ESP
-    enters only the TRACKED combo score. The captured step mirrors the eager body verbatim
-    with the best-update made in-place. Per-step temporaries (transformed clouds, ESP sums,
+    enters only the TRACKED combo score. The captured step does NOT mirror the eager body: it
+    has no _ESP_STRIDE, so it scores and best-tracks on every step where the eager loop does so
+    on 1 step in 5, and it therefore returns uniformly higher scores (jobs 22637452 / 22637626 --
+    see the budget note in fast_optimize_esp_combo_score_overlay_batch). The best-update is made
+    in-place. Per-step temporaries (transformed clouds, ESP sums,
     score) are fresh, served from the graph's private pool on replay; only the loop-carried
     state (q/t, Adam moments, best*) is persistent."""
 
@@ -509,9 +516,27 @@ def coarse_fine_esp_combo_align_many(
     # --- CUDA-graph fast path: capture the (shape-grad + 2 value-only ESP + 2 SE3) step and
     # replay it; the eager loop below is the fallback for large P / capture failure. ---
     _graphed = None
-    # Low work budget: the per-step cost here is heavy (2 surface-ESP kernels + 2 SE(3)
-    # transforms), so the graph crosses over sooner than the shape modes -- graph only the
-    # small/mid-P regime, eager beyond.
+    # READ THIS BEFORE TOUCHING THE BUDGET. The "graph the small/mid-P regime, eager beyond"
+    # rationale that stood here was wrong in premise and in direction. There is no crossover to
+    # sit below: forced graph-vs-eager at identical P, the graph is SLOWER at EVERY point
+    # measured on BOTH molecule pools -- 0.967x / 0.869x / 0.700x / 0.438x at P = 2,048 / 8,192 /
+    # 32,768 / 131,072 (work 1024, job 22637452) and 0.844x / 0.743x / 0.670x at the first three
+    # (work 2304, job 22637626). The small/mid-P regime this budget KEEPS is exactly where the
+    # graph loses.
+    #
+    # It is not early-stop over-run either: es_patience is 0 here (see the call below) and
+    # steps_mean is 60.0 on both paths in every one of those cells. THE TWO PATHS COMPUTE
+    # DIFFERENT ALGORITHMS. The eager loop applies _ESP_STRIDE=5, firing the 2 ESP kernels + 2
+    # SE(3) transforms on 1 step in 5 and tracking the best among those samples; the captured
+    # ``_GraphedFineEspCombo._step`` has NO stride -- it fires them EVERY step and tracks the best
+    # over every step. That is the dense baseline the _ESP_STRIDE note above says stride=1
+    # reproduces, so the graph scores are uniformly the higher ones: 66-90% of the score vector
+    # moves, max |delta| 8.30e-03, and the graph is strictly higher on 100% of the movers (jobs
+    # 22637452 / 22637626).
+    #
+    # OPEN CORRECTNESS QUESTION, NOT A TUNING KNOB: which of the two is the intended algorithm?
+    # Until that is answered, moving this budget moves WHICH SCORES USERS GET, not just how fast
+    # they get them.
     if (centers_1_k.is_cuda and centers_1_k.dtype == torch.float32
             and len(q_k) <= graph_cap(N_pad_centers * M_pad_centers, budget=8_000_000)):
         try:

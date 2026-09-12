@@ -435,9 +435,14 @@ def align_batch_pharm_arrays(ref_types: torch.Tensor, ref_ancs: torch.Tensor,
                 topk=topk, steps_fine=steps_fine, lr=lr)
             return sc, q, t
 
-        # NO pose cap here: armed, pharm measured 0.6496x (job 22598857). Its driver graphs
-        # only below graph_cap(N*M, budget=1e7) = 9,765 poses, so any cap loose enough to be
-        # worth setting still never reaches a graph and only multiplies the chunk count.
+        # NO pose cap here: armed, pharm measured 0.6496x (job 22598857). THAT DATUM STANDS;
+        # the arithmetic that used to explain it does not. The N_pad/M_pad this driver feeds
+        # graph_cap are the PHARMACOPHORE ANCHOR pads (drivers/pharm.py:191-192), not the shape
+        # band, so the threshold is far above the 9,765 poses once quoted here. Probed at the
+        # real gate: drug-like molecules pad to 16 anchors -> work 256 -> cap 39,062 poses (job
+        # 22637452); only peptide-sized feature counts reach work 1024 -> 9,765 (job 22637626).
+        # So a cap here CAN reach a graph on ordinary ligands, and the 0.6496x has no explanation
+        # yet. Keep the cap off until someone re-measures it, but not for the reason given.
         sc, qb, tb = _subbatched_align(_proc, k, key=("pharm", N_pad, M_pad, n_seeds),
                                        device=device)
         out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
@@ -741,6 +746,12 @@ def align_batch_vol_and_surf_esp_arrays(ref: dict, fit: tuple, *, alpha: float,
                 steps_fine=steps_fine, lr=lr, num_seeds=n_seeds)
             return sc, q, t
 
+        # NO pose cap here, and UNTESTED -- do not read this as "measured neutral". The other
+        # three array call sites each cite a measurement (vol 1.2985x kept, vol_esp 0.9981x,
+        # pharm 0.6496x, job 22598857); this mode appears in none of them -- that job's listing
+        # in batch/_pad.py names vol, vol_esp and pharm only, and no later run has armed a cap
+        # here. The 2026-09 campaign measured this mode's DRIVER-level graph gate (jobs 22637452
+        # / 22637626) but never its pose_cap. Arm it and measure before assuming either way.
         sc, qb, tb = _subbatched_align(
             _proc, k, key=("vol_and_surf_esp", n_wH_pad, m_wH_pad, n_cent_pad,
                            m_cent_pad, n_surf_pad, m_surf_pad, n_seeds), device=device)

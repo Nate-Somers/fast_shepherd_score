@@ -31,6 +31,14 @@ torch.backends.cuda.matmul.allow_tf32 = True
 #:         hardware. (The headline "1.70x" was that contention, not speed.)
 #:   vol   OMITTED: only 1.04-1.07x, for a LARGER 1.60e-02 divergence.
 #: surf_esp / vol_esp are on the ESP kernel and measured NEGATIVE (0.92-0.94x).
+#:
+#: PROVENANCE GAP -- every number above was measured, but NO JOB ID was recorded for any of it,
+#: so none of it can be re-run or re-checked. This is the most quantitative tuning comment in the
+#: package and it is the least reproducible. The same gap covers every other tuning constant in
+#: the accel stack: drivers/_graphed.py's _GRAPH_WORK_BUDGET (3e8), _GRAPH_CAP_CEIL (262144),
+#: _GRAPH_CAP_MIN (2000), _GRAPH_ES_BLOCK (5), _GRAPH_ES_MARGIN (2) and _GRAPH_CACHE_MAX (24);
+#: drivers/esp_combo.py's _ESP_STRIDE (5); and kernels/vol_color_triton.py's
+#: VOL_COLOR_FUSED_MAX_PAD (32). Cite the job id when you next touch any of them.
 _MODE_POSES = {"surf": 8}
 
 

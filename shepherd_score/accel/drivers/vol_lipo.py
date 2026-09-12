@@ -254,7 +254,26 @@ def coarse_fine_vol_lipo_align_many(
 
     # --- CUDA-graph fast path: capture the 2-kernel (shape+lipo) step, replay it. Gated to
     # the launch-bound small/medium-P CUDA fp32 regime; large P / capture failure fall back to
-    # the eager loop below. Two value+grad kernels per step -> the lower vol_color-style budget.
+    # the eager loop below.
+    # 3e7 IS INHERITED FROM vol_color AND BOTH ITS PREMISES ARE REFUTED. (a) The graph never
+    # loses below the ceiling: forced at identical P it is 2.52x at P=2,048 falling to 1.014x at
+    # P=262,144 (work 1024, job 22637452), so there is no crossover the budget protects; it only
+    # forgoes speed -- 54,359 -> 74,042 aligns/s (1.36x) at work 1024 and 33,928 -> 36,549 (1.08x)
+    # at work 2304 when the budget is raised 3x (jobs 22637452 / 22637626). (b) "Two value+grad
+    # kernels per step" does not make the step heavy in the way that argument needs: at the
+    # screen's real pads the lipo (ESP) kernel is CHEAPER than the shape kernel -- 0.3121 ms vs
+    # 0.4356 ms at P=131,072, pad 32 (job 22637392). Scores are bit-identical on both paths here
+    # (jobs 22637452 / 22637626).
+    #
+    # BUT THE SCREEN-SIDE THROUGHPUT OF A RAISE IS UNMEASURABLE FOR THIS MODE, not positive.
+    # Two jobs disagree in SIGN (1.042x / 1.060x on node4103, 0.988x / 0.937x on node3406) and
+    # every arm overlaps, because vol_lipo's run-to-run sd is ~8% of the mean against 0.3-1.3%
+    # for pharm (jobs 22638766 / 22638544). That variance tracks the real difference between
+    # these modes: vol_lipo is NOT in screen._ARRAY_MODES, so it screens on the _FastPair
+    # object front-end. Scores are bit-identical through the eager->graph flip (0 of 99,984
+    # moved, 23 comparisons). Do not quote a screen speedup for raising this budget.
+    # And note the sibling result: the same raise measured -6.5% cold on vol_color and -4.6%
+    # on pharm, so the prior here is a regression, not a win.
     if (centers_1_k.is_cuda
             and PK <= graph_cap(N_pad_cent * M_pad_cent, budget=30_000_000)
             and centers_1_k.dtype == torch.float32):

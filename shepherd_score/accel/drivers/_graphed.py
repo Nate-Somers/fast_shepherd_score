@@ -40,6 +40,11 @@ from .._stats import record as _record_steps
 # heavy-cloud splits that share a kernel (vol/surf, vol_esp/surf_esp) automatically.
 # CEIL is a fixed per-graph memory ceiling on P (buffers are ~1KB/row, so 256k rows is a
 # ~270MB graph); lower it on memory-constrained GPUs.
+# NO JOB ID: none of the constants in this module (the three below, _GRAPH_ES_BLOCK,
+# _GRAPH_ES_MARGIN, _GRAPH_CACHE_MAX) records the run that set it, so none can be re-checked.
+# Same gap as drivers/shape.py:_MODE_POSES. Cite the job id when you change one. The budget's
+# premise -- that a crossover exists to stay below -- is REFUTED for vol_color, vol_lipo and
+# pharm and INVERTED for vol_and_surf_esp (jobs 22637452 / 22637626); see those drivers.
 _GRAPH_WORK_BUDGET = 300_000_000
 _GRAPH_CAP_CEIL = 262144
 _GRAPH_CAP_MIN = 2000

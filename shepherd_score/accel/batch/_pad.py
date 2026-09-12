@@ -30,8 +30,12 @@ _PAIR_FOOTPRINT_BYTES: dict[tuple, int] = {}
 #: mode at N=20,000 (job 22598857) the answer differed by mode:
 #:      vol       1.2985x     <- kept
 #:      vol_esp   0.9981x     <- neutral; the ESP step is too heavy for launches to matter
-#:      pharm     0.6496x     <- REGRESSION: its graph threshold is 9,765 poses, so this cap
-#:                               only multiplied the chunk count without ever reaching a graph
+#:      pharm     0.6496x     <- REGRESSION, cause NOT established. The "graph threshold is
+#:                               9,765 poses" reading was wrong: pharm hands graph_cap its
+#:                               ANCHOR pads, not the shape band, so drug-like molecules give
+#:                               work 256 -> cap 39,062 poses (job 22637452) and 9,765 needs
+#:                               peptide-sized feature counts (job 22637626). A cap here CAN
+#:                               reach a graph; why arming one cost 0.6496x is still open
 #: So callers pass a cap they have measured, and most pass none.
 #:
 #: This is not a tuning knob, it is a CORRECTNESS-OF-MEASUREMENT one. The memory-derived chunk
@@ -39,10 +43,21 @@ _PAIR_FOOTPRINT_BYTES: dict[tuple, int] = {}
 #: poses, so a bucket that fits in one memory-sized chunk (a 96,850-molecule band at 10 seeds is
 #: 968,500 poses) silently runs the eager loop instead of the CUDA graph. Profiling the same
 #: N=100,000 vol screen twice showed both outcomes, because the answer depends on what the
-#: allocator happened to be holding. The two paths are not equivalent: the graph replay adds
-#: ``_GRAPH_ES_MARGIN`` blocks of early-stop patience, so it runs longer and scores differently
-#: (measured: 71,736 of 100,000 scores move, max 6.5e-03, when the same screen takes the eager
-#: path instead). What the cap actually buys is REPRODUCIBILITY, not an unconditional graph, and
+#: allocator happened to be holding. The two paths CAN diverge, but only where the early-stop
+#: margin is actually exercised: the graph replay adds ``_GRAPH_ES_MARGIN`` blocks of patience on
+#: top of the eager schedule, so a run that early-stops runs longer under the graph and scores
+#: differently. Both halves of that are now measured and they disagree BY MODE. It DOES diverge
+#: for vol: 71,736 of 100,000 scores move, max 6.5e-03, when the same screen takes the eager path
+#: instead (that run's job id was never recorded here). It does NOT for vol_color, vol_lipo or
+#: pharm: forced graph-vs-eager at identical P is BIT-IDENTICAL at every point of jobs 22637452 +
+#: 22637626 -- 9 forced P-points each for vol_color/vol_lipo and 10 for pharm, over two molecule
+#: pools (drug-like and peptide), up to 16,384 pairs per point, plus all 128 budget-sweep points
+#: of those two jobs (only vol_and_surf_esp moved there, for an unrelated reason -- see
+#: drivers/esp_combo.py). The margin never fired in any of that: early_stop_frac = 0.000 in every
+#: one of those cells, and in every mode of the 100k screen in job 22637463. So the divergence is
+#: real but MODE- AND REGIME-SPECIFIC (vol, in a regime that early-stops); it is not a property
+#: the graph path has unconditionally.
+#: What the cap actually buys is REPRODUCIBILITY, not an unconditional graph, and
 #: the arithmetic says so. The cap pins P at 81,920 poses (8,192 pairs x vol's 10 seeds) while
 #: ``_graphed.graph_cap(work) = max(2000, min(262144, 300_000_000 // work))``, so a capped chunk
 #: graphs only where N_pad*M_pad <= 3,662. Worked against the constants at HEAD: 48x48 -> cap

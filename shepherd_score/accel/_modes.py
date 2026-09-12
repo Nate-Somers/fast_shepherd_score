@@ -70,9 +70,19 @@ PROCESS_MODES = ("vol", "surf", "surf_esp", "pharm")
 #
 # These are BALANCED defaults, chosen at the accuracy/throughput knee rather than for maximum
 # accuracy: seed count is cheap in retrospective-screening ROC-AUC but expensive in throughput,
-# and ROC-AUC plateaus at low seed counts for every mode. Relative to an accuracy-maximizing
-# choice these cost <=0.006 ROC-AUC while recovering >=99% of the best achievable overlap.
-# Callers who want more accuracy pass ``num_repeats`` / ``max_num_steps`` explicitly.
+# and ROC-AUC plateaus at low seed counts for every mode.
+#
+# THE "<=0.006 ROC-AUC WHILE RECOVERING >=99% OF THE BEST ACHIEVABLE OVERLAP" CLAIM THAT STOOD
+# HERE IS UNSOURCED. No job, run or dataset is named for it anywhere in this package, and not one
+# of the 42 entries below carries a citation. Treat it as folklore until it is re-measured.
+# Exactly ONE entry has data behind it today -- vol_lipo, against a 48x150 reference over 4,000
+# pairs and a single query (job 22637392): the shipped 16x50 gives mean overlap 0.470105 vs the
+# reference's 0.471862 (deficit +0.001757), Spearman 0.9939, top-100 recall 96/100. That is
+# consistent with the OVERLAP half of the claim for that one mode, and says nothing about
+# ROC-AUC, nor about the other 20 modes.
+# Callers who want more accuracy pass ``max_num_steps`` explicitly. ``num_repeats`` does NOT
+# reach every path -- the batched vol_lipo / vol_color aligners accept and ignore it (job
+# 22637761; see accel/batch/aligners.py), so the seed count there comes from this table alone.
 MODE_SEEDS = {"vol": 10, "surf": 8, "surf_esp": 8, "vol_esp": 16, "vol_and_surf_esp": 8,
               "pharm": 32, "vol_color": 16, "vol_tversky": 10, "vol_lipo": 16,
               "vol_esp_tversky": 16,

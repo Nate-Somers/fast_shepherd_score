@@ -333,8 +333,27 @@ def coarse_fine_vol_color_align_many(
     # --- CUDA-graph fast path: capture the 2-kernel (shape+color) step, replay it. Gated to
     # the launch-bound small/medium-P CUDA fp32 regime (large P / capture failure fall back to
     # the eager loop below). See drivers/_graphed.
-    # vol_color runs a second (color) kernel per step, so it crosses over sooner than vol;
-    # hence the explicit, lower work budget on graph_cap.
+    # 3e7 IS NOT A CROSSOVER GUARD -- there is no crossover below the ceiling to guard against.
+    # Forced graph-vs-eager at identical P, the graph never loses: 1.97x / 1.77x / 1.30x / 1.04x
+    # / 1.035x at P = 2,048 / 8,192 / 32,768 / 131,072 / 262,144 on the drug-like pool (work
+    # 1024, job 22637452), and 2.19x / 1.78x / 1.16x / 1.08x at the first four of those on the
+    # peptide pool (work 2304, job 22637626). What the low budget does is FORGO a win at the P it
+    # excludes: same jobs, screen-shaped A run, 67,766 -> 85,657 aligns/s (1.26x) at work 1024 and
+    # 45,124 -> 63,556 (1.41x) at work 2304 when the budget is raised 3x. Raising it is a speed
+    # decision on the PAIRWISE path; the scores are bit-identical either way (see batch/_pad.py).
+    #
+    # BUT DO NOT RAISE IT FOR THE SCREEN -- measured, and it inverts the pairwise result.
+    # On a 100k streaming screen the raise is a REGRESSION: 257,542 -> 240,770 aligns/s
+    # (-6.5%, disjoint arm ranges, Welch t = -16.98, n=9/arm, job 22638766) on a cold screen,
+    # replicated -6.7% on a second node (job 22638544). It only turns positive (+2.0%) once
+    # the graph is already captured and cached in the process.
+    # MECHANISM: the raise is inert on the bucket holding 96.6% of the library -- that one
+    # stays eager because _GRAPH_CAP_CEIL=262,144 clips the cap regardless of budget. All the
+    # raise does is add ONE more graph CAPTURE, at work=768 / P=48,448, and at that P the
+    # capture costs more than its replay saves inside a single screen. The pairwise wins came
+    # from a much smaller, genuinely launch-bound P. Scores stay bit-identical through the
+    # flip: 0 of 99,984 moved over 23 full-vector comparisons on two nodes.
+    # So 3e7 vs 3e8 is a PAIRWISE-vs-SCREEN TRADE, not a free win in either direction.
     if (centers_1_k.is_cuda
             and PK <= graph_cap(N_pad_cent * M_pad_cent, budget=30_000_000)
             and centers_1_k.dtype == torch.float32):

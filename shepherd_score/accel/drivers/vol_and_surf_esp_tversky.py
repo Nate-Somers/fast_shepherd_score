@@ -213,6 +213,14 @@ def coarse_fine_esp_combo_tversky_align_many(
     no_improve_count = 0
 
     _graphed = None
+    # INHERITED CONSTANT, NOT MEASURED: this 8e6 was copied from esp_combo. vol_and_surf_esp_
+    # tversky was never run in the graph-budget campaign (jobs 22637452 / 22637626 covered
+    # vol_color, vol_lipo, pharm and vol_and_surf_esp only) and the screen cannot reach it -- the
+    # store reports supports=False for this mode (job 22637463).
+    # WORSE: this driver imports esp_combo's _ESP_STRIDE and applies it in the eager loop below,
+    # while its captured ``_step`` (like esp_combo's) has no stride, so it LIKELY carries the same
+    # graph-vs-eager algorithm divergence esp_combo was measured to have -- denser ESP scoring,
+    # best tracked every step, uniformly higher scores. LIKELY, UNMEASURED: nobody has run it.
     if (centers_1_k.is_cuda and centers_1_k.dtype == torch.float32
             and len(q_k) <= graph_cap(N_pad_centers * M_pad_centers, budget=8_000_000)):
         try:
