@@ -11,7 +11,10 @@ Two defects fixed, both measured on an L40S before and after:
      returned exactly the ndev=1 vol answer, 46 of 50 ids wrong. Fixed; all four array
      modes now match ndev=1 bit-for-bit.
 
-     ANY PUBLISHED ndev>1 NUMBER FOR A NON-VOL MODE IS INVALID AND MUST BE RE-RUN.
+     IMPACT ON THIS PROJECT: NONE. Checked after the fact -- zero cells in any results
+     file record ndev>1, and the only harness caller (p6_gpu_multiproc.py:72) passes
+     mode="vol", the one mode that was correct. The bug was latent here. It was live for
+     any user calling screen(ndev=2) with any other mode.
 
   2. The sub-batch footprint calibration billed a chunk for memory other objects held.
      With 44.98 GB resident elsewhere it recorded 45 GB/pair, collapsing K_sub to 1 and
