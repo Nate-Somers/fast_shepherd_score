@@ -267,11 +267,15 @@ def coarse_fine_vol_lipo_align_many(
     #
     # BUT THE SCREEN-SIDE THROUGHPUT OF A RAISE IS UNMEASURABLE FOR THIS MODE, not positive.
     # Two jobs disagree in SIGN (1.042x / 1.060x on node4103, 0.988x / 0.937x on node3406) and
-    # every arm overlaps, because vol_lipo's run-to-run sd is ~8% of the mean against 0.3-1.3%
-    # for pharm (jobs 22638766 / 22638544). That variance tracks the real difference between
-    # these modes: vol_lipo is NOT in screen._ARRAY_MODES, so it screens on the _FastPair
-    # object front-end. Scores are bit-identical through the eager->graph flip (0 of 99,984
-    # moved, 23 comparisons). Do not quote a screen speedup for raising this budget.
+    # every arm overlaps, because vol_lipo's run-to-run sd was ~8% of the mean against 0.3-1.3%
+    # for pharm (jobs 22638766 / 22638544). THOSE TWO JOBS MEASURED THE OBJECT PATH: vol_lipo
+    # was not in screen._ARRAY_MODES then, so it screened on the _FastPair object front-end. It
+    # has since been ported, and its array leg is far tighter -- 0.405 s of screen with a
+    # 0.0-0.6% spread between runs (jobs 22641030 / 22641516). That does NOT revive the budget
+    # question. The raise itself was never re-measured on the array path, so its sign is still
+    # unknown and the conclusion stands on its own terms: do not quote a screen speedup for
+    # raising this budget. Scores are bit-identical through the eager->graph flip (0 of 99,984
+    # moved, 23 comparisons).
     # And note the sibling result: the same raise measured -6.5% cold on vol_color and -4.6%
     # on pharm, so the prior here is a regression, not a win.
     if (centers_1_k.is_cuda

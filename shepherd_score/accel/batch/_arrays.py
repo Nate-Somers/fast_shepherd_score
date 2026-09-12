@@ -41,7 +41,7 @@ import numpy as np
 import torch
 
 from ._bucket import Bucket, _cap_upfront, _merge_group, _min_wave, PadSpec
-from ._pad import _band_key
+from ._pad import _band_key, _BAND
 
 #: Test seam only -- see the module docstring. Production always takes this path.
 ENABLED = True
@@ -756,6 +756,612 @@ def align_batch_vol_and_surf_esp_arrays(ref: dict, fit: tuple, *, alpha: float,
             _proc, k, key=("vol_and_surf_esp", n_wH_pad, m_wH_pad, n_cent_pad,
                            m_cent_pad, n_surf_pad, m_surf_pad, n_seeds), device=device)
         out_scores[rows_np] = sc.detach().cpu().numpy().astype(float)
+        out_q.index_copy_(0, rows, qb)
+        out_t.index_copy_(0, rows, tb)
+
+    SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
+    return out_scores, SE3
+
+
+# =========================================================================================
+# SECOND WAVE -- the six screen-capable modes that still ran the object path.
+#
+# WHY THESE SIX, AND WHAT THE GAIN ACTUALLY IS: the ``screen.py::_use_arrays`` docstring holds
+# the whole record -- the per-mode speedups, the jobs that measured them, the bit-identity
+# evidence, and why surf/surf_esp are a separate regime. It is deliberately the ONLY copy: this
+# header used to carry its own restatement, asserted a ~2.6x vol_lipo ceiling that measurement
+# later refuted, and the correction then had to be made in three files. Add measurements there.
+#
+# THE SIGNATURE IS ``(ref dict, fit tuple, *, per-mode kwargs)``, matching
+# :func:`align_batch_vol_and_surf_esp_arrays` -- the one existing aligner here that already
+# takes the dispatch-shaped pair. ``screen.py::_run_shards_inproc`` and ``_screen_worker`` call
+# ``align(ref, tuple(fit), batch_kw)`` through the single ``_array_dispatch`` selector, and the
+# ``_align_fast_arrays_<mode>`` wrapper on the other side of that table is what turns
+# ``batch_kw`` into these keywords. The DEFAULTS below are the ones the ``_align_batch_<mode>``
+# being replaced declares, so a direct call with no wrapper behaves like the object path too.
+#
+# EACH FIT TUPLE'S ARITY AND ORDER IS DERIVED FROM ITS OWN OBJECT PATH -- the ``p._fit_*_t``
+# attributes that mode's ``_align_batch_<mode>`` actually reads, and the offset table
+# ``screen.py::_build_fit_fast_pairs`` splits each of them by. It is stated per function and
+# must not be inferred from a mode that looks similar: ``vol_fukui`` rides ``vol_lipo``'s driver
+# on DIFFERENT arrays, and ``vol_esp_tversky`` reads ``_fit_xyz_noH_t``/``_fit_xyz_esp_t``
+# (heavy_off) while ignoring the ``_fit_xyz_t`` its object-path builder also sets.
+#
+# NONE OF THEM PASSES A POSE CAP, and that is measured rather than stylistic. Armed on
+# vol_lipo the cap measured 0.871x at 29,296 poses, 0.939x at 81,920 and 1.028x at 262,144
+# (job 22637392) -- i.e. a loss at exactly the ``_FINE_CHUNK_POSES`` value ``vol`` ships, and a
+# win only past the graph ceiling where no capture happens at all. On pharm it measured 0.6496x
+# (job 22598857). ``vol`` is the only call site in this module that keeps its cap.
+# =========================================================================================
+
+
+def align_batch_vol_tversky_arrays(ref: dict, fit: tuple, *, alpha: float = 0.81,
+                                   tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
+                                   steps_fine: int = 100):
+    """Array-native equivalent of ``_align_batch_vol_tversky`` for the screen path.
+
+    fit tuple: ``(fit_flat, fit_off)`` -- heavy-atom coordinates concatenated, plus their CSR
+    offsets. ONE ragged channel, because ``_align_batch_vol_tversky`` reads exactly one fit
+    attribute (``p._fit_xyz_t``, which ``_build_fit_fast_pairs`` splits out of
+    ``atom_pos``/``atom_off``). Identical in shape to ``vol``'s tuple, which is the point:
+    vol_tversky is ``vol``'s shape machinery under an asymmetric reduction, so it buckets on the
+    same band (``PadSpec(merge={ref: _ref_xyz_t, fit: _fit_xyz_t})``) and :func:`plan_spans`
+    applies directly.
+
+    Tversky lives entirely in the DRIVER: ``AA``/``BB`` are the same pose-invariant shape
+    self-overlaps ``vol`` computes, and only the reduction differs. So the assembly here is
+    :func:`align_batch_vol_arrays`'s, and the one substitution is
+    ``coarse_fine_align_many_tversky`` for ``coarse_fine_align_many``.
+    """
+    from shepherd_score.accel.drivers.vol_tversky import (
+        coarse_fine_align_many_tversky, _self_overlap_in_chunks)
+    from shepherd_score.accel.drivers._common import batched_seeds_torch
+    from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
+    from ._pad import _subbatched_align
+    from .._modes import MODE_SEEDS
+
+    fit_flat, fit_off = fit
+    ref_xyz = ref["_ref_xyz_t"]
+
+    device = fit_flat.device
+    n_seeds = int(MODE_SEEDS["vol_tversky"])
+    K = int(fit_off.shape[0]) - 1
+    if K == 0:
+        return np.empty(0, dtype=float), np.empty((0, 4, 4), dtype=np.float32)
+
+    counts_all = fit_off[1:] - fit_off[:-1]
+    m_sizes = counts_all.detach().cpu().numpy()
+    N = int(ref_xyz.shape[0])
+    order, buckets = plan_spans(m_sizes, N, n_seeds, device)
+    order_t = torch.as_tensor(order, device=device, dtype=torch.long)
+
+    out_scores = np.empty(K, dtype=float)
+    out_q = torch.empty(K, 4, device=device)
+    out_t = torch.empty(K, 3, device=device)
+
+    for bk in buckets:
+        N_pad, M_pad = int(bk.pad["ref"]), int(bk.pad["fit"])
+        k = bk.K
+        rows = order_t[bk.members.lo:bk.members.hi]
+        cnt = counts_all.index_select(0, rows)
+        start = fit_off.index_select(0, rows)
+
+        ref_pad = torch.zeros(k, N_pad, 3, device=device, dtype=torch.float32)
+        ref_pad[:, :N] = ref_xyz
+        fit_pad = torch.zeros(k, M_pad, 3, device=device, dtype=torch.float32)
+        gather_fill(fit_pad, fit_flat, start, cnt)
+
+        N_real = torch.full((k,), N, dtype=torch.int32, device=device)
+        M_real = cnt.to(torch.int32)
+
+        # ref BROADCAST, so its self-overlap is one row expanded. The object path takes this
+        # same branch whenever ``K > 1``: its ``_ref_shared`` predicate is an identity test on
+        # ``_ref_xyz_t`` and screen.py::_align_fast sets ONE ref tensor object on every pair.
+        # At k == 1 the two spellings are the same call on the same memory.
+        VAA = _self_overlap_in_chunks(ref_pad[:1], N_real[:1], alpha).expand(k).contiguous()
+        VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
+
+        # ref_shared=True unconditionally is EXACT here, not an approximation of the object
+        # path's ``K > 1 and all(p._ref_xyz_t is ...)``: batched_seeds_torch computes
+        # ``_dedup = bool(ref_shared) and K > 1`` internally (drivers/_common.py), so a k == 1
+        # bucket takes the full solve either way. The guarantee is STRUCTURAL here -- ref_pad is
+        # built by broadcasting the single query cloud into all k rows immediately above.
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
+                                               num_seeds=n_seeds, ref_shared=True)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            return coarse_fine_align_many_tversky(
+                ref_pad[sl], fit_pad[sl], VAA[sl], VBB[sl],
+                N_real=N_real[sl], M_real=M_real[sl], alpha=alpha,
+                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                steps_fine=steps_fine, seeds=(seeds_q[sl], seeds_t[sl]))
+
+        # NO pose cap -- see the section header (vol_lipo 0.871x/0.939x/1.028x job 22637392,
+        # pharm 0.6496x job 22598857). Same sub-batch key tuple as the object path, so the two
+        # share one ``_PAIR_FOOTPRINT_BYTES`` entry and chunk the same way.
+        sc, qb, tb = _subbatched_align(_proc, k, key=("vol_tversky", N_pad, M_pad, n_seeds),
+                                       device=device)
+        out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
+        out_q.index_copy_(0, rows, qb)
+        out_t.index_copy_(0, rows, tb)
+
+    SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
+    return out_scores, SE3
+
+
+def align_batch_vol_esp_tversky_arrays(ref: dict, fit: tuple, *, lam: float = 0.1,
+                                       alpha: float = 0.81, tversky_alpha: float = 0.95,
+                                       tversky_beta: float = 0.05, steps_fine: int = 100):
+    """Array-native equivalent of ``_align_batch_vol_esp_tversky`` for the screen path.
+
+    fit tuple: ``(fit_pts, fit_chg, off)`` -- strict-heavy centers, the heavy partial charges
+    that are 1:1 with them, and the ONE offset table (``heavy_off``) both index by. Identical to
+    ``vol_esp``'s tuple, and that is not an analogy: ``screen.py::_build_fit_fast_pairs`` handles
+    ``vol_esp`` and ``vol_esp_tversky`` in the SAME branch, and ``_align_batch_vol_esp_tversky``
+    reads only ``_fit_xyz_noH_t`` and ``_fit_xyz_esp_t``. The ``_fit_xyz_t`` (RemoveHs
+    ``atom_pos``) that branch also sets is trans-init-only, and this mode never reads it.
+
+    ``lam`` is RAW (no ``LAM_SCALING``), matching ``_align_batch_vol_esp_tversky``.
+
+    TWO DELIBERATE DIFFERENCES FROM :func:`align_batch_vol_tversky_arrays`, both derived from
+    this mode's object path rather than carried over from its neighbour:
+
+    * ``batched_seeds_torch`` is called WITHOUT ``ref_shared``. ``_align_batch_vol_esp_tversky``
+      computes no ``_ref_shared`` predicate at all, so its seeds come from the full K-row
+      reference eigensolve. That solve is documented as NOT bit-identical to the deduped one on
+      CUDA (8 of 100,000 scores move, max 4.1723e-07 -- drivers/_common.py), so passing the flag
+      here would be a scoring change, not a speedup.
+    * ``VAA`` is computed over all k rows, not broadcast from row 0 -- same reason: the object
+      path hands ``_self_overlap_esp_chunks`` the whole padded batch.
+
+    The bucket band is the HEAVY count (``PadSpec(merge={ref: _ref_xyz_noH_t, fit:
+    _fit_xyz_noH_t})``), which is exactly what ``off`` measures, so :func:`plan_spans` applies.
+    """
+    from shepherd_score.accel.drivers.vol_esp_tversky import (
+        coarse_fine_esp_tversky_align_many, _self_overlap_esp_chunks)
+    from shepherd_score.accel.drivers._common import batched_seeds_torch
+    from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
+    from ._pad import _subbatched_align
+    from .._modes import MODE_SEEDS
+
+    fit_pts_flat, fit_chg_flat, off = fit      # lam arrives RAW, as _align_batch_vol_esp_tversky
+    ref_pts = ref["_ref_xyz_noH_t"]
+    ref_chg = ref["_ref_xyz_esp_t"]
+
+    device = fit_pts_flat.device
+    n_seeds = int(MODE_SEEDS["vol_esp_tversky"])
+    K = int(off.shape[0]) - 1
+    if K == 0:
+        return np.empty(0, dtype=float), np.empty((0, 4, 4), dtype=np.float32)
+
+    cnt_all = off[1:] - off[:-1]
+    m_sizes = cnt_all.detach().cpu().numpy()
+    N = int(ref_pts.shape[0])
+    order, buckets = plan_spans(m_sizes, N, n_seeds, device)
+    order_t = torch.as_tensor(order, device=device, dtype=torch.long)
+
+    out_scores = np.empty(K, dtype=float)
+    out_q = torch.empty(K, 4, device=device)
+    out_t = torch.empty(K, 3, device=device)
+
+    for bk in buckets:
+        N_pad, M_pad = int(bk.pad["ref"]), int(bk.pad["fit"])
+        k = bk.K
+        rows = order_t[bk.members.lo:bk.members.hi]
+        c = cnt_all.index_select(0, rows)
+        st = off.index_select(0, rows)
+
+        ref_pad = torch.zeros(k, N_pad, 3, device=device, dtype=torch.float32)
+        ref_pad[:, :N] = ref_pts
+        fit_pad = torch.zeros(k, M_pad, 3, device=device, dtype=torch.float32)
+        gather_fill(fit_pad, fit_pts_flat, st, c)
+        ref_c_pad = torch.zeros(k, N_pad, device=device, dtype=torch.float32)
+        ref_c_pad[:, :N] = ref_chg
+        fit_c_pad = torch.zeros(k, M_pad, device=device, dtype=torch.float32)
+        gather_fill(fit_c_pad, fit_chg_flat, st, c)
+
+        N_real = torch.full((k,), N, dtype=torch.int32, device=device)
+        M_real = c.to(torch.int32)
+
+        # Full k-row ESP self-overlaps and NON-deduped seeds -- see the docstring. Mirroring the
+        # object path IS the bit-identity argument here; the broadcast shortcut the shape modes
+        # take is not available to a mode whose object path never took it.
+        VAA = _self_overlap_esp_chunks(ref_pad, ref_c_pad, N_real, alpha, lam)
+        VBB = _self_overlap_esp_chunks(fit_pad, fit_c_pad, M_real, alpha, lam)
+
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
+                                               num_seeds=n_seeds)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            return coarse_fine_esp_tversky_align_many(
+                ref_pad[sl], fit_pad[sl], ref_c_pad[sl], fit_c_pad[sl], VAA[sl], VBB[sl],
+                N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, lam=lam,
+                tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
+                steps_fine=steps_fine, seeds=(seeds_q[sl], seeds_t[sl]))
+
+        # NO pose cap -- see the section header. vol_esp, whose fused shape+ESP step this mode
+        # shares, measured a flat 0.9981x with one armed (job 22598857): the graph engages, but
+        # the per-step ESP kernel is heavy enough that the launch saving disappears.
+        sc, qb, tb = _subbatched_align(_proc, k, key=("vol_esp_tversky", N_pad, M_pad, n_seeds),
+                                       device=device)
+        out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
+        out_q.index_copy_(0, rows, qb)
+        out_t.index_copy_(0, rows, tb)
+
+    SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
+    return out_scores, SE3
+
+
+def _align_batch_vol_lipo_family_arrays(ref_cent: torch.Tensor, ref_fpos: torch.Tensor,
+                                        ref_fval: torch.Tensor, fit: tuple, *, tag: str,
+                                        field_weight: float, alpha: float, lam: float,
+                                        topk: int, steps_fine: int, lr: float):
+    """Shared array-native body for the two modes that ride the ``vol_lipo`` driver.
+
+    ``vol_lipo`` and ``vol_fukui`` are the same assembly over a DIFFERENT per-atom scalar field:
+    ``_align_batch_vol_fukui`` is ``_align_batch_vol_lipo`` with ``lipo_pos``/``lipophilicity``
+    replaced by ``fukui_pos``/``fukui`` and ``lipo_weight`` by ``fukui_weight``, feeding the same
+    ``fast_optimize_vol_lipo_overlay_batch``. So the channel is a parameter here rather than a
+    second copy of the body -- but ``tag`` is NOT cosmetic: it is the first element of the
+    ``_subbatched_align`` key, and the per-shape footprint cache (``_pad._PAIR_FOOTPRINT_BYTES``)
+    must stay keyed exactly as the object path keys it or the two paths chunk differently.
+
+    fit tuple: ``(cent_flat, cent_off, fpos_flat, fval_flat, field_off)``.
+
+    TWO INDEPENDENT OFFSET TABLES, and that is load-bearing rather than tidy. The SHAPE centres
+    are ``atom_pos`` (the ``Chem.RemoveHs`` set, which RETAINS some H -- stereo/isotope/valence),
+    while the field centres are the TRUE-heavy positions. The two counts diverge on exactly those
+    molecules, so each channel is gathered by its own CSR table; sharing one would desync the
+    fill on the first isotope-labelled molecule in the library.
+
+    BUCKETING IS ON THE SHAPE BAND ONLY, matching ``PadSpec(merge={ref: _ref_xyz_t, fit:
+    _fit_xyz_t})``. The field pads are NOT keyed: the object path pads them to the BUCKET'S max
+    field band and lets ``N_real_lipo``/``M_real_lipo`` mask the rest, so two molecules sharing a
+    shape bucket but differing in field count stay together. Reproduced literally, including the
+    ``or _BAND`` floor that keeps a zero-length channel a well-formed tensor.
+    """
+    from shepherd_score.accel.drivers.vol_lipo import fast_optimize_vol_lipo_overlay_batch
+    from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
+    from ._pad import _subbatched_align
+    from .._modes import MODE_SEEDS
+
+    cent_flat, cent_off, fpos_flat, fval_flat, field_off = fit
+    device = cent_flat.device
+    # Seeds come from the registry, and ``num_repeats`` is not a parameter of this path at all.
+    # The object path ACCEPTS it and never reads it -- measured on a 4,000-pair screen (job 22637761):
+    # num_repeats 4, 16 and 32 return the SAME score vector (0 of 4,000 moved), while moving
+    # MODE_SEEDS 16 -> 4 moves 2,604 of 4,000 (max 1.401e-01). Honouring the kwarg here would be
+    # a behaviour change the object path does not make.
+    n_seeds = int(MODE_SEEDS[tag])
+    K = int(cent_off.shape[0]) - 1
+    if K == 0:
+        return np.empty(0, dtype=float), np.empty((0, 4, 4), dtype=np.float32)
+
+    cnt_c = cent_off[1:] - cent_off[:-1]                 # (K,) shape-centre counts
+    cnt_f = field_off[1:] - field_off[:-1]               # (K,) field-centre counts
+    m_sizes = cnt_c.detach().cpu().numpy()
+    # Both count vectors come to the host HERE, in the one transfer the bucketer already forces,
+    # because the per-bucket field pad below is derived from them. Reading it as
+    # ``int(f_cnt.max())`` inside the loop instead put a device->host sync in every bucket, each
+    # one landing after that bucket's predecessor kernels were enqueued and stalling the
+    # pipeline; the object path derives the same pad from host-side Python lists and never
+    # syncs. Same VALUE either way -- f_cnt is cnt_f.index_select(0, rows) and rows is
+    # order_t[lo:hi], so the max is taken over exactly the same integers (verified bit-identical
+    # on the CPU parity run for vol_lipo and vol_fukui: 0 of 12 scores moved, max|delta| 0.0).
+    f_sizes = cnt_f.detach().cpu().numpy()
+    n_cent = int(ref_cent.shape[0])
+    n_field = int(ref_fpos.shape[0])
+    order, buckets = plan_spans(m_sizes, n_cent, n_seeds, device)
+    order_t = torch.as_tensor(order, device=device, dtype=torch.long)
+
+    out_scores = np.empty(K, dtype=float)
+    out_q = torch.empty(K, 4, device=device)
+    out_t = torch.empty(K, 3, device=device)
+
+    # One query for the whole screen, so its field band is fixed across every bucket -- the
+    # object path recomputes max(n_field_list) per bucket over k copies of that same query.
+    n_field_pad = _band_key(n_field) or _BAND
+
+    for bk in buckets:
+        n_cent_pad, m_cent_pad = int(bk.pad["ref"]), int(bk.pad["fit"])
+        k = bk.K
+        rows = order_t[bk.members.lo:bk.members.hi]
+        c_cnt = cnt_c.index_select(0, rows)
+        c_start = cent_off.index_select(0, rows)
+        f_cnt = cnt_f.index_select(0, rows)
+        f_start = field_off.index_select(0, rows)
+        # Host-side twin of ``int(f_cnt.max())`` -- see the f_sizes note above. No sync.
+        m_field_pad = _band_key(int(f_sizes[order[bk.members.lo:bk.members.hi]].max())) or _BAND
+
+        centers_1 = torch.zeros(k, n_cent_pad, 3, device=device, dtype=torch.float32)
+        centers_1[:, :n_cent] = ref_cent
+        centers_2 = torch.zeros(k, m_cent_pad, 3, device=device, dtype=torch.float32)
+        gather_fill(centers_2, cent_flat, c_start, c_cnt)
+
+        fpos_1 = torch.zeros(k, n_field_pad, 3, device=device, dtype=torch.float32)
+        fpos_1[:, :n_field] = ref_fpos
+        fpos_2 = torch.zeros(k, m_field_pad, 3, device=device, dtype=torch.float32)
+        gather_fill(fpos_2, fpos_flat, f_start, f_cnt)
+        fval_1 = torch.zeros(k, n_field_pad, device=device, dtype=torch.float32)
+        fval_1[:, :n_field] = ref_fval
+        fval_2 = torch.zeros(k, m_field_pad, device=device, dtype=torch.float32)
+        gather_fill(fval_2, fval_flat, f_start, f_cnt)
+
+        i32 = torch.int32
+        N_real_centers = torch.full((k,), n_cent, dtype=i32, device=device)
+        M_real_centers = c_cnt.to(i32)
+        N_real_field = torch.full((k,), n_field, dtype=i32, device=device)
+        M_real_field = f_cnt.to(i32)
+
+        # No self-overlap and no seed call here: fast_optimize_vol_lipo_overlay_batch computes
+        # both internally from the padded batch it is handed, on BOTH paths. There is no
+        # ref_shared shortcut to take or to skip.
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_vol_lipo_overlay_batch(
+                centers_1[sl], centers_2[sl], fpos_1[sl], fpos_2[sl],
+                fval_1[sl], fval_2[sl],
+                alpha=alpha, lam=lam, lipo_weight=field_weight,
+                N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
+                N_real_lipo=N_real_field[sl], M_real_lipo=M_real_field[sl],
+                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=n_seeds)
+            return sc, q, t
+
+        # NO pose cap, and for this driver the decline is DIRECTLY measured rather than
+        # inherited: armed on vol_lipo it gave 0.871x at 29,296 poses, 0.939x at 81,920 (the
+        # value ``vol`` ships) and only 1.028x at 262,144 (job 22637392). The driver graphs below
+        # ``graph_cap(N_pad*M_pad, budget=30e6)``, so a cap tight enough to reach the graph costs
+        # more in chunks than the graph returns -- the same shape of result as vol_color's
+        # 0.6523x (job 22599113) and pharm's 0.6496x (job 22598857).
+        sc, qb, tb = _subbatched_align(
+            _proc, k, key=(tag, n_cent_pad, m_cent_pad, n_field_pad, m_field_pad, n_seeds),
+            device=device)
+        out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
+        out_q.index_copy_(0, rows, qb)
+        out_t.index_copy_(0, rows, tb)
+
+    SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
+    return out_scores, SE3
+
+
+def align_batch_vol_lipo_arrays(ref: dict, fit: tuple, *, lipo_weight: float = 0.5,
+                                alpha: float = 0.81, lam: float = 0.1, topk: int = 30,
+                                steps_fine: int = 100, lr: float = 0.075):
+    """Array-native equivalent of ``_align_batch_vol_lipo`` for the screen path.
+
+    fit tuple: ``(atom_flat, atom_off, lipo_pos_flat, lipo_flat, lipo_off)`` -- the RemoveHs
+    shape centres on ``atom_off``, and the TRUE-heavy lipophilicity centres plus their per-atom
+    Crippen logP on ``lipo_off``. Those are exactly the three ``_fit_*_t`` attributes
+    ``_align_batch_vol_lipo`` reads (``_fit_xyz_t``, ``_fit_lipo_pos_t``, ``_fit_lipo_t``) and
+    the two tables ``screen.py::_build_fit_fast_pairs`` splits them by.
+
+    ``lam`` is RAW (atom-centred, no ``LAM_SCALING``), matching the object path.
+
+    ``num_repeats`` is deliberately absent from this signature. ``_align_batch_vol_lipo``
+    accepts it and no line of its body reads it -- the seed count comes from ``MODE_SEEDS``
+    (job 22637761) -- so accepting it here would advertise a knob that does nothing.
+    """
+    return _align_batch_vol_lipo_family_arrays(
+        ref["_ref_xyz_t"], ref["_ref_lipo_pos_t"], ref["_ref_lipo_t"], fit,
+        tag="vol_lipo", field_weight=lipo_weight, alpha=alpha, lam=lam,
+        topk=topk, steps_fine=steps_fine, lr=lr)
+
+
+def align_batch_vol_fukui_arrays(ref: dict, fit: tuple, *, fukui_weight: float = 0.5,
+                                 alpha: float = 0.81, lam: float = 0.1, topk: int = 30,
+                                 steps_fine: int = 100, lr: float = 0.075):
+    """Array-native equivalent of ``_align_batch_vol_fukui`` for the screen path.
+
+    fit tuple: ``(atom_flat, atom_off, fukui_pos_flat, fukui_flat, fukui_off)``.
+
+    SAME DRIVER AS vol_lipo, DIFFERENT ARRAYS -- and that difference is the whole reason the
+    channel is a parameter instead of a copied body. The store keeps ``fukui_pos``/``fukui`` on
+    their OWN ``fukui_off``, never ``lipo_off``; the ref tensors are ``_ref_fukui_pos_t`` /
+    ``_ref_fukui_t``; and the weight kwarg is ``fukui_weight``. Everything downstream
+    (``fast_optimize_vol_lipo_overlay_batch``, the pad policy, the seed source) is shared with
+    vol_lipo, but the sub-batch key tag is ``vol_fukui`` so the footprint cache stays split the
+    way the object path splits it. The weight keyword is renamed at THIS boundary, exactly as
+    ``_align_batch_vol_fukui`` renames it: only the shared driver call underneath still says
+    ``lipo_weight=``.
+    """
+    return _align_batch_vol_lipo_family_arrays(
+        ref["_ref_xyz_t"], ref["_ref_fukui_pos_t"], ref["_ref_fukui_t"], fit,
+        tag="vol_fukui", field_weight=fukui_weight, alpha=alpha, lam=lam,
+        topk=topk, steps_fine=steps_fine, lr=lr)
+
+
+def align_batch_surf_arrays(ref: dict, fit: tuple, *, alpha: float = 0.81,
+                            steps_fine: int = 100):
+    """Array-native equivalent of ``_align_batch_surf`` for the screen path.
+
+    fit tuple: ``(surf_all,)`` -- ONE dense ``(K, S, 3)`` block, not a flat buffer plus offsets.
+
+    THE BUCKETING SPEC IS THE SAME SHAPE AS ``vol``'S BUT ON A DIFFERENT CLOUD, and that is
+    derived, not assumed: ``_align_batch_surf`` builds ``PadSpec(merge={ref:
+    _ref_surf_t.shape[0], fit: _fit_surf_t.shape[0]})`` -- SURFACE point counts, never
+    ``_ref_xyz_t``. It keys its ``_ref_shared`` predicate and its seed eigensolve on the surface
+    cloud for the same reason, and this does too.
+
+    NO GATHER IS NEEDED. ``ProfileStore`` writes surfaces at a FIXED width
+    (``out["surf_pos"] = np.stack(...)``), so every library molecule has exactly ``S`` points and
+    the object path's per-molecule views come from ``torch.unbind`` rather than a split. A row
+    ``index_select`` replaces that unbind, exactly as
+    :func:`align_batch_vol_and_surf_esp_arrays` already does for its surface channel. The band
+    key is therefore constant across the library, so the shard is one cell before
+    ``_cap_upfront`` splits it -- which is what ``plan_buckets`` does on this mode too.
+
+    ``mode="surf"`` IS LOAD-BEARING, not decoration. ``drivers/shape.py:_MODE_POSES`` is
+    ``{"surf": 8}``, so that argument turns on the deduped multi-pose layout (``P_cta = 8``,
+    molecule blocks indexed by ``pid // S`` instead of materialised S times). Dropping it -- as
+    :func:`align_batch_vol_arrays` legitimately does, because ``vol`` is not in that table --
+    would silently run a different kernel schedule here.
+    """
+    from shepherd_score.accel.drivers.shape import coarse_fine_align_many, _self_overlap_in_chunks
+    from shepherd_score.accel.drivers._common import batched_seeds_torch
+    from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
+    from ._pad import _subbatched_align
+    from .._modes import MODE_SEEDS
+
+    (surf_all,) = fit
+    ref_surf = ref["_ref_surf_t"]
+
+    device = surf_all.device
+    n_seeds = int(MODE_SEEDS["surf"])
+    K = int(surf_all.shape[0])
+    if K == 0:
+        return np.empty(0, dtype=float), np.empty((0, 4, 4), dtype=np.float32)
+
+    S = int(surf_all.shape[1])
+    N = int(ref_surf.shape[0])
+    m_sizes = np.full(K, S, dtype=np.int64)
+    order, buckets = plan_spans(m_sizes, N, n_seeds, device)
+    order_t = torch.as_tensor(order, device=device, dtype=torch.long)
+
+    out_scores = np.empty(K, dtype=float)
+    out_q = torch.empty(K, 4, device=device)
+    out_t = torch.empty(K, 3, device=device)
+
+    for bk in buckets:
+        N_pad, M_pad = int(bk.pad["ref"]), int(bk.pad["fit"])
+        k = bk.K
+        rows = order_t[bk.members.lo:bk.members.hi]
+
+        ref_pad = torch.zeros(k, N_pad, 3, device=device, dtype=torch.float32)
+        ref_pad[:, :N] = ref_surf
+        fit_pad = torch.zeros(k, M_pad, 3, device=device, dtype=torch.float32)
+        fit_pad[:, :S] = surf_all.index_select(0, rows)
+
+        N_real = torch.full((k,), N, dtype=torch.int32, device=device)
+        M_real = torch.full((k,), S, dtype=torch.int32, device=device)
+
+        # ref broadcast; see align_batch_vol_tversky_arrays for why ref_shared=True is exact
+        # rather than approximate at every k, including k == 1.
+        VAA = _self_overlap_in_chunks(ref_pad[:1], N_real[:1], alpha).expand(k).contiguous()
+        VBB = _self_overlap_in_chunks(fit_pad, M_real, alpha)
+
+        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
+                                               num_seeds=n_seeds, ref_shared=True)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            return coarse_fine_align_many(
+                ref_pad[sl], fit_pad[sl], VAA[sl], VBB[sl],
+                N_real=N_real[sl], M_real=M_real[sl], alpha=alpha, steps_fine=steps_fine,
+                seeds=(seeds_q[sl], seeds_t[sl]), mode="surf")
+
+        # NO pose cap -- see the section header. NOT MEASURED FOR THIS MODE: no job has armed a
+        # cap on surf. What is measured is every OTHER mode a cap was armed on -- vol_color
+        # 0.6523x (job 22599113), pharm 0.6496x (job 22598857), vol_esp 0.9981x, vol_lipo
+        # 0.871x/0.939x at 29,296/81,920 poses (job 22637392) -- so ``vol`` remains the only mode
+        # a cap has ever helped, and surf pads WIDER than any of them (surface clouds are
+        # hundreds of points, which shrinks ``graph_cap(N_pad*M_pad)`` further). Arm it and
+        # measure before assuming either way.
+        sc, qb, tb = _subbatched_align(_proc, k, key=("surf", N_pad, M_pad, n_seeds),
+                                       device=device)
+        out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
+        out_q.index_copy_(0, rows, qb)
+        out_t.index_copy_(0, rows, tb)
+
+    SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
+    return out_scores, SE3
+
+
+def align_batch_surf_esp_arrays(ref: dict, fit: tuple, *, alpha: float, lam: float,
+                                num_repeats_per_trans: int = 10, topk: int = 30,
+                                steps_fine: int = 100, lr: float = 0.075):
+    """Array-native equivalent of ``_align_batch_surf_esp`` for the screen path.
+
+    fit tuple: ``(surf_all, surf_esp_all)`` -- two dense blocks, ``(K, S, 3)`` and ``(K, S)``,
+    the two ``_fit_*_t`` attributes ``_align_batch_surf_esp`` uploads (``_fit_surf_t``,
+    ``_fit_surf_esp_t``). No offset table: the store writes surfaces at a fixed width, so the
+    object path unbinds rather than splits here too.
+
+    ``lam`` IS SCALED, AND THAT IS THE ONE THING NOT TO COPY FROM ``vol_esp``.
+    ``_align_batch_surf_esp`` resolves ``lam_scaled = LAM_SCALING * lam`` BEFORE reaching the
+    shared ``_esp_bucketed_align``, where ``_align_batch_vol_esp`` passes ``lam`` raw. The two
+    are not interchangeable (``LAM_SCALING`` is ~207), so the scaling is applied here for the
+    same reason: this aligner stands in for ``_align_batch_surf_esp``, not for the shared core.
+
+    BUCKETING IS ON THE SURFACE CLOUDS -- ``_esp_bucketed_align`` is handed
+    ``ref_pts_attr="_ref_surf_t"`` / ``fit_pts_attr="_fit_surf_t"``, so its ``PadSpec`` merge
+    dims are surface point counts, and its ``partition={"tc": ...}`` collapses to 0 because the
+    screen always calls with ``trans_init=False`` (screen.py::_fast_batch_kwargs pins it). One
+    partition value means no split, so :func:`plan_spans` reproduces the partition exactly, and
+    ``trans_centers_batch``/``trans_centers_real`` are ``None`` as they are on the object path.
+
+    No ``VAA``/``VBB`` here: ``fast_optimize_ROCS_esp_overlay_batch`` computes the ESP
+    self-overlaps internally, on both paths.
+    """
+    from shepherd_score.accel.drivers.esp import fast_optimize_ROCS_esp_overlay_batch
+    from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
+    from shepherd_score.score.constants import LAM_SCALING
+    from ._pad import _subbatched_align
+    from .._modes import MODE_SEEDS
+
+    surf_all, surf_esp_all = fit
+    ref_surf = ref["_ref_surf_t"]
+    ref_surf_esp = ref["_ref_surf_esp_t"]
+    # ``alpha`` and ``lam`` are REQUIRED keywords, mirroring _align_batch_surf_esp, which
+    # declares a default for neither. lam arrives RAW and is scaled HERE -- see the docstring.
+    lam_scaled = LAM_SCALING * lam
+
+    device = surf_all.device
+    # Registry seeds, and no ``num_repeats`` parameter: _esp_bucketed_align reads
+    # ``_seeds_for(subbatch_tag)`` and never the ``num_repeats`` _align_batch_surf_esp accepts --
+    # the same accepted-and-ignored kwarg vol_lipo has (job 22637761).
+    n_seeds = int(MODE_SEEDS["surf_esp"])
+    K = int(surf_all.shape[0])
+    if K == 0:
+        return np.empty(0, dtype=float), np.empty((0, 4, 4), dtype=np.float32)
+
+    S = int(surf_all.shape[1])
+    N = int(ref_surf.shape[0])
+    m_sizes = np.full(K, S, dtype=np.int64)
+    order, buckets = plan_spans(m_sizes, N, n_seeds, device)
+    order_t = torch.as_tensor(order, device=device, dtype=torch.long)
+
+    out_scores = np.empty(K, dtype=float)
+    out_q = torch.empty(K, 4, device=device)
+    out_t = torch.empty(K, 3, device=device)
+
+    for bk in buckets:
+        N_pad, M_pad = int(bk.pad["ref"]), int(bk.pad["fit"])
+        k = bk.K
+        rows = order_t[bk.members.lo:bk.members.hi]
+
+        ref_pad = torch.zeros(k, N_pad, 3, device=device, dtype=torch.float32)
+        ref_pad[:, :N] = ref_surf
+        fit_pad = torch.zeros(k, M_pad, 3, device=device, dtype=torch.float32)
+        fit_pad[:, :S] = surf_all.index_select(0, rows)
+        ref_c_pad = torch.zeros(k, N_pad, device=device, dtype=torch.float32)
+        ref_c_pad[:, :N] = ref_surf_esp
+        fit_c_pad = torch.zeros(k, M_pad, device=device, dtype=torch.float32)
+        fit_c_pad[:, :S] = surf_esp_all.index_select(0, rows)
+
+        N_real = torch.full((k,), N, dtype=torch.int32, device=device)
+        M_real = torch.full((k,), S, dtype=torch.int32, device=device)
+
+        def _proc(_s, _k):
+            sl = slice(_s, _s + _k)
+            _, q, t, sc = fast_optimize_ROCS_esp_overlay_batch(
+                ref_pad[sl], fit_pad[sl], ref_c_pad[sl], fit_c_pad[sl],
+                alpha=alpha, lam=lam_scaled,
+                N_real=N_real[sl], M_real=M_real[sl],
+                trans_centers_batch=None, trans_centers_real=None,   # trans_init is False here
+                num_repeats_per_trans=num_repeats_per_trans, num_seeds=n_seeds,
+                topk=topk, steps_fine=steps_fine, lr=lr)
+            return sc, q, t
+
+        # NO pose cap -- see the section header. Not measured for surf_esp itself; what is
+        # measured is its sibling on the SAME kernel, vol_esp, at 0.9981x with one armed (job
+        # 22598857). surf_esp pads to surface clouds rather than heavy-atom counts, so its
+        # per-step kernel is the heavier of the two and a launch saving has less to win back --
+        # an argument for keeping the cap off, not a measurement of it.
+        sc, qb, tb = _subbatched_align(_proc, k, key=("surf_esp", N_pad, M_pad, n_seeds),
+                                       device=device)
+        out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
         out_q.index_copy_(0, rows, qb)
         out_t.index_copy_(0, rows, tb)
 

@@ -1172,18 +1172,59 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
 
 
 #: Modes with BOTH an array builder below and an array-native aligner in ``_arrays``. A mode
-#: joins this tuple only when both exist -- see ``_use_arrays``.
-_ARRAY_MODES = ("vol", "vol_color", "pharm", "vol_esp", "vol_and_surf_esp")
+#: joins this tuple only when both exist -- see ``_use_arrays``. This is now every mode
+#: ``_store_supports`` admits, i.e. every screen-capable mode: the object path survives only as
+#: the parity reference the gates compare against (and for a non-pre-centered / trans_init /
+#: jax-backend screen, which never reaches either array branch).
+_ARRAY_MODES = ("vol", "vol_color", "pharm", "vol_esp", "vol_and_surf_esp",
+                "vol_tversky", "vol_esp_tversky", "surf", "surf_esp",
+                "vol_lipo", "vol_fukui")
 
 
 def _use_arrays(mode: str) -> bool:
     """Whether to take the array-native screen path. Opt-in, and per-mode.
 
+    THIS DOCSTRING IS THE ONE AUTHORITATIVE RECORD OF WHAT THE ARRAY PATH IS WORTH. The same
+    numbers used to be restated above the array builders below and again in the ``SECOND WAVE``
+    header of ``accel/batch/_arrays.py``; those two now point here in a sentence instead,
+    because a single refuted figure (the ~2.6x ``vol_lipo`` ceiling, below) had to be corrected
+    in three places. This function is the gate every caller passes through and the only one of
+    the three sites that is a docstring, so it is the copy reachable from ``help()``.
+
     Round 1 established that a PARTIAL removal of the object model is worth exactly zero, so
     this is deliberately all-or-nothing per mode rather than a gradual migration: a mode is
     listed in ``_ARRAY_MODES`` only once its whole path -- builder AND aligner -- is array
     native. ``vol_color`` was added because it was the most host-bound mode measured (53.0% of
-    its screen inside ``_build_fit_fast_pairs``, in situ at N=1e5)."""
+    its screen inside ``_build_fit_fast_pairs``, in situ at N=1e5).
+
+    THE FIVE INCUMBENTS, measured as the cost of REMOVING the path they already have: 3.87x
+    (vol), 7.28x (vol_color), 4.80x (vol_esp), 2.33x (pharm) and 2.02x (vol_and_surf_esp) at
+    N=99,984 on an L40S (job 22637592), reproduced at 6.54x (vol_color) / 3.75x (vol) at N=1e5
+    on a different store and node (job 22637392).
+
+    THE SIX ADDED AFTERWARDS (``vol_tversky``, ``vol_esp_tversky``, ``surf``, ``surf_esp``,
+    ``vol_lipo``, ``vol_fukui``) are MEASURED now, not estimated -- array leg against object
+    leg at N=99,984 on an L40S, every mode run in two independent jobs (22641030 / 22641516,
+    with parity from 22640575)::
+
+        vol_esp_tversky  4.97x / 5.12x        vol_lipo  3.70x / 3.56x
+        vol_fukui        4.05x / 3.58x        surf_esp  1.34x / 1.29x
+        vol_tversky      4.04x / 4.25x        surf      1.33x / 1.29x
+
+    All six are BIT-IDENTICAL to the object path in those runs: 0 of 99,984 scores moved,
+    max|delta| exactly 0.000e+00, identical top-1000 ids, and identical 4x4 transforms element
+    for element. The five incumbents are undisturbed in the same runs (also 0 moved).
+
+    DO NOT QUOTE ONE RANGE ACROSS ALL SIX. ``surf`` and ``surf_esp`` gain only ~1.3x, and the
+    reason is that they are OPTIMIZER-bound rather than host-bound: the recorder shows 0/1
+    graphed for them -- a single eager fine-loop call over the 200-point surface clouds for the
+    whole shard -- so the host front-end this path deletes is a small share of their screen.
+    They are a different regime from the 3.5-5x modes and belong in a different sentence.
+
+    THE OLD ~2.6x CEILING ON ``vol_lipo`` IS REFUTED, not merely exceeded. It was derived from
+    a 0.679 s fine-loop wall inside a 1.766 s OBJECT-path screen. The array leg runs its ENTIRE
+    screen in 0.405-0.423 s (jobs 22641030 / 22641516) -- below that wall -- so the 0.679 s
+    figure does not bound this configuration and cannot be quoted as a ceiling for it."""
     from shepherd_score.accel.batch import _arrays
     return mode in _ARRAY_MODES and _arrays.ENABLED
 
@@ -1410,18 +1451,261 @@ def _align_fast_arrays_vol_and_surf_esp(ref: dict, fit: tuple, batch_kw: dict):
         lr=batch_kw.get("lr", 0.075))
 
 
+# --------------------------------------------------------------------------- #
+# The six remaining screen-capable modes. What the array path is worth per mode, and the jobs
+# that measured it, live in ONE place: the :func:`_use_arrays` docstring above. Do not restate
+# the numbers here -- they were duplicated across three blocks, and the stale ~2.6x vol_lipo
+# ceiling then had to be refuted in all three.
+#
+# Every fit tuple below is derived from that mode's OBJECT-path aligner in
+# accel/batch/aligners.py -- which ``_fit_*_t`` tensors it uploads, and which offset table
+# ``_build_fit_fast_pairs`` splits them on -- never by analogy with a mode that merely looks
+# alike. vol_fukui is the case in point: it rides the vol_lipo DRIVER but feeds it its OWN
+# arrays, and a store can hold both channels at once, so reading the lipo keys there would
+# silently score the wrong field instead of failing.
+# --------------------------------------------------------------------------- #
+def _build_fit_arrays_vol_tversky(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_tversky``:
+    ``(ids, fit_flat, fit_off)`` -- the ``vol`` tuple exactly.
+
+    DERIVED, not assumed. ``_align_batch_vol_tversky`` uploads two pair tensors and only two --
+    ``_ref_xyz_t``/``_fit_xyz_t`` from ``atom_pos`` -- and reads nothing else off the pair. The
+    Tversky reduction changes how ``AB`` is combined with the pose-invariant self-overlaps
+    ``VAA``/``VBB``, and both of those are computed ON THE DEVICE from these same clouds
+    (``_self_overlap_in_chunks``), so the asymmetry costs no extra input.
+
+    Delegates rather than copies: the two modes share one store layout, and two bodies that must
+    agree are two bodies that can drift apart."""
+    return _build_fit_arrays_vol(arrs, device)
+
+
+def _build_fit_arrays_vol_esp_tversky(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_esp_tversky``:
+    ``(ids, heavy_centers, heavy_charges, heavy_off)`` -- the ``vol_esp`` tuple exactly,
+    including its with-H-store gather.
+
+    DERIVED: ``_align_batch_vol_esp_tversky`` uploads ``_fit_xyz_noH_t`` (strict-heavy centres)
+    and ``_fit_xyz_esp_t`` (the charges 1:1 with them), and never touches ``_fit_xyz_t`` -- it
+    has no ``trans_init``, so the RemoveHs centres the object path also parks on the pair for
+    vol_esp are dead weight here and are not uploaded. ``_query_ref_arrays`` and
+    ``_ref_tensors_from_arrays`` already treat the two modes as one key for the same reason."""
+    return _build_fit_arrays_vol_esp(arrs, device)
+
+
+def _build_fit_arrays_surf(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``surf``: ``(ids, surf_all)``.
+
+    ONE tensor and NO offset table -- the only mode here with neither. Every profile carries
+    exactly ``num_surf_points`` surface points, so ``_concat`` writes them with ``np.stack``
+    rather than ``np.concatenate`` and the store already holds a DENSE ``(K, S, 3)`` block. The
+    object path's entire per-molecule step for this mode is a ``torch.unbind`` of that block
+    into K views, which an aligner-side row ``index_select`` replaces.
+
+    ``_align_batch_surf`` uploads ``_fit_surf_t`` and nothing else."""
+    import torch
+    return (arrs["ids"], _to_device(arrs["surf_pos"], device, dtype=torch.float32))
+
+
+def _build_fit_arrays_surf_esp(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``surf_esp``:
+    ``(ids, surf_all, surf_esp_all)``.
+
+    Two DENSE blocks on the same fixed surface width, for the reason spelled out in
+    :func:`_build_fit_arrays_surf`. ``_align_batch_surf_esp`` uploads exactly ``_fit_surf_t`` +
+    ``_fit_surf_esp_t`` before handing them to ``_esp_bucketed_align``; its ``_ref_xyz_t``
+    translation centres sit inside ``if trans_init:``, which this path excludes (``fast``
+    requires ``trans_init`` falsey and ``_fast_batch_kwargs`` pins it False), so they are not
+    part of the fit tuple.
+
+    ``lam`` is not a fit tensor but it is the trap next door: ``_align_batch_surf_esp`` scales
+    it by ``LAM_SCALING`` (x207) before the kernel where ``vol_esp`` passes its own raw, so the
+    aligner -- not this builder, and not the caller -- owns that scaling."""
+    import torch
+    f32 = torch.float32
+    return (arrs["ids"],
+            _to_device(arrs["surf_pos"], device, dtype=f32),
+            _to_device(arrs["surf_esp"], device, dtype=f32))
+
+
+def _build_fit_arrays_scalar_field(arrs: dict, device, *, pos_key: str, val_key: str,
+                                   off_key: str):
+    """Shared body for the two shape-plus-per-atom-scalar modes (``vol_lipo``, ``vol_fukui``).
+
+    Returns ``(ids, cent_flat, cent_off, field_pos_flat, field_val_flat, field_off)``.
+
+    TWO point sets on TWO offset tables, and they are not interchangeable. The shape channel is
+    ``atom_pos`` on ``atom_off`` (the ``Chem.RemoveHs`` coordinate set, the bucket merge key,
+    reusing the shape kernel); the field channel is the TRUE-heavy centres with their per-atom
+    scalar, on their own ``*_off``. The two counts DIVERGE whenever RemoveHs retained an H (an
+    isotope label), which is exactly why ``_concat`` gives the field its own offset table and why
+    ``_build_fit_fast_pairs`` splits each channel by its own -- one table for both would desync
+    the field from its positions on those molecules.
+
+    Parameterised on the key NAMES because the layout really is shared; the names themselves are
+    read off ``ProfileStore._concat``, not predicted from the mode name -- the value array is
+    ``lipophilicity`` for one mode and ``fukui`` for the other, which no single rule gives."""
+    import torch
+    f32 = torch.float32
+    return (arrs["ids"],
+            _to_device(arrs["atom_pos"], device, dtype=f32),
+            _to_device(arrs["atom_off"], device, dtype=torch.long),
+            _to_device(arrs[pos_key], device, dtype=f32),
+            _to_device(arrs[val_key], device, dtype=f32),
+            _to_device(arrs[off_key], device, dtype=torch.long))
+
+
+def _build_fit_arrays_vol_lipo(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_lipo``:
+    ``(ids, cent_flat, cent_off, lipo_pos, lipophilicity, lipo_off)``.
+
+    DERIVED from ``_align_batch_vol_lipo``, which uploads exactly three fit tensors:
+    ``_fit_xyz_t`` (``atom_pos``), ``_fit_lipo_pos_t`` (``get_lipo_positions()``) and
+    ``_fit_lipo_t`` (``get_lipophilicity(no_H=True)``) -- persisted by ``_concat`` as
+    ``atom_pos`` / ``lipo_pos`` / ``lipophilicity``. Its ``num_repeats`` kwarg is accepted and
+    IGNORED there (the seed count comes from ``MODE_SEEDS``; 4, 16 and 32 returned the same
+    4,000 scores in job 22637761), so it is no part of this tuple either."""
+    return _build_fit_arrays_scalar_field(arrs, device, pos_key="lipo_pos",
+                                          val_key="lipophilicity", off_key="lipo_off")
+
+
+def _build_fit_arrays_vol_fukui(arrs: dict, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_fukui``:
+    ``(ids, cent_flat, cent_off, fukui_pos, fukui, fukui_off)``.
+
+    SAME SHAPE AS vol_lipo, DIFFERENT ARRAYS -- verified against the source, not inferred from
+    the shared driver. ``_align_batch_vol_fukui`` does reach
+    ``fast_optimize_vol_lipo_overlay_batch`` (passing ``fukui_weight`` as its ``lipo_weight``),
+    but it uploads ``_fit_fukui_pos_t``/``_fit_fukui_t`` from
+    ``get_fukui_positions()``/``get_fukui(no_H=True)``, which ``_concat`` writes under
+    ``fukui_pos`` / ``fukui`` / ``fukui_off``. ``_schema_from_modes`` sets ``lipophilicity`` and
+    ``fukui`` independently, so a store built for both modes holds both channels and feeding the
+    lipo keys here would score the wrong field silently instead of raising KeyError."""
+    return _build_fit_arrays_scalar_field(arrs, device, pos_key="fukui_pos",
+                                          val_key="fukui", off_key="fukui_off")
+
+
+def _align_fast_arrays_vol_tversky(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``vol_tversky``. Returns ``(scores, SE3)``.
+
+    Kwargs mirror ``_align_batch_vol_tversky``'s own signature and defaults; the seed count is
+    internal to the driver there (``_seeds_for("vol_tversky")``) and stays internal here."""
+    from shepherd_score.accel.batch._arrays import align_batch_vol_tversky_arrays
+    return align_batch_vol_tversky_arrays(
+        ref, fit,
+        alpha=batch_kw.get("alpha", 0.81),
+        tversky_alpha=batch_kw.get("tversky_alpha", 0.95),
+        tversky_beta=batch_kw.get("tversky_beta", 0.05),
+        steps_fine=batch_kw["steps_fine"])
+
+
+def _align_fast_arrays_vol_esp_tversky(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``vol_esp_tversky``.
+
+    ``lam`` is RAW and defaults to 0.1 -- ``_align_batch_vol_esp_tversky`` declares that default
+    itself, unlike ``vol_esp``, whose ``lam`` ``screen()`` refuses to invent."""
+    from shepherd_score.accel.batch._arrays import align_batch_vol_esp_tversky_arrays
+    return align_batch_vol_esp_tversky_arrays(
+        ref, fit,
+        alpha=batch_kw.get("alpha", 0.81),
+        lam=batch_kw.get("lam", 0.1),
+        tversky_alpha=batch_kw.get("tversky_alpha", 0.95),
+        tversky_beta=batch_kw.get("tversky_beta", 0.05),
+        steps_fine=batch_kw["steps_fine"])
+
+
+def _align_fast_arrays_surf(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``surf``.
+
+    ``alpha`` here is the SURFACE alpha: ``_resolve_screen`` resolves it from
+    ``ALPHA(store.num_surf_points)`` for this mode, so it arrives in ``batch_kw`` already and the
+    0.81 fallback below is ``_align_batch_surf``'s own declared default, not a screen default."""
+    from shepherd_score.accel.batch._arrays import align_batch_surf_arrays
+    return align_batch_surf_arrays(
+        ref, fit,
+        alpha=batch_kw.get("alpha", 0.81),
+        steps_fine=batch_kw["steps_fine"])
+
+
+def _align_fast_arrays_surf_esp(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``surf_esp``.
+
+    ``lam`` is passed RAW, exactly as ``_align_batch_surf_esp`` takes it: that function applies
+    ``LAM_SCALING`` (x207) itself before ``_esp_bucketed_align``, so handing an already-scaled
+    value down would scale it twice. ``alpha``/``lam`` are indexed rather than ``.get``, because
+    ``_fast_batch_kwargs`` always supplies both for this mode and a missing one is a wiring bug
+    worth a KeyError. ``num_repeats`` is deliberately not forwarded: ``_align_batch_surf_esp``
+    accepts it and never passes it on -- ``_esp_bucketed_align`` takes its seed count from
+    ``_seeds_for("surf_esp")``."""
+    from shepherd_score.accel.batch._arrays import align_batch_surf_esp_arrays
+    return align_batch_surf_esp_arrays(
+        ref, fit,
+        alpha=batch_kw["alpha"], lam=batch_kw["lam"],
+        num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
+        topk=batch_kw.get("topk", 30),
+        steps_fine=batch_kw["steps_fine"],
+        lr=batch_kw.get("lr", 0.075))
+
+
+def _align_fast_arrays_vol_lipo(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``vol_lipo``.
+
+    ``lam`` is RAW (atom-centred, no ``LAM_SCALING``), matching per-pair ``align_with_vol_lipo``.
+    ``num_repeats`` is not forwarded: ``_align_batch_vol_lipo`` accepts it and no line of its body
+    reads it (job 22637761 -- 4, 16 and 32 moved 0 of 4,000 scores, while moving ``MODE_SEEDS``
+    16 -> 4 moved 2,604 of them), so forwarding it here would be a behaviour change dressed as a
+    port."""
+    from shepherd_score.accel.batch._arrays import align_batch_vol_lipo_arrays
+    return align_batch_vol_lipo_arrays(
+        ref, fit,
+        lipo_weight=batch_kw.get("lipo_weight", 0.5),
+        alpha=batch_kw.get("alpha", 0.81),
+        lam=batch_kw.get("lam", 0.1),
+        topk=batch_kw.get("topk", 30),
+        steps_fine=batch_kw["steps_fine"],
+        lr=batch_kw.get("lr", 0.075))
+
+
+def _align_fast_arrays_vol_fukui(ref: dict, fit: tuple, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast` for ``vol_fukui``.
+
+    The weight keyword is ``fukui_weight``, not ``lipo_weight``: ``_align_batch_vol_fukui``
+    renames it at the boundary and only the shared DRIVER call underneath still says
+    ``lipo_weight=fukui_weight``."""
+    from shepherd_score.accel.batch._arrays import align_batch_vol_fukui_arrays
+    return align_batch_vol_fukui_arrays(
+        ref, fit,
+        fukui_weight=batch_kw.get("fukui_weight", 0.5),
+        alpha=batch_kw.get("alpha", 0.81),
+        lam=batch_kw.get("lam", 0.1),
+        topk=batch_kw.get("topk", 30),
+        steps_fine=batch_kw["steps_fine"],
+        lr=batch_kw.get("lr", 0.075))
+
+
 #: mode -> (fit-array builder, array-native aligner). Keys MUST cover ``_ARRAY_MODES`` exactly;
 #: ``vol`` is in here too now rather than in an inline branch of its own -- see _array_dispatch.
 _ARRAY_BUILDERS = {"vol": _build_fit_arrays_vol,
                    "vol_color": _build_fit_arrays_vol_color,
                    "pharm": _build_fit_arrays_pharm,
                    "vol_esp": _build_fit_arrays_vol_esp,
-                   "vol_and_surf_esp": _build_fit_arrays_vol_and_surf_esp}
+                   "vol_and_surf_esp": _build_fit_arrays_vol_and_surf_esp,
+                   "vol_tversky": _build_fit_arrays_vol_tversky,
+                   "vol_esp_tversky": _build_fit_arrays_vol_esp_tversky,
+                   "surf": _build_fit_arrays_surf,
+                   "surf_esp": _build_fit_arrays_surf_esp,
+                   "vol_lipo": _build_fit_arrays_vol_lipo,
+                   "vol_fukui": _build_fit_arrays_vol_fukui}
 _ARRAY_ALIGNERS = {"vol": _align_fast_arrays_vol,
                    "vol_color": _align_fast_arrays_vol_color,
                    "pharm": _align_fast_arrays_pharm,
                    "vol_esp": _align_fast_arrays_vol_esp,
-                   "vol_and_surf_esp": _align_fast_arrays_vol_and_surf_esp}
+                   "vol_and_surf_esp": _align_fast_arrays_vol_and_surf_esp,
+                   "vol_tversky": _align_fast_arrays_vol_tversky,
+                   "vol_esp_tversky": _align_fast_arrays_vol_esp_tversky,
+                   "surf": _align_fast_arrays_surf,
+                   "surf_esp": _align_fast_arrays_surf_esp,
+                   "vol_lipo": _align_fast_arrays_vol_lipo,
+                   "vol_fukui": _align_fast_arrays_vol_fukui}
 
 
 def _array_dispatch(mode: str):
