@@ -1,4 +1,5 @@
 """MoleculePairBatch: batch of MoleculePair objects for fast sequential JAX alignment."""
+from contextlib import contextmanager
 from importlib.metadata import version as _pkg_version
 from typing import List, Optional, Tuple
 
@@ -80,6 +81,45 @@ def _compute_bucket_splits(sizes_a, sizes_b, num_buckets):
         for arr in np.array_split(sorted_order, num_buckets_actual)
         if len(arr) > 0
     ]
+
+
+@contextmanager
+def _pinned_torch_threads(pairs):
+    """Pin torch to ONE intra-op thread for the duration of a CPU batch alignment.
+
+    The numba kernels own the cores on this path -- they run ``parallel=True`` over
+    ``NUMBA_NUM_THREADS`` -- while torch's own pool is only doing the small tails around them.
+    Left unpinned the two pools oversubscribe and the tails spin-wait against the kernels.
+
+    MEASURED (cluster, numba 0.59.1 + SVML, aligns/sec, unpinned -> pinned):
+        numba=1 thread   vol 2,804 -> 3,677 (1.31x) | pharm 550 -> 718 (1.31x)
+                         vol_tversky 455 -> 619 (1.36x) | surf 55.8 -> 56.1 (1.00x)
+        numba=96 threads vol 7,533 -> 11,035 (1.47x) | pharm 1,774 -> 3,635 (2.05x)
+                         surf 617 -> 851 (1.38x) | vol_tversky 3,664 -> 5,033 (1.37x)
+    Bit-identical over the full score vector, 4 modes x 2 thread regimes, max_abs 0.0 -- this
+    changes scheduling, never arithmetic.
+
+    ``accel/cpu_pool.py`` and ``accel/screen_parallel.py`` already do this in their workers; the
+    single-process align path was the one CPU entry point that did not, which is why it was the
+    slow one. SCOPED rather than set once at import: ``torch.set_num_threads`` is PROCESS-GLOBAL,
+    so a library that set it permanently would silently reconfigure the caller's torch for
+    everything else they do afterwards. Restored on every exit path, exception included.
+
+    A no-op on CUDA, where torch's CPU pool is not in the loop at all.
+    """
+    import torch
+    if not pairs or pairs[0].device.type != "cpu":
+        yield
+        return
+    prev = torch.get_num_threads()
+    if prev == 1:
+        yield                                            # already pinned; do not touch it
+        return
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(prev)
 
 
 class MoleculePairBatch:
@@ -188,7 +228,8 @@ class MoleculePairBatch:
             else:
                 align_fn(pairs, **align_kwargs)          # mode not pooled -> single call
         else:
-            align_fn(pairs, **align_kwargs)              # <- identical to standalone Triton call
+            with _pinned_torch_threads(pairs):
+                align_fn(pairs, **align_kwargs)          # <- identical to standalone Triton call
         scores = np.array([float(getattr(p, score_attr)) for p in pairs])
         if not return_aligned:
             return scores, [None] * len(pairs)

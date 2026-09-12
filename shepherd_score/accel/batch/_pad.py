@@ -76,6 +76,32 @@ _PAIR_FOOTPRINT_BYTES: dict[tuple, int] = {}
 _FINE_CHUNK_POSES = 81920
 
 
+#: Pairs per call on the CPU path. Bounds peak host RSS on an out-of-core screen, where
+#: screen.py's shard_size=100_000 default otherwise hands the fine loop one 100k-pair batch.
+#: 10,000 measured indistinguishable from 1,000 on throughput (621.3 vs 621.5 aligns/s) while
+#: making the chunk count 10x smaller, so it takes the top of the measured-flat decade.
+_CPU_CHUNK_PAIRS = 10_000
+
+
+def _concat_chunks(process, K: int, step: int):
+    """Run ``process`` over ``K`` pairs in ``step``-sized chunks and concatenate.
+
+    The GPU branch below does the same thing with a dynamic, memory-derived chunk; this is the
+    fixed-size CPU twin, kept separate because none of the budget machinery (mem_get_info, the
+    footprint cache, the OOM halve-and-retry) has a meaning off CUDA.
+    """
+    sc_parts, q_parts, t_parts = [], [], []
+    s = 0
+    while s < K:
+        k = min(step, K - s)
+        sc, q, t = process(s, k)
+        sc_parts.append(sc); q_parts.append(q); t_parts.append(t)
+        s += k
+    if len(sc_parts) == 1:
+        return sc_parts[0], q_parts[0], t_parts[0]
+    return (torch.cat(sc_parts), torch.cat(q_parts), torch.cat(t_parts))
+
+
 def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
                       safety: float = 0.7, init_cap: int = 1024, pose_cap: int = 0,
                       seeds: int = 1):
@@ -106,10 +132,35 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
     fit) it just calls ``process`` once.
     """
     if device.type != "cuda":
-        # CPU (or any non-CUDA) tensors: memory-safe chunking is a GPU concern, so run
-        # the whole batch in one call. Keys off the *data* device, not machine
-        # capability, so a CUDA box driving CPU tensors (e.g. backend="numba") is CPU.
-        return process(0, K)
+        # CPU (or any non-CUDA) tensors. Memory-SAFETY chunking is a GPU concern -- there is no
+        # device allocator to run out of -- so there is no budget loop here. But running the
+        # whole batch in one call was NOT free: screen.py defaults shard_size=100_000, so an
+        # out-of-core CPU screen hands this a single 100k-pair batch and every per-pair
+        # intermediate is live at once.
+        #
+        # MEASURED (cluster node1611, 1 thread, numba 0.59.1 + SVML, pharm, library fixed at
+        # N=1e5 with only the per-call batch varied):
+        #     100 x 1,000   621.5 aligns/s     peak RSS   876 MB
+        #      10 x 10,000  621.3 aligns/s
+        #       1 x 100,000 575.0 aligns/s     peak RSS 6,383 MB
+        # i.e. 1.081x wall (173.9 s -> 160.9 s) and a 7.3x cut in peak RSS, which is the larger
+        # practical win -- 6.4 GB for one screen is what makes a CPU screen fall over on a shared
+        # node. Any cap in the 1e3-1e4 decade behaves the same (the two above differ by 0.03%).
+        #
+        # BIT-IDENTICAL, measured over the full 100,000-element score vector across the
+        # 1-shard / 10-shard / 100-shard partitions (0 moved, max|delta| 0.0). The guarantee is
+        # CONDITIONAL and the condition was checked: _stats reported early_stop_frac = 0.0 with
+        # steps_min == steps_max == steps_configured throughout, so every chunk ran its full
+        # budget and the chunk-global early-stop break could not fire. A workload that DOES
+        # early-stop can score differently under a different partition, for the reason
+        # _subbatched_align's docstring gives above -- that is a property of the early stop, not
+        # of this cap.
+        #
+        # Deliberately large: below _CPU_CHUNK_PAIRS nothing changes at all, so ordinary pairwise
+        # batches (hundreds to a few thousand pairs) take exactly the path they took before.
+        if K <= _CPU_CHUNK_PAIRS:
+            return process(0, K)
+        return _concat_chunks(process, K, _CPU_CHUNK_PAIRS)
 
     key = (torch.cuda.current_device(),) + tuple(key)   # device-scope the footprint cache
 

@@ -397,10 +397,39 @@ def coarse_fine_pharm_align_many(
         best_score, best_q, best_t = _graphed
 
     # --- opt-in CPU (numba) fast path: fully-fused fine loop, NO torch in the hot loop ------
-    # Only the default-kernel tanimoto branch (use_kernel) is fused; tversky / extended_points /
-    # the padded-autograd path keep the eager loop. The in-register dQ kernel keeps q ~unit each
-    # step (like the shape kernel), so the Tanimoto/Adam tail is shared.
-    if (_graphed is None and not anchors_1.is_cuda and use_kernel
+    # DISABLED FOR pharm. The fused loop and the eager loop land in DIFFERENT BASINS here, and
+    # the divergence is the largest measured anywhere on the CPU path: at N=2048, 1,668 of 2,048
+    # scores move, max|delta| 9.948e-02, max 57.96% relative, 42 above 1% relative and 14 above
+    # 5%; at N=512, 421 of 512 move, max 1.708e-02 / 9.37% relative (job 22637530, node2704,
+    # numba 0.59.1 + SVML, 1 thread).
+    #
+    # THAT IS THE SAME STANDARD surf_esp IS ALREADY EXCLUDED UNDER, and pharm fails it far worse.
+    # esp.py restricts the fused ESP loop to vol_esp because there the fused trajectory agrees
+    # with torch-eager to max|dscore| ~5e-5, and it excludes surf_esp explicitly as "the most
+    # shape-degenerate mode ... callers rely on pose-exact agreement". pharm's 9.9e-02 is ~2,000x
+    # the tolerance vol_esp was held to, so fusing it was never consistent with that rule.
+    #
+    # AND IT BUYS ALMOST NOTHING: 1.046x at N=512 and 1.025x at N=2048 (same job). pharm is the
+    # mode with the LEAST speed gain from fusion and BY FAR the most score movement.
+    #
+    # MECHANISM, so this is not re-enabled by accident: fusing pharm does not switch precision --
+    # there is no SoA twin for the pharmacophore kernel, so the fused path calls the same
+    # _pharm_grad_dq_kernel and gains only the torch-free loop. The divergence is the SCHEDULE:
+    # fine_loop_cpu applies its Adam tail BEFORE the early-stop check, so an N-iteration run is N
+    # evaluations AND N updates, where the eager loop interleaves them the other way. With 32
+    # seeds -- the highest of any mode -- and a strongly multi-basin objective, that difference
+    # relocates the optimum rather than perturbing it. Restoring the speed means making the two
+    # schedules agree, not flipping this gate; and note fine_loop_cpu is shared with vol / surf /
+    # vol_esp / vol_color, so changing its ordering would move THEIR scores too.
+    #
+    # The similarity == 'tanimoto' clause below is retained deliberately and is NOT tuning: it is
+    # load-bearing for correctness. cpu_fused.py's _tail_tanimoto hardcodes the Tanimoto
+    # reduction, so forcing a tversky call through it writes a TANIMOTO score into the
+    # pharm_tversky slot -- measured 509 of 512 scores moved, every one worse, mean 39.44%
+    # relative, and the forced mean was bit-for-bit the pharm-tanimoto mean (same job).
+    _PHARM_CPU_FUSION = False
+    if (_PHARM_CPU_FUSION
+            and _graphed is None and not anchors_1.is_cuda and use_kernel
             and similarity == 'tanimoto' and anchors_1_k.dtype == torch.float32):
         try:
             from ..kernels.cpu_fused import cpu_fused_pharm
