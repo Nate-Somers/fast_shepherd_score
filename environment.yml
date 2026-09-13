@@ -34,6 +34,7 @@ dependencies:
     - py3Dmol>=2.1.0
     - molscrub
     - tqdm
-    - h5py              # ProfileStore screening
+    - threadpoolctl     # runtime MKL/OMP cap for the multi-GPU workers
+    - pytest            # the suite runs off pytest.ini (no --cov, so pytest-cov is optional)
     - meeko             # docking
     - vina==1.2.5       # docking

@@ -70,7 +70,7 @@ def test_numba_batched_matches_per_pair_accel(cloud_name):
     from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS
     nr, ns = MODE_SEEDS["vol_avoid"], MODE_STEPS["vol_avoid"]
 
-    ref_m, fit_m = _mol(IBU), _mol(CAF)
+    ref_m = _mol(IBU)
     if cloud_name == "far":
         avoid = _far_cloud(ref_m)
     elif cloud_name == "mild":

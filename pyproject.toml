@@ -50,6 +50,12 @@ dependencies = [
     # ``environment.yml`` (numba 0.59.1 + icc_rt). Without SVML the kernels are correct but
     # slower and emit a one-time RuntimeWarning.
     "numba",
+    # threadpoolctl is imported by ``accel/multi_gpu.py`` to cap a worker's MKL/OpenBLAS/OMP
+    # pools at RUNTIME. With the ``fork`` start method a worker inherits the parent's
+    # already-sized pools, which env vars cannot resize after import, and uncapped workers
+    # oversubscribe until multi-GPU scaling falls below 1x. The import is best-effort
+    # (try/except), so the package runs without it -- but then the cap covers ATen only.
+    "threadpoolctl",
 ]
 
 [project.urls]
@@ -82,8 +88,15 @@ cpu = [
 #   2. Needs Triton >= 3.6. The overlap kernels use `@triton.autotune(cache_results=...)`,
 #      an API that only exists in Triton 3.6+. On older Triton every GPU kernel dies at
 #      compile with a missing-attribute error and there is no CPU fallback.
+#   3. Needs a torch whose ``torch.cuda.graph`` accepts ``capture_error_mode``, which the
+#      graphed fine loop in ``accel/drivers/_graphed.py`` passes. A capture failure that is
+#      not an OOM is re-raised rather than falling back to eager, so an older torch does not
+#      degrade -- it crashes the alignment. The base ``torch>=1.12`` floor is left alone
+#      because nothing on the CPU path reaches graph capture. Verified: 2.11.0+cu128 with
+#      triton 3.6.0 on CUDA, 2.6.0+cpu for the CPU path.
 gpu = [
     "triton>=3.6",
+    "torch>=2.6",
 ]
 jax = [
     "jax>=0.4.20; python_version <'3.11'",
@@ -149,11 +162,12 @@ ignore = [
 # such as O for an overlap matrix and I for the identity (E741), and short lambdas used as
 # local buffer factories (E731). The rest of the package keeps the project's full strictness.
 "shepherd_score/accel/**" = ["E702", "E741", "E731"]
-# Kernel/backend tests build small numeric fixtures with the same dense idioms.
-"tests/test_numba_backend.py" = ["E402", "E702", "E741"]  # imports follow pytest.importorskip
-"tests/test_cpu_pool.py" = ["E702"]
-"tests/test_screen.py" = ["E702"]
-"tests/test_fast_batch_alignment.py" = ["E731"]
+# The kernel/backend tests build small numeric fixtures with the same dense idioms as the
+# kernels they exercise: semicolon-grouped assignments (E702), single-capital math names
+# (E741), lambda buffer factories (E731), function-local grouped imports behind a
+# pytest.importorskip (E401/E402). One entry rather than a per-file list, which grew with
+# every new mode. ``shepherd_score/`` outside ``accel/`` keeps full strictness.
+"tests/**" = ["E401", "E402", "E702", "E741", "E731"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["shepherd_score"]
