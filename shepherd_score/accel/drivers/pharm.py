@@ -427,19 +427,6 @@ def coarse_fine_pharm_align_many(
     # reduction, so forcing a tversky call through it writes a TANIMOTO score into the
     # pharm_tversky slot -- measured 509 of 512 scores moved, every one worse, mean 39.44%
     # relative, and the forced mean was bit-for-bit the pharm-tanimoto mean (same job).
-    if (_PHARM_CPU_FUSION
-            and _graphed is None and not anchors_1.is_cuda and use_kernel
-            and similarity == 'tanimoto' and anchors_1_k.dtype == torch.float32):
-        try:
-            from ..kernels.cpu_fused import cpu_fused_pharm
-            _al, _Ks, _cats = _pk_tables
-            best_score, best_q, best_t = cpu_fused_pharm(
-                anchors_1_k, anchors_2_k, vectors_1_k, vectors_2_k, types_1_k, types_2_k,
-                q_param, t_param, N_k, M_k, VAA_an + VBB_an, _al, _Ks, _cats, lr, steps_fine,
-                early_stop_patience, early_stop_tol, n_seeds=P)
-            _graphed = True                                # skip the eager loop below
-        except Exception:
-            pass                                           # fall through to the eager loop
 
     for step in range(steps_fine):
         if _graphed is not None:
@@ -587,154 +574,6 @@ def coarse_fine_pharm_align_many(
     return (out_score, out_q, out_t)
 
 
-def fast_optimize_pharm_overlay(
-        ref_pharms: torch.Tensor,
-        fit_pharms: torch.Tensor,
-        ref_anchors: torch.Tensor,
-        fit_anchors: torch.Tensor,
-        ref_vectors: torch.Tensor,
-        fit_vectors: torch.Tensor,
-        similarity: str = 'tanimoto',
-        extended_points: bool = False,
-        only_extended: bool = False,
-        num_repeats: int = 50,
-        trans_centers: Optional[torch.Tensor] = None,
-        num_repeats_per_trans: int = 10,
-        topk: int = 30,
-        steps_fine: int = 100,
-        lr: float = 0.075,
-        **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Fast GPU-accelerated pharmacophore alignment.
-
-    Drop-in replacement for optimize_pharm_overlay with GPU acceleration.
-    Falls back to CPU implementation if CUDA is not available.
-
-    Parameters
-    ----------
-    ref_pharms : torch.Tensor (N,)
-        Reference pharmacophore type indices
-    fit_pharms : torch.Tensor (M,)
-        Fit pharmacophore type indices
-    ref_anchors : torch.Tensor (N, 3)
-        Reference anchor positions
-    fit_anchors : torch.Tensor (M, 3)
-        Fit anchor positions
-    ref_vectors : torch.Tensor (N, 3)
-        Reference direction vectors
-    fit_vectors : torch.Tensor (M, 3)
-        Fit direction vectors
-    similarity : str
-        Similarity function ('tanimoto', 'tversky', etc.)
-    extended_points : bool
-        Use extended points for HBA/HBD
-    only_extended : bool
-        Only score extended points
-    num_repeats : int
-        Number of seeds
-    topk : int
-        Number of top poses to refine
-    steps_fine : int
-        Fine optimization steps
-    lr : float
-        Learning rate
-
-    Returns
-    -------
-    aligned_anchors : torch.Tensor (M, 3)
-        Transformed fit anchors
-    aligned_vectors : torch.Tensor (M, 3)
-        Rotated fit vectors
-    SE3_transform : torch.Tensor (4, 4)
-        Best SE(3) transformation matrix
-    score : torch.Tensor scalar
-        Best similarity score
-    """
-    if not check_gpu_available():
-        from ...alignment._torch import optimize_pharm_overlay
-        return optimize_pharm_overlay(
-            ref_pharms, fit_pharms,
-            ref_anchors, fit_anchors,
-            ref_vectors, fit_vectors,
-            similarity, extended_points, only_extended,
-            num_repeats,
-            trans_centers=trans_centers,
-            lr=lr,
-            max_num_steps=steps_fine,
-            **kwargs)
-
-    device = torch.device('cuda')
-
-    # Move to GPU and add batch dimension
-    ref_anchors_gpu = ref_anchors.to(device, dtype=torch.float32).unsqueeze(0)
-    fit_anchors_gpu = fit_anchors.to(device, dtype=torch.float32).unsqueeze(0)
-    ref_vectors_gpu = ref_vectors.to(device, dtype=torch.float32).unsqueeze(0)
-    fit_vectors_gpu = fit_vectors.to(device, dtype=torch.float32).unsqueeze(0)
-    ref_types_gpu = ref_pharms.to(device, dtype=torch.int64).unsqueeze(0)
-    fit_types_gpu = fit_pharms.to(device, dtype=torch.int64).unsqueeze(0)
-
-    N_real = torch.tensor([ref_anchors.shape[0]], device=device, dtype=torch.int32)
-    M_real = torch.tensor([fit_anchors.shape[0]], device=device, dtype=torch.int32)
-
-    if trans_centers is not None:
-        trans_centers_batch = trans_centers.to(device=device, dtype=torch.float32).unsqueeze(0)
-        trans_centers_real = torch.tensor([trans_centers.shape[0]], device=device, dtype=torch.int32)
-    else:
-        trans_centers_batch = None
-        trans_centers_real = None
-
-    # Precompute self-overlaps
-    VAA = batch_pharm_self_overlap(
-        ref_anchors_gpu,
-        ref_vectors_gpu,
-        ref_types_gpu,
-        extended_points=extended_points,
-        only_extended=only_extended,
-        N_real=N_real,
-    )
-    # memoised like the other wrapper's: VBB depends only on the library, which the screen holds
-    # constant across its query loop. Free, and it cannot change a value. VAA above is left alone
-    # here -- this wrapper's callers cannot yet declare a shared ref. See job 22653340.
-    VBB = _self_overlap_cached(
-        fit_anchors_gpu, fit_vectors_gpu, fit_types_gpu,
-        extended_points=extended_points, only_extended=only_extended, N_real=M_real,
-    )
-
-    # Run alignment
-    score, q_best, t_best = coarse_fine_pharm_align_many(
-        ref_anchors_gpu, fit_anchors_gpu,
-        ref_vectors_gpu, fit_vectors_gpu,
-        ref_types_gpu, fit_types_gpu,
-        VAA, VBB,
-        similarity=similarity,
-        extended_points=extended_points,
-        only_extended=only_extended,
-        num_seeds=num_repeats,
-        trans_centers=trans_centers_batch,
-        trans_centers_real=trans_centers_real,
-        num_repeats_per_trans=num_repeats_per_trans,
-        topk=topk,
-        steps_fine=steps_fine,
-        lr=lr,
-        N_real=N_real,
-        M_real=M_real)
-
-    # Apply transform
-    aligned_anchors = apply_se3_transform(fit_anchors_gpu[0], q_best[0], t_best[0])
-    aligned_vectors = apply_so3_transform(fit_vectors_gpu[0], q_best[0])
-
-    # Build SE(3) matrix
-    R = quaternion_to_rotation_matrix(q_best[0])
-    SE3 = torch.eye(4, device=device)
-    SE3[:3, :3] = R
-    SE3[:3, 3] = t_best[0]
-
-    return (aligned_anchors.cpu(),
-            aligned_vectors.cpu(),
-            SE3.cpu(),
-            score[0].cpu())
-
-
 
 #: One-entry memo for the LIBRARY self-overlap.
 #:
@@ -796,13 +635,6 @@ def _self_overlap_shared_ref(anchors, vectors, types, *, extended_points, only_e
     return one.expand(anchors.shape[0]).contiguous()
 
 
-#: Whether pharm may take the fused numba CPU fine loop. OFF: the fused and eager loops land in
-#: different basins here and the divergence is the largest measured anywhere on the CPU path
-#: (1,668 of 2,048 scores, max 57.96% relative, job 22637530) while buying only 1.025-1.046x.
-#: See the long note at the gate below for the mechanism and what re-enabling would require.
-#: Module-level on purpose: it is a measurable trade, so it must be flippable for an A/B without
-#: editing source.
-_PHARM_CPU_FUSION = False
 
 def fast_optimize_pharm_overlay_batch(
         ref_pharms_batch: torch.Tensor,
