@@ -430,6 +430,10 @@ def align_batch_pharm_arrays(ref_types: torch.Tensor, ref_ancs: torch.Tensor,
                 _rt[sl], _ft[sl], _ra[sl], _fa[sl], _rv[sl], _fv[sl],
                 similarity=similarity, extended_points=extended_points,
                 only_extended=only_extended, num_repeats=n_seeds,
+                # the ref side here is ONE query materialised across the batch by
+                # `r_ancs[:, :N] = ref_ancs` above, so its self-overlap is one scalar computed
+                # BATCH times -- measured 64.6 ms, 10.2% of a 1500-pair screen (job 22653340)
+                ref_shared=True,
                 trans_centers_batch=None, trans_centers_real=None,
                 num_repeats_per_trans=10, N_real=_nr[sl], M_real=_mr[sl],
                 topk=topk, steps_fine=steps_fine, lr=lr)

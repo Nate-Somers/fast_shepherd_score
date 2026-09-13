@@ -427,7 +427,6 @@ def coarse_fine_pharm_align_many(
     # reduction, so forcing a tversky call through it writes a TANIMOTO score into the
     # pharm_tversky slot -- measured 509 of 512 scores moved, every one worse, mean 39.44%
     # relative, and the forced mean was bit-for-bit the pharm-tanimoto mean (same job).
-    _PHARM_CPU_FUSION = False
     if (_PHARM_CPU_FUSION
             and _graphed is None and not anchors_1.is_cuda and use_kernel
             and similarity == 'tanimoto' and anchors_1_k.dtype == torch.float32):
@@ -693,13 +692,12 @@ def fast_optimize_pharm_overlay(
         only_extended=only_extended,
         N_real=N_real,
     )
-    VBB = batch_pharm_self_overlap(
-        fit_anchors_gpu,
-        fit_vectors_gpu,
-        fit_types_gpu,
-        extended_points=extended_points,
-        only_extended=only_extended,
-        N_real=M_real,
+    # memoised like the other wrapper's: VBB depends only on the library, which the screen holds
+    # constant across its query loop. Free, and it cannot change a value. VAA above is left alone
+    # here -- this wrapper's callers cannot yet declare a shared ref. See job 22653340.
+    VBB = _self_overlap_cached(
+        fit_anchors_gpu, fit_vectors_gpu, fit_types_gpu,
+        extended_points=extended_points, only_extended=only_extended, N_real=M_real,
     )
 
     # Run alignment
@@ -737,6 +735,75 @@ def fast_optimize_pharm_overlay(
             score[0].cpu())
 
 
+
+#: One-entry memo for the LIBRARY self-overlap.
+#:
+#: IT DOES NOT CURRENTLY FIRE ON THE ARRAY SCREEN PATH, and that is measured, not suspected:
+#: adding it moved a 3-query screen_many only 1.044x against 1.059x for a single query (job
+#: 22653479), i.e. it contributed nothing beyond the VAA collapse below. The reason is the level
+#: it sits at. ``_run_shards_inproc`` is shard-outer and query-inner and does share the fit TUPLE
+#: across its query loop, but ``_arrays.align_batch_pharm_arrays`` rebuilds the PADDED BUCKET
+#: tensors on every call (``f_ancs = torch.zeros(...)`` then fill), so the driver sees a fresh
+#: allocation per query and the data_ptr key always misses.
+#:
+#: The redundancy it targets IS real -- 3 library-side self-overlap calls for 3 queries, with
+#: self-overlap at 20.3% of a 1.862 s wall (job 22653340). Closing it means hoisting the padded
+#: bucket build out of the per-query call, or computing VBB once per shard in _arrays.py and
+#: passing it down; not a cache at this level. Kept because it is free, correct, and fires the
+#: moment a caller does reuse its inputs -- but do not credit it with a speedup.
+#:
+#: Keyed on data_ptr identity, which is only sound because the entry HOLDS A REFERENCE to the
+#: tensors it keyed on: that keeps the allocation alive, so the pointer cannot be freed and
+#: handed to a different tensor while the key still matches. One entry, so nothing accumulates.
+_VBB_MEMO: dict = {}
+
+
+def _self_overlap_cached(anchors, vectors, types, *, extended_points, only_extended, N_real):
+    """``batch_pharm_self_overlap`` memoised on the identity of its inputs."""
+    key = (anchors.data_ptr(), tuple(anchors.shape), vectors.data_ptr(), types.data_ptr(),
+           None if N_real is None else N_real.data_ptr(),
+           bool(extended_points), bool(only_extended), str(anchors.device), anchors.dtype)
+    hit = _VBB_MEMO.get("k")
+    if hit == key:
+        return _VBB_MEMO["v"]
+    v = batch_pharm_self_overlap(anchors, vectors, types, extended_points=extended_points,
+                                 only_extended=only_extended, N_real=N_real)
+    # hold the inputs so their storage cannot be freed and their data_ptr reused under the key
+    _VBB_MEMO.clear()
+    _VBB_MEMO.update(k=key, v=v, _keep=(anchors, vectors, types, N_real))
+    return v
+
+
+def _self_overlap_shared_ref(anchors, vectors, types, *, extended_points, only_extended,
+                             N_real, shared):
+    """Self-overlap of a REF side that may be one molecule replicated across the batch.
+
+    On a screen the ref is a single query and ``_arrays.py`` materialises it with
+    ``r_ancs[:, :N] = ref_ancs``, so every row is a real copy rather than a broadcast view and
+    there is no stride trick to detect it -- hence the explicit ``shared`` flag, following the
+    ``ref_shared`` convention already used for seed generation in ``batch/aligners.py``.
+
+    Measured: on a 1500-pair screen the ref self-overlap was 64.6 ms on an input whose 1500 rows
+    were byte-identical, i.e. 10.2% of the whole screen spent computing one scalar 1500 times
+    (job 22653340).
+    """
+    if not shared or anchors.shape[0] <= 1:
+        return batch_pharm_self_overlap(anchors, vectors, types, extended_points=extended_points,
+                                        only_extended=only_extended, N_real=N_real)
+    one = _self_overlap_cached(anchors[:1], vectors[:1], types[:1],
+                               extended_points=extended_points, only_extended=only_extended,
+                               N_real=None if N_real is None else N_real[:1])
+    return one.expand(anchors.shape[0]).contiguous()
+
+
+#: Whether pharm may take the fused numba CPU fine loop. OFF: the fused and eager loops land in
+#: different basins here and the divergence is the largest measured anywhere on the CPU path
+#: (1,668 of 2,048 scores, max 57.96% relative, job 22637530) while buying only 1.025-1.046x.
+#: See the long note at the gate below for the mechanism and what re-enabling would require.
+#: Module-level on purpose: it is a measurable trade, so it must be flippable for an A/B without
+#: editing source.
+_PHARM_CPU_FUSION = False
+
 def fast_optimize_pharm_overlay_batch(
         ref_pharms_batch: torch.Tensor,
         fit_pharms_batch: torch.Tensor,
@@ -756,7 +823,8 @@ def fast_optimize_pharm_overlay_batch(
         M_real: Optional[torch.Tensor] = None,
         topk: int = 30,
         steps_fine: int = 100,
-        lr: float = 0.075) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        lr: float = 0.075,
+        ref_shared: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fast GPU-accelerated batch pharmacophore alignment.
 
@@ -801,21 +869,18 @@ def fast_optimize_pharm_overlay_batch(
         M_real = fit_anchors_batch.new_full((BATCH,), M_pad, dtype=torch.int32)
 
     # Precompute self-overlaps
-    VAA = batch_pharm_self_overlap(
-        ref_anchors_batch,
-        ref_vectors_batch,
-        ref_pharms_batch,
-        extended_points=extended_points,
-        only_extended=only_extended,
-        N_real=N_real,
+    # Self-overlaps. Both were measured redundant on a screen (job 22653340) -- see the two
+    # helpers above. VAA collapses to one row when the caller says the ref is shared; VBB is
+    # memoised on input identity so a multi-query panel pays it once per shard, not once per
+    # query. Neither changes a value: same inputs, same self-overlap.
+    VAA = _self_overlap_shared_ref(
+        ref_anchors_batch, ref_vectors_batch, ref_pharms_batch,
+        extended_points=extended_points, only_extended=only_extended,
+        N_real=N_real, shared=ref_shared,
     )
-    VBB = batch_pharm_self_overlap(
-        fit_anchors_batch,
-        fit_vectors_batch,
-        fit_pharms_batch,
-        extended_points=extended_points,
-        only_extended=only_extended,
-        N_real=M_real,
+    VBB = _self_overlap_cached(
+        fit_anchors_batch, fit_vectors_batch, fit_pharms_batch,
+        extended_points=extended_points, only_extended=only_extended, N_real=M_real,
     )
 
     # Run alignment
