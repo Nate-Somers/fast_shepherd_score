@@ -73,3 +73,23 @@ def test_pool_is_reused_for_the_same_library_and_refreshed_for_another():
     assert out["a"] == out["c"], "a fresh pool for the same library returned different scores"
     assert max(abs(x - y) for x, y in zip(out["a"], out["d"])) < 1e-3, \
         "a different shard split moved a score by more than the batch-composition level"
+
+
+def test_shards_are_strided_and_cover_the_library():
+    """Worker w gets w, w+k, w+2k, ...: a library stored as compound ensembles is then spread
+    across the workers instead of handing one of them the largest compounds."""
+    from shepherd_score.accel.screen_parallel import _chunks
+    ch = _chunks(10, 4)
+    assert [list(r) for r in ch] == [[0, 4, 8], [1, 5, 9], [2, 6], [3, 7]]
+    assert sorted(i for r in _chunks(1000, 7) for i in r) == list(range(1000))
+    assert len(_chunks(3, 8)) == 3, "never more chunks than molecules"
+
+
+def test_physical_core_selection_takes_one_cpu_per_sibling_group(tmp_path, monkeypatch):
+    from shepherd_score.accel import screen_parallel as sp
+    if not os.path.isdir("/sys/devices/system/cpu/cpu0/topology"):
+        pytest.skip("no CPU topology in /sys on this platform")
+    allowed = set(os.sched_getaffinity(0))
+    cores = sp._physical_cores(allowed)
+    assert cores and set(cores) <= allowed and len(cores) == len(set(cores))
+    assert len(cores) <= len(allowed)

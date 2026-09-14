@@ -207,7 +207,9 @@ hits = screen(Molecule(query_rdmol, num_surf_points=200),
 GPUs and `scores_out=` to write full score vectors (memmap-friendly; single-process only — passing it
 with `ndev>1` raises). The `ndev>1` workers — one process per device, each streaming its share of the
 shards with the same read-ahead as the single-process screen — are spawned on the first call and kept
-for later screens; `screen.close_multigpu_pool()` releases them (also run at interpreter exit).
+for later screens; `screen.close_multigpu_pool()` releases them (also run at interpreter exit). On a
+canonical store the workers run the same constant `vol` seed set as the single-process screen (they
+ran per-molecule seeds before, at 2.1× the cost per shard, so two devices screened no faster than one).
 
 Things that will bite you:
 
@@ -281,7 +283,12 @@ mode names only, returning a plain list of scores in library order — no `Hit`s
 The forked pool is **kept** for later calls against the same library (keyed by the list object's
 identity and length, so a new list or a resized one forks afresh, while molecules mutated in place
 after the first call are not seen by the workers); `screen_parallel_close()` releases it, and it is
-also run at interpreter exit. Forking was the per-call cost that grew with the worker count.
+also run at interpreter exit. Forking was the per-call cost that grew with the worker count. Each
+worker pins itself to its own physical core (one CPU per hardware-thread sibling group of the process's
+affinity mask; a no-op without `/sys` topology) and the library is dealt out strided — worker *w* gets
+*w*, *w+k*, *w+2k*, … — because unpinned workers landed on sibling threads of busy cores (8 of 64 on a
+96-core node, 1.8× the ideal time) and contiguous ranges of compound ensembles handed one worker the
+largest compounds.
 
 **Torch is pinned to one intra-op thread for a CPU batch alignment, then restored.** The numba kernels
 own the cores there; unpinned, torch's pool spin-waits against them. Scoped rather than global, so it

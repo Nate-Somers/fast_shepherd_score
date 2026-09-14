@@ -2001,6 +2001,39 @@ def _iter_shards_prefetched(store, shard_idxs):
         ex.shutdown(wait=True)                  # never leave a reader thread behind
 
 
+def _canonical_batch_kw(store, qs_ref, mode, device, batch_kw, fast=True):
+    """``batch_kw`` plus ``const_seeds`` when this screen can use them: a CANONICAL store, the
+    ``vol`` array path, one query. Seeds are then one constant set for the whole screen (see
+    _common.canonical_seed_quats) instead of a per-molecule eigensolve, which is the 1.5-2x the
+    canonical store exists for. Unchanged ``batch_kw`` otherwise.
+
+    ONE helper for the in-process shard loop AND the multi-GPU worker, deliberately: the worker
+    used to take ``batch_kw`` as handed to it, so on the same canonical store it ran the
+    per-molecule seeds and cost 2.1x the in-process screen per shard (measured 2026-09-14,
+    Shepherd-Score-Paper fig2_speed/p6_gpu_probe.py: 1.98 s against 0.94 s for 1e6 vol
+    conformers on one L40S, whatever the host-thread cap or socket), which is why two devices
+    screened no faster than one.
+
+    Gated on ``fast and _use_arrays`` because ``const_seeds`` is a parameter of
+    ``align_batch_vol_arrays`` ALONE -- the object path's ``_align_batch_vol`` has no such
+    keyword and raises TypeError on it. Those routes keep the per-molecule PCA seeds, which stay
+    CORRECT on a canonical store (they are derived from whatever coordinates it holds); they
+    just forgo the speedup.
+    """
+    if not (fast and _use_arrays(mode) and getattr(store, "canonical", False)
+            and mode == "vol" and len(qs_ref) == 1):
+        return batch_kw
+    _rx = qs_ref[0].get("xyz")
+    if _rx is None:
+        return batch_kw
+    from shepherd_score.accel.drivers._common import canonical_seed_quats
+    from .accel._modes import MODE_SEEDS
+    batch_kw = dict(batch_kw)
+    batch_kw["const_seeds"] = canonical_seed_quats(_rx, len(_rx), int(MODE_SEEDS.get(mode, 10)),
+                                                   device)
+    return batch_kw
+
+
 def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                        align_kwargs, backend, fast, center_profiles, scores_out, progress,
                        n_total):
@@ -2023,23 +2056,9 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
     try:
         heaps = [_TopK(top_k) for _ in qs_ref]
         tf_attr = _TRANSFORM_ATTR[mode]
-        # CANONICAL store: seeds are one constant set for the whole screen (see
-        # _common.canonical_seed_quats). Computed here, once, instead of per molecule per bucket.
-        # Gated on ``fast and _use_arrays`` because ``const_seeds`` is a parameter of
-        # ``align_batch_vol_arrays`` ALONE -- the object path's ``_align_batch_vol`` has no such
-        # keyword and raises TypeError on it, so an ungated canonical store crashed outright with
-        # the object path. Those routes simply keep the per-molecule PCA seeds, which stay
-        # CORRECT on a canonical store (they are derived from whatever coordinates the store
-        # holds) -- they just forgo the speedup.
-        if (fast and _use_arrays(mode) and getattr(store, "canonical", False)
-                and mode == "vol" and len(qs_ref) == 1):
-            from shepherd_score.accel.drivers._common import canonical_seed_quats
-            from .accel._modes import MODE_SEEDS
-            _rx = qs_ref[0].get("xyz")
-            if _rx is not None:
-                batch_kw = dict(batch_kw)
-                batch_kw["const_seeds"] = canonical_seed_quats(
-                    _rx, len(_rx), int(MODE_SEEDS.get(mode, 10)), device)
+        # CANONICAL store: one constant seed set for the whole screen, computed once here
+        # instead of per molecule per bucket. The same helper serves the multi-GPU worker.
+        batch_kw = _canonical_batch_kw(store, qs_ref, mode, device, batch_kw, fast)
         done = 0
         if not fast:
             from shepherd_score.container import MoleculePair, MoleculePairBatch
@@ -2367,6 +2386,9 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
         ref_tensors = [_ref_tensors_from_arrays(ra, mode, dev) for ra in ref_arrays_list]
         heaps = [_TopK(top_k) for _ in ref_arrays_list]
         tf_attr = _TRANSFORM_ATTR[mode]
+        # The canonical store's constant seeds, exactly as the in-process loop sets them; without
+        # this the worker ran per-molecule seeds on the same store at 2.1x the cost per shard.
+        batch_kw = _canonical_batch_kw(store, ref_arrays_list, mode, dev, batch_kw)
 
         def _drain(q):                                     # the queue form: serial reads
             while True:

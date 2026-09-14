@@ -21,6 +21,18 @@ the same list resized, forks a new pool, while molecules mutated in place after 
 not seen by the workers. Call :func:`screen_parallel_close` to release the workers early (it is
 also registered with :mod:`atexit`).
 
+WORKERS ARE PINNED, SHARDS ARE STRIDED (Linux). Measured on a 96-core, 192-thread node
+(Shepherd-Score-Paper fig2_speed/p6_cpu_place_probe.py, 2026-09-14): unpinned, the scheduler put
+8 of 64 workers on the hyperthread sibling of an already-busy core, the slowest chunk ran at half
+speed and the screen took 1.83x its ideal time; pinned to one physical core each it took 1.20x.
+So each worker pins itself to its own physical core (one CPU per sibling group of the process's
+affinity mask; a no-op where /sys has no topology) at pool start. The remaining 20% was chunk
+imbalance: a CONTIGUOUS range of a library that holds whole-compound conformer ensembles gives
+one worker the largest compounds, so the library is dealt out strided instead (worker w gets
+w, w+k, w+2k, ...), which spreads every compound across the workers. Scores are returned in
+library order either way; a different split moves a score at the 1e-4 level (the padded batch
+composition feeds the seed frame), as any change of worker count already did.
+
 fork-safety: ALL numba work happens in the forked workers — the parent never runs a numba prange,
 so libgomp is never active in it at fork time (forking a process with a live GNU-OpenMP pool aborts
 the child). So do not run an in-process numba align before the FIRST call for a library; featurize,
@@ -63,8 +75,44 @@ def _shard(task):
 
 
 def _chunks(n, k):
-    """k contiguous index ranges covering range(n), balanced to +/-1."""
-    return [range(i * n // k, (i + 1) * n // k) for i in range(k) if i * n // k < (i + 1) * n // k]
+    """k strided index ranges covering range(n): worker w gets w, w+k, w+2k, ... (balanced to
+    +/-1 in count, and in molecule size when the library is stored as compound ensembles)."""
+    return [range(w, n, k) for w in range(min(k, n))]
+
+
+def _physical_cores(allowed):
+    """One CPU per physical core among ``allowed`` (the lowest hardware-thread sibling), in CPU
+    order; ``allowed`` itself where the topology is not exposed."""
+    try:
+        seen, cores = set(), []
+        for c in sorted(allowed):
+            if c in seen:
+                continue
+            with open(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list") as f:
+                spec = f.read().strip()
+            sib = set()
+            for part in spec.split(","):
+                a, _, b = part.partition("-")
+                sib.update(range(int(a), int(b or a) + 1))
+            sib &= set(allowed)
+            seen |= sib
+            cores.append(min(sib))
+        return cores
+    except (OSError, ValueError):
+        return sorted(allowed)
+
+
+def _pin_worker(cores):
+    """Pool initializer: pin this worker to ``cores[worker number]`` (wrapping when there are
+    more workers than cores). Worker numbers are contiguous within one pool."""
+    if not cores:
+        return
+    from multiprocessing import current_process
+    ident = getattr(current_process(), "_identity", None) or (1,)
+    try:
+        os.sched_setaffinity(0, {cores[(ident[0] - 1) % len(cores)]})
+    except (AttributeError, OSError):      # no sched_setaffinity, or a CPU we may not use
+        pass
 
 
 def screen_parallel_close():
@@ -101,7 +149,12 @@ def _pool_for(library, n_workers):
     os.environ.update(_cap)
     try:
         # Always fork (even for 1 worker): keeps the parent numba-clean so the fork is libgomp-safe.
-        pool = get_context("fork").Pool(n_workers)      # fork -> COW-inherit the library
+        # Each worker pins itself to its own physical core (see the module docstring).
+        try:
+            cores = _physical_cores(os.sched_getaffinity(0))
+        except AttributeError:                           # no affinity API on this platform
+            cores = []
+        pool = get_context("fork").Pool(n_workers, initializer=_pin_worker, initargs=(cores,))
     finally:
         for k, v in _saved.items():
             if v is None:

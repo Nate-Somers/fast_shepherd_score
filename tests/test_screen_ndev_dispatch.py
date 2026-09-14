@@ -54,7 +54,8 @@ class _FakeStore:
         return 1
 
 
-def _install_recorders(mp, seen):
+def _install_recorders(mp, seen, seen_kw=None):
+    seen_kw = [] if seen_kw is None else seen_kw
     """Point every builder and aligner at a recorder that reports WHICH MODE's entry ran.
 
     The tables are replaced wholesale AND the two pre-fix module globals are replaced with the
@@ -74,6 +75,10 @@ def _install_recorders(mp, seen):
         # regression would surface as a TypeError rather than as the assertion below.
         def align(*a, **k):
             seen.append(("align", key))
+            # The fixed call shape is (ref, fit, batch_kw); keep batch_kw so a test can check
+            # what the driver put in it (the canonical store's const_seeds).
+            if len(a) >= 3 and isinstance(a[2], dict):
+                seen_kw.append(a[2])
             return np.zeros(1), np.zeros((1, 4, 4), dtype=np.float32)
         return align
 
@@ -86,19 +91,26 @@ def _install_recorders(mp, seen):
                lambda ra, mode, device: {"_ref_xyz_t": None}, raising=True)
 
 
-def _run_worker(mp, mode, share=None):
+def _run_worker(mp, mode, share=None, store_cls=_FakeStore, ref_arrays=None, seen_kw=None):
     """Drive ``_screen_worker`` for one mode and return what it selected: on one shard pulled
     off a queue (the hand-driven form), or on ``share``, a static LIST of shard indices (the
     form the persistent pool hands its workers, streamed with read-ahead)."""
     seen = []
-    _install_recorders(mp, seen)
-    mp.setattr(scr, "ProfileStore", _FakeStore, raising=True)
+    _install_recorders(mp, seen, seen_kw)
+    mp.setattr(scr, "ProfileStore", store_cls, raising=True)
     mp.setattr(torch.cuda, "set_device", lambda *a, **k: None, raising=True)
     mp.setattr(torch.cuda, "synchronize", lambda *a, **k: None, raising=True)
     # _cap_threads calls torch.set_num_threads, which is process-global. The worker normally
     # owns its own spawned process; here it is running inside the test process.
     import shepherd_score.accel.multi_gpu as mg
     mp.setattr(mg, "_cap_threads", lambda threads: None, raising=True)
+    # The worker addresses cuda:<rank>; the canonical store's seed set is the one real
+    # computation it now runs, so on a CPU-only box it is built on the CPU instead. The values
+    # are what the const_seeds test compares.
+    import shepherd_score.accel.drivers._common as _dc
+    _real_seeds = _dc.canonical_seed_quats
+    mp.setattr(_dc, "canonical_seed_quats",
+               lambda xyz, n, k, device: _real_seeds(xyz, n, k, "cpu"), raising=True)
 
     class _ShardQ:
         def __init__(self):
@@ -119,8 +131,8 @@ def _run_worker(mp, mode, share=None):
     # process it was written for, not here.
     prev = getattr(_DISPATCH_LOCAL, "active", False)
     try:
-        scr._screen_worker(0, 1, "<fake>", [{}], mode, _BATCH_KW, 1,
-                           _ShardQ() if share is None else share, out)
+        scr._screen_worker(0, 1, "<fake>", [{} if ref_arrays is None else ref_arrays], mode,
+                           _BATCH_KW, 1, _ShardQ() if share is None else share, out)
     finally:
         _DISPATCH_LOCAL.active = prev
 
@@ -131,13 +143,51 @@ def _run_worker(mp, mode, share=None):
     return seen
 
 
-def _run_inproc(mp, mode):
+def _run_inproc(mp, mode, store=None, ref_arrays=None, seen_kw=None):
     """Drive ``_run_shards_inproc`` over the same one shard and return what it selected."""
     seen = []
-    _install_recorders(mp, seen)
-    scr._run_shards_inproc(_FakeStore(), [0], [{}], mode, torch.device("cpu"), 1,
-                           _BATCH_KW, {}, "numba", True, False, None, False, 1)
+    _install_recorders(mp, seen, seen_kw)
+    scr._run_shards_inproc(_FakeStore() if store is None else store, [0],
+                           [{} if ref_arrays is None else ref_arrays], mode, torch.device("cpu"),
+                           1, _BATCH_KW, {}, "numba", True, False, None, False, 1)
     return seen
+
+
+class _CanonicalFakeStore(_FakeStore):
+    """The same one empty shard, flagged canonical, so the vol screen may use constant seeds."""
+
+    canonical = True
+
+    @staticmethod
+    def open(path):
+        return _CanonicalFakeStore()
+
+
+def test_worker_uses_the_canonical_stores_constant_seeds_like_the_inproc_loop(monkeypatch):
+    """On a canonical store the in-process vol loop passes ``const_seeds`` (one seed set for the
+    whole screen, the 1.5-2x the store exists for). The worker did not: it ran per-molecule seeds
+    on the same store at 2.1x the in-process cost per shard, so two GPUs screened no faster than
+    one (Shepherd-Score-Paper fig2_speed/p6_gpu_probe.py, 2026-09-14). Both must hand the
+    aligner the same seed tensor."""
+    rng = np.random.default_rng(0)
+    xyz = rng.standard_normal((12, 3)).astype(np.float32)
+    kw_w, kw_i = [], []
+    with monkeypatch.context() as mp:
+        _run_worker(mp, "vol", share=[0], store_cls=_CanonicalFakeStore,
+                    ref_arrays={"xyz": xyz}, seen_kw=kw_w)
+    with monkeypatch.context() as mp:
+        _run_inproc(mp, "vol", store=_CanonicalFakeStore(), ref_arrays={"xyz": xyz}, seen_kw=kw_i)
+    assert kw_w and kw_i, "the recorders saw no batch_kw"
+    assert "const_seeds" in kw_i[0], "the in-process loop no longer sets const_seeds"
+    assert "const_seeds" in kw_w[0], "the multi-GPU worker runs per-molecule seeds on a canonical store"
+    a, b = kw_w[0]["const_seeds"], kw_i[0]["const_seeds"]
+    assert np.allclose(np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)), \
+        "worker and in-process loop derived different constant seeds from the same query"
+    assert "steps_fine" in kw_w[0] and kw_w[0] is not _BATCH_KW, "batch_kw must be copied, not mutated"
+    with monkeypatch.context() as mp:                  # a non-canonical store: no const_seeds
+        kw_n = []
+        _run_worker(mp, "vol", share=[0], ref_arrays={"xyz": xyz}, seen_kw=kw_n)
+    assert kw_n and "const_seeds" not in kw_n[0]
 
 
 def test_array_tables_cover_every_array_mode():
