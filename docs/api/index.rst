@@ -30,6 +30,14 @@ Alignment
 
    alignment/index
 
+Screening
+---------
+
+.. toctree::
+   :maxdepth: 2
+
+   screening
+
 Evaluations
 -----------
 

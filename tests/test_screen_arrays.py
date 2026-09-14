@@ -180,8 +180,13 @@ def store_path(tmp_path_factory, molecules):
     moment it joins ``_ARRAY_MODES``.
     """
     p = os.path.join(tmp_path_factory.mktemp("arrays"), "lib.fss")
+    # NON-canonical, explicitly. Every parity test in this file asks whether the array path and the
+    # object path agree bit for bit, which is only defined when both run the same seeds; on a
+    # canonical store (the library default for any store that serves vol) the array path runs a
+    # constant seed set that the object path does not, and the two legitimately differ at ~1e-2.
+    # The canonical store has its own section below.
     with ProfileStore.create(p, num_surf_points=64, modes=_MODES,
-                             dtype="float32", pre_centered=True) as store:
+                             dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
             store.add(m, id=i)
     return p
@@ -465,10 +470,12 @@ def _canonical_store(tmp_path, molecules):
 
 
 def _plain_store(tmp_path, molecules):
-    """Same library, same modes, canonical OFF -- the control leg."""
+    """Same library, same modes, canonical OFF -- the control leg. Said explicitly: a pre-centred
+    vol store is canonical by default, so relying on the default here would make the control leg
+    canonical too and this section would compare a store with itself."""
     p = os.path.join(tmp_path, "plain.fss")
     with ProfileStore.create(p, num_surf_points=64, modes=("vol",), dtype="float32",
-                             pre_centered=True) as store:
+                             pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
             store.add(m, id=i)
     return p

@@ -470,7 +470,7 @@ class ProfileStore:
     def create(cls, path, *, num_surf_points: int, modes: Sequence[str],
                dtype: str = "float16", shard_size: int = 100_000,
                pre_centered: bool = True, overwrite: bool = False,
-               canonical: bool = False,
+               canonical: Optional[bool] = None,
                shard_format: str = "npy") -> "ProfileStore":
         """Open a store for writing.
 
@@ -496,6 +496,21 @@ class ProfileStore:
             while matching ``MoleculePair(do_center=True)`` global-alignment semantics.
         overwrite : bool
             If True, delete any existing shards + manifest in ``path`` first.
+        canonical : bool, optional
+            Store every profile rotated into its own principal-axis frame (the
+            centroid-relative eigenframe of its heavy atoms), with the rotation kept so
+            that returned transforms are composed back to the original centred frame.
+            A ``vol`` screen against such a store runs one constant seed set instead of
+            a per-molecule eigensolve, roughly 1.5-2x faster on GPU; the other modes
+            re-derive their seeds from the rotated coordinates and gain nothing, while
+            the different seed set moves their scores at the 1e-3 level (a non-canonical
+            store matches the pairwise path to ~1e-4). Requires ``pre_centered``.
+            Default (``None``): canonical when the store serves ``vol`` and is
+            pre-centred, raw centred coordinates otherwise. Pass ``True`` or ``False``
+            to decide explicitly. Screening scores and DUDE-Z enrichment on canonical
+            stores were validated against non-canonical stores and the pairwise path
+            before this became the default (Shepherd-Score-Paper,
+            fig2_speed/validate_canonical.py, results/CANONICAL_validation.json).
 
         Notes
         -----
@@ -508,6 +523,16 @@ class ProfileStore:
         if dtype not in ("float16", "float32"):
             raise ValueError("dtype must be 'float16' or 'float32'")
         modes = tuple(modes)
+        if canonical is None:
+            # The library default: canonical when the store serves ``vol`` and is pre-centred.
+            # Only the vol screen runs a constant seed set against a canonical store (1.5-2x on
+            # GPU); every other mode re-derives its seeds from the rotated coordinates and gains
+            # nothing, while the different seed set moves its scores at the 1e-3 level
+            # (Shepherd-Score-Paper fig2_speed/validate_canonical.py). A store without vol
+            # therefore keeps raw centred coordinates, which match the pairwise path to ~1e-4.
+            canonical = bool(pre_centered) and ("vol" in modes)
+        elif canonical and not pre_centered:
+            raise ValueError("canonical stores require pre_centered=True (axes are centroid-relative)")
         schema = _schema_from_modes(modes)
         os.makedirs(path, exist_ok=True)
         manifest_path = os.path.join(path, cls.MANIFEST)

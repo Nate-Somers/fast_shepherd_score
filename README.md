@@ -292,6 +292,52 @@ scores, aligned = batch.align_with_vol()
 scores, aligned = batch.align_with_vol(num_workers=4, num_buckets=4, use_shmap=True)
 ```
 
+### Virtual screening (`ProfileStore` + `screen`)
+For one query against a large library, featurise the library once into an on-disk `ProfileStore`
+and stream it past the query with `screen`. The store keeps only the arrays the requested modes
+need (float16 by default, about 200 bytes per molecule for `vol`), in shards, so the library is
+never held in RAM and a screen of ten million conformers runs from disk.
+
+```python
+import numpy as np
+from shepherd_score.container import Molecule
+from shepherd_score.screen import ProfileStore, screen
+
+# Build once. Each library entry is a featurised Molecule (conformer, charges, surface,
+# pharmacophores -- see "Extraction" above). One store serves every mode listed at creation.
+store = ProfileStore.create("library.fss", num_surf_points=200, modes=("vol", "vol_esp"))
+for m in library_molecules:            # any iterable; nothing accumulates in RAM
+    store.add(m)
+store.close()
+
+# Screen as often as you like. backend=None resolves to triton on a CUDA machine, numba otherwise.
+store = ProfileStore.open("library.fss")
+hits = screen(query_molecule, store, mode="vol", top_k=1000)      # [Hit(score, id, transform), ...]
+hits = screen(query_molecule, store, mode="vol_esp", top_k=1000, lam=0.1)
+
+# Every score in library order (e.g. for an enrichment analysis), not only the top-K
+scores = np.empty(len(store), dtype=np.float32)
+screen(query_molecule, store, mode="vol", top_k=1, scores_out=scores)
+
+# Several GPUs on one node: one worker process per device
+hits = screen(query_molecule, store, mode="vol", ndev=4)
+```
+
+- `num_surf_points` and the mode-specific kwargs (`alpha` for the surface modes, `lam` for the
+  ESP modes) must match how the query was built; `screen` raises if a required kwarg is missing.
+- A store that serves `vol` is **canonical** by default: each molecule is stored rotated into its
+  principal-axis frame, which lets the `vol` screen run one constant seed set instead of a
+  per-molecule eigensolve (roughly 1.5-2x faster on GPU). Returned transforms are composed back
+  to the centred frame, so hits read the same either way. The seed set differs from the pairwise
+  path's, so `vol` scores from a canonical store differ from `MoleculePair` scores at the 1e-3
+  level on average (rankings agree: top-1000 overlap 99%); stores without `vol` keep raw centred
+  coordinates, which match the pairwise path to ~1e-4. Pass `canonical=True/False` to
+  `ProfileStore.create` to decide explicitly.
+- A store directory is single-writer. For a parallel build, give each worker its own store and
+  screen the parts in turn.
+- On CPU, `screen(..., backend="numba")` reaches full speed only with the SVML build described
+  under *Fast CPU alignment* above.
+
 ## Evaluation Examples and Scripts
 
 We implement three evaluations of generated 3D conformers. Evaluations can be done on an individual basis or in a pipeline. Here we show the most basic use case in the unconditional setting.

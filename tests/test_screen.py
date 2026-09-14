@@ -93,16 +93,49 @@ def test_store_heavy_charges_identity_index(tmp_path):
 
 
 def test_store_pre_centered(tmp_path):
-    """pre_centered=True shifts to the heavy-atom COM but preserves geometry."""
+    """pre_centered=True shifts to the heavy-atom COM but preserves geometry.
+
+    ``canonical=False`` explicitly: a pre-centred vol store is canonical BY DEFAULT now, which
+    also rotates the coordinates into the principal frame; this test is about the centring alone.
+    """
     store_path = os.path.join(tmp_path, "lib.fss")
     p = _synthetic_profile(0, with_full_charges=False)
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol",),
-                             dtype="float32", pre_centered=True) as store:
+                             dtype="float32", pre_centered=True, canonical=False) as store:
         store.add_profile(p)
     got = next(iter(ProfileStore.open(store_path).iter_shards()))[0]
     np.testing.assert_allclose(got.atom_pos.mean(0), 0.0, atol=1e-5)
     np.testing.assert_allclose(got.atom_pos - got.atom_pos.mean(0),
                                p.atom_pos - p.atom_pos.mean(0), atol=1e-6)
+
+
+def test_store_is_canonical_by_default_only_when_it_serves_vol(tmp_path):
+    """``canonical=None`` resolves to True for a pre-centred store whose modes include ``vol`` --
+    the one mode whose screen runs a constant seed set against a canonical store -- and to False
+    for a store without it, which gains nothing from the rotation. A canonical store's
+    ``atom_pos`` is the molecule in its own principal frame: still centred, and the geometry is
+    preserved up to that rotation (every pairwise distance). Canonical without pre-centring is
+    refused, since the axes are centroid-relative."""
+    p = _synthetic_profile(0, with_full_charges=False)
+
+    vol = os.path.join(tmp_path, "vol.fss")
+    with ProfileStore.create(vol, num_surf_points=64, modes=("vol",), dtype="float32") as store:
+        store.add_profile(p)
+    st = ProfileStore.open(vol)
+    assert st.canonical is True
+    got = next(iter(st.iter_shards()))[0]
+    np.testing.assert_allclose(got.atom_pos.mean(0), 0.0, atol=1e-5)
+    dist = lambda x: np.linalg.norm(x[:, None, :] - x[None, :, :], axis=-1)   # noqa: E731
+    np.testing.assert_allclose(dist(got.atom_pos), dist(p.atom_pos), atol=1e-4)
+
+    surf = os.path.join(tmp_path, "surf.fss")
+    with ProfileStore.create(surf, num_surf_points=64, modes=("surf",), dtype="float32") as store:
+        store.add_profile(p)
+    assert ProfileStore.open(surf).canonical is False
+
+    with pytest.raises(ValueError):
+        ProfileStore.create(os.path.join(tmp_path, "bad.fss"), num_surf_points=64,
+                            modes=("vol",), pre_centered=False, canonical=True)
 
 
 def test_float16_store_is_lossy_but_close(tmp_path):

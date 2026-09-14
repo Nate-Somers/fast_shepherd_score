@@ -3,7 +3,7 @@
 What this package adds to `coleygroup/shepherd-score`, and what an existing caller must change.
 Upstream at `20ebed7`, this fork at `main`.
 
-> ## ⚠️ Five changes affect existing results or installs
+> ## ⚠️ Six changes affect existing results or installs
 >
 > 1. **`align_with_*` on a batch no longer defaults to JAX** — it is device-aware (Triton on CUDA,
 >    numba on CPU), and those backends use a different SE(3) seed set, so a default call returns
@@ -15,6 +15,10 @@ Upstream at `20ebed7`, this fork at `main`.
 >    a converged neighbour. Search effort is unchanged. [B9](#b9-early-stopping-is-per-pair)
 > 5. **`pharm` CPU scores changed** — its fused CPU loop found different optima, so it is disabled.
 >    [B12](#b12-pharm-cpu-scores-changed)
+> 6. **Profile stores that serve `vol` are canonical by default** — such a store holds each molecule
+>    in its principal-axis frame, and a `vol` screen against it runs one constant seed set, so `vol`
+>    screening scores differ slightly (1e-3 on average) from a store built before; existing stores
+>    are unchanged. `ProfileStore.create(..., canonical=False)` restores the old layout. [B13](#b13-profile-stores-are-canonical-by-default)
 
 The fork is additive — no upstream file deleted, no upstream public name removed — and it merges
 upstream's own `Molecule` refactor and interaction-subselection work, so a fork→upstream merge is a
@@ -219,6 +223,11 @@ Things that will bite you:
   `pre_centered=False`.
 - **`shard_size` is a GPU-memory knob**, not just I/O: a whole shard uploads as device tensors at
   once, and a screen holds **two** shards in host RAM (the one aligning plus one read ahead).
+- **Stores that serve `vol` are canonical by default** (`canonical=None`): each molecule is stored
+  rotated into its principal-axis frame, which lets a `vol` screen skip the per-molecule eigensolve
+  for one constant seed set (roughly 1.5–2× on GPU). Transforms are composed back to the centered
+  frame, so `Hit.transform` reads the same as on a non-canonical store. Stores without `vol` keep
+  raw centered coordinates. See [B13](#b13-profile-stores-are-canonical-by-default).
 - **`trans_init=True`, `backend="jax"`, or a non-pre-centered store** drop you onto a much slower
   object path.
 - A killed build leaves a **readable store** of every completed shard. A store is **single-writer**.
@@ -555,6 +564,23 @@ where the eager loop interleaves them the other way. With 32 seeds — the most 
 strongly multi-basin objective, that relocates the optimum rather than perturbing it. The fused path
 is therefore **disabled for `pharm`** — the standard `surf_esp` is excluded under — at a few percent
 less throughput. **Any `pharm` CPU score produced before this came from the fused trajectory.**
+
+### B13. Profile stores are canonical by default
+
+`ProfileStore.create` now defaults `canonical` to `True` when the store's modes include `vol` (and
+`pre_centered` is on), so such a store holds every molecule rotated into its own principal-axis frame
+with the rotation kept. Screening `vol` against it runs one constant seed set instead of a
+per-molecule eigensolve — this is what the paper's screening throughput was measured on — and the
+transforms it returns are composed back to the centered frame. Because that seed set differs from
+the per-molecule one, **`vol` scores from a canonical store differ from a non-canonical store's, and
+from `MoleculePair`, by about 1e-3 on average** (Spearman 0.997, top-1000 overlap 99% at N=99,000),
+with a few molecules landing in a different optimizer basin. The same holds for every other mode on
+a canonical store, but those modes gain no speed from it, so a store without `vol` stays
+non-canonical and matches the pairwise path to ~1e-4. Stores already on disk keep their manifest's
+`canonical=False` and are unaffected. Before this became the default, screening scores
+and DUDE-Z enrichment on canonical stores were validated against non-canonical stores and against the
+pairwise path (Shepherd-Score-Paper, `paper/fig2_speed/validate_canonical.py` and its
+`results/CANONICAL_validation.json`). Pass `canonical=False` for the previous layout.
 
 ### Minor
 
