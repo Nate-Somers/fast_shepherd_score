@@ -61,6 +61,6 @@ Writing a prepared molecule into a `vol` profile store costs about 29 us (canoni
 
 ## Multi-device scaling
 
-Sharding a 10^7-conformer `vol` screen across four L40S raised the compute rate 1.7x; the per-device worker startup (about 4 s) cancelled the wall-clock gain at that size. On CPU the fork-sharded driver (`shepherd_score.accel.screen_parallel`) peaks at 7.2x on 16 workers for N = 10^5, where per-call overhead of about 0.13 s per worker dominates; larger libraries amortise it. Both are documented in the paper repository's results.
+Sharding a 10^6-conformer `vol` screen across L40S devices with `screen(ndev=k)`, one worker process per device kept for the life of the calling process, gave 1,071,914 alignments/s on one device, 1,105,253 on two and 1,808,852 on four (1.7x): 0.93, 0.90 and 0.55 s per screen after the first. Starting the workers costs 2.9 s (two devices) or 4.0 s (four), once per process, and each screen then carries about 0.02 s of fixed cost. On CPU the fork-sharded driver (`shepherd_score.accel.screen_parallel`) peaked at 7.2x on 16 workers for N = 10^5 in the version that forked its pool on every call (about 0.13 s per worker per call); the pool now persists across calls against the same library, and that measurement has not been repeated. Both are documented in the paper repository's results.
 
 The earlier version of this page reported the Jax/PyTorch batch paths at 10^2-10^3 alignments per second; those paths are superseded by the numba and triton back ends measured above, which `backend=None` selects.
