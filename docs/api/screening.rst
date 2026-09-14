@@ -14,3 +14,15 @@ for the end-to-end example.
 .. autofunction:: shepherd_score.screen.screen
 
 .. autofunction:: shepherd_score.screen.screen_many
+
+.. autofunction:: shepherd_score.screen.close_multigpu_pool
+
+Shard-parallel CPU screening
+----------------------------
+
+A RAM-resident list of molecules screened across forked worker processes, one
+core each; the pool is kept for later calls against the same library.
+
+.. autofunction:: shepherd_score.accel.screen_parallel.screen_parallel
+
+.. autofunction:: shepherd_score.accel.screen_parallel.screen_parallel_close

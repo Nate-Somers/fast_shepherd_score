@@ -48,6 +48,7 @@ Example
 """
 from __future__ import annotations
 
+import atexit
 import copy
 import heapq
 import json
@@ -2185,7 +2186,8 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
 
     See :func:`screen` for the per-query parameters. ``scores_out`` may be a list of
     one preallocated array per query (single-process only). ``ndev>1`` streams shards
-    across a persistent one-process-per-GPU pool (fast modes only).
+    across one worker process per GPU, spawned on the first such call and kept until
+    :func:`close_multigpu_pool` or interpreter exit (fast modes only).
     """
     import torch
     queries = list(queries)
@@ -2302,7 +2304,9 @@ def screen(query, store: "ProfileStore", mode: str = "surf_esp", *,
     top_k : int
         Number of best hits to retain. Default 1000.
     ndev : int, optional
-        Stream shards across this many GPUs via a persistent pool (fast modes only).
+        Stream shards across this many GPUs, one worker process per device (fast modes only).
+        The workers are spawned on the first ``ndev>1`` call and kept for later screens;
+        :func:`close_multigpu_pool` releases them (also run at interpreter exit).
     scores_out : np.ndarray, optional
         Preallocated ``(len(store),)`` array (e.g. an ``np.memmap``) written with every
         score in library order. Single-process only.
@@ -2325,14 +2329,29 @@ def screen(query, store: "ProfileStore", mode: str = "surf_esp", *,
 
 
 # --------------------------------------------------------------------------- #
-# Multi-GPU: persistent one-process-per-GPU pool, spawned ONCE, that streams shards
-# (NOT respawned per shard like align_multi_gpu). Each worker pins to a GPU, holds
-# its query panel resident, pulls shard indices off a queue, reads + aligns them with
-# the fast path, and returns its per-query top-K. Mirrors accel.multi_gpu's spawn +
-# thread-cap pattern (the host-bound align needs one process per GPU to parallelise).
+# Multi-GPU: ONE persistent worker process per GPU, spawned on first use and kept for the life
+# of the calling process, each holding its device and receiving whole screens as jobs. Within a
+# screen a worker owns a static share of the shards -- r, r+ndev, r+2*ndev, ... -- and streams
+# them with the same read-ahead thread the single-process screen uses, so the disk read of one
+# shard overlaps the alignment of the previous one. Both halves were measured before they were
+# written (Shepherd-Score-Paper, SI): with a fresh pool per call and a serial read-then-align loop
+# per worker, four L40S screened 10^7 vol conformers no faster than one (9.2 s either way) and two
+# were slower (13.4 s), because the ~4 s spawn was paid every call and a serial worker cost ~2.2x
+# the pipelined single process per shard.
 # --------------------------------------------------------------------------- #
+_MGPU_POOL = None                        # {"key": (ndev, threads), "procs", "job_qs", "out_q"}
+
+
 def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, top_k,
                    shard_q, out_q):
+    """One device's share of one screen, run inside its worker process.
+
+    ``shard_q`` is either this worker's static LIST of shard indices -- streamed through
+    :func:`_iter_shards_prefetched`, so shard i+1 is read while shard i aligns -- or a queue
+    yielding indices and then ``None`` (the original work-stealing form, kept for callers and
+    tests that drive a worker by hand; it reads and aligns serially). Results go to ``out_q`` as
+    ``(rank, per_query_raw_heaps)``; an exception goes there as ``(rank, "__ERR__", traceback)``.
+    """
     try:
         import torch
         from shepherd_score.accel.multi_gpu import _cap_threads
@@ -2348,11 +2367,20 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
         ref_tensors = [_ref_tensors_from_arrays(ra, mode, dev) for ra in ref_arrays_list]
         heaps = [_TopK(top_k) for _ in ref_arrays_list]
         tf_attr = _TRANSFORM_ATTR[mode]
-        while True:
-            idx = shard_q.get()
-            if idx is None:
-                break
-            _sh, arrs = store.read_shard(idx)
+
+        def _drain(q):                                     # the queue form: serial reads
+            while True:
+                idx = q.get()
+                if idx is None:
+                    return
+                yield store.read_shard(idx)
+
+        if isinstance(shard_q, (list, tuple, range)):
+            share = list(shard_q)
+            shards = _iter_shards_prefetched(store, share) if share else iter(())
+        else:
+            shards = _drain(shard_q)
+        for _sh, arrs in shards:
             rot = _canonical_rot(store, arrs)      # canonical-frame stores; None otherwise
             if _use_arrays(mode):
                 # THE SAME selector the in-process driver uses, deliberately: this branch was
@@ -2371,9 +2399,7 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
             for qi, ref in enumerate(ref_tensors):
                 scores = _align_fast(pairs, ref, mode, batch_kw)
                 # Same pre-filtered reduce as the in-process driver (scores_out is not
-                # supported with ndev>1, hence the None). No read-ahead here on purpose:
-                # a worker pulls its shards off a shared queue, and grabbing the next
-                # index early would unbalance the pool's work stealing.
+                # supported with ndev>1, hence the None).
                 _accumulate(heaps[qi], ids, scores, pairs, tf_attr, None, qi, 0, rot)
             torch.cuda.synchronize()
         out_q.put((rank, [h.raw() for h in heaps]))
@@ -2382,10 +2408,63 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
         out_q.put((rank, "__ERR__", traceback.format_exc()))
 
 
+def _mgpu_pool_worker(rank, threads, job_q, out_q):
+    """The persistent per-device process: one CUDA device, many screens. A job is
+    ``(store_path, ref_arrays_list, mode, batch_kw, top_k, shard_list)``; ``None`` ends it."""
+    while True:
+        job = job_q.get()
+        if job is None:
+            return
+        store_path, ref_arrays_list, mode, batch_kw, top_k, shards = job
+        _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, top_k,
+                       shards, out_q)
+
+
+def close_multigpu_pool():
+    """Shut down the persistent ``screen(ndev>1)`` worker pool, if one is running. Registered
+    with :mod:`atexit`; call it yourself to release the devices earlier."""
+    global _MGPU_POOL
+    pool, _MGPU_POOL = _MGPU_POOL, None
+    if pool is None:
+        return
+    for q in pool["job_qs"]:
+        try:
+            q.put(None)
+        except Exception:                        # noqa: BLE001 - a dead queue is already closed
+            pass
+    for p in pool["procs"]:
+        p.join(timeout=10)
+        if p.is_alive():
+            p.terminate()
+
+
+def _mgpu_pool(ndev, threads):
+    """The pool for ``(ndev, threads)``: reused while it is alive, (re)spawned otherwise. Spawning
+    ndev CUDA processes costs seconds (about 4 s for four L40S) and used to be paid on every
+    call; a screen now pays it once per process lifetime."""
+    global _MGPU_POOL
+    pool = _MGPU_POOL
+    if pool is not None and pool["key"] == (ndev, threads) and all(p.is_alive() for p in pool["procs"]):
+        return pool
+    close_multigpu_pool()
+    import torch.multiprocessing as mp
+    ctx = mp.get_context("spawn")
+    out_q = ctx.Queue()
+    job_qs, procs = [], []
+    for r in range(ndev):
+        q = ctx.Queue()
+        p = ctx.Process(target=_mgpu_pool_worker, args=(r, threads, q, out_q), daemon=True)
+        p.start()
+        job_qs.append(q)
+        procs.append(p)
+    _MGPU_POOL = {"key": (ndev, threads), "procs": procs, "job_qs": job_qs, "out_q": out_q}
+    return _MGPU_POOL
+
+
 def _screen_many_multigpu(qs, store_path, mode, ndev, batch_kw, top_k, progress):
     import os as _os
     import torch
-    import torch.multiprocessing as mp
+    from queue import Empty
 
     ndev = max(1, min(ndev, torch.cuda.device_count() if torch.cuda.is_available() else 1))
     try:
@@ -2398,48 +2477,49 @@ def _screen_many_multigpu(qs, store_path, mode, ndev, batch_kw, top_k, progress)
     store = ProfileStore.open(store_path)
     n_shards = store.num_shards
 
+    # The thread caps are read by the workers at spawn; set them around the spawn only.
     _saved = {k: _os.environ.get(k) for k in
               ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")}
     for k in _saved:
         _os.environ[k] = str(threads)
     try:
-        ctx = mp.get_context("spawn")
-        shard_q = ctx.Queue()
-        out_q = ctx.Queue()
-        for idx in range(n_shards):
-            shard_q.put(idx)
-        for _ in range(ndev):
-            shard_q.put(None)                    # one sentinel per worker
-        procs = []
-        for r in range(ndev):
-            p = ctx.Process(target=_screen_worker,
-                            args=(r, threads, store_path, ref_arrays_list, mode,
-                                  batch_kw, top_k, shard_q, out_q))
-            p.start()
-            procs.append(p)
-        results, errs = {}, []
-        for _ in range(ndev):
-            msg = out_q.get()
-            if len(msg) == 3 and msg[1] == "__ERR__":
-                errs.append((msg[0], msg[2]))
-            else:
-                results[msg[0]] = msg[1]
-        for p in procs:
-            p.join()
+        pool = _mgpu_pool(ndev, threads)
     finally:
         for k, v in _saved.items():
             if v is None:
                 _os.environ.pop(k, None)
             else:
                 _os.environ[k] = v
+
+    # Static, interleaved shares: shards are equal-sized except the last, so this is balanced
+    # without a shared queue, and a static share is what lets a worker read ahead.
+    for r, q in enumerate(pool["job_qs"]):
+        q.put((store_path, ref_arrays_list, mode, batch_kw, top_k, list(range(r, n_shards, ndev))))
+    results, errs = {}, []
+    out_q = pool["out_q"]
+    while len(results) + len(errs) < ndev:
+        try:
+            msg = out_q.get(timeout=5.0)
+        except Empty:
+            dead = [p.pid for p in pool["procs"] if not p.is_alive()]
+            if dead:
+                close_multigpu_pool()
+                raise RuntimeError(f"multi-GPU screen: worker process(es) {dead} died")
+            continue
+        if len(msg) == 3 and msg[1] == "__ERR__":
+            errs.append((msg[0], msg[2]))
+        else:
+            results[msg[0]] = msg[1]
     if errs:
         raise RuntimeError("multi-GPU screen failed on ranks "
                            f"{[r for r, _ in errs]}:\n" +
                            "\n".join(f"[rank {r}]\n{tb}" for r, tb in errs))
-
     heaps = [_TopK(top_k) for _ in qs]
     for rank in results:
         per_query = results[rank]
         for qi, raw in enumerate(per_query):
             heaps[qi].merge_raw(raw)
     return heaps
+
+
+atexit.register(close_multigpu_pool)

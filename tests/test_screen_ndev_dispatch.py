@@ -86,8 +86,10 @@ def _install_recorders(mp, seen):
                lambda ra, mode, device: {"_ref_xyz_t": None}, raising=True)
 
 
-def _run_worker(mp, mode):
-    """Drive ``_screen_worker`` for one mode on one shard and return what it selected."""
+def _run_worker(mp, mode, share=None):
+    """Drive ``_screen_worker`` for one mode and return what it selected: on one shard pulled
+    off a queue (the hand-driven form), or on ``share``, a static LIST of shard indices (the
+    form the persistent pool hands its workers, streamed with read-ahead)."""
     seen = []
     _install_recorders(mp, seen)
     mp.setattr(scr, "ProfileStore", _FakeStore, raising=True)
@@ -117,7 +119,8 @@ def _run_worker(mp, mode):
     # process it was written for, not here.
     prev = getattr(_DISPATCH_LOCAL, "active", False)
     try:
-        scr._screen_worker(0, 1, "<fake>", [{}], mode, _BATCH_KW, 1, _ShardQ(), out)
+        scr._screen_worker(0, 1, "<fake>", [{}], mode, _BATCH_KW, 1,
+                           _ShardQ() if share is None else share, out)
     finally:
         _DISPATCH_LOCAL.active = prev
 
@@ -167,6 +170,19 @@ def test_worker_selects_the_same_pair_as_the_inproc_driver(monkeypatch, mode):
         f"the ndev>1 worker selected {worker_seen} for mode={mode}"
     assert worker_seen == inproc_seen, \
         f"worker selected {worker_seen}, in-process driver selected {inproc_seen}"
+
+
+@pytest.mark.parametrize("mode", scr._ARRAY_MODES)
+def test_worker_static_share_dispatches_like_the_queue_form(monkeypatch, mode):
+    """The persistent pool gives each worker its shard share as a list, streamed through
+    ``_iter_shards_prefetched`` (two shards here, so the read-ahead thread really runs); that
+    branch must dispatch exactly as the queue form does, once per shard, and an empty share
+    must still report (empty) heaps so the parent's collection completes."""
+    with monkeypatch.context() as mp:
+        seen = _run_worker(mp, mode, share=[0, 0])
+    assert seen == [("build", mode), ("align", mode)] * 2
+    with monkeypatch.context() as mp:
+        assert _run_worker(mp, mode, share=[]) == []
 
 
 def test_use_arrays_is_on_for_every_mode_this_file_drives():

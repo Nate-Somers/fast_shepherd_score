@@ -319,7 +319,8 @@ hits = screen(query_molecule, store, mode="vol_esp", top_k=1000, lam=0.1)
 scores = np.empty(len(store), dtype=np.float32)
 screen(query_molecule, store, mode="vol", top_k=1, scores_out=scores)
 
-# Several GPUs on one node: one worker process per device
+# Several GPUs on one node: one worker process per device, spawned on the first call and
+# kept for later screens (close_multigpu_pool() releases them)
 hits = screen(query_molecule, store, mode="vol", ndev=4)
 ```
 

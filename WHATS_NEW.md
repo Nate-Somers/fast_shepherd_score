@@ -205,7 +205,9 @@ hits = screen(Molecule(query_rdmol, num_surf_points=200),
 
 `screen_many` streams the library **once** for a list of queries. Both accept `ndev=` to shard across
 GPUs and `scores_out=` to write full score vectors (memmap-friendly; single-process only — passing it
-with `ndev>1` raises).
+with `ndev>1` raises). The `ndev>1` workers — one process per device, each streaming its share of the
+shards with the same read-ahead as the single-process screen — are spawned on the first call and kept
+for later screens; `screen.close_multigpu_pool()` releases them (also run at interpreter exit).
 
 Things that will bite you:
 
@@ -275,6 +277,11 @@ mode names only, returning a plain list of scores in library order — no `Hit`s
 
 > It **always forks**, so POSIX-only, and must run **before** any in-process numba alignment — a live
 > libgomp thread pool at `fork` aborts the child. Featurize, then screen.
+
+The forked pool is **kept** for later calls against the same library (keyed by the list object's
+identity and length, so a new list or a resized one forks afresh, while molecules mutated in place
+after the first call are not seen by the workers); `screen_parallel_close()` releases it, and it is
+also run at interpreter exit. Forking was the per-call cost that grew with the worker count.
 
 **Torch is pinned to one intra-op thread for a CPU batch alignment, then restored.** The numba kernels
 own the cores there; unpinned, torch's pool spin-waits against them. Scoped rather than global, so it
