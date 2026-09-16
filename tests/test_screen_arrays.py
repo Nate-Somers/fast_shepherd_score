@@ -575,3 +575,90 @@ def test_canonical_transform_is_in_the_molecule_frame(tmp_path, molecules):
         assert abs(reported - rescored) < 2e-3, (
             f"id={mol_id} reported {reported:.6f} but its own pose re-scores to {rescored:.6f} "
             f"-- the transform is not in the molecule's frame")
+
+
+# ---------------------------------------------------------------------------------------------
+# vol_esp on a canonical store, with a molecule whose Chem.RemoveHs RETAINS an H.
+#
+# ``xyz_noH`` (the strict-heavy centre set) is materialised ONLY for such a molecule; every other
+# molecule's row is filled from its ``atom_pos``, which on a canonical store is already rotated.
+# So if ``_profile_from_schema`` centres ``atom_pos_noH`` but forgets to ROTATE it, one row of
+# that array sits in the raw centred frame while its neighbours are canonical -- and vol_esp then
+# solves that row's pose unrotated while ``_compose_rot`` composes a rotation it never received.
+#
+# No score comparison can see it: the affected molecule's score still matches the pairwise path
+# EXACTLY (both are unrotated), which is why tests/test_screen.py's retained-H test stays green.
+# Only re-scoring the returned pose catches it. Measured before the rotation was added: the
+# retained-H molecule re-scored 0.619 below its reported score, every other molecule at ~1e-7.
+# ---------------------------------------------------------------------------------------------
+
+_RETAINED_H_SMI = "[2H]OC(=O)c1ccccc1"          # the deuterium survives RemoveHs
+
+
+def _esp_molecules():
+    smis = ["CC(=O)Oc1ccccc1C(=O)O", "c1ccccc1O", _RETAINED_H_SMI,
+            "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"]
+    mols = [_build_molecule(s, seed=i) for i, s in enumerate(smis)]
+    retained = [i for i, m in enumerate(mols) if len(m.atom_pos) != len(m._nonH_atoms_idx)]
+    assert retained, "test premise broken: no molecule retains an H after RemoveHs"
+    return mols, set(retained)
+
+
+def _rescore_hits_vol_esp(hits, molecules, query, lam=0.1):
+    """``(id, reported, re-scored)`` per hit for vol_esp, on the strict-heavy basis.
+
+    ``get_overlap_esp`` ALREADY returns the Tanimoto -- it must NOT be wrapped in a second
+    ``n / (saa + sbb - n)``, which would read correct on a self-pair (1/(1+1-1) == 1) and wrong
+    on every distinct pair.
+    """
+    from shepherd_score.score.electrostatic_scoring import get_overlap_esp
+
+    def heavy(m):
+        x = m.mol.GetConformer().GetPositions()[m._nonH_atoms_idx]
+        return np.ascontiguousarray(x, dtype=np.float64)
+
+    q = heavy(query); q = q - np.asarray(query.atom_pos, dtype=np.float64).mean(0)
+    qt = torch.as_tensor(q)
+    qc = torch.as_tensor(np.asarray(query.get_charges(no_H=True), dtype=np.float64))
+    out = []
+    for h in hits:
+        m = molecules[h.id]
+        fit = heavy(m) - np.asarray(m.atom_pos, dtype=np.float64).mean(0)
+        T = np.asarray(h.transform, dtype=np.float64)
+        posed = torch.as_tensor(fit @ T[:3, :3].T + T[:3, 3])
+        fc = torch.as_tensor(np.asarray(m.get_charges(no_H=True), dtype=np.float64))
+        out.append((h.id, h.score,
+                    float(get_overlap_esp(qt, posed, qc, fc, alpha=0.81, lam=lam))))
+    return out
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+def test_vol_esp_retained_h_transform_is_in_the_molecule_frame(tmp_path, canonical):
+    """A vol_esp pose must reproduce its own score even when the molecule retained an H.
+
+    Both legs run: the non-canonical leg is the control that proves the harness reproduces the
+    library's scoring at all, so a failure on the canonical leg is the library and not the check.
+    """
+    mols, retained = _esp_molecules()
+    p = os.path.join(str(tmp_path), f"esp_{int(canonical)}.fss")
+    with ProfileStore.create(p, num_surf_points=64, modes=("vol", "vol_esp"),
+                             dtype="float32", pre_centered=True, canonical=canonical) as store:
+        for i, m in enumerate(mols):
+            store.add(m, id=i)
+
+    opened = ProfileStore.open(p)
+    assert opened.canonical is canonical
+    assert "xyz_noH" in opened.read_shard(0)[1], \
+        "premise broken: the strict-heavy centre array was not stored"
+
+    hits = screen(mols[0], ProfileStore.open(p), mode="vol_esp", backend="torch",
+                  lam=0.1, top_k=len(mols))
+    assert hits, "screen returned nothing"
+    seen = set()
+    for mol_id, reported, rescored in _rescore_hits_vol_esp(hits, mols, mols[0]):
+        seen.add(mol_id)
+        assert abs(reported - rescored) < 2e-3, (
+            f"id={mol_id} reported {reported:.6f} but its own pose re-scores to {rescored:.6f} "
+            f"-- the transform is not in the molecule's frame (canonical={canonical}"
+            f"{', RETAINED-H' if mol_id in retained else ''})")
+    assert retained <= seen, "the retained-H molecule was not among the hits checked"

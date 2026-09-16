@@ -108,8 +108,9 @@ The pose is the parent's; the ranking changes — which is the point, for substr
 where a small reference should match a large fit. `vol_tversky` (10 × 40), `vol_esp_tversky` (16 × 50),
 `surf_tversky` and `surf_esp_tversky` (8 × 40), `vol_color_tversky` (16 × 40), `vol_lipo_tversky`
 (16 × 50), `pharm_tversky` (32 × 50), `vol_and_surf_esp_tversky` (8 × 60). `pharm` also takes
-`similarity='tversky'|'tversky_ref'|'tversky_fit'` directly. Tversky forfeits both the CUDA-graph and
-the fused-CPU fast paths.
+`similarity='tversky'|'tversky_ref'|'tversky_fit'` directly. Tversky forfeits the **fused-CPU** fast
+path — `cpu_fused_shape` hardcodes the Tanimoto reduction — but keeps the CUDA graph: each Tversky
+driver has its own graphed fine loop.
 
 ### Wiring, and the rename
 

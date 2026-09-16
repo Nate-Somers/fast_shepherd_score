@@ -10,186 +10,280 @@ description: >-
 
 # Design a scoring mode
 
-You are given a description, in words, of how two molecules should be scored against each
-other and aligned. Your job is to turn it into a **correct, readable Python alignment mode**
-that plugs into `shepherd_score` — the *reference* implementation. Correctness first; speed is
-a separate skill (`accelerate-scoring-mode`).
+You are given a description, in words, of how two molecules should be scored against each other
+and aligned. Turn it into a **correct, readable Python alignment mode** that plugs into
+`shepherd_score` — the *reference* implementation. Correctness first; speed is a separate skill
+(`accelerate-scoring-mode`).
+
+## Before you write anything: check whether the mode already exists
+
+The library ships **21 canonical modes**. Read `shepherd_score/accel/_modes.py` first — `MODE_ATTRS`
+is the complete list, in public order:
+
+```
+vol  vol_esp  surf  surf_esp  vol_and_surf_esp  pharm  vol_color  vol_tversky  vol_lipo
+vol_esp_tversky  vol_mr  surf_tversky  surf_esp_tversky  vol_lipo_tversky  vol_color_tversky
+vol_atomtype  vol_pharm  pharm_tversky  vol_and_surf_esp_tversky  vol_fukui  vol_avoid
+```
+
+Eight of those are Tversky reductions of a parent, six reuse another mode's optimizer outright.
+If the request restates one of these, say so and stop. `esp_field` was built and then removed
+entirely — do not use it as a model; nothing by that name exists.
 
 ## The two-layer picture
 
-`shepherd_score` has two layers for every mode:
+Every mode has two layers:
 
-1. **Reference layer** (this skill) — pure PyTorch/NumPy math and an eager autograd optimizer.
-   Slow, obviously-correct, easy to read. This is the ground truth.
-2. **Accel layer** (`accelerate-scoring-mode`) — hand-written Triton (GPU) + numba (CPU) kernels
-   that reproduce the reference at screening throughput.
+1. **Reference layer** (this skill) — pure PyTorch math and an eager Adam optimizer over autograd.
+   Slow, obviously correct, easy to read.
+2. **Accel layer** (`accelerate-scoring-mode`) — hand-written Triton (GPU) and numba (CPU)
+   value+gradient kernels reproducing the reference at screening throughput.
 
-The single most important thing to understand: **the eager optimizer you write here is the
-parity oracle the accel skill validates against.** Everything the fast kernels do later must
-reproduce your `optimize_<mode>_overlay` to floating-point tolerance. So your reference does
-not need to be fast, but it must be *right* and *deterministic*.
+The single most important thing to understand: **the eager optimizer you write here is the oracle
+the accel skill validates against.** Your reference does not need to be fast, but it must be right
+and deterministic.
 
 ## Progress checklist
 
-Copy this into your working notes and check items off as you finish them:
-
 ```
 Mode design progress:
+- [ ] 0. Confirm the mode is not already one of the 21
 - [ ] 1. Pin the objective in math (channels, similarity, symmetry, what moves, inputs)
-- [ ] 2. Add new per-atom Molecule data — ONLY if a channel needs it (most modes skip)
-- [ ] 3. Write the pure overlap in score/ (or confirm channel reuse — nothing to add)
-- [ ] 4. Write objective_<mode>_overlay + optimize_<mode>_overlay (the oracle)
-- [ ] 5. Add MoleculePair.align_with_<mode> with literal seed/step defaults
-- [ ] 6. Register result slots in _ALIGN_KEYS — NOT accel/_modes.py
-- [ ] 7. Export the public functions
-- [ ] 8. Validate: self-overlap = 1.000, grad vs finite-diff, planted-pose recovery, determinism
+- [ ] 2. Decide the reuse level: existing optimizer / existing channel / new channel
+- [ ] 3. Add new per-atom Molecule data — ONLY if a channel needs it (the accessor QUARTET)
+- [ ] 4. Write the pure overlap in score/ — only if no existing channel fits
+- [ ] 5. Write objective_<mode>_overlay + optimize_<mode>_overlay — only if no optimizer fits
+- [ ] 6. Add MoleculePair.align_with_<mode>
+- [ ] 7. Register result slots in _ALIGN_KEYS — NOT accel/_modes.py
+- [ ] 8. Export from alignment/__init__.py (NOT score/__init__.py — it is empty)
+- [ ] 9. Validate: self-overlap 1.000, grad vs finite-diff, planted pose, determinism, retained-H
 ```
 
 ## The contract you must deliver
 
-By the end of this skill the mode must satisfy all of:
-
-- `MoleculePair.align_with_<mode>(...)` runs end-to-end on a pair of real molecules and writes
+- `MoleculePair.align_with_<mode>(...)` runs end to end on a pair of real molecules and writes
   `self.transform_<mode>` / `self.sim_aligned_<mode>`.
-- A self-comparison (a molecule against a copy of itself) scores **exactly 1.000** for a
-  Tanimoto objective (the mode's built-in sanity check).
-- `optimize_<mode>_overlay(...)` is a self-contained eager function: given reference/fit inputs
-  and a seed count it returns `(aligned_fit_points, se3_transform, score)`, is deterministic
-  given the seeds, and uses only autograd — **no custom kernels**. This is the oracle.
-- The mode's result slots are registered via `_ALIGN_KEYS` in `container/_core.py` (**not**
-  `accel/_modes.py` — see step 6) and its public functions are exported.
-- A test file exists and passes (see `template_test.py`).
+- A self-comparison scores **1.000** for a Tanimoto objective, at a generous search budget.
+  Pass an explicit `num_repeats` / `max_num_steps` (20 x 200 is what the shipped tests use) —
+  this gate is a statement about the objective, not about the per-mode defaults. At its own
+  registry defaults even `vol` self-scores 0.9996, which would fail an `atol=1e-4` assertion.
+- The optimizer entry point is self-contained and deterministic, returns
+  `(aligned_fit_points, se3_transform, score)`, and uses only autograd — no custom kernels.
+- The mode id is in `_ALIGN_KEYS` in `container/_core.py` (**not** `accel/_modes.py`).
+- A test file exists and passes, modeled on `template_test.py`.
 
 ## Steps
 
 ### 1. Pin the objective in math before touching code
+
 Write down `O(ref, T·fit)` — the scalar overlap after the fit molecule is moved by an SE(3)
 transform `T`. Decide explicitly:
-- **Channels**: shape (atom-centred Gaussians), electrostatics (ESP), pharmacophore ("color"),
-  or a weighted combination. Reuse an existing channel wherever the description allows.
-- **Similarity**: Tanimoto (self-overlap = 1) vs Tversky (asymmetric). Tanimoto is the default.
-- **Symmetry**: is `O(a,b) == O(b,a)`? If not, say so — it changes the tests.
-- **What moves**: only `fit` is transformed; `ref` is fixed. The optimization variable is the
-  SE(3) pose, parameterized as a unit quaternion + translation.
-- **Inputs**: what per-atom / per-point data does each channel consume? If it is something the
-  `Molecule` does not already carry (positions, charges, surface, pharmacophores), you add it in
-  step 2.
 
-### 2. Add any new per-atom `Molecule` data (only if your mode needs it)
-**Most modes skip this entirely** — they reuse data the `Molecule` already carries (atom
-positions, partial charges, surface points/ESP, pharmacophores). Only if a channel needs a
-**per-atom property the `Molecule` does not compute yet** do you add it in `container/_core.py`,
-following the established `partial_charges` "trio": an **attribute** in `Molecule.__init__`, a
-`get_<feature>()` **compute method**, and a `get_<feature>(no_H)` **heavy-atom slicer** via
-`_nonH_atoms_idx`.
+- **Channels**: shape (atom-centred Gaussians), electrostatics, pharmacophore ("color"), a
+  per-atom scalar field, or a weighted blend. Reuse wherever the description allows.
+- **Similarity**: Tanimoto (self-overlap 1.000) or Tversky (asymmetric,
+  `AB / (AB + ta·(AA−AB) + tb·(BB−AB))`). Tanimoto is the default.
+- **Symmetry**: is `O(a,b) == O(b,a)`? A Tversky mode is not, and its test needs an asymmetry gate.
+- **What moves**: only `fit` is transformed; `ref` is fixed. The variable is the SE(3) pose, a unit
+  quaternion plus a translation.
+- **Inputs**: what per-atom or per-point data each channel consumes. A mode may also take a
+  **third, non-molecule input** — `vol_avoid` takes a fixed `avoid_points` cloud off
+  `MoleculePair.avoid_points`. Such a mode is pairwise-only by construction: the per-molecule
+  screening store has nowhere to put a global constant.
 
-Two traps make a misaligned field score a silent-wrong 1.000 on a self-pair (so only a planted-pose
-test catches them): **atom-order** (the array must be full `(N,)` RDKit-mol order, sliced with the
-*same* `_nonH_atoms_idx` the charges use), and the **retained-H basis** (`self.atom_pos` is NOT the
-heavy set on deuterated molecules — pair heavy charges with
-`mol.GetConformer().GetPositions()[self._nonH_atoms_idx]`, never `atom_pos`). The full recipe and
-both traps are in **`seams.md`** ("Adding a per-atom Molecule feature") and **`pitfalls.md`**
-("Per-atom data must stay aligned… retained-H basis") — read those before wiring the channel. If you
-do this step, keep gate 5 in `template_test.py` (SMILES `[2H]OC(=O)c1ccccc1`); it is the only gate
-that catches the retained-H desync.
+### 2. Decide the reuse level — most modes write no new math
 
-### 3. Write the pure overlap in `score/`
-Put the channel math in the matching module — `score/gaussian_overlap.py` (shape),
-`score/electrostatic_scoring.py` (ESP), `score/pharmacophore_scoring.py` (color) — or add a new
-`score/<family>_scoring.py` if it is genuinely a new family. Provide the Torch version and keep
-the `_np` mirror in sync (add a `_jax` mirror only if you want the jax path). The function is
-pure: positions/charges/types in, scalar overlap out, no optimization. Verify by hand that a
-molecule scored against itself gives 1.000 under Tanimoto.
+Work down this list and stop at the first that fits. Reuse is the norm, not a shortcut.
 
-**If the mode fully reuses existing channels there is nothing to add here and nothing to export** —
-skip straight to the objective. (E.g. a shape + scalar-field combo can reuse `get_overlap` and
-`get_overlap_esp`, feeding a new per-atom scalar as `get_overlap_esp`'s "charges" argument — pass
-the `(N,)` array straight in, `get_overlap_esp` reshapes it to `(N,1)` internally and is
-batch-capable, so no manual reshaping. Note `get_overlap_esp` folds the shape Gaussian into its
-field overlap, so you get a *shape-weighted* field similarity — the intended ESP-style behaviour,
-not an independent scalar field. Its `lam` sets the field's influence; self-overlap is
-`lam`-invariant so the self-check passes for any value, but choose `lam` for your point type rather
-than the function's signature default: that default (`0.3*LAM_SCALING`) is tuned for **surface**
-point clouds, while the docstring recommends **`lam=0.1` for volumetric / atom-centred** overlap —
-pass `lam=0.1` for an atom-centred field.)
+**(a) Reuse an existing optimizer outright.** Six of the 21 modes add *no* `objective_*` /
+`optimize_*` function at all — they call another mode's optimizer with different inputs:
 
-### 4. Write the eager objective + optimizer in `alignment/_torch.py`
-Two functions, following the shape of the existing `optimize_*_overlay` functions:
-- `objective_<mode>_overlay(se3_params, ...)` — applies the SE(3) transform to the fit inputs
-  and returns the (negative) overlap for a single pose. Autograd differentiates this.
-- `optimize_<mode>_overlay(ref_..., fit_..., num_repeats, lr, max_num_steps, ...)` — generates
-  `num_repeats` SO(3) seeds, runs Adam on each, and returns the best `(aligned_points,
-  se3_transform, score)`.
+| Mode | Calls | Difference |
+|---|---|---|
+| `vol_mr` | `optimize_vol_lipo_overlay` | molar refractivity fed as the field |
+| `vol_fukui` | `optimize_vol_lipo_overlay` | Fukui dual descriptor fed as the field |
+| `vol_pharm` | `optimize_vol_color_overlay` | `directionless=False` |
+| `surf_tversky` | `optimize_vol_tversky_overlay` | surface points instead of atom centres |
+| `surf_esp_tversky` | `optimize_vol_esp_tversky_overlay` | surface points and surface ESP |
+| `pharm_tversky` | `optimize_pharm_overlay` | `similarity='tversky'` |
 
-**Naming**: name both functions after the *canonical mode id* (e.g. `optimize_vol_color_overlay`),
-not after the physics. The oldest modes use physics names (`optimize_ROCS_overlay` is the `vol`
-mode) for historical reasons — do not follow that; the id-based name is the modern convention
-and is what the accel skill expects to find.
+If your objective is an existing one with a different field, different point set, or a different
+similarity flag, this is your path. Skip steps 4 and 5 entirely.
 
-### 5. Expose the per-pair API in `container/_core.py`
-Add `MoleculePair.align_with_<mode>(...)`. Mirror an existing `align_with_*` method:
-- Give `num_repeats` and `max_num_steps` sensible **literal** defaults (the optimizer's own
-  defaults). Do **not** resolve them via `_default_seeds` / `_default_steps` here — those read
-  `MODE_SEEDS` / `MODE_STEPS`, the *canonical* registry a reference-only mode is deliberately not
-  in yet (step 6). The accel skill moves the defaults there when it promotes the mode.
-- Pull inputs off `self.ref_molec` / `self.fit_molec` (use the existing cached `_ref_xyz_t` /
-  `_fit_xyz_t` tensors where they fit; read any new per-atom feature via its `get_<feature>(no_H)`
-  slicer from step 2).
-- Call your `optimize_<mode>_overlay`, write `self.transform_<mode>` and
-  `self.sim_aligned_<mode>`, and return the aligned fit coordinates as a NumPy array.
-- Validate inputs the mode requires (e.g. raise a clear `ValueError` if pharmacophores are
-  missing), matching the tone of the surrounding methods.
+**(b) Reuse an existing channel, new blend.** Write only the objective and optimizer, built from
+`get_overlap` (shape) and `get_overlap_esp` (a signed scalar field). No `score/` addition.
 
-### 6. Register the mode's result slots in `container/_core.py`
-Add your mode id to the `_ALIGN_KEYS` tuple in `container/_core.py`. That is what generates the
-`transform_<mode>` / `sim_aligned_<mode>` accessors (backed by an `AlignmentResult`), giving your
-`align_with_<mode>` method somewhere to write. This edit is purely additive and safe.
+**(c) Reuse an existing channel, new *reduction*.** A different way of combining the same overlaps —
+Tversky, Dice, anything that is not Tanimoto. Write only the objective and optimizer. **Build it
+from `VAB_2nd_order`, not from `get_overlap`.**
 
-**Do not add the mode to `accel/_modes.py` (`MODE_ATTRS` / `MODE_SEEDS` / `MODE_STEPS`).** That
-registry is for *canonical* (screening) modes, and adding to it here **breaks the build**:
-`MODE_ATTRS` feeds `CANONICAL_MODES`, which the `@_bind_batch_aligners` decorator on `MoleculePair`
-walks *at import time*, calling `getattr(accel.batch, "_align_batch_<mode>")` — an aligner that does
-not exist until the accel skill builds it, so `import shepherd_score.container` raises
-`AttributeError`. `tests/test_mode_registry.py` also pins an exact `len(CANONICAL_MODES)` count,
-`set(MODE_SEEDS) == set(CANONICAL_MODES)`, and a batch-bind for every canonical mode — all of which
-fail the instant you add a mode with no aligner. Promoting your mode to canonical is the accel
-skill's job, done once the aligner exists. Leave `accel/_modes.py`, `PROCESS_MODES`, and
-`_MODE_SPEC` untouched; `screen.py`, `accel/multi_gpu.py`, and `accel/cpu_pool.py` derive from that
-registry and so pick the mode up only after promotion — correct, since a reference-only mode has no
-batched screening path yet.
+**(d) Genuinely new channel math.** Write the pure overlap in `score/` too.
 
-### 7. Export the public functions
-Add your `optimize_<mode>_overlay` / scoring functions to the relevant package `__init__.py`
-(`score/`, `alignment/`, `container/`) following the existing export style. (If the mode reused
-existing channels and added no new `score/` function, there is nothing to export from `score/`.)
+> **`get_overlap` and `get_overlap_esp` return the Tanimoto, not the raw overlap.** They call
+> `shape_tanimoto` internally, so `AB`, `AA` and `BB` are already consumed and cannot be recovered
+> from the result. Any mode that changes the reduction must go one level lower and call
+> `VAB_2nd_order(centers_1, centers_2, alpha)` three times — `AB`, `AA`, `BB` — then combine them
+> itself. That is exactly what `objective_vol_tversky_overlay` does; read it before writing a
+> reduction. Reaching for `get_overlap` here produces a reduction *of a Tanimoto*, which is not
+> what anyone asked for and still scores 1.000 on a self-pair, so the mode's own sanity check will
+> not catch it.
 
-### 8. Validate
-Copy `template_test.py` to `tests/test_<mode>.py`, replace the `YOURMODE` token, and make it
-pass. The required checks: self-overlap = 1.000, autograd gradient (evaluated at a **non-identity**
-pose — see `pitfalls.md`) agrees with a finite-difference gradient, the optimizer recovers a planted
-rotation on a self-pair, and results are deterministic given a fixed seed. **If your mode reads
-per-atom charges/fields (step 2), also keep gate 5 — the retained-H molecule** (`[2H]OC(=O)c1ccccc1`):
-it is the only gate that catches the `atom_pos`-vs-heavy-charge desync, because every plain
-heavy-atom molecule has `atom_pos` equal to the heavy set and sails through the other four. Run
-`tests/test_mode_registry.py` too — it must still pass **unchanged**, which confirms you kept the
-mode out of the canonical registry (step 6). Some suite tests need open3d or a GPU and may error for
-reasons unrelated to your change; run your own test and `test_mode_registry.py` specifically rather
-than the whole suite.
+> **`get_overlap_esp` folds the shape Gaussian into its field overlap**, so what you get is a
+> *shape-weighted* field similarity, not an independent field. That is the intended ESP-style
+> behaviour and is what `vol_lipo` / `vol_mr` / `vol_fukui` all rely on. If you need an
+> **independent** field channel, `get_overlap_esp` is the wrong tool — write a new one.
+
+> **`lam` is a width, and the scaling convention differs by point type.** `get_overlap_esp`'s
+> signature default is `0.3 * LAM_SCALING` (`LAM_SCALING ≈ 207`, from `score/constants.py`), which
+> is tuned for **surface** clouds. Surface modes take `lam` raw from the user and multiply by
+> `LAM_SCALING` internally; **atom-centred modes take `lam` raw and do not scale it**. For an
+> atom-centred field pass `lam=0.1`, matching `vol_lipo`, `vol_mr`, `vol_fukui` and `vol_esp`.
+
+### 3. Add new per-atom `Molecule` data — the accessor quartet
+
+Most modes skip this. Only if a channel needs a per-atom property `Molecule` does not carry, add it
+in `container/_core.py` following the **four-part pattern** the existing per-atom channels use.
+Read `get_lipophilicity_contribs` / `get_lipophilicity` / `get_lipo_positions` together before
+starting; they are the reference implementation of this pattern.
+
+1. **Storage** — a full `(N,)` array in RDKit-mol (with-H) order. Eager for a cheap descriptor
+   (`self.lipophilicity` at `__init__`); a **lazy property** backed by `self._<feature>` for
+   anything expensive (`partial_charges` and `fukui` both shell out to xTB and are computed on
+   first read).
+2. **Compute** — `get_<feature>_contribs()` derives the full array from the RDKit mol.
+3. **Slice** — `get_<feature>(no_H=True)` returns `self.<feature>[self._nonH_atoms_idx]`.
+4. **Centres** — `get_<feature>_positions()` returns
+   `self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]`, the strict-heavy coordinates the
+   field is 1:1 with.
+
+**Step 4 is not optional and is the whole point.** `self.atom_pos` is the `Chem.RemoveHs`
+coordinate set, which *retains isotope-labelled hydrogen*, so it is longer than the strict-heavy
+set on a deuterated molecule. Pairing a heavy field with `atom_pos` broadcasts `(N)` against
+`(N−1)` and crashes, or silently mispairs. Providing `get_<feature>_positions()` also lets the
+RDKit-free `MoleculeProfile` in `screen.py` duck-type into the same aligner by exposing the same
+method name — the accel skill depends on that. There is **no `atom_pos_noH` attribute on
+`Molecule`**; that name exists only on `MoleculeProfile`.
+
+Call the slicer at align time, never in `__init__` — `_nonH_atoms_idx` is set late in the
+constructor.
+
+### 4. Write the pure overlap in `score/`
+
+Only for genuinely new channel math. Put it in the matching module —
+`score/gaussian_overlap.py`, `score/electrostatic_scoring.py`, `score/pharmacophore_scoring.py` —
+or add `score/<family>_scoring.py`. The function is pure: positions and per-atom data in, scalar
+out, no optimization. Verify by hand that a molecule against itself gives 1.000 under Tanimoto.
+
+Mirrors are a judgement call with precedent both ways: `gaussian_overlap`,
+`electrostatic_scoring` and `pharmacophore_scoring` each keep `_np` and `_jax` twins, while
+`atomtype_scoring.py` is deliberately torch-only. Either mirror fully or not at all, and say which
+you chose. Do not edit a mirror halfway.
+
+### 5. Write the eager objective and optimizer in `alignment/_torch.py`
+
+- `objective_<mode>_overlay(se3_params, ...)` — applies the SE(3) transform to the fit inputs and
+  returns the negative overlap for a single pose. Autograd differentiates this.
+- `optimize_<mode>_overlay(...)` — generates `num_repeats` SO(3) seeds, runs Adam on each, returns
+  the best `(aligned_points, se3_transform, score)`.
+
+**Name after the canonical mode id**, not the physics. Three functions carry legacy physics names
+for historical reasons — `optimize_ROCS_overlay` is `vol`, `optimize_ROCS_esp_overlay` is the
+`vol_esp`/`surf_esp` pair, `optimize_esp_combo_score_overlay` is `vol_and_surf_esp`. Everything
+added since uses the id, and the accel skill expects the id.
+
+Keep the eager defaults `num_repeats=50, lr=0.1, max_num_steps=200`, matching every other
+optimizer in the file. The per-mode registry values are applied by the caller, not here.
+
+### 6. Expose the per-pair API in `container/_core.py`
+
+Add `MoleculePair.align_with_<mode>(...)`, mirroring an existing method:
+
+- Pull inputs off `self.ref_molec` / `self.fit_molec`, converting with `self._to_tensor(...)`.
+  Read shape centres through `get_positions(no_H)`, a per-atom field through its
+  `get_<feature>(no_H)` slicer, and its centres through `get_<feature>_positions()`.
+  **Do not reach for the cached `_ref_xyz_t` / `_fit_xyz_t` tensors if your mode takes a `no_H`
+  flag.** Those are built once in `MoleculePair.__init__` from `atom_pos` alone, so a mode that
+  reads them ignores `no_H=False` silently. `align_with_vol` and `align_with_vol_tversky` both
+  go through `get_positions(no_H)` for exactly this reason.
+- Call your optimizer, write `self.transform_<mode>` and `self.sim_aligned_<mode>`, return the
+  aligned fit coordinates as a NumPy array.
+- Validate what the mode requires, raising a clear `ValueError` in the tone of the surrounding
+  methods.
+
+**Seed and step defaults.** `_default_seeds(mode)` / `_default_steps(mode)` read `MODE_SEEDS` /
+`MODE_STEPS` from the canonical registry, which a reference-only mode is deliberately not in yet
+(step 7). So a reference-only mode takes literal defaults, and the accel skill switches it over
+when it promotes the mode.
+
+> Eleven shipped modes were promoted to the registry but never had their eager defaults switched
+> over, so their per-pair and batched defaults diverge: eager `vol_tversky` runs 50×200 where
+> `MoleculePairBatch` runs 10×40. Do not add a twelfth. Once the accel skill adds the registry
+> rows, switch to `_default_seeds` / `_default_steps` so both paths read one source.
+
+### 7. Register the result slots in `_ALIGN_KEYS`
+
+Add your mode id to the `_ALIGN_KEYS` tuple in `container/_core.py`. A class-body loop turns each
+key into `transform_<mode>` / `sim_aligned_<mode>` properties backed by an `AlignmentResult`
+dataclass in `MoleculePair._alignments`, so this one line is the whole registration. The tuple has
+23 entries for 21 modes because `vol` and `vol_esp` each keep a legacy `_noH` twin.
+
+**Do not add the mode to `accel/_modes.py`.** That registry is for *canonical* (screening) modes
+and adding to it here **breaks the build**. `MODE_ATTRS` feeds `CANONICAL_MODES`, which the
+`@_bind_batch_aligners` decorator on `MoleculePair` walks *at import time*, calling
+`getattr(accel.batch, "_align_batch_<mode>")` — an aligner that does not exist until the accel
+skill builds it, so `import shepherd_score.container` raises `AttributeError`.
+`tests/test_mode_registry.py` also pins `len(CANONICAL_MODES) == 21`, `set(MODE_SEEDS) ==
+set(MODE_STEPS) == set(CANONICAL_MODES)`, and a batch bind for every canonical mode. Leave
+`PROCESS_MODES`, `_MODE_SPEC` and `screen.py` alone too; they are accel-skill territory.
+
+### 8. Export the public functions
+
+Add your `objective_<mode>_overlay` / `optimize_<mode>_overlay` to `alignment/__init__.py`'s
+`__all__`, following the existing style.
+
+**`score/__init__.py` is an empty file.** Nothing is exported from it and nothing should be —
+score functions are imported by full path (`from shepherd_score.score.gaussian_overlap import
+get_overlap`). Do not add exports there.
+
+### 9. Validate
+
+Copy `template_test.py` to `tests/test_<mode>.py`, replace the `YOURMODE` token, and make it pass.
+
+| Gate | What it proves |
+|---|---|
+| 1. Self-overlap = 1.000 (explicit budget) | normalization is consistent |
+| 2. Autograd vs central finite difference | the objective is analytically correct |
+| 3. Planted-pose recovery | the multi-start optimizer works, and atom order is right |
+| 4. Determinism | the reference can serve as a parity oracle |
+| 5. Retained-H molecule | only if the mode reads a per-atom field |
+| 6. Asymmetry | only if the mode is Tversky |
+
+Gates 2 and 3 are the ones that catch real bugs; gate 1 passes under a consistently-wrong atom
+mapping. Run `tests/test_mode_registry.py` as well — it must pass **unchanged**, which is what
+confirms you kept the mode out of the canonical registry.
+
+Register any new pytest marker in `pytest.ini`; `--strict-markers` is on. There is no `conftest.py`,
+so a test needing CUDA carries both `@pytest.mark.cuda` and its own `skipif` guard. Keep the code
+Python 3.9-compatible and `ruff check shepherd_score/ tests/` clean — CI runs both.
+
+Some suite tests need Open3D or a GPU and may error for unrelated reasons. Run your own file and
+`test_mode_registry.py` specifically rather than the whole suite.
 
 ## Handoff to `accelerate-scoring-mode`
-State three things for the next skill: the exact name of your `optimize_<mode>_overlay` oracle,
-the path of your test file, and the gradient structure of the objective (which channels
-contribute, and how the SE(3) gradient decomposes). That is all it needs. It will promote the mode
-to canonical (`accel/_modes.py`) and move the seed/step defaults into `MODE_SEEDS` / `MODE_STEPS`
-as part of building the batched path. If you added a new per-atom `Molecule` feature (step 2), flag
-that too — the batched path must pad that new per-atom scalar into its input tensors.
+
+State four things: the exact name of the optimizer entry point (or which existing optimizer you
+reused), the path of your test file, the gradient structure of the objective (which channels
+contribute and how the SE(3) gradient decomposes), and whether you added new per-atom `Molecule`
+data. The accel skill needs the last one because the batched path and the screening store must
+both learn to carry that array.
 
 ## Constraints
-- **Additive and minimal.** Add functions; do not rewrite shared code. Keep the diff small.
-- **Match the surrounding code** — naming, docstring format, argument order, error style.
-- **Do not break existing modes.** Reuse channels rather than forking them; run the full test
-  suite before declaring done.
-- **One clear name per concept.** Do not add back-compat aliases for a name only this mode uses.
 
-See `seams.md` for the exact file map and name-map, and `pitfalls.md` for the recurring traps.
-`evals/` holds worked scenarios that exercise the common paths through this skill.
+- **Additive and minimal.** Add functions; do not rewrite shared code.
+- **Match the surrounding code** — naming, docstring format, argument order, error style.
+- **Do not break existing modes.** Reuse channels rather than forking them.
+- **One clear name per concept.** No back-compat aliases for a name only this mode uses.
+
+See `seams.md` for the file map and the reuse tables, and `pitfalls.md` for the recurring traps.
+`evals/` holds grading rubrics for these paths — they state expected answers, so they are for
+reviewing work, not for doing it.

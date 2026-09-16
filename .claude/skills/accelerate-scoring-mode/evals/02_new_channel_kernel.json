@@ -1,13 +1,17 @@
 {
   "skills": ["accelerate-scoring-mode"],
-  "query": "Accelerate a reference mode whose field channel is genuinely new math that no existing kernel computes.",
+  "query": "Accelerate a reference mode whose second channel is a piecewise-linear clash penalty against a fixed external point cloud supplied per pair, which no existing kernel computes.",
   "files": [],
   "expected_behavior": [
-    "Confirms via step 1 that no existing kernel already emits this channel's value+gradient, so a new kernel pair is actually required (does not write a redundant kernel for a channel that could be reused).",
-    "Writes the numba CPU kernel FIRST (cpu.py / cpu_fused.py / cpu_soa.py), emitting both the overlap value and the analytic dO/dq in-register, then validates it against the autograd reference (gate 1) BEFORE writing any Triton.",
-    "Compares gate 1 in the tangent space of the unit quaternion (subtracting the q-parallel component), knowing a raw comparison fails at ~0.4-0.8 even for a correct kernel.",
-    "Writes the Triton twin with an IDENTICAL call signature to the numba kernel, using tl.exp2 and @triton.autotune, and reuses the shared dR/dq tail; validates Triton vs numba in-process (gate 2).",
-    "Registers the dispatch wrapper routing by tensor device per call with lazy Triton import; then builds driver, aligner, promotion, and API as usual.",
-    "Fixes the kernel rather than the threshold when a gate fails; does not change the reference to make parity pass."
+    "Works through the step-2 kernel table before writing anything and states which existing kernel was rejected and why -- here the Gaussian shape and ESP kernels cannot express a hinge, so a new kernel pair is genuinely required rather than assumed.",
+    "Writes the numba CPU kernel FIRST in accel/kernels/cpu.py as an @njit(parallel=True, fastmath=True, cache=True) inner kernel plus a torch-facing wrapper, emitting both the value and the analytic dO/dq in-register, and validates it against the reference BEFORE writing any Triton.",
+    "Compares gate 1 in the tangent space of the unit quaternion, subtracting the q-parallel component, knowing the kernels emit a RAW dO/dq and that a raw-vs-autograd comparison fails at ~0.4-0.8 even for a correct kernel.",
+    "Writes the Triton twin with an IDENTICAL call signature, in its own kernels/<family>_triton.py, reusing shape_triton's _quat_to_rotmat and _quat_grad_tail helpers and matching the @triton.autotune idiom; notes that tl.exp2 is the Gaussian idiom and does not apply to a sqrt/hinge kernel.",
+    "Adds one _make(name, triton_tag) line to kernels/dispatch.py, keeping routing per-call by tensor device with the lazy Triton import intact.",
+    "Recognizes that a kinked, piecewise-linear objective is a reason to OPT OUT of the shared CUDA-graph fine loop rather than to force it -- the graph's blocked early stop is tuned for smooth Gaussians -- and says so, following drivers/avoid.py, which is the only driver that does this.",
+    "Recognizes that a per-pair external point cloud is a third, non-molecule input, so the mode is pairwise-only: it cannot be screen-wired (the per-molecule ProfileStore does not model a global constant) and gets no _MODE_SPEC entry, and it declares this with an explicit documented `return False` in _store_supports rather than relying on the fallthrough.",
+    "Threads the extra input through _align_batch_<mode> off the MoleculePair attribute and gives MoleculePairBatch.align_with_<mode> the extra positional argument, rather than trying to force it through the standard thin-wrapper template.",
+    "Fixes the kernel rather than the threshold when a gate fails, and never edits the reference to make parity pass.",
+    "If no CUDA device was available, reports gate 2 as PENDING with the reason, rather than omitting it or implying it passed."
   ]
 }

@@ -1,13 +1,19 @@
 {
   "skills": ["accelerate-scoring-mode"],
-  "query": "Accelerate the vol_lipo reference mode (shape blended with a per-atom lipophilicity field) so it screens at 10k-100k alignments/second.",
+  "query": "Accelerate the vol_tpsa reference mode (shape blended with a per-atom topological polar surface area field) so it screens at 10k-100k alignments/second and can appear in the screening-speed figure.",
   "files": [],
   "expected_behavior": [
-    "Identifies the driver-analog (vol_color, a two-channel combined-gradient blend) and the kernel-analog (shape kernel + ESP kernel, feeding lipophilicity where the ESP kernel expects charges) INDEPENDENTLY; does not assume 'looks like vol_esp' means reuse vol_esp.",
-    "Writes NO new kernel: reuses overlap_score_grad_se3_batch and the device-dispatched ESP kernel, so it SKIPS steps 2-4 and goes straight to the driver, which blends the per-channel dQs.",
-    "Builds accel/drivers/vol_lipo.py reusing the shared CUDA-graph fine loop in drivers/_graphed.py and helpers in drivers/_common.py; does not reimplement the graph loop.",
-    "Adds _align_batch_vol_lipo to aligners.py (bound + exported), promotes the mode to accel/_modes.py (a row each to MODE_ATTRS/MODE_SEEDS/MODE_STEPS + the test_mode_registry count bump), and adds the MoleculePairBatch API resolving backend=None device-aware.",
-    "Wires screen as Tier B (new per-molecule lipophilicity data): MoleculeProfile slot + schema flag + serialization with an offset table for the variable-length set, then the six-edit fast engine because it will appear in a speed figure.",
-    "Passes every parity gate: gate 1 comparing dO/dq in the tangent space of the unit quaternion (not raw), gate 2 in-process, gate 3, gate 4 on both backends, and gate 5 with the disk check; never weakens a tolerance to pass."
+    "Identifies the driver-analog and the kernel-analog INDEPENDENTLY, and does not assume 'looks like vol_esp' means reuse vol_esp -- vol_esp optimizes the field alone and its driver cannot produce a shape+field blend.",
+    "Writes NO new kernel: recognizes that overlap_score_grad_se3_batch plus the ESP kernel (with TPSA fed where it expects charges) already emit both channels' value and gradient, so steps 3-5 are skipped entirely.",
+    "Goes further and checks whether a new DRIVER is needed either, finding that drivers/vol_lipo.py already serves vol_lipo, vol_mr and vol_fukui unchanged and takes vol_tpsa as a fourth parameterisation -- adding a near-copy driver file would be the wrong call.",
+    "Adds _align_batch_vol_tpsa to accel/batch/aligners.py with _ref_/_fit_ prefixed tensor attributes so _batch_upload's molecule-keyed cache infers key_fn correctly, and adds the explicit re-export line to accel/batch/__init__.py.",
+    "Promotes to canonical AFTER the aligner exists (a row each in MODE_ATTRS, MODE_SEEDS, MODE_STEPS) and bumps tests/test_mode_registry.py from 21 to 22 with its comment updated; does not bind onto MoleculePair by hand, since @_bind_batch_aligners walks CANONICAL_MODES at import.",
+    "States plainly whether the seed/step defaults were measured or inherited from vol_lipo, rather than implying a knee was found.",
+    "Switches MoleculePair.align_with_vol_tpsa from its literal 50/200 defaults to _default_seeds/_default_steps now that the registry carries them, instead of adding a twelfth mode whose eager and batched defaults disagree.",
+    "Adds MoleculePairBatch.align_with_vol_tpsa modeled on the align_with_vol_mr thin-wrapper template, with backend=None resolving device-aware.",
+    "Wires screen as Tier B: schema flag, MoleculeProfile slots with get_tpsa_positions/get_tpsa accessors named exactly like the Molecule methods, its OWN offset table (not atom_off), _profile_from_schema extraction AND pre-center shift AND canonical rotation, _concat and _reconstruct.",
+    "Does not omit the canonical rotation, and explains why omitting it is invisible to a score test: the library and query would both sit unrotated and score consistently while _compose_rot still composes Hit.transform with a rotation the coordinates never received.",
+    "Because it will appear in a speed figure, adds the mode to BOTH _FAST_MODES and _ARRAY_MODES plus a builder, an array aligner, the two dispatch-table rows and align_batch_vol_tpsa_arrays -- reusing _build_fit_arrays_scalar_field rather than writing a near-copy -- and routes it through the single _array_dispatch selector.",
+    "Validates at the honest tolerances: gate 3 against the per-pair reference at the shipped MODE_SEEDS/MODE_STEPS budget, gate 5 with the disk check read through store.read_shard(0)[1], and array-vs-object as BIT-IDENTICAL rather than a tolerance; never weakens a gate to pass."
   ]
 }

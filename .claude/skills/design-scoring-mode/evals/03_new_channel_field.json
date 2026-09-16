@@ -1,12 +1,14 @@
 {
   "skills": ["design-scoring-mode"],
-  "query": "Add a mode that overlaps two molecules on a new per-atom scalar field the Molecule doesn't carry yet as an INDEPENDENT Gaussian field channel (not shape-weighted).",
+  "query": "Add a mode that overlaps two molecules on a per-atom scalar field the Molecule doesn't carry yet, scored as an INDEPENDENT Gaussian field channel rather than a shape-weighted one, then blended with shape.",
   "files": [],
   "expected_behavior": [
-    "Recognizes get_overlap_esp folds in the shape Gaussian and is therefore NOT usable for an independent field, so writes a new pure overlap in score/<family>_scoring.py (plus the _np mirror), inputs in and scalar out, no optimization.",
-    "Verifies by hand that the new channel scores exactly 1.000 for a molecule against itself under Tanimoto, matching numerator and self-overlap widths/masks.",
-    "Adds the per-atom property to Molecule via the trio, as a full (N,) RDKit-mol-order array sliced by the same _nonH_atoms_idx the charges use; guards the atom-order and retained-H traps and keeps gate 5.",
-    "Names by mode id; registers only _ALIGN_KEYS; align_with_<mode> uses literal defaults; exports the new score function from score/__init__.py.",
-    "Test passes all gates including the planted-pose recovery (the only gate that catches a consistently-wrong atom-order mapping); tests/test_mode_registry.py passes unchanged."
+    "Recognizes that get_overlap_esp folds the shape Gaussian into its field overlap and is therefore NOT usable for an independent field -- the whole vol_lipo / vol_mr / vol_fukui family is shape-weighted by construction -- so it writes a new pure overlap in score/<family>_scoring.py, inputs in and scalar out, no optimization.",
+    "Decides the _np / _jax mirror question deliberately and says which way it went, citing the precedent both ways: gaussian_overlap / electrostatic_scoring / pharmacophore_scoring keep mirrors, while score/atomtype_scoring.py is intentionally torch-only. Does not edit a mirror halfway.",
+    "Verifies by hand that the new channel scores exactly 1.000 for a molecule against itself under Tanimoto, matching numerator and self-overlap widths and masks.",
+    "Adds the per-atom property to Molecule via the four-part accessor pattern, as a full (N,) RDKit-mol-order array sliced by the same _nonH_atoms_idx the charges use, including the get_<feature>_positions() centres accessor so MoleculeProfile can duck-type the same name later; chooses eager storage for a cheap descriptor or a lazy property for an expensive one and says why.",
+    "Guards both per-atom traps -- atom order and the retained-H basis -- and keeps gate 5; keeps the planted-pose gate, which is the only gate that catches a consistently-wrong atom-order mapping.",
+    "Names objective_/optimize_ by mode id; registers only _ALIGN_KEYS; align_with_<mode> uses literal defaults; exports the alignment functions from alignment/__init__.py and nothing from the empty score/__init__.py.",
+    "Hands off to accelerate-scoring-mode stating the optimizer name, the test path, the gradient structure, AND the fact that new per-atom Molecule data was added -- the last because both the batched path and the screening store must learn to carry that array."
   ]
 }

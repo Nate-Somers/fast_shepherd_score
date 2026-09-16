@@ -417,6 +417,18 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool, canonical: bool 
             fukui_pos = (fukui_pos @ rot.T).astype(np.float32)
         if cwh is not None:
             cwh = (cwh @ rot.T).astype(np.float32)
+        if atom_pos_noH is not None:
+            # The strict-heavy centres are a coordinate channel like any other and MUST rotate
+            # with the rest. They are only materialised when Chem.RemoveHs kept an H, and
+            # ``_concat`` fills every other molecule's xyz_noH row from its (already rotated)
+            # atom_pos -- so leaving this one unrotated puts a single row of that array in the
+            # raw centred frame while its neighbours are canonical. vol_esp then solves that
+            # row's pose in the unrotated frame and ``_compose_rot`` composes a rotation its
+            # coordinates never received, which no score-based test can see: the score still
+            # matches the pairwise path exactly (both are unrotated) while the returned pose is
+            # wrong. Measured before this line existed: the retained-H molecule's transform
+            # re-scored 0.619 below its reported score, every other molecule at 1e-7.
+            atom_pos_noH = (atom_pos_noH @ rot.T).astype(np.float32)
 
 
     return MoleculeProfile(

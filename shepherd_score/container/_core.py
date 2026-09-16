@@ -2255,9 +2255,16 @@ class MoleculePair:
 
     # =====================================================================================
     # SI experimental modes (reference layer). Each reuses an existing eager optimizer or one
-    # of the new SI optimizers in ``alignment/_torch.py``; seed/step defaults are LITERAL (50/200)
-    # because these modes are not yet in the canonical ``MODE_SEEDS``/``MODE_STEPS`` registry (the
-    # accelerate-scoring-mode pass promotes them and moves the defaults there).
+    # of the new SI optimizers in ``alignment/_torch.py``; seed/step defaults are LITERAL (50/200),
+    # matching every eager optimizer in ``alignment/_torch.py``.
+    #
+    # These modes ARE in ``MODE_SEEDS``/``MODE_STEPS`` -- all 21 canonical modes are -- so the
+    # literals here are not a consequence of the registry lacking them. They are what a
+    # reference-only mode starts with (``_default_seeds``/``_default_steps`` read tables the mode
+    # is not in yet), and the accelerate-scoring-mode pass that promoted these modes did not come
+    # back to switch them over. The effect is that the per-pair and batched defaults DIVERGE here:
+    # eager ``vol_tversky`` runs 50x200 where ``MoleculePairBatch`` runs 10x40. Callers comparing
+    # the two paths must pass ``num_repeats``/``max_num_steps`` explicitly.
     # =====================================================================================
     def align_with_vol_pharm(self,
                              color_weight: float = 0.5,

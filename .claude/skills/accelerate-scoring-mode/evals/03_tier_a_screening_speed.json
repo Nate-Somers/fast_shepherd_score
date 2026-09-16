@@ -1,12 +1,17 @@
 {
   "skills": ["accelerate-scoring-mode"],
-  "query": "Accelerate vol_tversky (an asymmetric Tversky reduction of the shape overlap) and make it ready to appear in a screening-speed figure.",
+  "query": "Accelerate vol_dice (a Dice/Sorensen reduction of the shape overlap) and make it ready to appear in a screening-speed figure.",
   "files": [],
   "expected_behavior": [
-    "Recognizes the mode reuses the shape kernel entirely and only changes the reduction, so it writes NO new kernel; the driver applies the Tversky reduction over the shape overlap the existing kernel already emits.",
-    "Promotes the mode to canonical (MODE_ATTRS/MODE_SEEDS/MODE_STEPS + count bump) and adds the MoleculePairBatch API.",
-    "Wires screen as Tier A: a single _store_supports branch (atom_pos is always stored), routing through the fast=False MoleculePairBatch path automatically.",
-    "Because the mode will appear in a speed figure, ADDS it to _FAST_MODES as a drop-in copy of vol's fast path (shape-only, same fit tensors) rather than reporting object-path throughput; alternatively, if left on the object path, explicitly does NOT plot its throughput on the same axis as the fast modes.",
-    "Gate 5 passes bit-identical (abs=1e-4) since fast and object paths feed identical inputs to one driver; never loosens the tolerance."
+    "Recognizes the mode reuses the shape kernel entirely and only changes the host-side reduction, so it writes NO new kernel; the driver applies the Dice reduction over the overlap the existing kernel already emits, modeled on drivers/vol_tversky.py as the nearest reduction-only precedent.",
+    "Notes that a non-Tanimoto reduction forfeits the fused-CPU path (cpu_fused_shape hardcodes Tanimoto) but KEEPS the CUDA graph, exactly as the Tversky family does -- each Tversky driver has its own _GraphedFine* subclass -- and does not claim otherwise.",
+    "Promotes the mode to canonical (MODE_ATTRS / MODE_SEEDS / MODE_STEPS) only after _align_batch_vol_dice exists and is re-exported, and bumps the hardcoded count in tests/test_mode_registry.py from 21 to 22.",
+    "Adds MoleculePairBatch.align_with_vol_dice with backend=None resolving device-aware, and switches the eager align_with_vol_dice defaults to _default_seeds/_default_steps.",
+    "Wires screen as Tier A: a single _store_supports branch returning True, since atom_pos is unconditionally stored and the mode needs no new per-molecule data. Does not add a schema flag, MoleculeProfile slot or serialization it does not need.",
+    "Because the mode will appear in a speed figure, does NOT stop at Tier A: adds it to _FAST_MODES and _ARRAY_MODES with a builder that delegates to _build_fit_arrays_vol (shape-only, same fit tensors), an array aligner, and both dispatch-table rows -- reusing rather than copying vol's builder.",
+    "Understands that _FAST_MODES gates `fast`, which gates the array path, so a mode added to _ARRAY_MODES alone would silently never reach it.",
+    "States the throughput honesty rule explicitly: the object path rebuilds MoleculePair objects every shard on the IDENTICAL GPU kernel and measured 1.3-5x slower across eleven modes, so plotting an object-path aligns/s beside array-path numbers understates the mode. Either wire the array path or do not plot it on that axis.",
+    "Gate 5 passes bit-identical (abs=1e-4) since fast and object paths feed identical inputs to one driver, and the array-vs-object comparison is asserted as exactly zero scores moved rather than as a tolerance; never loosens either.",
+    "Adds its parity test driven off screenmod._ARRAY_MODES rather than a fresh hardcoded mode list, and confirms tests/test_screen_arrays.py's derived negative control (CANONICAL_MODES minus _ARRAY_MODES) still holds."
   ]
 }
