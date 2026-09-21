@@ -83,8 +83,17 @@ step. Run your mode through each and compare:
   wins — set `cpu_fused=False` on the spec, as the pharmacophore family does, and say what you
   measured. Do not ship a mode whose default CPU path disagrees with its own eager loop.
 
-`tests/_es_fixture.py` is the standing harness for this: it runs a mode on both CPU loops and prints
-each fine loop's executed step count against its budget.
+The CPU half is now a TEST, not a manual check: `tests/test_cpu_fine_loops_agree.py` parametrizes
+over `CANONICAL_MODES`, runs each mode twice -- once normally, once with `cpu_fused.run_fused`
+forced to raise so the engine's own fallback takes the eager loop -- and bounds the gap at 1e-5
+absolute / 0.01% relative. Your mode joins it by being in the registry, so there is nothing to add;
+just read the failure if it fires. Measured across all 21 modes on that fixture: worst 1.699e-06
+(0.0004%, `surf_esp`). It also asserts that forcing the fused loop off really reaches the eager
+loop, so the comparison cannot pass vacuously.
+
+`tests/_es_fixture.py` remains the standing harness for the step-count side: run
+`python tests/_es_fixture.py` and every fine loop should execute its full configured budget
+(30/30, 40/40, 50/50 today) with deficits at the fp32 noise floor.
 
 ## Gate 4 — self-copy = 1.000
 
