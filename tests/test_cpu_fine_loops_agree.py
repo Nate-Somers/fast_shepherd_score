@@ -13,10 +13,22 @@ depending on whether an unrelated failure fired -- and nothing measured the gap.
 rewrite put 19 of the 21 modes on the fused loop (4 before), so the question went from narrow
 to library-wide.
 
-MEASURED, this tree, 6 molecules, every mode: worst disagreement 1.699e-06 absolute and 0.0004%
-relative (`surf_esp`). The pharmacophore family sets `cpu_fused=False` and is identical either
-way because both runs take the eager loop. The bounds below sit an order of magnitude above the
-measurement; a failure means a mode's two loops have genuinely diverged, not that fp32 drifted.
+The gap is ENVIRONMENT-DEPENDENT, which the first version of this file got wrong. With SVML the
+fused loop swaps in the fp32 SoA kernels (`kernels/cpu_soa.py`, ~1e-6 value / ~1e-4 gradient
+relative error by construction); without it the fp64 AoS kernels run. A bound fitted to one
+environment fails in the other, so these are fitted to BOTH.
+
+MEASURED over 6 molecules, every mode, in both:
+
+| | worst, no SVML (Windows) | worst, SVML (node3509) |
+|---|---|---|
+| every mode except `surf_esp` | 1.699e-06 / 0.0004% | 2.086e-06 / 0.0005% |
+| `surf_esp` | 1.699e-06 / 0.0004% | **1.782e-04 / 0.0375%** |
+
+`surf_esp` is the outlier by 75x, and it is the mode already singled out as the most
+shape-degenerate in the library -- the reason its spec carries `cpu_fused_max_pad=100`. It gets
+its own bound rather than loosening every mode to fit it. The pharmacophore family sets
+`cpu_fused=False` and is identical either way, because both runs take the eager loop.
 """
 import warnings
 
@@ -31,8 +43,11 @@ except ImportError:
 
 pytestmark = pytest.mark.skipif(not TORCH, reason="PyTorch required")
 
-MAX_ABS = 1.0e-5      # measured worst 1.699e-06
-MAX_REL_PCT = 0.01    # measured worst 0.0004%
+# (max |delta|, max relative %) per mode, defaulting to the tight pair. Roughly an order of
+# magnitude above the worse of the two measured environments, so a failure means two loops
+# have genuinely diverged rather than that fp32 drifted.
+TOL_DEFAULT = (1.0e-5, 0.01)
+TOL = {"surf_esp": (1.0e-3, 0.2)}
 
 SMILES = ["CC(C)Cc1ccc(cc1)C(C)C(=O)O", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
           "CC(=O)Oc1ccccc1C(=O)O", "c1ccc2c(c1)cccc2O"]
@@ -108,9 +123,12 @@ def test_fused_and_eager_cpu_loops_agree(mode, mols):
     d = max(abs(a - b) for a, b in zip(fused, eager))
     rel = max(abs(a - b) / max(abs(a), 1e-12) for a, b in zip(fused, eager)) * 100
 
-    assert d <= MAX_ABS and rel <= MAX_REL_PCT, (
+    max_abs, max_rel = TOL.get(mode, TOL_DEFAULT)
+
+    assert d <= max_abs and rel <= max_rel, (
         f"{mode}: fused vs eager max|d| {d:.3e} ({rel:.4f}% relative) exceeds "
-        f"{MAX_ABS:.1e} / {MAX_REL_PCT}%.\n  fused {fused}\n  eager {eager}")
+        f"{max_abs:.1e} / {max_rel}%.\n  fused {fused}\n  eager {eager}\n"
+        "  (SVML widens this gap; see the module docstring for both measurements)")
 
     if not spec_of(mode).cpu_fused:
         assert fused == eager, \
