@@ -188,3 +188,27 @@ def test_shape_modes_accept_trans_init_and_ignore_it(mode, monkeypatch):
 
     assert seen == {}, f"{mode} now builds a coarse grid for trans_init=True: {seen}"
     assert got[0] == got[1], f"{mode} trans_init changed the score: {got[0]} -> {got[1]}"
+
+
+@pytest.mark.skipif(not (TORCH and torch.cuda.is_available()), reason="CUDA required")
+@pytest.mark.parametrize("mode", sorted(GRID_CLOUD))
+def test_triton_coarse_grid_matches_numba(mode, monkeypatch):
+    """The coarse path is device-dispatched like every other part of the engine, so the GPU must
+    build the grid from the same cloud and land in the same basin as the CPU. The grid itself is
+    built by the shared ``build_coarse_grid``; only the value-only scoring of it is per-device,
+    which is exactly where a channel mix-up would show up as a different top-k."""
+    from shepherd_score.accel._modes import MODE_ATTRS
+    from shepherd_score.container import MoleculePairBatch
+
+    ref, fit = _mol(IBU), _mol(CAF, seed=1)
+    out, clouds = [], []
+    for backend in ("numba", "triton"):
+        seen = _spy(monkeypatch)
+        p = _pair(ref, fit)
+        getattr(MoleculePairBatch([p]), "align_with_" + mode)(
+            backend=backend, trans_init=True, **KW[mode])
+        out.append(float(getattr(p, MODE_ATTRS[mode][1])))
+        clouds.append(seen.get("n"))
+
+    assert clouds[0] == clouds[1],         f"{mode}: triton built its grid from a {clouds[1]}-point cloud, numba from {clouds[0]}"
+    assert abs(out[0] - out[1]) <= 2e-3,         f"{mode}: trans_init triton {out[1]} vs numba {out[0]}"
