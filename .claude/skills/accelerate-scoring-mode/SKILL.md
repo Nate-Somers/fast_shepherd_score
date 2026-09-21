@@ -39,6 +39,19 @@ If you find yourself writing a per-mode driver, a per-mode aligner, a per-mode a
 per-mode `screen.py` branch, **stop**: that is the shape the refactor removed, and reintroducing it
 takes the mode back off the derived path.
 
+**Tests it also inherits** — these parametrize over the registry, so they start gating your mode the
+moment it is registered, and a failure in one is about your mode, not about them:
+
+| test | what it holds |
+|---|---|
+| `test_cpu_fine_loops_agree.py` | the fused numba and eager torch CPU loops agree (1e-5 / 0.01%) |
+| `test_screen_arrays.py` | array-native screen ≡ object screen, and the required-kwarg table |
+| `test_screen_const_seeds.py` | the canonical store's constant seeds, where your seed channel allows |
+| `test_mode_registry.py` | the mode count — **the only hardcoded mode fact left**; bump it |
+
+`test_trans_init_accel.py` is the exception: it needs one line from you, and only if your
+`align_with_*` exposes `trans_init` (see [gate 4b](parity_gates.md)).
+
 ## What "fast" means here
 
 The reference optimizer is autograd over one pair at a time. The accel layer instead:
