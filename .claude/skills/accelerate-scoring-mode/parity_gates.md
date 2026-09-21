@@ -78,9 +78,12 @@ step. Run your mode through each and compare:
   higher values. Measured on the 6-molecule fixture: 3.354e-03 (1.55%) for `vol_and_surf_esp` and
   5.291e-04 (0.063%) for its Tversky twin, every other mode exactly 0. If YOUR mode shows a
   difference and has no strided term, that is a bug in your spec or your term evaluator.
-- **fused CPU vs eager CPU**: expect fp32 agreement (~1e-7 on the shipped modes). A basin-level
-  difference means the mode is multi-basin enough that the float32 tail's rounding flips which seed
-  wins — set `cpu_fused=False` on the spec, as the pharmacophore family does, and say what you
+- **fused CPU vs eager CPU**: expect fp32 agreement, but measure it **with and without SVML** —
+  the fused loop swaps in the fp32 SoA kernels (`kernels/cpu_soa.py`) only when `USING_SVML`, and
+  the gap widens when it does. Across all 21 modes: 0.0004% without SVML, 0.0375% with it for
+  `surf_esp` and 0.0005% for everything else. A tolerance fitted on one environment will fail in
+  the other; that already happened once. A basin-level difference means the mode is multi-basin
+  enough that the float32 tail's rounding flips which seed wins — set `cpu_fused=False` on the spec, as the pharmacophore family does, and say what you
   measured. Do not ship a mode whose default CPU path disagrees with its own eager loop.
 
 The CPU half is now a TEST, not a manual check: `tests/test_cpu_fine_loops_agree.py` parametrizes
