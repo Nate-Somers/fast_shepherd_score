@@ -319,6 +319,13 @@ trajectory settles in different but equally valid basins), and the pharmacophore
 ([B12](#b12-pharm-cpu-scores-changed)). The numba kernels run `fastmath=True, parallel=True` over `NUMBA_NUM_THREADS` (default: *all*
 cores), which oversubscribes alongside the process pool — hence `screen_parallel` pinning it to 1.
 
+**The fused loop and the eager loop agree, and that is now tested.** `engine.align` falls back to
+the eager torch loop on any exception from the fused one, silently, so a mode whose two loops
+disagreed would return different scores depending on an unrelated failure. Measured across all 21
+modes: worst disagreement 1.699e-06 absolute, 0.0004% relative (`surf_esp`), with the pharmacophore
+pair identical because both runs take the eager loop.
+`tests/test_cpu_fine_loops_agree.py` holds that bound and picks up new modes from the registry.
+
 ## 7. Surfaces and pharmacophores
 
 **A mesh-free surface generator (opt-in).** `Molecule(..., surface_method="smooth_sdf")` builds the
