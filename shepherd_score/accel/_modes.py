@@ -131,6 +131,15 @@ class ModeSpec:
     screen_lr : the fine-loop learning rate the SCREEN front-end uses when the caller passes
         none. Historically 0.1 for the ESP / pharmacophore / colour / field modes and the driver
         default 0.075 for the shape and Tversky modes; kept per mode so scores do not move.
+    coarse_channel : the cloud the LEGACY ``trans_init`` coarse grid is built from, when that is
+        not the seed channel. Only the combo modes set it. The pre-registry drivers were not
+        consistent here: ``esp``, ``pharm`` and ``vol_color`` built the grid from the cloud they
+        seed from, but ``esp_combo`` built it from the SURFACE clouds while seeding from the
+        volume centres. That looks like an oversight rather than a decision, but it is the
+        shipped behaviour, so it is preserved as data: routing the combo grid through the seed
+        channel instead moved ``vol_and_surf_esp`` trans_init scores by up to 1.24% relative
+        (0.251114 -> 0.254234 on a 6-molecule smoke). ``vol_and_surf_esp_tversky`` never had a
+        trans_init path at all, so it has no old behaviour to preserve and follows its parent.
     process : whether the mode has a process-per-GPU / CPU-pool tensor spec.
     """
     name: str
@@ -156,6 +165,7 @@ class ModeSpec:
     lam_scaling: bool = False
     honors_num_repeats: bool = False
     channel_switch: dict = field(default_factory=dict)
+    coarse_channel: Optional[str] = None
     screen_lr: float = 0.075
     process: bool = True
 
@@ -259,7 +269,7 @@ _reg(ModeSpec("vol_and_surf_esp", ("transform_vol_and_surf_esp", "sim_aligned_vo
               work="combo", terms=_combo_terms(),
               params={"alpha": None, "lam": 0.001, "probe_radius": 1.0, "esp_weight": 0.5, **_LR},
               graph_budget=8_000_000, graph_full_steps=True, channel_switch=_COMBO_SWITCH,
-              screen_lr=0.1))
+              coarse_channel="surf", screen_lr=0.1))
 _reg(ModeSpec("pharm", ("transform_pharm", "sim_aligned_pharm"), 32, 50, 5,
               seed_channel="pharm_ancs", channels=("pharm_ancs", "pharm_vecs", "pharm_types"),
               bucket=("pharm_ancs",),
@@ -341,7 +351,7 @@ _reg(ModeSpec("vol_and_surf_esp_tversky",
               params={"alpha": 0.81, "lam": 0.001, "probe_radius": 1.0, "esp_weight": 0.5,
                       **_TV, **_LR},
               graph_budget=8_000_000, graph_full_steps=True, channel_switch=_COMBO_SWITCH,
-              screen_lr=0.1))
+              coarse_channel="surf", screen_lr=0.1))
 _reg(ModeSpec("vol_fukui", ("transform_vol_fukui", "sim_aligned_vol_fukui"), 16, 50, 2,
               seed_channel="atoms", channels=("atoms", "fukui_pos", "fukui"), bucket=("atoms",),
               terms=_field_blend("fukui_pos", "fukui", "fukui_weight"),

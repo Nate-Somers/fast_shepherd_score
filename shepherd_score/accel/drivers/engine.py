@@ -162,7 +162,9 @@ def assemble(spec, chans: dict, *, params: dict, num_seeds: int, seeds=None,
     if trans_centers is not None:
         prob0 = _finish(spec, chans, term_objs, params, B, None, None, device, dtype,
                         c_ref, c_fit, seed_ch, ref_shared)
-        quats, t_seeds = _coarse_topk(prob0, sb, num_seeds, trans_centers, trans_centers_real,
+        cb = sb if spec.coarse_channel is None else chans[
+            res.get(spec.coarse_channel, spec.coarse_channel)]
+        quats, t_seeds = _coarse_topk(prob0, cb, num_seeds, trans_centers, trans_centers_real,
                                       num_repeats_per_trans, topk)
     elif seeds is not None:
         quats, t_seeds = seeds
@@ -266,9 +268,12 @@ def _reduce_value(tm, V, pr):
 
 
 @torch.no_grad()
-def _coarse_topk(pr0, sb, num_seeds, trans_centers, trans_centers_real, nrpt, topk):
-    """Legacy ``trans_init`` path: a coarse grid of poses scored value-only, top-k kept."""
-    q_grid, t_grid = build_coarse_grid(sb.ref, sb.fit, sb.n_real, sb.m_real, num_seeds=num_seeds,
+def _coarse_topk(pr0, cb, num_seeds, trans_centers, trans_centers_real, nrpt, topk):
+    """Legacy ``trans_init`` path: a coarse grid of poses scored value-only, top-k kept.
+
+    ``cb`` is the mode's ``coarse_channel`` batch, which is the SEED channel for every mode but
+    the combo pair (see ``ModeSpec.coarse_channel``)."""
+    q_grid, t_grid = build_coarse_grid(cb.ref, cb.fit, cb.n_real, cb.m_real, num_seeds=num_seeds,
                                        trans_centers_batch=trans_centers,
                                        trans_centers_real=trans_centers_real,
                                        num_repeats_per_trans=nrpt)

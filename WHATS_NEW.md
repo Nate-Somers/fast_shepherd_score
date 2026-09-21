@@ -97,8 +97,9 @@ joint gradient.
 | `vol_pharm` | **directional** pharmacophores (the directional twin of `vol_color`) | 32 × 50 |
 | `vol_avoid` | shape Tanimoto **minus** a hard-sphere excluded-volume penalty vs a fixed avoid cloud | 16 × 50 |
 
-> **`vol_avoid` is pairwise-only** — it takes a third, non-molecule input (`avoid_points`), so it is
-> not screen-wired and has no worker-process path. **`vol_fukui` needs xTB**: `Molecule.fukui` comes
+> **`vol_avoid` takes a third, non-molecule input** (`avoid_points`). It belongs to the QUERY, not
+> to a library molecule, so a screen passes it as `screen(..., avoid_points=...)` rather than storing
+> it per molecule. **`vol_fukui` needs xTB**: `Molecule.fukui` comes
 > from three gfn2-xTB single points and has **no MMFF fallback**, unlike `partial_charges`, so without
 > `xtb` on PATH you must pass a precomputed `fukui=` array.
 
@@ -110,15 +111,19 @@ The pose is the parent's; the ranking changes — which is the point, for substr
 where a small reference should match a large fit. `vol_tversky` (10 × 40), `vol_esp_tversky` (16 × 50),
 `surf_tversky` and `surf_esp_tversky` (8 × 40), `vol_color_tversky` (16 × 40), `vol_lipo_tversky`
 (16 × 50), `pharm_tversky` (32 × 50), `vol_and_surf_esp_tversky` (8 × 60). `pharm` also takes
-`similarity='tversky'|'tversky_ref'|'tversky_fit'` directly. Tversky forfeits the **fused-CPU** fast
-path — `cpu_fused_shape` hardcodes the Tanimoto reduction — but keeps the CUDA graph: each Tversky
-driver has its own graphed fine loop.
+`similarity='tversky'|'tversky_ref'|'tversky_fit'` directly. Tversky keeps BOTH fast paths: the
+fused CPU loop takes its reduction from the mode registry now, so the Tanimoto-only restriction that
+used to exclude these modes is gone.
 
 ### Wiring, and the rename
 
-All 21 have pairwise and batched paths. **11 are screen-capable**, all on the array-native screen
-path — the seven core modes plus `vol_tversky`, `vol_esp_tversky`, `vol_lipo`, `vol_fukui` — and **4
-have a worker-process path**: `vol`, `surf`, `surf_esp`, `pharm`.
+**All 21 have every path.** Each mode is a `ModeSpec` in `accel/_modes.py` — the channels it reads,
+the terms it optimises, how they reduce and blend, and its schedule — and one generic engine runs all
+of them, so the batched aligner, the CUDA-graph and fused-CPU fine loops, the array-native screen,
+the multi-GPU screen and the worker-process path are all derived from that spec rather than written
+per mode. Where the counts stood before: worker-process path 4 → 21, fused CPU loop 4 → 19 (the
+pharmacophore family opts out, [B12](#b12-pharm-cpu-scores-changed)), screen-capable 11 → 21,
+array-native screen 11 → 21, canonical-store constant seeds 8 → 15.
 
 `esp` → `surf_esp` and `esp_combo` → `vol_and_surf_esp`; both legacy names still work everywhere
 ([B2](#b2-mode-rename)).
@@ -158,6 +163,16 @@ changes results — see [B1](#b1-num_repeats-and-max_num_steps-defaults).
 seed goes straight into the fine loop and the per-pair maximum is taken — ranking seeds on raw
 un-optimized overlap repeatedly discarded the true basin for pseudo-symmetric molecules. The
 coarse-grid path runs **only** when `trans_init=True`, so cost scales linearly with seed count.
+
+**The coarse grid is not always built from the cloud the mode seeds from.** `vol_and_surf_esp`
+builds it from the **surface** clouds while seeding from the volume centres; every other mode uses
+its seed cloud. The pre-registry drivers differed here by accident rather than by design, but the
+behaviour ships, so it is carried as `ModeSpec.coarse_channel` — routing the combo mode through its
+seed channel instead moves its `trans_init` scores by up to 1.24% relative. A new mode inherits the
+default (its seed cloud) and needs no entry. `tests/test_trans_init_accel.py` pins the choice per
+mode; that path had no test before. The same file records the one mode whose `trans_init` self-copy
+does not reach 1.0 (`vol_and_surf_esp`, ~0.54), which is long-standing and reproduces exactly on
+591f695.
 
 **Gradients are analytic, not autograd** — every kernel emits closed-form `dV/dq` and `dV/dt`, so no
 autograd graph is built in the fine loop, and the pharmacophore and colour kernels emit `dO/dq`
@@ -297,10 +312,11 @@ largest compounds.
 own the cores there; unpinned, torch's pool spin-waits against them. Scoped rather than global, so it
 does not reconfigure the caller's torch; if you already export `OMP_NUM_THREADS=1`, nothing changes.
 
-**The fused CPU loop is not applied uniformly.** `surf_esp` is excluded above 100 padded points (the
-most shape-degenerate mode, whose fused trajectory settles in different but equally valid basins),
-`pharm` entirely ([B12](#b12-pharm-cpu-scores-changed)), and the other 16 modes have no fused call
-site. The numba kernels run `fastmath=True, parallel=True` over `NUMBA_NUM_THREADS` (default: *all*
+**The fused CPU loop now serves 19 of the 21 modes** (it served 4). It is generic over a mode's
+terms and reductions, so a mode joins it by existing. Two exclusions remain, both on the mode's own
+`ModeSpec`: `surf_esp` above 100 padded points (the most shape-degenerate mode, whose fused
+trajectory settles in different but equally valid basins), and the pharmacophore family entirely
+([B12](#b12-pharm-cpu-scores-changed)). The numba kernels run `fastmath=True, parallel=True` over `NUMBA_NUM_THREADS` (default: *all*
 cores), which oversubscribes alongside the process pool — hence `screen_parallel` pinning it to 1.
 
 ## 7. Surfaces and pharmacophores
@@ -403,9 +419,19 @@ its on-disk format carries `VERSION = 1` — validated on open, and provisional.
 `has_triton()`, `align_multi_gpu(...)`, `MultiGPUAligner`, `clear_caches()`, plus
 `accel.screen_parallel.screen_parallel(...)`.
 
-**`accel._modes`** is the mode registry: `CANONICAL_MODES` (the 21, in public order),
+**`accel._modes`** is the mode registry, and the modes are DATA. `SPECS` holds one `ModeSpec` per
+mode — its channels, its objective terms (kernel, reduction, blend weight), its optimiser schedule
+and its per-mode tuning (graph budget, pose cap, fused-CPU opt-out, multipose) — and the flat tables
+every consumer reads are derived from it: `CANONICAL_MODES` (the 21, in public order),
 `LEGACY_MODE_ALIASES`, `PROCESS_MODES`, `MODE_ATTRS`, `MODE_SEEDS`/`MODE_STEPS` (what
-`num_repeats=None` / `max_num_steps=None` resolve to) and `canonical(mode)`.
+`num_repeats=None` / `max_num_steps=None` resolve to), `CONST_SEED_MODES`, `canonical(mode)` and
+`spec_of(mode)`.
+
+**`accel.channels`** is the matching per-molecule data table: one `Channel` per named array (the
+heavy-atom cloud, the surface points, the partial charges, the pharmacophore anchors, ...) carrying
+how to read it off a `Molecule`, which pair tensor holds it, how a `ProfileStore` persists it, and
+whether it rotates and translates under the canonical frame. Adding per-molecule data is a row here,
+not an edit in five files.
 
 **`accel._stats`** records fine-loop effort and is a no-op until armed. `reset()` enables it,
 `summary()` returns `calls`, `graphed` (calls that took the CUDA-graph path), `steps_min/max/mean`,
@@ -417,7 +443,7 @@ effort** — and the reference per-pair optimizers and the JAX path do not recor
 
 | Constant | Module | Default | Effect |
 |---|---|---|---|
-| `_ESP_STRIDE` | `drivers/esp_combo.py` | 5 | ESP re-scoring interval; 1 = dense |
+| `_ESP_STRIDE` | `drivers/engine.py` | 5 | ESP re-scoring interval; 1 = dense |
 | `VOL_COLOR_FUSED_MAX_PAD` | `kernels/vol_color_triton.py` | 32 | Above this pad, the fused vol_color kernel is skipped |
 | `_GRAPH_WORK_BUDGET` | `drivers/_graphed.py` | 300,000,000 | Default pose budget for graph engagement |
 | `_GRAPH_CAP_CEIL` / `_GRAPH_CAP_MIN` | `drivers/_graphed.py` | 262,144 / 2,000 | Hard bounds on the graph pose cap |
@@ -622,8 +648,8 @@ pairwise path (Shepherd-Score-Paper, `paper/fig2_speed/validate_canonical.py` an
 - **Ten of the 21 modes have never been benchmarked** — `vol_mr`, `vol_atomtype`, `vol_pharm`,
   `vol_avoid` and the six Tversky variants other than `vol_tversky`. They are correctness-tested, not
   performance-characterised, and several carry tuning constants inherited from a sibling rather than
-  measured for themselves. **Nine are not screen-capable** — `ProfileStore.supports()` has no branch
-  for them even against a full-schema store, and `vol_avoid` is pairwise-only by design.
+  measured for themselves. They all screen now, on the array-native path, but **no throughput number
+  has been measured for any of them** — do not quote one by analogy with a sibling.
 - **`accel/` and `screen.py` have no Sphinx API pages**, so none of [§8](#8-api-reference) renders on
   the docs site. When adding them, set `autodoc_mock_imports = ["triton", "numba"]`.
 - **Bit-identity results come from non-early-stopping workloads.** A very small chunk or a

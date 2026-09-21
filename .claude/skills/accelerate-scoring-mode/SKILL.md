@@ -187,6 +187,13 @@ constant seeds apply), `bucket` + `work` (the cost model), `graph_budget`, `cpu_
 > reasonable starting point — state in the commit that you did, rather than presenting an
 > unmeasured constant as a measured knee.
 
+`coarse_channel` is the one field you should almost certainly leave alone. It names the cloud the
+legacy `trans_init=True` coarse grid is built from, and its default — the mode's seed cloud — is
+what four of the five pre-registry drivers did. It exists only because `esp_combo` built its grid
+from the **surface** clouds while seeding from the volume centres, and that oddity moves scores by
+1.24% relative if you normalise it away. Set it only to reproduce an existing driver you are
+porting, never to express a preference.
+
 ### 8. Public batched API
 
 Add `MoleculePairBatch.align_with_<mode>(backend=None, return_aligned=False)` in

@@ -1,0 +1,190 @@
+"""Gates for the LEGACY translation-seeded accelerated path (``trans_init=True``).
+
+That path replaces the SO(3) multi-start with a coarse grid of pose hypotheses built around the
+reference molecule's own atom positions, scores the grid value-only and keeps the top-k as
+fine-loop starts. It had no test at all before this file, which is how a real regression survived
+review: the pre-registry drivers did not agree on WHICH cloud the grid is built from -- ``esp``,
+``pharm`` and ``vol_color`` used the cloud they seed from, but ``esp_combo`` used the SURFACE
+clouds while seeding from the volume centers -- and routing every mode through its seed channel
+moved ``vol_and_surf_esp`` scores by up to 1.24% relative. The choice now lives on the ModeSpec
+as ``coarse_channel`` and the first test below pins it per mode.
+
+Surfaces and charges are INJECTED (deterministic pseudo-random clouds) so the file needs neither
+open3d nor xtb: which cloud reaches ``build_coarse_grid`` does not depend on how it was produced.
+"""
+import warnings
+
+import numpy as np
+import pytest
+
+try:
+    import torch
+    TORCH = True
+except ImportError:
+    TORCH = False
+
+pytestmark = pytest.mark.skipif(not TORCH, reason="PyTorch required")
+
+IBU = "CC(C)Cc1ccc(cc1)C(C)C(=O)O"
+CAF = "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"
+N_SURF = 75
+
+# Seven of the 21 modes expose ``trans_init`` publicly; five of them act on it, and those five map
+# here to the cloud their coarse grid is built from, as the PRE-REGISTRY driver built it. The
+# other two (``vol``, ``surf``) accept it and ignore it -- see the last test.
+# Hardcoded on purpose: deriving it from the spec would only restate the code under test.
+# "atoms" and "heavy" are the same cloud for these fixtures, so this table pins the surface /
+# anchor / atom distinction, which is the one that regressed.
+GRID_CLOUD = {
+    "vol_esp": "atoms",
+    "surf_esp": "surf",
+    "vol_and_surf_esp": "surf",
+    "pharm": "pharm_ancs",
+    "vol_color": "atoms",
+}
+
+KW = {
+    "vol": dict(alpha=0.81),      # ignores trans_init; kept for the last test
+    "surf": dict(alpha=0.81),     # ignores trans_init; kept for the last test
+    "vol_esp": dict(alpha=0.81, lam=0.3),
+    "surf_esp": dict(alpha=0.81, lam=0.3),
+    "vol_and_surf_esp": dict(alpha=0.81),
+    "pharm": {},
+    "vol_color": dict(alpha=0.81),
+}
+
+
+def _mol(smiles, seed=0):
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from shepherd_score.container import Molecule
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        rd = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        p = AllChem.ETKDGv3()
+        p.randomSeed = seed
+        assert AllChem.EmbedMolecule(rd, p) == 0, smiles
+    rng = np.random.default_rng(seed)
+    return Molecule(rd, pharm_multi_vector=False,
+                    surface_points=(rng.standard_normal((N_SURF, 3)) * 3.0).astype(np.float32),
+                    electrostatics=rng.standard_normal(N_SURF).astype(np.float32),
+                    partial_charges=(rng.standard_normal(rd.GetNumAtoms()) * 0.2
+                                     ).astype(np.float32))
+
+
+def _pair(a, b):
+    from shepherd_score.container import MoleculePair
+    return MoleculePair(a, b, do_center=True, device=torch.device("cpu"))
+
+
+def _widths(mol):
+    """Real-point count of each cloud the coarse grid could be built from."""
+    return {"atoms": int(np.asarray(mol.atom_pos).shape[0]),
+            "surf": int(np.asarray(mol.surf_pos).shape[0]),
+            "pharm_ancs": int(np.asarray(mol.pharm_ancs).shape[0])}
+
+
+def _spy(monkeypatch):
+    """Record the reference cloud size and grid size the coarse path is called with."""
+    from shepherd_score.accel.drivers import engine
+    seen = {}
+    real = engine.build_coarse_grid
+
+    def spy(A_batch, B_batch, N_real, M_real, **kw):
+        q, t = real(A_batch, B_batch, N_real, M_real, **kw)
+        seen.setdefault("n", int(N_real[0].item()))
+        seen.setdefault("g", int(q.shape[1]))
+        return q, t
+
+    monkeypatch.setattr(engine, "build_coarse_grid", spy)
+    return seen
+
+
+@pytest.mark.parametrize("mode", sorted(GRID_CLOUD))
+def test_coarse_grid_is_built_from_the_documented_cloud(mode, monkeypatch):
+    """The grid must be built from the mode's ``coarse_channel`` -- its seed channel unless the
+    spec overrides it, which only the combo pair does."""
+    from shepherd_score.container import MoleculePairBatch
+
+    ref, fit = _mol(IBU), _mol(CAF, seed=1)
+    w = _widths(ref)
+    assert len(set(w.values())) == len(w), f"fixture clouds are not distinguishable: {w}"
+
+    seen = _spy(monkeypatch)
+    getattr(MoleculePairBatch([_pair(ref, fit)]), "align_with_" + mode)(
+        backend="numba", trans_init=True, **KW[mode])
+
+    assert seen, f"{mode}: trans_init=True did not reach the coarse-grid path"
+    want = GRID_CLOUD[mode]
+    assert seen["n"] == w[want], (
+        f"{mode}: coarse grid built from a {seen['n']}-point cloud, expected the {want} cloud "
+        f"({w[want]} points). Cloud widths: {w}")
+
+
+def test_grid_size_follows_the_legacy_contract(monkeypatch):
+    """G = 10*P + 5 for P translation centers, and the batch layer takes P from the REFERENCE
+    molecule's atom positions."""
+    from shepherd_score.container import MoleculePairBatch
+
+    ref, fit = _mol(IBU), _mol(CAF, seed=1)
+    p_count = int(np.asarray(ref.atom_pos).shape[0])
+    seen = _spy(monkeypatch)
+    MoleculePairBatch([_pair(ref, fit)]).align_with_vol_esp(
+        backend="numba", trans_init=True, alpha=0.81, lam=0.3)
+    assert seen["g"] == 10 * p_count + 5, \
+        f"grid size {seen['g']} != 10*{p_count}+5"
+
+
+def _self_copy(mode):
+    from shepherd_score.accel._modes import MODE_ATTRS
+    from shepherd_score.container import MoleculePairBatch
+    p = _pair(_mol(IBU), _mol(IBU))
+    getattr(MoleculePairBatch([p]), "align_with_" + mode)(
+        backend="numba", trans_init=True, **KW[mode])
+    return float(getattr(p, MODE_ATTRS[mode][1]))
+
+
+@pytest.mark.parametrize("mode", [m for m in sorted(GRID_CLOUD) if m != "vol_and_surf_esp"])
+def test_self_copy_scores_one_through_the_coarse_path(mode):
+    """A molecule aligned to a copy of itself still scores ~1.0 when the fine-loop starts come
+    from the coarse grid rather than the SO(3) multi-start."""
+    s = _self_copy(mode)
+    assert 0.97 <= s <= 1.0 + 1e-5, f"{mode} trans_init self-copy scored {s}"
+
+
+def test_combo_self_copy_falls_short_of_one_as_it_always_has():
+    """``vol_and_surf_esp`` is the one mode that does NOT recover the identity pose from the
+    translation-seeded grid: its fine loop gets 60 steps from grid starts that are all far from
+    identity, and its blended shape+ESP objective does not close the gap. This is PRE-EXISTING,
+    not a refactor artifact -- 591f695 returns the same 0.5369912981987 on this fixture, to every
+    digit. Pinned as a floor so a future change that fixes it is noticed rather than silently
+    absorbed, and so the shortfall is not mistaken for a regression."""
+    s = _self_copy("vol_and_surf_esp")
+    assert 0.45 <= s < 0.97, (
+        f"vol_and_surf_esp trans_init self-copy scored {s}; the shipped behaviour is ~0.54. "
+        "Above 0.97 means the coarse path now reaches identity -- a real improvement, but check "
+        "it against the rest of the parity gates before widening this bound.")
+
+
+@pytest.mark.parametrize("mode", ["vol", "surf"])
+def test_shape_modes_accept_trans_init_and_ignore_it(mode, monkeypatch):
+    """``vol`` and ``surf`` take the keyword and do nothing with it: the accelerated shape path
+    re-derives its own seeds and never builds a coarse grid. Scores are IDENTICAL either way.
+
+    Pinned because the keyword's presence in the signature reads as support, and a future change
+    that starts honouring it would silently move every caller's shape scores. Verified to hold on
+    591f695 as well (same bit pattern with the keyword on and off)."""
+    from shepherd_score.accel._modes import MODE_ATTRS
+    from shepherd_score.container import MoleculePairBatch
+
+    ref, fit = _mol(IBU), _mol(CAF, seed=1)
+    seen = _spy(monkeypatch)
+    got = []
+    for flag in (False, True):
+        p = _pair(ref, fit)
+        getattr(MoleculePairBatch([p]), "align_with_" + mode)(
+            backend="numba", trans_init=flag, **KW[mode])
+        got.append(float(getattr(p, MODE_ATTRS[mode][1])))
+
+    assert seen == {}, f"{mode} now builds a coarse grid for trans_init=True: {seen}"
+    assert got[0] == got[1], f"{mode} trans_init changed the score: {got[0]} -> {got[1]}"

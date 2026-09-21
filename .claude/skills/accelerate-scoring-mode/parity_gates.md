@@ -100,6 +100,22 @@ also need not RANK the self-copy first, though it still scores it 1.000.
 For a surface mode, build the self-pair from a **shared surface** — two independently sampled
 surfaces of the same molecule are not the same point cloud and will not score 1.000.
 
+## Gate 4b — the `trans_init` path *(cheap, and it has caught a real bug)*
+
+`trans_init=True` swaps the SO(3) multi-start for a coarse grid of poses built around the
+reference molecule's atom positions. Every mode reaches it through the same engine, so a new mode
+gets it for free and nobody thinks to check it — which is how a 1.24% score move on
+`vol_and_surf_esp` survived a full green parity run. Add your mode to
+`tests/test_trans_init_accel.py`: one line in `GRID_CLOUD` naming the cloud the grid is built from
+(your seed cloud unless you set `coarse_channel`), and its keywords in `KW`. The spy test then
+pins the cloud and the self-copy test covers the path end to end.
+
+Only 7 of the 21 modes expose `trans_init` at all, and two of those (`vol`, `surf`) accept it and
+**ignore** it — the accelerated shape path re-derives its own seeds. If your mode's wrapper does not
+take the keyword, it has nothing to add here. Expect the self-copy to reach ~1.0 if it does act on
+it; if it does not, check the base before treating it as your bug, because `vol_and_surf_esp` has
+always scored ~0.54 there.
+
 ## Gate 5 — streamed screen ≡ per-pair `MoleculePairBatch`
 
 The out-of-core path must reproduce the in-memory result. Full detail in `screen_wiring.md`.
