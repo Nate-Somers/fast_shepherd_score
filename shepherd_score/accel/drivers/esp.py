@@ -168,6 +168,7 @@ def coarse_fine_esp_align_many(
         lr: float = 0.075,
         N_real: Optional[torch.Tensor] = None,
         M_real: Optional[torch.Tensor] = None,
+        seeds: Optional[tuple] = None,
         early_stop_patience: int = 5,
         early_stop_tol: float = 1e-5) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -233,8 +234,11 @@ def coarse_fine_esp_align_many(
         # predictor of post-optimisation score and repeatedly discarded the
         # true basin for pseudo-symmetric molecules, pulling ESP scores ~5%
         # below the reference. See coarse_fine_align_many for the full rationale.
-        quats, t_seeds = batched_seeds_torch(A_batch, B_batch, N_real, M_real,
-                                             num_seeds=num_seeds)
+        if seeds is not None:
+            quats, t_seeds = seeds  # precomputed per pair (a canonical store's constant set); see batched_seeds_torch
+        else:
+            quats, t_seeds = batched_seeds_torch(A_batch, B_batch, N_real, M_real,
+                                                 num_seeds=num_seeds)
         P = quats.size(1)
         q_best = quats.clone()
         t_best = t_seeds.clone()
@@ -535,7 +539,8 @@ def fast_optimize_ROCS_esp_overlay_batch(
         num_seeds: int = 50,
         topk: int = 30,
         steps_fine: int = 100,
-        lr: float = 0.075) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        lr: float = 0.075,
+        seeds: Optional[tuple] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fast GPU-accelerated batch ESP alignment.
 
@@ -599,7 +604,8 @@ def fast_optimize_ROCS_esp_overlay_batch(
         steps_fine=steps_fine,
         lr=lr,
         N_real=N_real,
-        M_real=M_real)
+        M_real=M_real,
+        seeds=seeds)
 
     # Apply transforms
     aligned_batch = apply_se3_transform(fit_batch, q_best, t_best)

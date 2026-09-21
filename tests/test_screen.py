@@ -111,8 +111,9 @@ def test_store_pre_centered(tmp_path):
 
 def test_store_is_canonical_by_default_only_when_it_serves_vol(tmp_path):
     """``canonical=None`` resolves to True for a pre-centred store whose modes include ``vol`` --
-    the one mode whose screen runs a constant seed set against a canonical store -- and to False
-    for a store without it, which gains nothing from the rotation. A canonical store's
+    or any other mode that seeds from the atom cloud (``accel._modes.CONST_SEED_MODES``; the
+    per-mode sweep is in test_screen_const_seeds.py) -- and to False for a ``surf``-only store,
+    which seeds from the surface and gains nothing from the rotation. A canonical store's
     ``atom_pos`` is the molecule in its own principal frame: still centred, and the geometry is
     preserved up to that rotation (every pairwise distance). Canonical without pre-centring is
     refused, since the axes are centroid-relative."""
@@ -318,8 +319,12 @@ def test_vol_color_store_and_fast_matches_object(tmp_path, molecules):
     store, and its fast path matches the per-pair object path on identical inputs."""
     import copy
     store_path = os.path.join(tmp_path, "lib.fss")
+    # ``canonical=False`` explicitly: a pre-centred store serving this mode is canonical BY
+    # DEFAULT now (accel._modes.CONST_SEED_MODES), and the fast path then runs one constant
+    # seed set the object path does not, so the two legitimately differ at ~1e-3. This test
+    # is about the array->kernel plumbing, which needs both legs on the same seeds.
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_color",),
-                             dtype="float32", pre_centered=True) as store:
+                             dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
             store.add(m, id=i)
     store = ProfileStore.open(store_path)
@@ -348,8 +353,12 @@ def test_vol_tversky_stream_matches_object(tmp_path, molecules):
     per-pair object path on identical centered inputs."""
     import copy
     store_path = os.path.join(tmp_path, "lib.fss")
+    # ``canonical=False`` explicitly: a pre-centred store serving this mode is canonical BY
+    # DEFAULT now (accel._modes.CONST_SEED_MODES), and the fast path then runs one constant
+    # seed set the object path does not, so the two legitimately differ at ~1e-3. This test
+    # is about the array->kernel plumbing, which needs both legs on the same seeds.
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_tversky",),
-                             dtype="float32", pre_centered=True) as store:
+                             dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
             store.add(m, id=i)
     store = ProfileStore.open(store_path)
@@ -377,8 +386,12 @@ def test_vol_esp_tversky_stream_matches_object(tmp_path, molecules):
     pre_centered) match the per-pair object path on identical centered molecules."""
     import copy, glob
     store_path = os.path.join(tmp_path, "lib.fss")
+    # ``canonical=False`` explicitly: a pre-centred store serving this mode is canonical BY
+    # DEFAULT now (accel._modes.CONST_SEED_MODES), and the fast path then runs one constant
+    # seed set the object path does not, so the two legitimately differ at ~1e-3. This test
+    # is about the array->kernel plumbing, which needs both legs on the same seeds.
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_esp_tversky",),
-                             dtype="float32", pre_centered=True) as store:
+                             dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
             store.add(m, id=i)
     store = ProfileStore.open(store_path)
@@ -419,8 +432,12 @@ def test_vol_lipo_stream_matches_object(tmp_path, molecules):
     store must actually persist the lipo arrays (offset table + centres + scalar)."""
     import copy, glob
     store_path = os.path.join(tmp_path, "lib.fss")
+    # ``canonical=False`` explicitly: a pre-centred store serving this mode is canonical BY
+    # DEFAULT now (accel._modes.CONST_SEED_MODES), and the fast path then runs one constant
+    # seed set the object path does not, so the two legitimately differ at ~1e-3. This test
+    # is about the array->kernel plumbing, which needs both legs on the same seeds.
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_lipo",),
-                             dtype="float32", pre_centered=True) as store:
+                             dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
             store.add(m, id=i)
     store = ProfileStore.open(store_path)
@@ -622,8 +639,12 @@ def test_vol_fukui_stream_matches_object(tmp_path):
     mols = [_build_molecule_fukui(s, seed=i) for i, s in enumerate(smis)]
 
     store_path = os.path.join(tmp_path, "lib.fss")
+    # ``canonical=False`` explicitly: a pre-centred store serving this mode is canonical BY
+    # DEFAULT now (accel._modes.CONST_SEED_MODES), and the fast path then runs one constant
+    # seed set the object path does not, so the two legitimately differ at ~1e-3. This test
+    # is about the array->kernel plumbing, which needs both legs on the same seeds.
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_fukui",),
-                             dtype="float32", pre_centered=True) as store:
+                             dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(mols):
             store.add(m, id=i)
     store = ProfileStore.open(store_path)

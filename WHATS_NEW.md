@@ -15,10 +15,12 @@ Upstream at `20ebed7`, this fork at `main`.
 >    a converged neighbour. Search effort is unchanged. [B9](#b9-early-stopping-is-per-pair)
 > 5. **`pharm` CPU scores changed** — its fused CPU loop found different optima, so it is disabled.
 >    [B12](#b12-pharm-cpu-scores-changed)
-> 6. **Profile stores that serve `vol` are canonical by default** — such a store holds each molecule
->    in its principal-axis frame, and a `vol` screen against it runs one constant seed set, so `vol`
->    screening scores differ slightly (1e-3 on average) from a store built before; existing stores
->    are unchanged. `ProfileStore.create(..., canonical=False)` restores the old layout. [B13](#b13-profile-stores-are-canonical-by-default)
+> 6. **Profile stores that serve any atom-cloud-seeded mode are canonical by default** — `vol`,
+>    `vol_color`, `vol_esp`, `vol_lipo`, `vol_fukui`, the volumetric Tversky modes and
+>    `vol_and_surf_esp`. Such a store holds each molecule in its principal-axis frame, and a screen in
+>    those modes runs one constant seed set instead of a per-molecule eigensolve, so their screening
+>    scores differ slightly (1e-3 on average) from a store built before; existing stores are
+>    unchanged. `ProfileStore.create(..., canonical=False)` restores the old layout. [B13](#b13-profile-stores-are-canonical-by-default)
 
 The fork is additive — no upstream file deleted, no upstream public name removed — and it merges
 upstream's own `Molecule` refactor and interaction-subselection work, so a fork→upstream merge is a
@@ -582,16 +584,21 @@ less throughput. **Any `pharm` CPU score produced before this came from the fuse
 
 ### B13. Profile stores are canonical by default
 
-`ProfileStore.create` now defaults `canonical` to `True` when the store's modes include `vol` (and
-`pre_centered` is on), so such a store holds every molecule rotated into its own principal-axis frame
-with the rotation kept. Screening `vol` against it runs one constant seed set instead of a
-per-molecule eigensolve — this is what the paper's screening throughput was measured on — and the
-transforms it returns are composed back to the centered frame. Because that seed set differs from
+`ProfileStore.create` now defaults `canonical` to `True` when the store's modes include any mode that
+seeds from the heavy-atom cloud — `accel._modes.CONST_SEED_MODES`: `vol`, `vol_color`, `vol_esp`,
+`vol_lipo`, `vol_fukui`, `vol_tversky`, `vol_esp_tversky` and `vol_and_surf_esp` (at `alpha=0.81`) —
+and `pre_centered` is on, so such a store holds every molecule rotated into its own principal-axis
+frame with the rotation kept. Screening any of those modes against it runs one constant seed set
+instead of a per-molecule eigensolve — for `vol` this is what the paper's screening throughput was
+measured on; the others gained it later, with the same set (`canonical_seed_quats`) and the same
+zero translations, because their drivers seed from the same cloud — and the transforms it returns are
+composed back to the centered frame. Because that seed set differs from
 the per-molecule one, **`vol` scores from a canonical store differ from a non-canonical store's, and
 from `MoleculePair`, by about 1e-3 on average** (Spearman 0.997, top-1000 overlap 99% at N=99,000),
-with a few molecules landing in a different optimizer basin. The same holds for every other mode on
-a canonical store, but those modes gain no speed from it, so a store without `vol` stays
-non-canonical and matches the pairwise path to ~1e-4. Stores already on disk keep their manifest's
+with a few molecules landing in a different optimizer basin. The same holds for the other
+constant-seed modes. `surf`, `surf_esp` and `pharm` seed from the surface or anchor clouds, which the
+store does not canonicalise, so they keep their per-molecule generator and gain no speed; a store
+serving only them stays non-canonical and matches the pairwise path to ~1e-4. Stores already on disk keep their manifest's
 `canonical=False` and are unaffected. Before this became the default, screening scores
 and DUDE-Z enrichment on canonical stores were validated against non-canonical stores and against the
 pairwise path (Shepherd-Score-Paper, `paper/fig2_speed/validate_canonical.py` and its

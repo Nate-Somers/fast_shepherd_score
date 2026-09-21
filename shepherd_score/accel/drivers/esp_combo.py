@@ -357,6 +357,7 @@ def coarse_fine_esp_combo_align_many(
         M_real_atoms_w_H_2: Optional[torch.Tensor] = None,
         N_real_surf_1: Optional[torch.Tensor] = None,
         M_real_surf_2: Optional[torch.Tensor] = None,
+        seeds: Optional[tuple] = None,
         early_stop_patience: int = 5,
         early_stop_tol: float = 1e-5) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -408,8 +409,11 @@ def coarse_fine_esp_combo_align_many(
         # the volume shape gradient, so seeding from the centers aligns the seed PCA
         # starts with the basins the optimiser actually descends. The matching per-mode
         # seed count lives in shepherd_score/accel/_modes.py::MODE_SEEDS.
-        quats, t_seeds = batched_seeds_torch(centers_1, centers_2, N_real_centers,
-                                             M_real_centers, num_seeds=num_seeds)
+        if seeds is not None:
+            quats, t_seeds = seeds  # precomputed per pair (a canonical store's constant set); see batched_seeds_torch
+        else:
+            quats, t_seeds = batched_seeds_torch(centers_1, centers_2, N_real_centers,
+                                                 M_real_centers, num_seeds=num_seeds)
         P = quats.size(1)
         q_best = quats.clone()
         t_best = t_seeds.clone()
@@ -678,7 +682,8 @@ def fast_optimize_esp_combo_score_overlay_batch(
         topk: int = 30,
         steps_fine: int = 100,
         num_seeds: int = 50,
-        lr: float = 0.075) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        lr: float = 0.075,
+        seeds: Optional[tuple] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fast GPU-accelerated batch ESP-combo alignment with padding-safe masks.
 
@@ -744,6 +749,7 @@ def fast_optimize_esp_combo_score_overlay_batch(
         M_real_atoms_w_H_2=M_real_atoms_w_H_2,
         N_real_surf_1=N_real_surf_1,
         M_real_surf_2=M_real_surf_2,
+        seeds=seeds,
     )
 
     aligned_fit_points = apply_se3_transform(fit_points_batch, q_best, t_best)

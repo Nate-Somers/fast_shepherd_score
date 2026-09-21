@@ -189,6 +189,7 @@ def coarse_fine_vol_lipo_align_many(
         M_real_centers: Optional[torch.Tensor] = None,
         N_real_lipo: Optional[torch.Tensor] = None,
         M_real_lipo: Optional[torch.Tensor] = None,
+        seeds: Optional[tuple] = None,
         early_stop_patience: int = 2,
         early_stop_tol: float = 1e-5) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Vectorized vol_lipo alignment over a batch of pairs (coarse-to-fine SE(3)).
@@ -220,8 +221,11 @@ def coarse_fine_vol_lipo_align_many(
     # ------------------------------------------------------------------
     # 1) pose hypotheses (seed from the SHAPE atom clouds, like vol/vol_color)
     # ------------------------------------------------------------------
-    quats, t_seeds = batched_seeds_torch(centers_1, centers_2, N_real_centers,
-                                         M_real_centers, num_seeds=num_seeds)
+    if seeds is not None:
+        quats, t_seeds = seeds  # precomputed per pair (a canonical store's constant set); see batched_seeds_torch
+    else:
+        quats, t_seeds = batched_seeds_torch(centers_1, centers_2, N_real_centers,
+                                             M_real_centers, num_seeds=num_seeds)
     P = quats.size(1)
     q_best = quats.clone()
     t_best = t_seeds.clone()
@@ -393,7 +397,8 @@ def fast_optimize_vol_lipo_overlay_batch(
         topk: int = 30,
         steps_fine: int = 100,
         lr: float = 0.075,
-        num_seeds: int = 50) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_seeds: int = 50,
+        seeds: Optional[tuple] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched vol_lipo alignment. Returns (aligned_fit_centers, q_best, t_best, scores)."""
     BATCH = ref_centers_batch.shape[0]
     if N_real_centers is None:
@@ -413,6 +418,7 @@ def fast_optimize_vol_lipo_overlay_batch(
         num_seeds=num_seeds, steps_fine=steps_fine, lr=lr,
         N_real_centers=N_real_centers, M_real_centers=M_real_centers,
         N_real_lipo=N_real_lipo, M_real_lipo=M_real_lipo,
+        seeds=seeds,
     )
     aligned = apply_se3_transform(fit_centers_batch, q_best, t_best)
     return aligned, q_best, t_best, scores

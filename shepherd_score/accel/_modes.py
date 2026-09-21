@@ -95,3 +95,29 @@ MODE_STEPS = {"vol": 30, "surf": 40, "surf_esp": 40, "vol_esp": 50, "vol_and_sur
               "vol_mr": 50, "surf_tversky": 40, "surf_esp_tversky": 40, "vol_lipo_tversky": 50,
               "vol_color_tversky": 40, "vol_atomtype": 40, "vol_pharm": 50, "pharm_tversky": 50,
               "vol_and_surf_esp_tversky": 60, "vol_fukui": 50, "vol_avoid": 50}
+
+# Screen modes whose seed ROTATIONS come from the heavy-atom cloud -- the cloud a canonical
+# ProfileStore rotates into its principal frame -- and whose seed TRANSLATIONS are zero once both
+# sides are centred on that cloud's centroid. On a canonical store their per-molecule seed
+# eigensolve (drivers/_common.py::batched_seeds_torch, measured at 0.82-0.91 us/mol for vol,
+# vol_color and vol_esp) is redundant: every fit molecule already sits in its principal frame, so
+# the rotation that carries it onto the query is ONE constant set for the whole screen
+# (drivers/_common.py::canonical_seed_quats), broadcast over each bucket. screen.py gates the
+# constant-seed path on this tuple; before it, only ``vol`` took that path and the other modes
+# re-ran the eigensolve on already-rotated coordinates to rediscover a near-constant answer.
+#
+# NOT listed, because they seed from a cloud the store does not canonicalise: ``surf`` and
+# ``surf_esp`` (surface PCA) and ``pharm`` (anchor PCA). ``vol_and_surf_esp`` seeds from the atom
+# cloud only at alpha == 0.81 and from the surface otherwise; screen.py checks that per call.
+# ``vol_esp`` / ``vol_esp_tversky`` seed from the STRICT-heavy centres, which equal ``atom_pos``
+# except on a molecule whose RemoveHs retained an H (and are rotated by the same ``rot`` --
+# screen.py::_profile_from_schema), so the constant set is exact there and off by that one
+# molecule's own frame difference otherwise: a seed perturbation the flip/swap set covers.
+#
+# The constant seeds are NOT bit-identical to the per-molecule ones (the frames differ by each
+# molecule's own rotation), so scores move at the 1e-3 level -- the same magnitude the rotated
+# coordinates alone already moved them on a canonical store, with no enrichment change on 27
+# DUDE-Z targets for vol, vol_esp or surf (Shepherd-Score-Paper fig2_speed/validate_canonical.py,
+# results/CANONICAL_validation.json, commit 6993bef). Re-run that harness after changing this.
+CONST_SEED_MODES = ("vol", "vol_color", "vol_esp", "vol_and_surf_esp", "vol_tversky",
+                    "vol_esp_tversky", "vol_lipo", "vol_fukui")

@@ -638,6 +638,9 @@ def canonical_seed_quats(ref_points, n_real, num_seeds: int, device):
 
     This is NOT bit-identical to the per-molecule seeds -- the frames differ by each molecule's
     own rotation -- so scores move and enrichment has to be revalidated.
+
+    Serves every mode in ``accel._modes.CONST_SEED_MODES`` (all seed from the heavy-atom cloud
+    the store canonicalises), with ``num_seeds`` taken from that mode's ``MODE_SEEDS`` entry.
     """
     import numpy as np
     import torch

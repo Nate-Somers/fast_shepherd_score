@@ -131,6 +131,22 @@ def gather_fill(out: torch.Tensor, src: torch.Tensor,
     out.view(k * P_pad, *out.shape[2:])[dst] = src.index_select(0, srcrow)
 
 
+def _const_seed_batch(const_seeds: torch.Tensor, k: int, device):
+    """A canonical store's constant seed set, broadcast over a bucket of ``k`` molecules.
+
+    Returns ``(quats (k,S,4), trans (k,S,3))`` in the layout ``batched_seeds_torch`` produces, so
+    a driver's ``seeds=`` argument takes either without knowing which. The translations are ZERO:
+    a canonical store is pre-centred on the heavy-atom centroid and the query is centred the same
+    way (screen.py::_centered_copy), so the COM-aligning translation the per-molecule generator
+    computes is identically zero for every mode that seeds from the atom cloud -- which is what
+    ``_modes.CONST_SEED_MODES`` lists. The expand is materialised (``.contiguous()``) because the
+    drivers ``.reshape(-1, 4)`` the seeds into pose rows and a stride-0 view cannot serve that.
+    """
+    S = int(const_seeds.shape[0])
+    return (const_seeds.unsqueeze(0).expand(k, -1, -1).contiguous(),
+            torch.zeros(k, S, 3, device=device, dtype=torch.float32))
+
+
 def align_batch_vol_arrays(ref_xyz: torch.Tensor, fit_flat: torch.Tensor,
                            fit_off: torch.Tensor, *, alpha: float = 0.81,
                            steps_fine: int = 100, const_seeds=None):
@@ -203,8 +219,7 @@ def align_batch_vol_arrays(ref_xyz: torch.Tensor, fit_flat: torch.Tensor,
             # one constant set broadcast over the bucket. This is the 44.1% of a vol screen that
             # batched_seeds_torch was spending on a per-molecule float64 eigensolve.
             # (k, S, 4) -- coarse_fine_align_many reads S from quats.size(1) and slices by PAIR
-            seeds_q = const_seeds.unsqueeze(0).expand(k, -1, -1).contiguous()
-            seeds_t = torch.zeros(k, n_seeds, 3, device=device, dtype=torch.float32)
+            seeds_q, seeds_t = _const_seed_batch(const_seeds, k, device)
         else:
             seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
                                                    num_seeds=n_seeds, ref_shared=True)
@@ -256,8 +271,13 @@ def align_batch_vol_color_arrays(ref_xyz: torch.Tensor, ref_types: torch.Tensor,
                                  fit_ancs_flat: torch.Tensor, ph_off: torch.Tensor,
                                  *, alpha: float = 0.81, color_weight: float = 0.5,
                                  num_repeats_per_trans: int = 10, topk: int = 30,
-                                 steps_fine: int = 100, lr: float = 0.075):
+                                 steps_fine: int = 100, lr: float = 0.075, const_seeds=None):
     """Array-native equivalent of ``_align_batch_vol_color`` for the screen path.
+
+    ``const_seeds`` -- a canonical store's ``(S, 4)`` constant rotation set -- replaces the
+    driver's per-molecule seed eigensolve, exactly as it does in :func:`align_batch_vol_arrays`;
+    vol_color seeds from the SHAPE atom clouds (drivers/vol_color.py), the cloud the store
+    canonicalises, so the same set applies. See ``_modes.CONST_SEED_MODES``.
 
     vol_color was the most host-bound mode measured: 53.0% of its screen is spent inside
     ``_build_fit_fast_pairs`` (in situ, N=1e5), because its object-path branch runs a 7-way zip
@@ -352,7 +372,8 @@ def align_batch_vol_color_arrays(ref_xyz: torch.Tensor, ref_types: torch.Tensor,
             N_real_pharm=N_real_p, M_real_pharm=p_cnt.to(torch.int32),
             trans_centers_batch=None, trans_centers_real=None,     # trans_init is False here
             num_repeats_per_trans=num_repeats_per_trans,
-            topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=n_seeds)
+            topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=n_seeds,
+            seeds=None if const_seeds is None else _const_seed_batch(const_seeds, k, device))
 
         out_scores[bk.members.idx(order)] = sc.detach().cpu().numpy().astype(float)
         out_q.index_copy_(0, rows, qb)
@@ -461,8 +482,13 @@ def align_batch_vol_esp_arrays(ref_pts: torch.Tensor, ref_chg: torch.Tensor,
                                fit_pts_flat: torch.Tensor, fit_chg_flat: torch.Tensor,
                                off: torch.Tensor, *, alpha: float = 0.81, lam: float,
                                num_repeats_per_trans: int = 10, topk: int = 30,
-                               steps_fine: int = 100, lr: float = 0.075):
+                               steps_fine: int = 100, lr: float = 0.075, const_seeds=None):
     """Array-native equivalent of ``_esp_bucketed_align`` (``vol_esp``) for the screen path.
+
+    ``const_seeds`` (a canonical store's constant rotation set) replaces the per-molecule seed
+    eigensolve inside ``fast_optimize_ROCS_esp_overlay_batch``. vol_esp seeds from the
+    strict-heavy centres, which the store rotates by the same ``rot`` as ``atom_pos``; see
+    ``_modes.CONST_SEED_MODES`` for the retained-H caveat.
 
     Two channels on one offset table: strict-heavy centers and the heavy partial charges that
     are 1:1 with them. vol_esp reaches the shared ``_esp_bucketed_align``, whose PadSpec is the
@@ -511,15 +537,20 @@ def align_batch_vol_esp_arrays(ref_pts: torch.Tensor, ref_chg: torch.Tensor,
         N_real = torch.full((k,), N, dtype=torch.int32, device=device)
         M_real = c.to(torch.int32)
 
+        # Seeds hoisted per BUCKET and sliced per chunk, as vol does; None keeps the driver's
+        # own per-molecule generator.
+        cs = None if const_seeds is None else _const_seed_batch(const_seeds, k, device)
+
         def _proc(_s, _k, _rp=ref_pad, _fp=fit_pad, _rc=ref_c, _fc=fit_c,
-                  _nr=N_real, _mr=M_real):
+                  _nr=N_real, _mr=M_real, _cs=cs):
             sl = slice(_s, _s + _k)
             _, q, t, sc = fast_optimize_ROCS_esp_overlay_batch(
                 _rp[sl], _fp[sl], _rc[sl], _fc[sl], alpha=alpha, lam=lam,
                 N_real=_nr[sl], M_real=_mr[sl],
                 trans_centers_batch=None, trans_centers_real=None,
                 num_repeats_per_trans=num_repeats_per_trans, num_seeds=n_seeds,
-                topk=topk, steps_fine=steps_fine, lr=lr)
+                topk=topk, steps_fine=steps_fine, lr=lr,
+                seeds=None if _cs is None else (_cs[0][sl], _cs[1][sl]))
             return sc, q, t
 
         # NO pose cap here: armed, vol_esp measured 0.9981x (job 22598857) -- the graph does
@@ -613,8 +644,14 @@ def align_batch_vol_and_surf_esp_arrays(ref: dict, fit: tuple, *, alpha: float,
                                         lam: float = 0.001, probe_radius: float = 1.0,
                                         esp_weight: float = 0.5,
                                         num_repeats_per_trans: int = 10, topk: int = 30,
-                                        steps_fine: int = 100, lr: float = 0.075):
+                                        steps_fine: int = 100, lr: float = 0.075,
+                                        const_seeds=None):
     """Array-native equivalent of ``_align_batch_vol_and_surf_esp`` for the screen path.
+
+    ``const_seeds`` is honoured ONLY at alpha == 0.81: the driver seeds from ``centers_1/2``,
+    which are the atom clouds there and the SURFACE clouds otherwise (drivers/esp_combo.py), and
+    a canonical store canonicalises the atom frame alone. Off that alpha the per-molecule
+    generator runs as before, whatever the caller passed.
 
     The heaviest object-path branch in the tree: nine splits, six attribute stores, an
     ``_ArrView`` AND a nested ``_MolShim`` per library molecule, for a measured 39.284 us/mol of
@@ -735,7 +772,9 @@ def align_batch_vol_and_surf_esp_arrays(ref: dict, fit: tuple, *, alpha: float,
         N_ct = torch.full((k,), n_cent, dtype=i32, device=device)
         M_ct = c_ct.to(i32) if a0 else M_sf
 
-        def _proc(_s, _k):
+        cs = None if (const_seeds is None or not a0) else _const_seed_batch(const_seeds, k, device)
+
+        def _proc(_s, _k, _cs=cs):
             sl = slice(_s, _s + _k)
             _, q, t, sc = fast_optimize_esp_combo_score_overlay_batch(
                 centers_w_H_1[sl], centers_w_H_2[sl], centers_1[sl], centers_2[sl],
@@ -747,7 +786,8 @@ def align_batch_vol_and_surf_esp_arrays(ref: dict, fit: tuple, *, alpha: float,
                 N_real_surf_1=N_sf[sl], M_real_surf_2=M_sf[sl],
                 trans_centers_batch=None, trans_centers_real=None,
                 num_repeats_per_trans=num_repeats_per_trans, topk=topk,
-                steps_fine=steps_fine, lr=lr, num_seeds=n_seeds)
+                steps_fine=steps_fine, lr=lr, num_seeds=n_seeds,
+                seeds=None if _cs is None else (_cs[0][sl], _cs[1][sl]))
             return sc, q, t
 
         # NO pose cap here, and UNTESTED -- do not read this as "measured neutral". The other
@@ -801,8 +841,12 @@ def align_batch_vol_and_surf_esp_arrays(ref: dict, fit: tuple, *, alpha: float,
 
 def align_batch_vol_tversky_arrays(ref: dict, fit: tuple, *, alpha: float = 0.81,
                                    tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
-                                   steps_fine: int = 100):
+                                   steps_fine: int = 100, const_seeds=None):
     """Array-native equivalent of ``_align_batch_vol_tversky`` for the screen path.
+
+    ``const_seeds`` replaces the hoisted ``batched_seeds_torch`` call below with a canonical
+    store's constant set -- the same substitution :func:`align_batch_vol_arrays` makes, on the
+    same atom clouds.
 
     fit tuple: ``(fit_flat, fit_off)`` -- heavy-atom coordinates concatenated, plus their CSR
     offsets. ONE ragged channel, because ``_align_batch_vol_tversky`` reads exactly one fit
@@ -870,8 +914,11 @@ def align_batch_vol_tversky_arrays(ref: dict, fit: tuple, *, alpha: float = 0.81
         # ``_dedup = bool(ref_shared) and K > 1`` internally (drivers/_common.py), so a k == 1
         # bucket takes the full solve either way. The guarantee is STRUCTURAL here -- ref_pad is
         # built by broadcasting the single query cloud into all k rows immediately above.
-        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
-                                               num_seeds=n_seeds, ref_shared=True)
+        if const_seeds is not None:
+            seeds_q, seeds_t = _const_seed_batch(const_seeds, k, device)
+        else:
+            seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
+                                                   num_seeds=n_seeds, ref_shared=True)
 
         def _proc(_s, _k):
             sl = slice(_s, _s + _k)
@@ -896,8 +943,12 @@ def align_batch_vol_tversky_arrays(ref: dict, fit: tuple, *, alpha: float = 0.81
 
 def align_batch_vol_esp_tversky_arrays(ref: dict, fit: tuple, *, lam: float = 0.1,
                                        alpha: float = 0.81, tversky_alpha: float = 0.95,
-                                       tversky_beta: float = 0.05, steps_fine: int = 100):
+                                       tversky_beta: float = 0.05, steps_fine: int = 100,
+                                       const_seeds=None):
     """Array-native equivalent of ``_align_batch_vol_esp_tversky`` for the screen path.
+
+    ``const_seeds`` replaces the hoisted seed call below with a canonical store's constant set
+    (strict-heavy centres, rotated with ``atom_pos``; see ``_modes.CONST_SEED_MODES``).
 
     fit tuple: ``(fit_pts, fit_chg, off)`` -- strict-heavy centers, the heavy partial charges
     that are 1:1 with them, and the ONE offset table (``heavy_off``) both index by. Identical to
@@ -974,8 +1025,11 @@ def align_batch_vol_esp_tversky_arrays(ref: dict, fit: tuple, *, lam: float = 0.
         VAA = _self_overlap_esp_chunks(ref_pad, ref_c_pad, N_real, alpha, lam)
         VBB = _self_overlap_esp_chunks(fit_pad, fit_c_pad, M_real, alpha, lam)
 
-        seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
-                                               num_seeds=n_seeds)
+        if const_seeds is not None:
+            seeds_q, seeds_t = _const_seed_batch(const_seeds, k, device)
+        else:
+            seeds_q, seeds_t = batched_seeds_torch(ref_pad, fit_pad, N_real, M_real,
+                                                   num_seeds=n_seeds)
 
         def _proc(_s, _k):
             sl = slice(_s, _s + _k)
@@ -1001,7 +1055,8 @@ def align_batch_vol_esp_tversky_arrays(ref: dict, fit: tuple, *, lam: float = 0.
 def _align_batch_vol_lipo_family_arrays(ref_cent: torch.Tensor, ref_fpos: torch.Tensor,
                                         ref_fval: torch.Tensor, fit: tuple, *, tag: str,
                                         field_weight: float, alpha: float, lam: float,
-                                        topk: int, steps_fine: int, lr: float):
+                                        topk: int, steps_fine: int, lr: float,
+                                        const_seeds=None):
     """Shared array-native body for the two modes that ride the ``vol_lipo`` driver.
 
     ``vol_lipo`` and ``vol_fukui`` are the same assembly over a DIFFERENT per-atom scalar field:
@@ -1102,7 +1157,12 @@ def _align_batch_vol_lipo_family_arrays(ref_cent: torch.Tensor, ref_fpos: torch.
         # No self-overlap and no seed call here: fast_optimize_vol_lipo_overlay_batch computes
         # both internally from the padded batch it is handed, on BOTH paths. There is no
         # ref_shared shortcut to take or to skip.
-        def _proc(_s, _k):
+        # ``const_seeds`` (a canonical store's constant set, valid because this driver seeds
+        # from the SHAPE atom clouds) is hoisted per bucket and sliced per chunk; None keeps the
+        # driver's own per-molecule generator.
+        cs = None if const_seeds is None else _const_seed_batch(const_seeds, k, device)
+
+        def _proc(_s, _k, _cs=cs):
             sl = slice(_s, _s + _k)
             _, q, t, sc = fast_optimize_vol_lipo_overlay_batch(
                 centers_1[sl], centers_2[sl], fpos_1[sl], fpos_2[sl],
@@ -1110,7 +1170,8 @@ def _align_batch_vol_lipo_family_arrays(ref_cent: torch.Tensor, ref_fpos: torch.
                 alpha=alpha, lam=lam, lipo_weight=field_weight,
                 N_real_centers=N_real_centers[sl], M_real_centers=M_real_centers[sl],
                 N_real_lipo=N_real_field[sl], M_real_lipo=M_real_field[sl],
-                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=n_seeds)
+                topk=topk, steps_fine=steps_fine, lr=lr, num_seeds=n_seeds,
+                seeds=None if _cs is None else (_cs[0][sl], _cs[1][sl]))
             return sc, q, t
 
         # NO pose cap, and for this driver the decline is DIRECTLY measured rather than
@@ -1132,7 +1193,7 @@ def _align_batch_vol_lipo_family_arrays(ref_cent: torch.Tensor, ref_fpos: torch.
 
 def align_batch_vol_lipo_arrays(ref: dict, fit: tuple, *, lipo_weight: float = 0.5,
                                 alpha: float = 0.81, lam: float = 0.1, topk: int = 30,
-                                steps_fine: int = 100, lr: float = 0.075):
+                                steps_fine: int = 100, lr: float = 0.075, const_seeds=None):
     """Array-native equivalent of ``_align_batch_vol_lipo`` for the screen path.
 
     fit tuple: ``(atom_flat, atom_off, lipo_pos_flat, lipo_flat, lipo_off)`` -- the RemoveHs
@@ -1150,12 +1211,12 @@ def align_batch_vol_lipo_arrays(ref: dict, fit: tuple, *, lipo_weight: float = 0
     return _align_batch_vol_lipo_family_arrays(
         ref["_ref_xyz_t"], ref["_ref_lipo_pos_t"], ref["_ref_lipo_t"], fit,
         tag="vol_lipo", field_weight=lipo_weight, alpha=alpha, lam=lam,
-        topk=topk, steps_fine=steps_fine, lr=lr)
+        topk=topk, steps_fine=steps_fine, lr=lr, const_seeds=const_seeds)
 
 
 def align_batch_vol_fukui_arrays(ref: dict, fit: tuple, *, fukui_weight: float = 0.5,
                                  alpha: float = 0.81, lam: float = 0.1, topk: int = 30,
-                                 steps_fine: int = 100, lr: float = 0.075):
+                                 steps_fine: int = 100, lr: float = 0.075, const_seeds=None):
     """Array-native equivalent of ``_align_batch_vol_fukui`` for the screen path.
 
     fit tuple: ``(atom_flat, atom_off, fukui_pos_flat, fukui_flat, fukui_off)``.
@@ -1173,7 +1234,7 @@ def align_batch_vol_fukui_arrays(ref: dict, fit: tuple, *, fukui_weight: float =
     return _align_batch_vol_lipo_family_arrays(
         ref["_ref_xyz_t"], ref["_ref_fukui_pos_t"], ref["_ref_fukui_t"], fit,
         tag="vol_fukui", field_weight=fukui_weight, alpha=alpha, lam=lam,
-        topk=topk, steps_fine=steps_fine, lr=lr)
+        topk=topk, steps_fine=steps_fine, lr=lr, const_seeds=const_seeds)
 
 
 def align_batch_surf_arrays(ref: dict, fit: tuple, *, alpha: float = 0.81,

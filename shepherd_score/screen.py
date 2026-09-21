@@ -68,6 +68,7 @@ __all__ = ["MoleculeProfile", "ProfileStore", "screen", "screen_many", "Hit"]
 # disagree on attribute names or valid modes. Legacy mode names resolve via ``canonical()``.
 from shepherd_score.accel._modes import (
     MODE_ATTRS as _MODE_ATTRS, canonical as _canon_mode,
+    CONST_SEED_MODES as _CONST_SEED_MODES,
 )
 _TRANSFORM_ATTR = {m: a[0] for m, a in _MODE_ATTRS.items()}
 _SCORE_ATTR = {m: a[1] for m, a in _MODE_ATTRS.items()}
@@ -513,14 +514,19 @@ class ProfileStore:
             Store every profile rotated into its own principal-axis frame (the
             centroid-relative eigenframe of its heavy atoms), with the rotation kept so
             that returned transforms are composed back to the original centred frame.
-            A ``vol`` screen against such a store runs one constant seed set instead of
-            a per-molecule eigensolve, roughly 1.5-2x faster on GPU; the other modes
-            re-derive their seeds from the rotated coordinates and gain nothing, while
-            the different seed set moves their scores at the 1e-3 level (a non-canonical
-            store matches the pairwise path to ~1e-4). Requires ``pre_centered``.
-            Default (``None``): canonical when the store serves ``vol`` and is
-            pre-centred, raw centred coordinates otherwise. Pass ``True`` or ``False``
-            to decide explicitly. Screening scores and DUDE-Z enrichment on canonical
+            A screen in any mode that seeds from the heavy-atom cloud
+            (``accel._modes.CONST_SEED_MODES``: ``vol``, ``vol_color``, ``vol_esp``,
+            ``vol_lipo``, ``vol_fukui``, the volumetric Tversky modes, and
+            ``vol_and_surf_esp`` at ``alpha=0.81``) then runs one constant seed set instead
+            of a per-molecule eigensolve -- roughly 1.5-2x faster for ``vol`` on GPU, less
+            for the heavier modes, whose seed generation is a smaller share. ``surf``,
+            ``surf_esp`` and ``pharm`` seed from the surface / anchor clouds and still run
+            their own generator on the rotated coordinates. Either way the scores move at
+            the 1e-3 level against a non-canonical store (which matches the pairwise path
+            to ~1e-4). Requires ``pre_centered``.
+            Default (``None``): canonical when the store serves any constant-seed mode
+            and is pre-centred, raw centred coordinates otherwise. Pass ``True`` or
+            ``False`` to decide explicitly. Screening scores and DUDE-Z enrichment on canonical
             stores were validated against non-canonical stores and the pairwise path
             before this became the default (Shepherd-Score-Paper,
             fig2_speed/validate_canonical.py, results/CANONICAL_validation.json).
@@ -537,13 +543,15 @@ class ProfileStore:
             raise ValueError("dtype must be 'float16' or 'float32'")
         modes = tuple(modes)
         if canonical is None:
-            # The library default: canonical when the store serves ``vol`` and is pre-centred.
-            # Only the vol screen runs a constant seed set against a canonical store (1.5-2x on
-            # GPU); every other mode re-derives its seeds from the rotated coordinates and gains
-            # nothing, while the different seed set moves its scores at the 1e-3 level
-            # (Shepherd-Score-Paper fig2_speed/validate_canonical.py). A store without vol
-            # therefore keeps raw centred coordinates, which match the pairwise path to ~1e-4.
-            canonical = bool(pre_centered) and ("vol" in modes)
+            # The library default: canonical when the store serves a mode that seeds from the
+            # heavy-atom cloud (``_CONST_SEED_MODES``) and is pre-centred, because those are the
+            # modes whose screen swaps the per-molecule seed eigensolve for one constant set.
+            # ``surf``/``surf_esp``/``pharm`` seed from other clouds and still run their generator
+            # on the rotated coordinates, so a store serving only them keeps raw centred
+            # coordinates, which match the pairwise path to ~1e-4 (a canonical store moves scores
+            # at the 1e-3 level; Shepherd-Score-Paper fig2_speed/validate_canonical.py).
+            canonical = bool(pre_centered) and any(_canon_mode(m) in _CONST_SEED_MODES
+                                                   for m in modes)
         elif canonical and not pre_centered:
             raise ValueError("canonical stores require pre_centered=True (axes are centroid-relative)")
         schema = _schema_from_modes(modes)
@@ -1384,7 +1392,8 @@ def _align_fast_arrays_vol_color(ref: dict, fit: tuple, batch_kw: dict):
         num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
         topk=batch_kw.get("topk", 30),
         steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075))
+        lr=batch_kw.get("lr", 0.075),
+        const_seeds=batch_kw.get("const_seeds"))
 
 
 def _build_fit_arrays_pharm(arrs: dict, device):
@@ -1449,7 +1458,8 @@ def _align_fast_arrays_vol_esp(ref: dict, fit: tuple, batch_kw: dict):
         num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
         topk=batch_kw.get("topk", 30),
         steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075))
+        lr=batch_kw.get("lr", 0.075),
+        const_seeds=batch_kw.get("const_seeds"))
 
 
 def _build_fit_arrays_vol_and_surf_esp(arrs: dict, device):
@@ -1486,7 +1496,8 @@ def _align_fast_arrays_vol_and_surf_esp(ref: dict, fit: tuple, batch_kw: dict):
         num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
         topk=batch_kw.get("topk", 30),
         steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075))
+        lr=batch_kw.get("lr", 0.075),
+        const_seeds=batch_kw.get("const_seeds"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1633,7 +1644,8 @@ def _align_fast_arrays_vol_tversky(ref: dict, fit: tuple, batch_kw: dict):
         alpha=batch_kw.get("alpha", 0.81),
         tversky_alpha=batch_kw.get("tversky_alpha", 0.95),
         tversky_beta=batch_kw.get("tversky_beta", 0.05),
-        steps_fine=batch_kw["steps_fine"])
+        steps_fine=batch_kw["steps_fine"],
+        const_seeds=batch_kw.get("const_seeds"))
 
 
 def _align_fast_arrays_vol_esp_tversky(ref: dict, fit: tuple, batch_kw: dict):
@@ -1648,7 +1660,8 @@ def _align_fast_arrays_vol_esp_tversky(ref: dict, fit: tuple, batch_kw: dict):
         lam=batch_kw.get("lam", 0.1),
         tversky_alpha=batch_kw.get("tversky_alpha", 0.95),
         tversky_beta=batch_kw.get("tversky_beta", 0.05),
-        steps_fine=batch_kw["steps_fine"])
+        steps_fine=batch_kw["steps_fine"],
+        const_seeds=batch_kw.get("const_seeds"))
 
 
 def _align_fast_arrays_surf(ref: dict, fit: tuple, batch_kw: dict):
@@ -1700,7 +1713,8 @@ def _align_fast_arrays_vol_lipo(ref: dict, fit: tuple, batch_kw: dict):
         lam=batch_kw.get("lam", 0.1),
         topk=batch_kw.get("topk", 30),
         steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075))
+        lr=batch_kw.get("lr", 0.075),
+        const_seeds=batch_kw.get("const_seeds"))
 
 
 def _align_fast_arrays_vol_fukui(ref: dict, fit: tuple, batch_kw: dict):
@@ -1717,7 +1731,8 @@ def _align_fast_arrays_vol_fukui(ref: dict, fit: tuple, batch_kw: dict):
         lam=batch_kw.get("lam", 0.1),
         topk=batch_kw.get("topk", 30),
         steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075))
+        lr=batch_kw.get("lr", 0.075),
+        const_seeds=batch_kw.get("const_seeds"))
 
 
 #: mode -> (fit-array builder, array-native aligner). Keys MUST cover ``_ARRAY_MODES`` exactly;
@@ -2015,9 +2030,16 @@ def _iter_shards_prefetched(store, shard_idxs):
 
 def _canonical_batch_kw(store, qs_ref, mode, device, batch_kw, fast=True):
     """``batch_kw`` plus ``const_seeds`` when this screen can use them: a CANONICAL store, the
-    ``vol`` array path, one query. Seeds are then one constant set for the whole screen (see
+    array path, ONE query, and a mode that seeds from the heavy-atom cloud
+    (``_CONST_SEED_MODES``). Seeds are then one constant set for the whole screen (see
     _common.canonical_seed_quats) instead of a per-molecule eigensolve, which is the 1.5-2x the
-    canonical store exists for. Unchanged ``batch_kw`` otherwise.
+    canonical store exists for on ``vol``. Unchanged ``batch_kw`` otherwise.
+
+    One query, because the set depends on the query's frame: :func:`_canonical_batch_kws` is the
+    per-panel form, one ``batch_kw`` per query.
+
+    ``vol_and_surf_esp`` qualifies only at ``alpha == 0.81``, where its driver seeds from the atom
+    clouds; at any other alpha it seeds from the surfaces, which the store does not canonicalise.
 
     ONE helper for the in-process shard loop AND the multi-GPU worker, deliberately: the worker
     used to take ``batch_kw`` as handed to it, so on the same canonical store it ran the
@@ -2033,7 +2055,9 @@ def _canonical_batch_kw(store, qs_ref, mode, device, batch_kw, fast=True):
     just forgo the speedup.
     """
     if not (fast and _use_arrays(mode) and getattr(store, "canonical", False)
-            and mode == "vol" and len(qs_ref) == 1):
+            and mode in _CONST_SEED_MODES and len(qs_ref) == 1):
+        return batch_kw
+    if mode == "vol_and_surf_esp" and batch_kw.get("alpha") != 0.81:
         return batch_kw
     _rx = qs_ref[0].get("xyz")
     if _rx is None:
@@ -2044,6 +2068,18 @@ def _canonical_batch_kw(store, qs_ref, mode, device, batch_kw, fast=True):
     batch_kw["const_seeds"] = canonical_seed_quats(_rx, len(_rx), int(MODE_SEEDS.get(mode, 10)),
                                                    device)
     return batch_kw
+
+
+def _canonical_batch_kws(store, qs_ref, mode, device, batch_kw, fast=True):
+    """One ``batch_kw`` per query of a panel: :func:`_canonical_batch_kw` applied per query.
+
+    The constant seed set is a function of the QUERY's principal frame alone, so a panel simply
+    gets one set per query; the single-query gate above is about deriving one set from one
+    frame, not a limit of the method. Every entry is the caller's own ``batch_kw`` object when the
+    store or mode does not qualify, so the object path (which has no ``const_seeds`` keyword)
+    never sees it.
+    """
+    return [_canonical_batch_kw(store, [ra], mode, device, batch_kw, fast) for ra in qs_ref]
 
 
 def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
@@ -2068,9 +2104,9 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
     try:
         heaps = [_TopK(top_k) for _ in qs_ref]
         tf_attr = _TRANSFORM_ATTR[mode]
-        # CANONICAL store: one constant seed set for the whole screen, computed once here
-        # instead of per molecule per bucket. The same helper serves the multi-GPU worker.
-        batch_kw = _canonical_batch_kw(store, qs_ref, mode, device, batch_kw, fast)
+        # CANONICAL store: one constant seed set per QUERY for the whole screen, computed once
+        # here instead of per molecule per bucket. The same helper serves the multi-GPU worker.
+        batch_kws = _canonical_batch_kws(store, qs_ref, mode, device, batch_kw, fast)
         done = 0
         if not fast:
             from shepherd_score.container import MoleculePair, MoleculePairBatch
@@ -2097,7 +2133,7 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                     ids, *fit = build(arrs, device)
                     for qi, ra in enumerate(qs_ref):
                         ref = _ref_tensors_from_arrays(ra, mode, device)
-                        scores, se3 = align(ref, tuple(fit), batch_kw)
+                        scores, se3 = align(ref, tuple(fit), batch_kws[qi])
                         _accumulate_arrays(heaps[qi], ids, scores, se3,
                                            scores_out, qi, start, rot)
                 else:
@@ -2398,9 +2434,10 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
         ref_tensors = [_ref_tensors_from_arrays(ra, mode, dev) for ra in ref_arrays_list]
         heaps = [_TopK(top_k) for _ in ref_arrays_list]
         tf_attr = _TRANSFORM_ATTR[mode]
-        # The canonical store's constant seeds, exactly as the in-process loop sets them; without
-        # this the worker ran per-molecule seeds on the same store at 2.1x the cost per shard.
-        batch_kw = _canonical_batch_kw(store, ref_arrays_list, mode, dev, batch_kw)
+        # The canonical store's constant seeds, exactly as the in-process loop sets them (one set
+        # per query); without this the worker ran per-molecule seeds on the same store at 2.1x
+        # the cost per shard.
+        batch_kws = _canonical_batch_kws(store, ref_arrays_list, mode, dev, batch_kw)
 
         def _drain(q):                                     # the queue form: serial reads
             while True:
@@ -2425,7 +2462,7 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
                 build, align = _array_dispatch(mode)
                 ids, *fit = build(arrs, dev)
                 for qi, ref in enumerate(ref_tensors):
-                    scores, se3 = align(ref, tuple(fit), batch_kw)
+                    scores, se3 = align(ref, tuple(fit), batch_kws[qi])
                     _accumulate_arrays(heaps[qi], ids, scores, se3, None, qi, 0, rot)
                 torch.cuda.synchronize()
                 continue
