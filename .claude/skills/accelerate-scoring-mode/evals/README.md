@@ -10,17 +10,19 @@ present, and check the result against `expected_behavior`.
 
 | File | Path exercised |
 |---|---|
-| `01_reuse_no_new_kernel.json` | **reuse existing kernels** (skip steps 3–5) + Tier-B store + the array path |
-| `02_new_channel_kernel.json` | **new kernel pair** (numba first, dispatch, parity) for a not-screen-wired mode |
-| `03_tier_a_screening_speed.json` | reduction mode + **Tier-A store + array-path honesty** |
+| `01_reuse_no_new_kernel.json` | **reuse existing kernels** (skip the kernel trio) + a NEW CHANNEL (Tier-B store) |
+| `02_new_channel_kernel.json` | **new kernel pair** (numba first, dispatch, three engine branches) + a pair-level channel |
+| `03_tier_a_screening_speed.json` | reduction-only mode: **one spec, zero screen edits**, and array-path honesty |
 
 The queries name modes that do **not** exist in the tree. The library already ships 21, and
 `vol_lipo` / `vol_tversky` / `vol_avoid` — which earlier versions of these evals used — are all
 built, so grading against them tests recall of a diff rather than the skill. Each scenario assumes
 `design-scoring-mode` has just produced the reference layer and nothing else.
 
-Two things every scenario should surface, because they are the failures this skill exists to
-prevent: reaching for a new kernel when an existing one already emits the channel, and reporting a
-screening throughput number from the object path.
+Three things every scenario should surface, because they are the failures this skill exists to
+prevent: reaching for a new kernel when an existing one already emits the channel; writing a
+per-mode driver, aligner, array builder or `screen.py` branch that the ModeSpec already generates
+(which silently takes the mode back off the derived path); and reporting a screening throughput
+number from the object path.
 
 `files` is empty for every scenario: the working context is the repository itself.

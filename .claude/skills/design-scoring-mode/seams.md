@@ -103,12 +103,13 @@ Telling these apart is the one non-obvious part of this skill.
   into `transform_<key>` / `sim_aligned_<key>` **data descriptors** over an `AlignmentResult`
   dataclass stored in `MoleculePair._alignments`. Adding your mode id here is the only
   registration a reference-only mode does. Purely additive and safe.
-- **`accel/_modes.py`** (`MODE_ATTRS` / `MODE_SEEDS` / `MODE_STEPS`) — the canonical screening
-  registry. **Do not touch it in this skill.** `MODE_ATTRS` feeds `CANONICAL_MODES`, which
-  `@_bind_batch_aligners` walks at import time calling
-  `getattr(accel.batch, "_align_batch_<mode>")`; that aligner does not exist yet, so adding your
-  mode here makes `import shepherd_score.container` raise. `tests/test_mode_registry.py` pins
-  `len(CANONICAL_MODES) == 21` and several set equalities that all fail at the same moment.
+- **`accel/_modes.py`** (`SPECS`, and the `MODE_ATTRS` / `MODE_SEEDS` / `MODE_STEPS` tables
+  derived from it) — the canonical screening registry. **Do not touch it in this skill.** A
+  `ModeSpec` names the kernels its terms run on and the channels its data comes from; until the
+  accel skill has built those, the spec describes a mode that cannot execute. Registering one also
+  generates `_align_batch_<mode>` and promises a screen path immediately, and
+  `tests/test_mode_registry.py` pins `len(CANONICAL_MODES) == 21` precisely so that promoting a
+  mode is a visible, deliberate act.
 
 Because your mode is not in `MODE_SEEDS` / `MODE_STEPS`, you cannot use `_default_seeds` /
 `_default_steps` for its defaults — they read those tables. Use literals, and let the accel skill

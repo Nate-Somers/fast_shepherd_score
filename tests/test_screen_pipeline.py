@@ -302,7 +302,9 @@ def test_shard_upload_stages_through_pinned_memory(monkeypatch, canon_store):
         return real_empty(*a, **k)
 
     monkeypatch.setattr(torch, "empty", spy)
-    ids, pos, off = scr._build_fit_arrays_vol(arrs, dev)
+    # the builder returns (ids, {channel: (flat, off)}) -- one dict, whatever the mode
+    ids, fit = scr._build_fit_arrays_vol(arrs, dev)
+    pos, off = fit["atoms"]
     monkeypatch.undo()
     assert pinned, "the shard upload did not stage through pinned memory"
     assert pos.is_cuda and pos.dtype == torch.float32

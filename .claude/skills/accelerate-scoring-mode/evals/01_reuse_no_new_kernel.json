@@ -1,19 +1,19 @@
 {
-  "skills": ["accelerate-scoring-mode"],
+  "skills": [
+    "accelerate-scoring-mode"
+  ],
   "query": "Accelerate the vol_tpsa reference mode (shape blended with a per-atom topological polar surface area field) so it screens at 10k-100k alignments/second and can appear in the screening-speed figure.",
   "files": [],
   "expected_behavior": [
-    "Identifies the driver-analog and the kernel-analog INDEPENDENTLY, and does not assume 'looks like vol_esp' means reuse vol_esp -- vol_esp optimizes the field alone and its driver cannot produce a shape+field blend.",
-    "Writes NO new kernel: recognizes that overlap_score_grad_se3_batch plus the ESP kernel (with TPSA fed where it expects charges) already emit both channels' value and gradient, so steps 3-5 are skipped entirely.",
-    "Goes further and checks whether a new DRIVER is needed either, finding that drivers/vol_lipo.py already serves vol_lipo, vol_mr and vol_fukui unchanged and takes vol_tpsa as a fourth parameterisation -- adding a near-copy driver file would be the wrong call.",
-    "Adds _align_batch_vol_tpsa to accel/batch/aligners.py with _ref_/_fit_ prefixed tensor attributes so _batch_upload's molecule-keyed cache infers key_fn correctly, and adds the explicit re-export line to accel/batch/__init__.py.",
-    "Promotes to canonical AFTER the aligner exists (a row each in MODE_ATTRS, MODE_SEEDS, MODE_STEPS) and bumps tests/test_mode_registry.py from 21 to 22 with its comment updated; does not bind onto MoleculePair by hand, since @_bind_batch_aligners walks CANONICAL_MODES at import.",
-    "States plainly whether the seed/step defaults were measured or inherited from vol_lipo, rather than implying a knee was found.",
-    "Switches MoleculePair.align_with_vol_tpsa from its literal 50/200 defaults to _default_seeds/_default_steps now that the registry carries them, instead of adding a twelfth mode whose eager and batched defaults disagree.",
-    "Adds MoleculePairBatch.align_with_vol_tpsa modeled on the align_with_vol_mr thin-wrapper template, with backend=None resolving device-aware.",
-    "Wires screen as Tier B: schema flag, MoleculeProfile slots with get_tpsa_positions/get_tpsa accessors named exactly like the Molecule methods, its OWN offset table (not atom_off), _profile_from_schema extraction AND pre-center shift AND canonical rotation, _concat and _reconstruct.",
-    "Does not omit the canonical rotation, and explains why omitting it is invisible to a score test: the library and query would both sit unrotated and score consistently while _compose_rot still composes Hit.transform with a rotation the coordinates never received.",
-    "Because it will appear in a speed figure, adds the mode to BOTH _FAST_MODES and _ARRAY_MODES plus a builder, an array aligner, the two dispatch-table rows and align_batch_vol_tpsa_arrays -- reusing _build_fit_arrays_scalar_field rather than writing a near-copy -- and routes it through the single _array_dispatch selector.",
-    "Validates at the honest tolerances: gate 3 against the per-pair reference at the shipped MODE_SEEDS/MODE_STEPS budget, gate 5 with the disk check read through store.read_shard(0)[1], and array-vs-object as BIT-IDENTICAL rather than a tolerance; never weakens a gate to pass."
+    "Decomposes the objective into TERMS over CHANNELS before touching code: a shape term on the atom cloud and a signed-scalar-field term on the true-heavy centres, Tanimoto each, blended by a weight and its complement.",
+    "Writes NO new kernel: recognises that the shape kernel plus the ESP kernel (with TPSA fed where it expects charges) already emit both terms' value and gradient, so the kernel trio is skipped entirely.",
+    "Writes NO driver, NO batched aligner, NO array builder and NO screen.py branch, recognising that all of those are generated from the ModeSpec -- and says so, rather than adding a near-copy of drivers/vol_lipo.py that would take the mode back off the derived path.",
+    "Adds the per-molecule data as TWO Channel rows in accel/channels.py (the true-heavy centres and their per-atom scalar, sharing one new basis), plus the basis's offset-table key, the schema flag, one _BASIS_TABLE row and the MoleculeProfile slots/get_tpsa_positions/get_tpsa accessors named exactly like the Molecule methods.",
+    "Gives the field its OWN offset table rather than reusing atom_off, and explains why: atom_pos is the Chem.RemoveHs set and is longer than the strict-heavy set on an isotope-labelled molecule, so a shared table desyncs the field from its positions on exactly the molecules hardest to notice.",
+    "Does NOT hand-write the canonical rotation, correctly noting that _profile_from_schema now rotates every channel whose kind is points or vectors -- but can still explain why getting it wrong used to be invisible to a score test (library and query both unrotated score consistently while _compose_rot composes Hit.transform with a rotation the coordinates never received).",
+    "Registers ONE ModeSpec with the right seed_channel (atoms, so the mode inherits a canonical store's constant seeds), bucket, terms, params and graph budget, and states plainly whether the seed/step defaults were measured or inherited from vol_lipo.",
+    "Adds MoleculePairBatch.align_with_vol_tpsa modelled on align_with_vol_mr, with backend=None resolving device-aware, and switches MoleculePair.align_with_vol_tpsa from literal defaults to _default_seeds/_default_steps.",
+    "Bumps tests/test_mode_registry.py from 21 to 22 -- and does NOT hunt for other mode-name lists to edit, because _FAST_MODES, _ARRAY_MODES, the dispatch tables, the store schema and the parity tests' parametrization all derive from the registry now.",
+    "Validates at the honest tolerances: gate 3 against the per-pair reference at the shipped MODE_SEEDS/MODE_STEPS budget, gate 3b comparing the eager, CUDA-graph and fused-CPU loops (expecting bit-identity from the graph since the mode has no strided term), gate 5 with the disk check read through store.read_shard(0)[1], and array-vs-object as BIT-IDENTICAL rather than a tolerance; never weakens a gate to pass."
   ]
 }

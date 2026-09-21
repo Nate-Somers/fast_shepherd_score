@@ -36,8 +36,9 @@ Every mode has two layers:
 
 1. **Reference layer** (this skill) — pure PyTorch math and an eager Adam optimizer over autograd.
    Slow, obviously correct, easy to read.
-2. **Accel layer** (`accelerate-scoring-mode`) — hand-written Triton (GPU) and numba (CPU)
-   value+gradient kernels reproducing the reference at screening throughput.
+2. **Accel layer** (`accelerate-scoring-mode`) — a `ModeSpec` in the mode registry, over
+   hand-written Triton (GPU) and numba (CPU) value+gradient kernels, reproducing the reference at
+   screening throughput. One generic engine runs every mode, so that layer is mostly data.
 
 The single most important thing to understand: **the eager optimizer you write here is the oracle
 the accel skill validates against.** Your reference does not need to be fast, but it must be right
@@ -227,14 +228,14 @@ key into `transform_<mode>` / `sim_aligned_<mode>` properties backed by an `Alig
 dataclass in `MoleculePair._alignments`, so this one line is the whole registration. The tuple has
 23 entries for 21 modes because `vol` and `vol_esp` each keep a legacy `_noH` twin.
 
-**Do not add the mode to `accel/_modes.py`.** That registry is for *canonical* (screening) modes
-and adding to it here **breaks the build**. `MODE_ATTRS` feeds `CANONICAL_MODES`, which the
-`@_bind_batch_aligners` decorator on `MoleculePair` walks *at import time*, calling
-`getattr(accel.batch, "_align_batch_<mode>")` — an aligner that does not exist until the accel
-skill builds it, so `import shepherd_score.container` raises `AttributeError`.
-`tests/test_mode_registry.py` also pins `len(CANONICAL_MODES) == 21`, `set(MODE_SEEDS) ==
-set(MODE_STEPS) == set(CANONICAL_MODES)`, and a batch bind for every canonical mode. Leave
-`PROCESS_MODES`, `_MODE_SPEC` and `screen.py` alone too; they are accel-skill territory.
+**Do not add the mode to `accel/_modes.py`.** That registry is for *canonical* (screening) modes,
+and a `ModeSpec` there is the accel skill's deliverable, not yours. Adding one here would be
+premature in the strong sense: the spec names the kernels its terms run on and the channels its
+data comes from, and until those exist the spec describes a mode that cannot execute. It would
+also immediately generate `_align_batch_<mode>`, promise a screen path, and trip
+`tests/test_mode_registry.py`, which pins `len(CANONICAL_MODES) == 21` on purpose so that
+promoting a mode is a visible act. Leave `accel/channels.py`, `_MODE_SPEC` and `screen.py` alone
+too; they are accel-skill territory.
 
 ### 8. Export the public functions
 
@@ -271,11 +272,26 @@ Some suite tests need Open3D or a GPU and may error for unrelated reasons. Run y
 
 ## Handoff to `accelerate-scoring-mode`
 
-State four things: the exact name of the optimizer entry point (or which existing optimizer you
-reused), the path of your test file, the gradient structure of the objective (which channels
-contribute and how the SE(3) gradient decomposes), and whether you added new per-atom `Molecule`
-data. The accel skill needs the last one because the batched path and the screening store must
-both learn to carry that array.
+That skill turns your mode into a `ModeSpec`: a list of TERMS (one kernel launch each, with a
+reduction and a blend weight) over named CHANNELS (per-molecule arrays). Everything it needs from
+you maps onto that, so state it in those words:
+
+1. **The optimizer entry point** you wrote, or which existing optimizer you reused.
+2. **The terms**: for each channel pair the objective scores, which kernel family computes it
+   (shape / signed scalar field / pharmacophore / element identity / surface-ESP agreement /
+   hard-sphere penalty), how it reduces (Tanimoto, Tversky, raw, agreement) and its blend weight.
+   A blend is two terms; a Tversky variant is a reduction; a penalty is a negative weight.
+3. **The channels**: which per-molecule arrays each term reads, and whether any is data the
+   library does not already carry — i.e. whether you added an accessor quartet in step 3. That is
+   the one thing that still costs the accel skill real wiring, because the screening store has to
+   learn to persist and rotate it.
+4. **Anything a third input**: a non-molecule input like `vol_avoid`'s `avoid_points`. It is a
+   pair-level channel now, not a reason the mode cannot screen.
+5. **Your test file's path**, which is the oracle.
+
+If your mode reuses existing kernels and existing per-molecule data — the common case — the accel
+work is one spec and one API method, and it inherits the batched aligner, the CUDA-graph and fused
+CPU fine loops, the array-native screen, the multi-GPU path and constant seeds automatically.
 
 ## Constraints
 

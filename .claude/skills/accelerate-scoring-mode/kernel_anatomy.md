@@ -1,16 +1,16 @@
-# Kernel anatomy
+# Kernel and engine anatomy
 
-How the accel kernels, dispatch, drivers and graph loop fit together. Read this alongside an
-existing family's kernel and driver before writing your own.
+How the kernels, the dispatch, the term evaluators and the one fine loop fit together. Read this
+alongside an existing family's kernel before writing your own.
 
 ## The value+gradient kernel
 
-Each channel has one fused kernel computing, in a single launch, both the overlap value and its
-gradient with respect to the SE(3) pose. It does not return an intermediate the host has to
+Each channel pair has one fused kernel computing, in a single launch, both the overlap value and
+its gradient with respect to the SE(3) pose. It does not return an intermediate the host has to
 differentiate — the analytic gradient is computed in-register.
 
 - **Inputs**: padded batch tensors (reference and fit positions / charges / pharm types, anchors
-  and vectors, as the mode needs), the current unit quaternion `q` and translation `t`, and the
+  and vectors, as the term needs), the current unit quaternion `q` and translation `t`, and the
   real per-pair counts `N_real` / `M_real` used to mask padding.
 - **Outputs**: the scalar overlap per pair, `dO/dq` (unit-quaternion space) and the translation
   gradient.
@@ -23,7 +23,7 @@ the host. Do not do that. Compute `dO/dq` inside the kernel, reusing the shape c
 `dR/dq` tail (`_quat_grad_tail` in `shape_triton.py`):
 
 - **Positional term**: force ⊗ fit-anchor, fed through the tail.
-- **Directional term** (if the mode weights orientation vectors): Σ over vector pairs of the
+- **Directional term** (if the channel weights orientation vectors): Σ over vector pairs of the
   per-feature coefficient times (ref-vec ⊗ fit-vec), through the same tail.
 
 `q` is kept unit each step (the Adam renormalizes), so pass a unit quaternion and the kernel need
@@ -32,23 +32,26 @@ including the radial component, which the optimizer discards — this matters wh
 against autograd, see `parity_gates.md`.
 
 `pharm_score_grad_se3_batch` is the surviving R-matrix-gradient variant. It is still exported by
-dispatch but **no driver uses it**; do not model a new kernel on it.
+dispatch but **no term uses it**; do not model a new kernel on it.
 
-### Combining channels
+### Combining channels is the ENGINE's job, not a kernel's
 
-A combined mode is a weighted sum in the same quaternion space:
+A blended mode is a weighted sum in the same quaternion space:
 
 ```
 dO/dq = (1 - w) * (scale_shape * dQ_shape) + w * (scale_field * dQ_field)
 ```
 
-Because projection is linear, scaling each channel's `dO/dq` and summing is identical to projecting
-a combined rotation-space gradient, but cheaper and done in one place. This is why a blended mode
-usually needs **no new kernel**: the driver blends `dQ`s that existing kernels already emit.
+Because projection is linear, scaling each term's `dO/dq` and summing is identical to projecting a
+combined rotation-space gradient, but cheaper. `engine._step_generic` does exactly this, over an
+arbitrary number of terms, from the spec's weights. **This is why a blended mode needs no new
+kernel and no new driver**: it declares two `Term`s and the engine blends what existing kernels
+already emit.
 
-`vol_avoid` is the instructive exception — its descent gradient is
-`-scale_s·dQ_shape + avoid_weight·dQ_avoid`, with the penalty raw and un-normalized (no Tanimoto
-scale) and a **positive** sign, because the penalty is subtracted from the score.
+`vol_avoid` is the instructive exception: its descent gradient is `-scale_s·dQ_shape +
+avoid_weight·dQ_avoid`, with the penalty raw and un-normalized (no Tanimoto scale) and a **positive**
+sign, because the penalty is subtracted from the score. In the registry that is a term with
+`reduction="raw"` and `weight="-avoid_weight"`; the engine's sign handling falls out of the weight.
 
 ## Dispatch (`accel/kernels/dispatch.py`)
 
@@ -67,68 +70,76 @@ The numba and Triton kernels must have **identical signatures**; the wrapper can
 calling conventions.
 
 One kernel deliberately bypasses dispatch: `vol_color_triton.vol_color_score_grad_se3_batch`, the
-fused shape+colour single-kernel variant, is imported directly by `drivers/vol_color.py` and used
-only when every pad is at or below `VOL_COLOR_FUSED_MAX_PAD` (32). It has no numba twin, which is
-exactly why it is not in dispatch.
+fused shape+colour single-kernel variant, reached through `ModeSpec.fused_pair` and used only when
+every pad is at or below `VOL_COLOR_FUSED_MAX_PAD` (32). It has no numba twin, which is exactly why
+it is not in dispatch — the engine falls back to the two separate kernels on CPU or past that pad.
 
-## The driver and the CUDA-graph fine loop
+## Adding a kernel to the engine: three small branches
 
-The batched driver runs the fine loop over all seeds and takes the per-pair maximum. The fine loop
-is shared across modes in `drivers/_graphed.py`: capture the per-step kernel+optimizer update once
-as a CUDA graph, then replay it.
+A new kernel is not wired by writing a driver. It is three branches:
 
-```python
-run_graphed(make, key, inputs, *, es_patience=0, es_tol=1e-5, es_seeds=0)
-```
+1. `drivers/terms.py::evaluate` — one `if term.kernel == "<yours>":` returning `(V, dQ, dT)`.
+2. `drivers/terms.py::self_overlap` — one branch, **only** if your reduction needs a self-overlap
+   (`tanimoto`, `tversky` and `pharm_sim` do; `raw` and `agreement` do not).
+3. `kernels/cpu_fused.py::_term_closure` — one closure marshalling the term's tensors to numpy
+   once and returning `(q, t) -> (V, dQ, dT)` float32, so the mode keeps the fused CPU path.
 
-- `make` is a zero-arg factory for your `_GraphedFineBase` subclass, called **only on cache miss**.
-- `key` is the cache key `(device, mode, shapes, P, steps, params)`.
-- `es_seeds` is the **seed rows per pair**, and it is set on every call including cache hits,
-  because it is a property of the call rather than of the cached graph. Pass the same value your
-  driver uses to gather its own result.
+Skip (3) and the mode still works — it just falls back to the eager loop on CPU. Skip (1) and it
+raises `KeyError` at the first fine step.
 
-Subclass hooks: `_step()`, `_load(*x)`, `_reset()`, `_result()`. Capture does three warmup steps on
-a side stream, then `torch.cuda.graph(..., capture_error_mode="thread_local")`.
+## The fine loop (`drivers/engine.py`)
+
+One body serves every mode. `align()`:
+
+1. **`assemble`** — resolve the spec's channels under this call's keywords (`channel_switch`),
+   centre the seed clouds if `center_clouds`, build each term's inputs, compute the pose-invariant
+   self-overlaps each reduction needs, generate (or accept) the seeds, and expand everything into
+   the per-pose layout.
+2. **the graph path** — `run_graphed` on `_GraphedFineTerms`, gated by the spec's `graph_budget`.
+3. **the fused CPU path** — `cpu_fused.run_fused`, gated by `cpu_fused` / `cpu_fused_max_pad`.
+4. **the eager path** — the fall-back, and the reference all three agree with.
+5. **gather** — each pair's best over its own seeds, with the pharm family's centring folded back
+   into the returned translation.
+
+All three loops run the **same per-step arithmetic in the same order**: evaluate every term, track
+the best PRE-Adam pose on the blended score, form the blended descent gradient, then (after the
+early-stop check) apply the tangent-projected Adam. That ordering is deliberate — the old fused CPU
+loop applied Adam *before* the check, which relocated the optimum for multi-basin modes.
 
 **Blocked, per-pair early stop.** The convergence test is per pair: a pair has converged when its
 own best — the max over its own seeds — stops improving, and the loop breaks only once no pair has
-improved for `es_patience` checks. Never test a maximum over the whole bucket: that lets one
-converged pair halt every pair sharing it, silently truncating the search and making the mode read
-faster than it is. The loop replays once to seed `prev`, then checks every `_GRAPH_ES_BLOCK` (5)
-replays, with `_GRAPH_ES_MARGIN` (2) added to the eager patience so the graphed schedule neither
-over- nor under-runs relative to eager. One host sync per block, not per step.
+improved for `patience` checks. Never test a maximum over the whole bucket: that lets one converged
+pair halt every pair sharing it, silently truncating the search and making the mode read faster
+than it is. The graph replays once to seed `prev`, then checks every `_GRAPH_ES_BLOCK` (5) replays,
+with `_GRAPH_ES_MARGIN` (2) added to the eager patience. One host sync per block, not per step.
 
-**Graph engagement is not uniform**, and the budget is per mode, not global:
+**Graph engagement is not uniform**, and the budget is per mode (`ModeSpec.graph_budget`):
 
 | Budget | Modes |
 |---|---|
 | `3e8` (the `_GRAPH_WORK_BUDGET` default) | shape, ESP, and their Tversky variants |
-| `3e7` | `vol_color`, `vol_lipo`, `vol_atomtype` and their Tversky variants |
-| `1e7` | `pharm`, `vol_pharm` |
+| `3e7` | `vol_color`, `vol_lipo`, `vol_mr`, `vol_fukui`, `vol_atomtype` and their Tversky variants |
+| `1e7` | `pharm`, `pharm_tversky`, `vol_pharm` |
 | `8e6` | `vol_and_surf_esp` and its Tversky variant |
-| none | `vol_avoid` — eager only, by design |
+| `None` | `vol_avoid` — eager only, by design: its objective is piecewise-linear and kinked while the graph's early-stop schedule is tuned for smooth Gaussians |
 
-Whether a bucket graphs is a function of its pad shape and that budget, via
-`graph_cap(work, budget)` clamped between `_GRAPH_CAP_MIN` (2,000) and `_GRAPH_CAP_CEIL` (262,144).
-It is deliberately **not** a function of allocator state: sub-batch sizing used to derive from
-*free* device memory, which made the same screen return different scores run to run.
+Whether a bucket graphs is a function of its pad shape and that budget, via `graph_cap(work,
+budget)` clamped between `_GRAPH_CAP_MIN` (2,000) and `_GRAPH_CAP_CEIL` (262,144). It is
+deliberately **not** a function of allocator state: sub-batch sizing used to derive from *free*
+device memory, which made the same screen return different scores run to run.
 
 Graphs live in a bounded LRU of `_GRAPH_CACHE_MAX` (24) and **pin GPU buffers for the process
 lifetime**; `reset_graph_cache()` releases them. An OOM during capture evicts the LRU and retries.
 
 Two caveats worth knowing before you trust a graphed number:
 
-- **Tversky modes forfeit the fused-CPU path but KEEP the CUDA graph.** `cpu_fused_shape`
-  hardcodes the Tanimoto reduction, so no Tversky driver calls it; each one does have its own
-  `_GraphedFine*` subclass and takes the graph under the usual budget. Do not remove a Tversky
-  mode's graphed path on the strength of the fused-CPU exclusion.
+- **Tversky modes keep BOTH the CUDA graph and the fused CPU loop.** The old fused CPU entry point
+  hardcoded Tanimoto, which excluded them; the generic one takes the reduction from the spec, so
+  they no longer forfeit it.
 - **`vol_and_surf_esp`'s graph and eager paths compute different algorithms.** The eager loop
-  applies `_ESP_STRIDE` (5) and the captured step does not, so the graph scores every step and
-  returns uniformly higher values. The screen runs eager. Do not treat the two as interchangeable.
-
-Use the helpers in `drivers/_common.py` for seed generation, transforms and result extraction so
-your driver stays small. Note `_update_best` returns **new** tensors and must not be used inside a
-captured `_step`.
+  applies `_ESP_STRIDE` (5) to its value-only ESP term and the captured step does not, so the graph
+  scores every step and returns uniformly higher values. `graph_full_steps` records that the mode
+  replays the full step count. The screen runs eager. Do not treat the two as interchangeable.
 
 ## Seeds
 
@@ -142,52 +153,53 @@ reference/JAX seeder's set, which has no structured seeds — which is why cross
 not comparable.
 
 The eigensolve is a closed-form Cardano solve in float64 (`_analytic_sym3x3_axes`), deliberately
-not `torch.linalg.eigh`, which syncs and fails past ~8192 rows. Two dedups apply: the reference
-side is solved once when `ref_shared=True`, which the caller must establish by **object identity**
-(`a is b`), not by value; and the fit side is deduped at the first axis iteration.
+not `torch.linalg.eigh`, which syncs and fails past ~8192 rows. Two dedups apply: the reference side
+is solved once when `ref_shared=True`, which the caller must establish by **object identity**
+(`a is b`) or structurally (the screen broadcasts one query into every row); and the fit side is
+deduped at the first axis iteration.
 
-**Constant / canonical-frame** — `_common.canonical_seed_quats(ref_points, n_real, num_seeds,
-device)` returns one seed set for the whole screen, valid only against a canonical store where
-every molecule is already in its own principal frame. One 3×3 solve per screen instead of one per
-molecule. It is plumbed as `const_seeds`, accepted by `align_batch_vol_arrays` **alone** — the
-object path's `_align_batch_vol` raises `TypeError` on it — and is gated to `mode == "vol"` with a
-single query. It is not bit-identical to per-molecule seeds, by construction.
+**Constant / canonical-frame** — `_common.canonical_seed_quats(...)` returns one seed set for the
+whole screen, valid only against a canonical store where every molecule is already in its own
+principal frame. One 3×3 solve per screen instead of one per molecule. A mode gets it when its
+`seed_channel` resolves to `atoms` or `heavy` — `CONST_SEED_MODES` is derived from exactly that, so
+a new mode seeding from the atom cloud inherits it. It is not bit-identical to per-molecule seeds,
+by construction.
 
 **Coarse-grid translations** — `legacy_seeds_with_translations_torch` and `build_coarse_grid`, used
 only on the `trans_init` path.
 
-Seed and step **counts** come from `MODE_SEEDS` / `MODE_STEPS` via `aligners._seeds_for` /
-`_steps_for`. Note that `_align_batch_vol_color` and `_align_batch_vol_lipo` **accept and ignore**
-`num_repeats`; their seed count comes from the table alone.
+Seed and step **counts** come from the spec via `aligners._seeds_for` / `_steps_for`. `num_repeats`
+reaches the seed count only for modes whose spec sets `honors_num_repeats` (the pharm family); the
+others accept and ignore it.
 
 ## The optimizer is not `torch.optim.Adam`
 
 β₁=0.9, β₂=0.999, ε=1e-8 *inside* the sqrt, **no bias correction**, a quaternion tangent-space
-projection fused into the kernel, and unit-quaternion renormalization every step. `lr` does not
-mean what it means in `torch.optim.Adam`, and the drivers' internal default is `0.075`, not the
-`0.1` the public API advertises. Early stopping is per mode and per pair: patience 2 for
-`vol`/`surf`/`vol_color`, 5 for the ESP and pharmacophore modes, tolerance 1e-5, checked every 5
-steps.
+projection fused into the kernel, and unit-quaternion renormalization every step. `lr` does not mean
+what it means in `torch.optim.Adam`, and the drivers' internal default is `0.075`, not the `0.1` the
+public API advertises — which is why `ModeSpec.screen_lr` records per mode which one the screen
+front end uses. Early stopping is per mode and per pair (`ModeSpec.patience`: 2 for the shape and
+colour modes, 5 for the ESP and pharmacophore ones), tolerance 1e-5, checked every 5 steps.
 
 ## Uploads: `_batch_upload` is keyed on the MOLECULE
 
 `accel/batch/aligners.py:_batch_upload(pairs, attr, src_fn, dtype, device, *, key_fn=None)`.
 
-It skips warm pairs entirely, infers `key_fn` from the attribute prefix (`_ref*` → the ref
-molecule, `_fit*` → the fit molecule), picks one representative pair per distinct molecule
-*object*, does one concatenate and one host-to-device copy, and clones once **per molecule**. An
-all-vs-all workload draws K pairs from far fewer distinct molecules — 100,000 pairs from 317
-compounds, each appearing ~632 times — so pair-keying uploaded every molecule hundreds of times.
-This was 61.3% of a `vol_color` pairwise batch.
+It skips warm pairs entirely, infers `key_fn` from the attribute prefix (`_ref*` → the ref molecule,
+`_fit*` → the fit molecule), picks one representative pair per distinct molecule *object*, does one
+concatenate and one host-to-device copy, and clones once **per molecule**. An all-vs-all workload
+draws K pairs from far fewer distinct molecules — 100,000 pairs from 317 compounds, each appearing
+~632 times — so pair-keying uploaded every molecule hundreds of times. This was 61.3% of a
+`vol_color` pairwise batch.
 
-Two consequences for a new mode:
+Two consequences for a new channel:
 
-- Name your tensor attributes with the `_ref_` / `_fit_` prefix so the key inference works. An
-  un-keyable attribute silently falls back to per-pair uploads.
+- The `Channel.attr` you choose becomes `_ref_<attr>_t` / `_fit_<attr>_t`, so the key inference
+  works automatically. Do not invent a name outside that shape.
 - Molecules sharing an object share one tensor. That is safe only because these are **read-only**
   inputs; if you ever add an in-place op on a `_ref_*_t` / `_fit_*_t` tensor you break it.
 
-The screen path never exercises this: `build_fit` pre-warms the attributes, so `cold` is empty.
+The screen path never exercises this: the fit builders pre-warm the attributes, so `cold` is empty.
 
 ## numba specifics
 
@@ -200,20 +212,20 @@ The screen path never exercises this: `build_fit` pre-warms the attributes, so `
   loops switch to fp32 structure-of-arrays kernels (`cpu_soa.py`): values ~1e-6 relative, gradients
   ~1e-4. Without it they are correct but much slower, and emit a one-time `RuntimeWarning`.
   A CPU throughput number taken without SVML understates the library by a large factor.
-- **The fused CPU loop is not applied uniformly.** `cpu_fused` is called by `shape`, `esp` and
-  `vol_color` only; `surf_esp` is excluded above 100 padded points, and `pharm` is excluded
-  entirely — its fused loop applies the Adam tail *before* the early-stop check where the eager
-  loop interleaves the other way, which with 32 seeds relocates the optimum rather than perturbing
-  it. `cpu_fused_pharm` is kept as dead-but-working code because it is what anyone fixing that
-  ordering would need.
+- **The fused CPU loop is now near-universal**: 19 of 21 modes take it. The pharmacophore family
+  opts out via `cpu_fused=False`, measured — its float32 tail rounding alone (the schedule matches
+  eager step for step) moved 5 of 12 screen scores by up to 35.7% relative, against an old-measured
+  gain of only 1.025–1.046x. `surf_esp` keeps `cpu_fused_max_pad=100`.
 
 ## Padding and masking
 
 Pad per-pair inputs to a common width, but mask padded slots by the **real count**, not by a
 sentinel type value — masking on a magic type index breaks the moment the type table is reordered.
-Carry `N_real` / `M_real` and mask on those.
+Carry `N_real` / `M_real` and mask on those. (`Channel.pad` exists so a padded slot holds something
+harmless — the Dummy pharmacophore family, element 0 — not so anything masks on it.)
 
-Bucketing is result-identical by construction: the kernels are one-CTA-per-pose and mask to the
-real counts, and seeds key on real counts rather than pad width, so padding two different-sized
-molecules into one bucket cannot change a score. Sub-batching bounds peak memory — on CUDA by a
-fixed pose cap (`_FINE_CHUNK_POSES`), on CPU by `_CPU_CHUNK_PAIRS` (10,000).
+Bucketing is result-identical by construction: the kernels are one-CTA-per-pose and mask to the real
+counts, and seeds key on real counts rather than pad width, so padding two different-sized molecules
+into one bucket cannot change a score. Sub-batching bounds peak memory — on CUDA by a fixed pose cap
+(`_FINE_CHUNK_POSES`, armed per mode through `_arrays._POSE_CAP_MODES`), on CPU by
+`_CPU_CHUNK_PAIRS` (10,000).

@@ -2,9 +2,9 @@
 name: accelerate-scoring-mode
 description: >-
   Take a correct but slow reference alignment mode in shepherd_score (an eager optimizer produced
-  by `design-scoring-mode`) and build the fast backend: matched Triton (GPU) and numba (CPU)
-  value+gradient kernels where new math is genuinely needed, a batched coarse-to-fine driver, the
-  `MoleculePairBatch` API, and the array-native screening path — validated against the reference.
+  by `design-scoring-mode`) and give it the fast backend: a ModeSpec in the mode registry, a
+  Channel row if it reads per-molecule data the library does not carry, and matched Triton/numba
+  value+gradient kernels only where the math is genuinely new — validated against the reference.
   Use when a mode runs correctly per-pair but needs to screen at 10k-100k alignments/second.
 ---
 
@@ -12,7 +12,32 @@ description: >-
 
 You are given a working reference mode: an eager optimizer in `alignment/_torch.py` (or a reuse of
 an existing one), its test, and its result slots registered in `_ALIGN_KEYS`. It is **not** yet in
-`accel/_modes.py` — promoting it to a canonical screening mode is part of your job.
+`accel/_modes.py` — promoting it is your job.
+
+## The one thing to understand first
+
+**A mode is DATA, not code.** `accel/_modes.py` holds a `ModeSpec` per mode: the per-molecule
+channels it reads, the objective terms it optimises, how each term reduces and how they blend, and
+its optimiser schedule. Everything mode-shaped downstream reads that spec:
+
+| Layer | File | Per-mode code you write |
+|---|---|---|
+| batched pairwise aligner | `accel/batch/aligners.py` | **none** — `_align_batch_<mode>` is generated |
+| fine loop (eager, CUDA-graph, fused CPU) | `accel/drivers/engine.py` | **none** |
+| array-native screen aligner | `accel/batch/_arrays.py` | **none** |
+| store schema / profile / shard I/O | `shepherd_score/screen.py` | **none** |
+| query + fit tensor plumbing | `shepherd_score/screen.py` | **none** |
+| process-per-GPU / CPU-pool spec | `accel/batch/_dispatch.py` | **none** |
+
+So a mode that reuses existing kernels and existing per-molecule data is **one `ModeSpec` plus one
+API method**. It inherits, automatically and on the day it lands: the batched aligner, adaptive
+bucketing, memory-safe sub-batching, the CUDA-graph fine loop, the fused numba CPU fine loop, the
+array-native screen path, the multi-GPU screen, the process pool, and a canonical store's constant
+seeds where its seed channel allows.
+
+If you find yourself writing a per-mode driver, a per-mode aligner, a per-mode array builder or a
+per-mode `screen.py` branch, **stop**: that is the shape the refactor removed, and reintroducing it
+takes the mode back off the derived path.
 
 ## What "fast" means here
 
@@ -21,9 +46,10 @@ The reference optimizer is autograd over one pair at a time. The accel layer ins
 - computes **value and gradient in a single hand-written kernel** (Triton on CUDA, numba on CPU),
 - emits the gradient directly in **unit-quaternion space** (`dO/dq`) in-register, so there is no
   host-side chain-rule tail,
-- runs a **batched coarse-to-fine** loop over many pairs, with a shared CUDA-graph fine loop,
+- runs one **batched coarse-to-fine** loop over many pairs, with a shared CUDA-graph fine loop and
+  a fused numba CPU twin,
 - exposes it through `MoleculePairBatch.align_with_<mode>(backend=...)`,
-- and, for a screening mode, aligns straight from the store's contiguous arrays.
+- and aligns straight from the store's contiguous arrays when screening.
 
 Despite the "coarse-to-fine" naming there is **no coarse grid on the default path**: every seed
 goes into the fine loop and the per-pair maximum is taken. The coarse grid runs only when
@@ -33,9 +59,9 @@ for pseudo-symmetric molecules.
 ## The oracle
 
 The reference optimizer is your ground truth. Never "fix" a parity failure by changing the
-reference — the reference is correct by construction; the kernel is what is under test.
+reference — the reference is correct by construction; the new wiring is what is under test.
 
-Be precise about what parity means here, because the honest tolerances are looser than they look
+Be precise about what parity means, because the honest tolerances are looser than they look
 (`parity_gates.md`): the accelerated seeder uses a **different seed set** from the reference by
 design, so agreement is at the *basin* level, not bitwise.
 
@@ -43,194 +69,178 @@ design, so agreement is at the *basin* level, not bitwise.
 
 ```
 Mode acceleration progress:
-- [ ] 1. Read the gradient structure; separate driver-analog from kernel-analog
-- [ ] 2. Do you even need a new kernel? (usually NO — 17 of 21 modes reuse one)
+- [ ] 1. Read the gradient structure; name each channel and each term
+- [ ] 2. Do you need a new KERNEL?  (usually NO — 21 modes run on 6 kernels)
 - [ ] 3. numba CPU kernel      | only if step 2 says yes
 - [ ] 4. Triton GPU twin       | only if step 2 says yes
 - [ ] 5. Dispatch wrapper      | only if step 2 says yes
-- [ ] 6. Batched driver (reuse the shared CUDA-graph fine loop)
-- [ ] 7. _align_batch_<mode> in aligners.py + re-export from batch/__init__.py
-- [ ] 8. Promote to canonical (accel/_modes.py) + bump the registry count 21 -> 22
-- [ ] 9. MoleculePairBatch.align_with_<mode>(backend=None)
-- [ ] 10. (Optional) worker-process path: paired _MODE_SPEC + PROCESS_MODES
-- [ ] 11. Wire into screen — store data, then the ARRAY path — see screen_wiring.md
+- [ ] 6. Do you need a new CHANNEL? (only if the mode reads per-molecule data nobody stores)
+- [ ] 7. The ModeSpec in accel/_modes.py  <- the actual work
+- [ ] 8. MoleculePairBatch.align_with_<mode>(backend=None)
+- [ ] 9. Bump the registry count 21 -> 22 in tests/test_mode_registry.py
 - [ ] Gates: 1 kernel≡ref · 2 Triton≡numba · 3 batched≡per-pair · 4 self=1.000 · 5 screen≡batch
-
-EARLY EXIT: if steps 3-5 are all "reuse" AND an existing driver already serves your mode
-unchanged, you are adding ONE aligner, three registry rows, one API method and the screen
-wiring. Skip kernel_anatomy.md except its graph-budget table.
 ```
+
+`EARLY EXIT`: if step 2 and step 6 are both "reuse", you are writing **one spec, one API method
+and one test-count bump**. That is the normal outcome.
 
 ## Steps
 
 ### 1. Read the reference's gradient structure
 
-Understand how the objective's SE(3) gradient decomposes: which channels contribute, and what each
-channel's `dO/dq` looks like. A combined mode is a weighted sum of per-channel gradients in the
-same quaternion space. Reuse the shape channel's `dR/dq` tail — it is validated and every mode's
-positional gradient shares it.
+Decompose the objective into TERMS. Each term is one kernel launch per fine step over one pair of
+channels, with a reduction (`tanimoto`, `tversky`, `raw`, `agreement`, `pharm_sim`) and a blend
+weight. A two-channel blend is two terms whose weights are `w` and its complement; a penalty is a
+term with a negative weight and the `raw` reduction.
 
-**Separate the two "nearest modes".** For a blended mode, the mode whose **driver / combining
-structure** you copy is usually not the one whose **field kernel** you reuse. A mode that is
-`(1−w)·shape + w·<scalar field>` has the driver shape of a two-channel combined-gradient mode, but
-its field kernel is the ESP kernel (a signed scalar field over atoms), not a pharmacophore kernel.
-Do not assume "looks like `vol_esp`" means "reuse `vol_esp`": `vol_esp` optimizes the field
-**alone**, so its driver cannot produce a shape+field blend. Identify the two independently.
+**Separate the two "nearest modes".** For a blended mode, the mode whose **term structure** you copy
+is usually not the one whose **field kernel** you reuse. A mode that is `(1−w)·shape + w·<scalar
+field>` has two terms, and its field term runs on the **ESP kernel** (a signed scalar field over
+atoms), not a pharmacophore kernel. Do not assume "looks like `vol_esp`" means "reuse `vol_esp`":
+`vol_esp` is a single ESP term with no shape term at all.
 
-### 2. Do you even need a new kernel? Almost certainly not
+### 2. Do you need a new kernel? Almost certainly not
 
-Twenty-one modes are served by **four** Triton kernel modules. Before writing anything, check whether an
-existing dispatched kernel already emits your channel's value and gradient:
+Twenty-one modes are served by **six** kernels. Check whether one already emits your channel's
+value and gradient:
 
-| Channel | Kernel | Module |
+| Channel | `Term.kernel` | Module |
 |---|---|---|
-| shape (Gaussian volume) | `overlap_score_grad_se3_batch` | `kernels/shape_triton.py` + `kernels/cpu.py` |
-| signed scalar field over atoms | `overlap_score_grad_esp_se3_batch` | `kernels/esp_triton.py` + `kernels/cpu.py` |
-| ShaEP surface-ESP comparison (value only) | `esp_comparison_batch` | same |
-| pharmacophore, directional | `pharm_grad_dq_se3_batch` | `kernels/pharm_triton.py` + `kernels/cpu.py` |
-| pharmacophore, directionless ("color") | `pharm_color_score_grad_se3_batch` | same |
-| hard-sphere excluded volume | `overlap_score_grad_avoid_se3_batch` | `kernels/avoid_triton.py` + `kernels/cpu.py` |
+| shape (Gaussian volume) | `shape` | `kernels/shape_triton.py` + `kernels/cpu.py` |
+| signed scalar field over points | `esp` | `kernels/esp_triton.py` + `kernels/cpu.py` |
+| ShaEP surface-ESP agreement (value only) | `esp_cmp` | same |
+| pharmacophore, directional | `pharm` | `kernels/pharm_triton.py` + `kernels/cpu.py` |
+| pharmacophore/element, directionless | `color` | same |
+| hard-sphere excluded volume | `avoid` | `kernels/avoid_triton.py` + `kernels/cpu.py` |
 
-**Feeding a new per-atom scalar where the ESP kernel expects charges is a reuse, not a new
-kernel.** That single move covers `vol_lipo`, `vol_mr` and `vol_fukui`. A Tversky variant is a
-host-side reduction over a parent's kernel output — also not a new kernel.
+**Feeding a new per-atom scalar where the ESP kernel expects charges is a reuse.** That one move
+covers `vol_lipo`, `vol_mr` and `vol_fukui`. **A Tversky variant is a `reduction=` string**, not a
+kernel and not a driver. **An element-identity channel is the `color` kernel with element tables**
+(`Term(tables="element")`).
 
 Only one mode in recent history needed genuinely new channel math: `vol_avoid`, whose relu-hinge
-penalty no Gaussian kernel computes. If you conclude you need a new kernel, state which existing
-kernel you rejected and why. Then do steps 3–5; otherwise skip straight to the driver.
+penalty no Gaussian kernel computes. If you conclude you need a kernel, state which existing kernel
+you rejected and why, then do steps 3–5. Otherwise skip to step 6.
 
-### 3. Write the numba CPU kernel first *(new math only)*
+### 3–5. The kernel trio *(new math only)*
 
-CPU is easier to debug than Triton. Add the value+grad kernel to `accel/kernels/cpu.py` as an
-`@njit(parallel=True, fastmath=True, cache=True)` inner kernel plus a thin torch-facing wrapper.
-It must return the same value the reference computes **and** the analytic `dO/dq`. Validate it
-against the reference immediately (gate 1) before writing any Triton.
+Write the **numba CPU kernel first** (`accel/kernels/cpu.py`), because CPU is easier to debug;
+validate it against the reference (gate 1). Then the **Triton twin** with an *identical call
+signature* (`accel/kernels/<family>_triton.py`), validated against numba (gate 2). Then the
+**dispatch wrapper** (`accel/kernels/dispatch.py`, one `_make(name, triton_tag)` line): routing is
+per call by the device of the first tensor argument, never frozen at import.
 
-### 4. Write the Triton GPU twin *(new math only)*
+Then teach `drivers/terms.py` to call it: one `if term.kernel == "<yours>":` branch in `evaluate`,
+one in `self_overlap` if the reduction needs a self-overlap, and one closure in
+`kernels/cpu_fused.py::_term_closure` so the fused CPU loop can run it. Three small branches — see
+`kernel_anatomy.md`.
 
-Add the matching kernel to `accel/kernels/<family>_triton.py` with an **identical call signature**
-to the numba wrapper. Match the surrounding idiom: `@triton.autotune` over the family's config
-list, `tl.exp2(x * inv_ln2)` rather than `tl.exp`, and the shared `_quat_to_rotmat` /
-`_quat_grad_tail` helpers from `shape_triton.py`. Validate against numba (gate 2).
+### 6. Do you need a new channel?
 
-### 5. Register the dispatch wrapper *(new math only)*
+A **channel** is one named per-molecule array: `accel/channels.py` holds the table. Add a row only
+if your mode reads data no channel already carries. The row states how to read it off a `Molecule`,
+which pair tensor attribute carries it, how the store persists it (array key, offset table or
+dense, schema flag), whether it rotates/translates under the canonical frame, and what a padded
+slot holds.
 
-Add the routing wrapper in `accel/kernels/dispatch.py` via its `_make(name, triton_tag)` factory.
-Routing is **per call, by the device of the first tensor argument** — never frozen at import — and
-Triton source modules are imported lazily, so a CPU-only box never touches them. The wrapper
-exports 11 names today; yours makes 12.
+```python
+_reg(Channel("tpsa_pos", "points", "tpsa", "tpsa_pos",
+             _read_accessor("get_tpsa_positions", "TPSA centres"), "tpsa_pos", flag="tpsa"))
+_reg(Channel("tpsa", "scalar", "tpsa", "tpsa",
+             _read_accessor_noH("get_tpsa", "TPSA"), "tpsa", flag="tpsa"))
+```
 
-### 6. Write the batched driver
+Then three small additions, all in one place each:
 
-Add `accel/drivers/<mode>.py`, modeled on the nearest family. Fourteen driver modules serve 21 modes,
-so check first whether an existing driver already takes your mode as a parameterisation —
-`drivers/vol_lipo.py` serves `vol_lipo`, `vol_mr` **and** `vol_fukui` unchanged, and
-`drivers/vol_tversky.py` serves both `vol_tversky` and `surf_tversky`.
+- a **basis** entry in `channels.BASES` (its offset-table key) if the data is not 1:1 with an
+  existing basis. **Give a per-atom field its own table**: `atom_pos` is the `Chem.RemoveHs` set and
+  is longer than the true-heavy set whenever RemoveHs retained an isotope-labelled H, so a shared
+  table desyncs the field from its positions on exactly the molecules hardest to notice;
+- the flag in `channels.SCHEMA_FLAGS`;
+- a row in `screen.py::_BASIS_TABLE` (`basis, flag, offset key, [(profile attr, store key)]`) and
+  the matching `MoleculeProfile` slots + `get_<data>()` accessors **named exactly like the
+  `Molecule` methods**, so a profile duck-types into the aligner identically.
 
-Use the shared CUDA-graph fine loop in `drivers/_graphed.py` (`run_graphed(make, key, inputs, *,
-es_patience, es_tol, es_seeds)`) and the helpers in `drivers/_common.py`. Do not reimplement the
-graph loop. Every mode but `vol_avoid` uses it; `vol_avoid` opts out because its objective is
-piecewise-linear and kinked while the graph's early-stop schedule is tuned for smooth Gaussians.
+Extraction, pre-centring, the canonical rotation, `_concat`, `_reconstruct`, the query tensors, the
+fit tensors and the array builder are then all derived from those rows. In particular you do **not**
+hand-write the canonical rotation any more — `_profile_from_schema` rotates every channel whose
+`kind` is `points` or `vectors`. That was the single most dangerous manual step: getting it wrong
+left scores right and `Hit.transform` silently wrong.
 
-### 7. Wire the batched aligner
+### 7. Write the ModeSpec — the actual work
 
-Add `_align_batch_<mode>(pairs, ...)` to `accel/batch/aligners.py`: upload per-pair inputs with
-`_batch_upload`, bucket and pad, call the driver, write `transform_<mode>` / `sim_aligned_<mode>`
-back onto each pair. Then add an explicit re-export line to `accel/batch/__init__.py`.
+```python
+_reg(ModeSpec("vol_tpsa", ("transform_vol_tpsa", "sim_aligned_vol_tpsa"), 16, 50, 2,
+              seed_channel="atoms", channels=("atoms", "tpsa_pos", "tpsa"), bucket=("atoms",),
+              terms=_field_blend("tpsa_pos", "tpsa", "tpsa_weight"),
+              params={"alpha": 0.81, "lam": 0.1, "tpsa_weight": 0.5, "lr": 0.075},
+              graph_budget=30_000_000, screen_lr=0.1))
+```
 
-You do **not** bind it onto `MoleculePair` by hand: the `@_bind_batch_aligners` decorator in
-`container/_core.py` walks `CANONICAL_MODES` at import and binds every one as a static method. That
-is also why step 8 must come after this step and not before.
-
-### 8. Promote the mode to canonical
-
-Add one row each to `MODE_ATTRS`, `MODE_SEEDS` and `MODE_STEPS` in `accel/_modes.py`, choosing
-seed/step defaults at the accuracy/throughput knee. Then bump the hardcoded count in
-`tests/test_mode_registry.py` from 21 to 22 and update its trailing comment.
-
-This is exactly the step the reference skill could not do: adding to `MODE_ATTRS` before the
-aligner exists makes `import shepherd_score.container` raise, because the decorator walks
-`CANONICAL_MODES` calling `getattr(accel.batch, "_align_batch_<mode>")`.
+Read the dataclass docstrings in `accel/_modes.py` before filling these in; the fields that decide
+behaviour rather than describing it are `seed_channel` (which decides whether a canonical store's
+constant seeds apply), `bucket` + `work` (the cost model), `graph_budget`, `cpu_fused`,
+`lam_scaling`, `screen_lr` and `honors_num_repeats`.
 
 > **Say where your seed/step numbers came from.** `_modes.py` records that only one of the 21
-> entries has measured data behind it; the rest were inherited from a sibling mode. Inheriting is
-> a reasonable starting point, but state in the commit that you did, rather than presenting an
+> entries has measured data behind it; the rest were inherited from a sibling. Inheriting is a
+> reasonable starting point — state in the commit that you did, rather than presenting an
 > unmeasured constant as a measured knee.
 
-Now that the registry carries the defaults, switch the reference `align_with_<mode>`'s literal
-seed/step defaults to `_default_seeds` / `_default_steps` so the per-pair and batched paths share
-one source. Eleven shipped modes never got this treatment and their eager and batched defaults
-disagree; do not add a twelfth.
-
-### 9. Public batched API
+### 8. Public batched API
 
 Add `MoleculePairBatch.align_with_<mode>(backend=None, return_aligned=False)` in
-`container/_batch.py`. Copy the thin-wrapper template — `align_with_vol_mr` is the cleanest
-instance. Resolve `num_repeats` / `max_num_steps` from the registry, then call
+`container/_batch.py` — copy `align_with_vol_mr`, the cleanest instance. Resolve `num_repeats` /
+`max_num_steps` from the registry via `_default_seeds` / `_default_steps`, then call
 `_run_fast_or_fallthrough(...)`, falling back to `_delegate_alignment` for the JAX/unknown path.
-`backend=None` resolves device-aware (Triton on CUDA, else numba); do not hard-default.
+`backend=None` resolves device-aware; do not hard-default.
 
-### 10. (Optional) worker-process path
+You do **not** bind `_align_batch_<mode>` onto `MoleculePair` by hand: the `@_bind_batch_aligners`
+decorator in `container/_core.py` walks `CANONICAL_MODES` at import. That is also why step 7 must
+come after the aligner exists — and it always does now, because the aligner is generated from the
+spec in the same module import.
 
-Only if the mode should run across multiple GPUs via `align_multi_gpu` / `MultiGPUAligner` or the
-CPU process pool: add a `_MODE_SPEC` entry in `accel/batch/_dispatch.py` (declaring `extract`,
-`tensors` and `out`) **and** add the mode to `PROCESS_MODES` in `accel/_modes.py`. A registry test
-asserts `tuple(_MODE_SPEC) == PROCESS_MODES`, so these are a pair — never one without the other.
+Now switch the reference `MoleculePair.align_with_<mode>`'s literal seed/step defaults to
+`_default_seeds` / `_default_steps` so the per-pair and batched paths share one source.
 
-Only four modes have this today (`vol`, `surf`, `surf_esp`, `pharm`). Skipping it is the normal
-outcome; the mode then runs single-GPU or in-process, which is fine. Note that `screen(ndev>1)` is
-a **separate** multi-GPU path and is *not* restricted to `PROCESS_MODES`.
+### 9. The one hardcoded thing left
 
-### 11. Wire the mode into `screen` — see `screen_wiring.md`
+`tests/test_mode_registry.py` pins `len(CANONICAL_MODES)` as a literal. Bump it and update the
+trailing comment. That is deliberate: it is the tripwire that makes adding a mode a visible act.
 
-The registry makes `screen` **dispatch** your mode; it does not teach the on-disk store what
-per-molecule arrays your mode *reads*, and it does not give you the fast path. This is the step
-that is easy to miss: the in-memory path works, the mode imports, tests pass, and
-`screen(..., mode="<yours>")` still raises or feeds zeros.
+Everything else in the test suite is derived — the parity tests parametrize over
+`CANONICAL_MODES` / `screen._ARRAY_MODES`, the store fixture is built for the whole tuple, the
+required-kwarg table is read off the specs, and the self-copy exclusion is read off the terms. Your
+mode is covered on the next run without touching them. If you find yourself editing a mode-name
+list in a test, check first whether it should be derived.
 
-Three things, all detailed with exact edit lists in **`screen_wiring.md`** — read it before
-starting:
+### 10. Validate against the gates
 
-- **Store data.** *Tier A* reuses arrays the store already holds: one `_store_supports` line.
-  *Tier B* needs new per-molecule data: schema flag, `MoleculeProfile` slots and accessors,
-  serialization with its own offset table, and — easy to forget — **rotation in the canonical
-  block**, since a store is canonical by default whenever it serves `vol`.
-- **The array-native path**, which is what `screen` actually runs. Five edits plus one aligner in
-  `accel/batch/_arrays.py`. A mode left off it still screens correctly through the object path, but
-  that path is 1.3–5× slower on the *identical* GPU kernel, so benchmarking it against the array
-  modes understates it. Wire it, or do not plot its screening throughput on the same axis.
-- **Nine of the 21 modes are deliberately not screen-wired.** If yours is one of them — a mode
-  taking a third non-molecule input cannot be, since the store models molecules — say so with an
-  explicit documented `return False` in `_store_supports` rather than letting it fall through.
+See `parity_gates.md`. Gates 1–4 before you declare the mode accelerated, plus gate 5 if it screens.
 
-### 12. Validate against the gates
+## Deliberately NOT screen-wired
 
-See `parity_gates.md`. Gates 1–4 must pass before you declare the mode accelerated, plus gate 5
-(the screen round-trip) if the mode screens.
+Every registry mode screens now, including `vol_avoid`, whose avoid cloud is carried with the query
+(`screen(..., avoid_points=...)`) rather than stored per molecule. If your mode genuinely cannot
+screen, make `_store_supports` say so explicitly with a comment rather than letting it fall
+through — a reader otherwise cannot tell "deliberately pairwise-only" from "someone forgot".
 
 ## Minimality discipline
 
-- **Derive mode *routing*; add mode *data*.** `_bind_batch_aligners`, `_TRANSFORM_ATTR`,
-  `_SCORE_ATTR`, `_seeds_for` / `_steps_for` and `screen_parallel`'s `_ALIGN_ATTR` all derive from
-  `accel/_modes.py` — never hardcode a list to decide which modes exist or where they dispatch.
-  This does **not** forbid the per-mode data plumbing of step 11, which is inherently
-  mode-specific. The tell: editing a mode-name list to decide *dispatch* is wrong; adding a
-  `_store_supports` branch or a `MoleculeProfile` field is right.
-- **One dispatch table, not two.** `screen.py`'s `_array_dispatch` is the single selector for both
-  the in-process driver and the multi-GPU worker. A second table is what made `screen(ndev>1)`
-  return `vol`'s answers under every mode's name.
+- **Derive routing; add data.** Never hardcode a mode-name list to decide which modes exist, where
+  they dispatch, what the store keeps or which tensors a mode reads. The tell: editing a list of
+  mode names is almost always wrong now; adding a `ModeSpec` or a `Channel` row is right.
+- **One dispatch table, not two.** `screen.py::_array_dispatch` is the single selector for both the
+  in-process driver and the multi-GPU worker. A second table is what made `screen(ndev>1)` return
+  `vol`'s answers under every mode's name.
 - **Two kernels, identical signatures.** The dispatch wrapper cannot adapt between calling
   conventions.
-- **Prefer parameterising an existing driver over a near-copy.** One shared
-  `_build_fit_arrays_scalar_field` serves `vol_lipo` and `vol_fukui`; a third such mode should be a
-  third line, not a third function.
-- **Small diff.** Typically: no new kernel, one driver (or a parameterisation), one aligner, three
-  registry rows plus the count bump, one API method, and the step-11 screen wiring. If the diff is
-  much larger than that, question it.
-- **Keep the tests derived.** Drive new parity tests off `_ARRAY_MODES` / `CANONICAL_MODES` rather
-  than a fresh hardcoded list. Three hardcoded lists once let six modes ship with zero coverage,
-  and the negative control had silently gone false.
+- **Small diff.** Typically: no kernel, no channel, one spec, one API method, one count bump. If the
+  diff is much larger, question it.
+- **Keep the tests derived.** Drive new tests off `CANONICAL_MODES` / `_ARRAY_MODES`, never a fresh
+  hardcoded list. Three hardcoded lists once let six modes ship with zero coverage.
 
-See `seams.md` for the file map, `kernel_anatomy.md` for kernel/dispatch/graph mechanics,
-`screen_wiring.md` for step 11, and `parity_gates.md` for the validation contract. `evals/` holds grading
-rubrics — they state expected answers, so they are for reviewing work, not for doing it.
+See `seams.md` for the file map, `kernel_anatomy.md` for kernel/engine/graph mechanics,
+`screen_wiring.md` for what the store still needs from you, and `parity_gates.md` for the validation
+contract. `evals/` holds grading rubrics — they state expected answers, so they are for reviewing
+work, not for doing it.
