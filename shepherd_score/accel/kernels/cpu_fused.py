@@ -1,35 +1,32 @@
-"""Fused CPU (numba) fine-loop driver — a first-class CPU path, not a GPU fallback.
+"""Fused CPU (numba) fine loop -- a first-class CPU path for EVERY mode, not a GPU fallback.
 
-Constraints this module exists to satisfy:
-
-* No torch in the hot loop. torch's thread pool (``OMP_NUM_THREADS``) contends with numba's
-  ``prange``, and the per-step score/best/Adam tail would be serial. Inputs are marshalled to
-  numpy once; each step chains the overlap+grad njit kernel with an njit ``prange`` tail, and
-  the early-stop check is a numpy per-pair ``.max(axis=1)``.
-* The tail must stay bit-compatible with ``fused_adam_qt_with_tangent_proj``: β1=0.9,
-  β2=0.999, eps=1e-8 *inside* the sqrt, no bias correction, unit-quaternion renorm — and with
-  ``_update_best``: the tracked best pose is the PRE-Adam pose. Seeds, step count and
-  early-stop are the caller's; this module does not define its own schedule.
-* Intended numeric differences vs the eager path: fastmath reassociation in the overlap
-  kernels (the tails are ``fastmath=False``), plus fp32 accumulation on the SoA kernels.
+No torch in the hot loop: the inputs are marshalled to numpy once, each step chains the
+per-term overlap+grad njit kernels with two njit ``prange`` tails (score / best / blended
+descent gradient, then the tangent-projected Adam), and the per-pair early-stop check is a numpy
+``.max(axis=1)``. The tails reproduce the torch fp32 arithmetic of ``drivers/engine.py`` op for
+op -- same operand order, float32 constants, eps inside the sqrt, no bias correction -- so on the
+fp64 AoS kernels (no SVML) the fused loop and the eager loop see the same kernel outputs and
+differ only in float32 rounding of the tail; with SVML the SoA fp32 kernels add ~1e-4 gradient
+error (see ``cpu_soa.py``). Seeds, step count and early-stop schedule are the caller's.
 """
 from __future__ import annotations
+
+import math
 
 import numpy as np
 from numba import njit, prange
 
 from .._stats import record as _record_steps
 
+# Adam constants as float32, matching what torch computes in float32 from the double literals.
+_B1 = np.float32(0.9)
+_A1 = np.float32(1.0 - 0.9)
+_B2 = np.float32(0.999)
+_A2 = np.float32(1.0 - 0.999)
+_EPS = np.float32(1e-8)
+_F1 = np.float32(1.0)
+_F0 = np.float32(0.0)
 
-# Adam constants — must match fused_adam_qt_with_tangent_proj in cpu.py / the Triton tail.
-_B1 = 0.9
-_B2 = 0.999
-_EPS = 1e-8
-
-# The SoA fp32 kernels (cpu_soa.py) vectorize the exp-bound inner loop only when this numba
-# build has SVML (numba<=0.59 + icc_rt; config.USING_SVML). Without SVML the scalar exp is the
-# barrier and SoA buys nothing, so the fp64 AoS kernels in cpu.py run instead. The SoA path is
-# fp32 (gradient rel-err ~1e-4), so it is not bit-identical to the AoS path.
 try:
     import numba.core.config as _nbcfg
     _SVML = bool(_nbcfg.USING_SVML)
@@ -37,7 +34,6 @@ except Exception:
     _SVML = False
 _USE_SOA = _SVML
 
-# One-time warning, raised only when a CPU align actually runs.
 _SVML_WARNED = False
 
 
@@ -54,318 +50,354 @@ def _warn_if_no_svml():
             RuntimeWarning, stacklevel=3)
 
 
+# =============================================================================================
+# njit tails
+# =============================================================================================
 @njit(parallel=True, fastmath=False, cache=True)
-def _tail_tanimoto(O, dQ, dT, q, t, mq, vq, mt, vt, best, bq, bt, norm, lr):
-    """One fine-loop tail step for a single-channel Tanimoto objective (vol/surf/vol_esp/
-    surf_esp/pharm). In place. O,(dQ,dT) = overlap value + dO/dq, dO/dt from the kernel at the
-    CURRENT (q,t). Tracks the pre-Adam pose as best (== _update_best), then tangent-projected
-    Adam on q + plain Adam on t + renorm (== fused_adam_qt_with_tangent_proj)."""
-    P = O.shape[0]
+def _tail_blend(Vg, dQg, dTg, kind, kc, cst, guard, useg, gpos, sims, wt, q, t, best, bq, bt,
+                gq, gt, score_now):
+    """Per pose: reduce every gradient term (Tanimoto / Tversky / raw, guarded), blend the
+    similarities in term order (value-only rows of ``sims`` prefilled by the host), track the
+    best PRE-Adam pose, and build the blended descent gradient into ``gq``/``gt``."""
+    P = q.shape[0]
+    Tg = Vg.shape[0]
+    T = sims.shape[0]
     for p in prange(P):
+        # ---- gradient terms: similarity + d(sim)/dV, then their gradient contribution -------
+        for g in range(Tg):
+            V = Vg[g, p]
+            k = kind[g]
+            if k == 0:
+                denom = cst[g, p] - V
+                if useg[g] and not guard[g, p]:
+                    denom = _F1
+                sim = V / denom
+                scale = cst[g, p] / (denom * denom)
+            elif k == 1:
+                denom = kc[g] * V + cst[g, p]
+                if useg[g] and not guard[g, p]:
+                    denom = _F1
+                sim = V / denom
+                scale = cst[g, p] / (denom * denom)
+            else:
+                sim = V
+                scale = _F1
+            if useg[g] and not guard[g, p]:
+                sim = _F0
+                scale = _F0
+            j = gpos[g]
+            sims[j, p] = sim
+            w = wt[j]
+            if g == 0:
+                x0 = dQg[g, p, 0] * scale; x1 = dQg[g, p, 1] * scale
+                x2 = dQg[g, p, 2] * scale; x3 = dQg[g, p, 3] * scale
+                y0 = dTg[g, p, 0] * scale; y1 = dTg[g, p, 1] * scale; y2 = dTg[g, p, 2] * scale
+                x0 = -x0; x1 = -x1; x2 = -x2; x3 = -x3
+                y0 = -y0; y1 = -y1; y2 = -y2
+                if w != _F1:
+                    x0 = x0 * w; x1 = x1 * w; x2 = x2 * w; x3 = x3 * w
+                    y0 = y0 * w; y1 = y1 * w; y2 = y2 * w
+                gq[p, 0] = x0; gq[p, 1] = x1; gq[p, 2] = x2; gq[p, 3] = x3
+                gt[p, 0] = y0; gt[p, 1] = y1; gt[p, 2] = y2
+            else:
+                nw = -w
+                x0 = dQg[g, p, 0] * scale; x1 = dQg[g, p, 1] * scale
+                x2 = dQg[g, p, 2] * scale; x3 = dQg[g, p, 3] * scale
+                y0 = dTg[g, p, 0] * scale; y1 = dTg[g, p, 1] * scale; y2 = dTg[g, p, 2] * scale
+                if w != _F1:
+                    x0 = x0 * nw; x1 = x1 * nw; x2 = x2 * nw; x3 = x3 * nw
+                    y0 = y0 * nw; y1 = y1 * nw; y2 = y2 * nw
+                else:
+                    x0 = -x0; x1 = -x1; x2 = -x2; x3 = -x3
+                    y0 = -y0; y1 = -y1; y2 = -y2
+                gq[p, 0] += x0; gq[p, 1] += x1; gq[p, 2] += x2; gq[p, 3] += x3
+                gt[p, 0] += y0; gt[p, 1] += y1; gt[p, 2] += y2
+        if score_now:
+            # ---- blend in term order: score = w0*s0 (+ w1*s1 ...) ---------------------------
+            s = sims[0, p]
+            if wt[0] != _F1:
+                s = s * wt[0]
+            for j in range(1, T):
+                c = sims[j, p]
+                if wt[j] != _F1:
+                    c = c * wt[j]
+                s = s + c
+            if s > best[p]:
+                best[p] = s
+                bq[p, 0] = q[p, 0]; bq[p, 1] = q[p, 1]; bq[p, 2] = q[p, 2]; bq[p, 3] = q[p, 3]
+                bt[p, 0] = t[p, 0]; bt[p, 1] = t[p, 1]; bt[p, 2] = t[p, 2]
+
+
+@njit(parallel=True, fastmath=False, cache=True)
+def _tail_pharm(O, dQr, dTr, norm, C, tanimoto, q, t, best, bq, bt, gq, gt):
+    """Pharm-style score / best / gradient: the kernel saw the unit-normalised ``q``; apply the
+    guarded (clamped for Tversky) similarity, the normalisation Jacobian and leave the raw
+    (not yet tangent-projected) gradient in ``gq``/``gt``."""
+    P = q.shape[0]
+    for p in prange(P):
+        q0 = q[p, 0]; q1 = q[p, 1]; q2 = q[p, 2]; q3 = q[p, 3]
+        qn = np.float32(math.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3))
+        qnc = qn
+        if qnc < np.float32(1e-12):
+            qnc = np.float32(1e-12)
+        u0 = q0 / qnc; u1 = q1 / qnc; u2 = q2 / qnc; u3 = q3 / qnc
         Op = O[p]
-        denom = norm[p] - Op
-        if denom == 0.0:
-            denom = 1e-12
-        score = Op / denom
-        scale = norm[p] / (denom * denom)            # d(Tanimoto)/dO  (>=0)
-        # best-pose tracking (pre-Adam pose), identical to _update_best
+        if tanimoto:
+            denom = norm[p] - Op
+            if denom > np.float32(1e-8):
+                score = Op / denom
+            else:
+                score = _F0
+            scale = -norm[p] / (denom * denom)
+        else:
+            D = C[p]
+            if D > np.float32(1e-8):
+                score = Op / D
+            else:
+                score = _F0
+            if score > _F1:
+                score = _F1
+            active = _F1 if Op < D else _F0
+            scale = -active / D
+        s0 = scale * dQr[p, 0]; s1 = scale * dQr[p, 1]; s2 = scale * dQr[p, 2]; s3 = scale * dQr[p, 3]
+        gt[p, 0] = scale * dTr[p, 0]; gt[p, 1] = scale * dTr[p, 1]; gt[p, 2] = scale * dTr[p, 2]
+        dot = u0 * s0 + u1 * s1 + u2 * s2 + u3 * s3
+        gq[p, 0] = (s0 - u0 * dot) / qnc
+        gq[p, 1] = (s1 - u1 * dot) / qnc
+        gq[p, 2] = (s2 - u2 * dot) / qnc
+        gq[p, 3] = (s3 - u3 * dot) / qnc
         if score > best[p]:
             best[p] = score
-            bq[p, 0] = q[p, 0]; bq[p, 1] = q[p, 1]; bq[p, 2] = q[p, 2]; bq[p, 3] = q[p, 3]
+            bq[p, 0] = q0; bq[p, 1] = q1; bq[p, 2] = q2; bq[p, 3] = q3
             bt[p, 0] = t[p, 0]; bt[p, 1] = t[p, 1]; bt[p, 2] = t[p, 2]
-        # descent gradient g = -scale * dO/d(.)   (ascend Tanimoto == descend -Tanimoto)
-        gq0 = -scale * dQ[p, 0]; gq1 = -scale * dQ[p, 1]
-        gq2 = -scale * dQ[p, 2]; gq3 = -scale * dQ[p, 3]
-        gt0 = -scale * dT[p, 0]; gt1 = -scale * dT[p, 1]; gt2 = -scale * dT[p, 2]
-        # tangent projection of the quaternion grad: dq = g - q (g·q)
-        radial = gq0 * q[p, 0] + gq1 * q[p, 1] + gq2 * q[p, 2] + gq3 * q[p, 3]
-        dq0 = gq0 - q[p, 0] * radial; dq1 = gq1 - q[p, 1] * radial
-        dq2 = gq2 - q[p, 2] * radial; dq3 = gq3 - q[p, 3] * radial
-        # Adam on q (no bias correction; eps inside the sqrt)
-        mq[p, 0] = _B1 * mq[p, 0] + (1.0 - _B1) * dq0
-        mq[p, 1] = _B1 * mq[p, 1] + (1.0 - _B1) * dq1
-        mq[p, 2] = _B1 * mq[p, 2] + (1.0 - _B1) * dq2
-        mq[p, 3] = _B1 * mq[p, 3] + (1.0 - _B1) * dq3
-        vq[p, 0] = _B2 * vq[p, 0] + (1.0 - _B2) * dq0 * dq0
-        vq[p, 1] = _B2 * vq[p, 1] + (1.0 - _B2) * dq1 * dq1
-        vq[p, 2] = _B2 * vq[p, 2] + (1.0 - _B2) * dq2 * dq2
-        vq[p, 3] = _B2 * vq[p, 3] + (1.0 - _B2) * dq3 * dq3
-        q[p, 0] -= lr * mq[p, 0] / np.sqrt(vq[p, 0] + _EPS)
-        q[p, 1] -= lr * mq[p, 1] / np.sqrt(vq[p, 1] + _EPS)
-        q[p, 2] -= lr * mq[p, 2] / np.sqrt(vq[p, 2] + _EPS)
-        q[p, 3] -= lr * mq[p, 3] / np.sqrt(vq[p, 3] + _EPS)
-        # Adam on t (no tangent projection)
-        mt[p, 0] = _B1 * mt[p, 0] + (1.0 - _B1) * gt0
-        mt[p, 1] = _B1 * mt[p, 1] + (1.0 - _B1) * gt1
-        mt[p, 2] = _B1 * mt[p, 2] + (1.0 - _B1) * gt2
-        vt[p, 0] = _B2 * vt[p, 0] + (1.0 - _B2) * gt0 * gt0
-        vt[p, 1] = _B2 * vt[p, 1] + (1.0 - _B2) * gt1 * gt1
-        vt[p, 2] = _B2 * vt[p, 2] + (1.0 - _B2) * gt2 * gt2
-        t[p, 0] -= lr * mt[p, 0] / np.sqrt(vt[p, 0] + _EPS)
-        t[p, 1] -= lr * mt[p, 1] / np.sqrt(vt[p, 1] + _EPS)
-        t[p, 2] -= lr * mt[p, 2] / np.sqrt(vt[p, 2] + _EPS)
-        # renorm q to the unit sphere
-        qn = np.sqrt(q[p, 0] * q[p, 0] + q[p, 1] * q[p, 1] + q[p, 2] * q[p, 2] + q[p, 3] * q[p, 3])
-        if qn < 1e-12:
-            qn = 1e-12
-        q[p, 0] /= qn; q[p, 1] /= qn; q[p, 2] /= qn; q[p, 3] /= qn
 
 
 @njit(parallel=True, fastmath=False, cache=True)
-def _tail_vol_color(Vs, dQs, dTs, Oc, dQc, dTc, q, t, mq, vq, mt, vt, best, bq, bt,
-                    norm_s, norm_c, w, lr):
-    """vol_color tail: score = (1-w)*shape_Tc + w*color_Tc; combined descent grad
-    g = (1-w)*(-scale_s*dO_s) + w*(-scale_c*dO_c); tangent-projected Adam (matches the eager
-    vol_color loop / _GraphedFineVolColor)."""
-    P = Vs.shape[0]
+def _tail_adam(q, t, gq, gt, mq, vq, mt, vt, lr):
+    """Tangent-projected Adam on ``q`` + plain Adam on ``t`` + unit renorm, float32, in the
+    operand order of ``kernels/cpu.py::fused_adam_qt_with_tangent_proj``."""
+    P = q.shape[0]
+    nlr = -lr
     for p in prange(P):
-        ds = norm_s[p] - Vs[p]
-        if ds == 0.0:
-            ds = 1e-12
-        ss = Vs[p] / ds
-        scale_s = norm_s[p] / (ds * ds)
-        dc = norm_c[p] - Oc[p]
-        if dc == 0.0:
-            dc = 1e-12
-        sc = Oc[p] / dc
-        scale_c = norm_c[p] / (dc * dc)
-        score = (1.0 - w) * ss + w * sc
-        if score > best[p]:
-            best[p] = score
-            bq[p, 0] = q[p, 0]; bq[p, 1] = q[p, 1]; bq[p, 2] = q[p, 2]; bq[p, 3] = q[p, 3]
-            bt[p, 0] = t[p, 0]; bt[p, 1] = t[p, 1]; bt[p, 2] = t[p, 2]
-        cs = -(1.0 - w) * scale_s
-        cc = -w * scale_c
-        gq0 = cs * dQs[p, 0] + cc * dQc[p, 0]; gq1 = cs * dQs[p, 1] + cc * dQc[p, 1]
-        gq2 = cs * dQs[p, 2] + cc * dQc[p, 2]; gq3 = cs * dQs[p, 3] + cc * dQc[p, 3]
-        gt0 = cs * dTs[p, 0] + cc * dTc[p, 0]; gt1 = cs * dTs[p, 1] + cc * dTc[p, 1]
-        gt2 = cs * dTs[p, 2] + cc * dTc[p, 2]
-        radial = gq0 * q[p, 0] + gq1 * q[p, 1] + gq2 * q[p, 2] + gq3 * q[p, 3]
-        dq0 = gq0 - q[p, 0] * radial; dq1 = gq1 - q[p, 1] * radial
-        dq2 = gq2 - q[p, 2] * radial; dq3 = gq3 - q[p, 3] * radial
-        mq[p, 0] = _B1 * mq[p, 0] + (1.0 - _B1) * dq0
-        mq[p, 1] = _B1 * mq[p, 1] + (1.0 - _B1) * dq1
-        mq[p, 2] = _B1 * mq[p, 2] + (1.0 - _B1) * dq2
-        mq[p, 3] = _B1 * mq[p, 3] + (1.0 - _B1) * dq3
-        vq[p, 0] = _B2 * vq[p, 0] + (1.0 - _B2) * dq0 * dq0
-        vq[p, 1] = _B2 * vq[p, 1] + (1.0 - _B2) * dq1 * dq1
-        vq[p, 2] = _B2 * vq[p, 2] + (1.0 - _B2) * dq2 * dq2
-        vq[p, 3] = _B2 * vq[p, 3] + (1.0 - _B2) * dq3 * dq3
-        q[p, 0] -= lr * mq[p, 0] / np.sqrt(vq[p, 0] + _EPS)
-        q[p, 1] -= lr * mq[p, 1] / np.sqrt(vq[p, 1] + _EPS)
-        q[p, 2] -= lr * mq[p, 2] / np.sqrt(vq[p, 2] + _EPS)
-        q[p, 3] -= lr * mq[p, 3] / np.sqrt(vq[p, 3] + _EPS)
-        mt[p, 0] = _B1 * mt[p, 0] + (1.0 - _B1) * gt0
-        mt[p, 1] = _B1 * mt[p, 1] + (1.0 - _B1) * gt1
-        mt[p, 2] = _B1 * mt[p, 2] + (1.0 - _B1) * gt2
-        vt[p, 0] = _B2 * vt[p, 0] + (1.0 - _B2) * gt0 * gt0
-        vt[p, 1] = _B2 * vt[p, 1] + (1.0 - _B2) * gt1 * gt1
-        vt[p, 2] = _B2 * vt[p, 2] + (1.0 - _B2) * gt2 * gt2
-        t[p, 0] -= lr * mt[p, 0] / np.sqrt(vt[p, 0] + _EPS)
-        t[p, 1] -= lr * mt[p, 1] / np.sqrt(vt[p, 1] + _EPS)
-        t[p, 2] -= lr * mt[p, 2] / np.sqrt(vt[p, 2] + _EPS)
-        qn = np.sqrt(q[p, 0] * q[p, 0] + q[p, 1] * q[p, 1] + q[p, 2] * q[p, 2] + q[p, 3] * q[p, 3])
-        if qn < 1e-12:
-            qn = 1e-12
-        q[p, 0] /= qn; q[p, 1] /= qn; q[p, 2] /= qn; q[p, 3] /= qn
+        radial = gq[p, 0] * q[p, 0] + gq[p, 1] * q[p, 1] + gq[p, 2] * q[p, 2] + gq[p, 3] * q[p, 3]
+        d0 = gq[p, 0] - q[p, 0] * radial; d1 = gq[p, 1] - q[p, 1] * radial
+        d2 = gq[p, 2] - q[p, 2] * radial; d3 = gq[p, 3] - q[p, 3] * radial
+        mq[p, 0] = mq[p, 0] * _B1 + d0 * _A1; mq[p, 1] = mq[p, 1] * _B1 + d1 * _A1
+        mq[p, 2] = mq[p, 2] * _B1 + d2 * _A1; mq[p, 3] = mq[p, 3] * _B1 + d3 * _A1
+        vq[p, 0] = vq[p, 0] * _B2 + (_A2 * d0) * d0; vq[p, 1] = vq[p, 1] * _B2 + (_A2 * d1) * d1
+        vq[p, 2] = vq[p, 2] * _B2 + (_A2 * d2) * d2; vq[p, 3] = vq[p, 3] * _B2 + (_A2 * d3) * d3
+        q[p, 0] = q[p, 0] + (nlr * mq[p, 0]) / np.float32(math.sqrt(vq[p, 0] + _EPS))
+        q[p, 1] = q[p, 1] + (nlr * mq[p, 1]) / np.float32(math.sqrt(vq[p, 1] + _EPS))
+        q[p, 2] = q[p, 2] + (nlr * mq[p, 2]) / np.float32(math.sqrt(vq[p, 2] + _EPS))
+        q[p, 3] = q[p, 3] + (nlr * mq[p, 3]) / np.float32(math.sqrt(vq[p, 3] + _EPS))
+        e0 = gt[p, 0]; e1 = gt[p, 1]; e2 = gt[p, 2]
+        mt[p, 0] = mt[p, 0] * _B1 + e0 * _A1; mt[p, 1] = mt[p, 1] * _B1 + e1 * _A1
+        mt[p, 2] = mt[p, 2] * _B1 + e2 * _A1
+        vt[p, 0] = vt[p, 0] * _B2 + (_A2 * e0) * e0; vt[p, 1] = vt[p, 1] * _B2 + (_A2 * e1) * e1
+        vt[p, 2] = vt[p, 2] * _B2 + (_A2 * e2) * e2
+        t[p, 0] = t[p, 0] + (nlr * mt[p, 0]) / np.float32(math.sqrt(vt[p, 0] + _EPS))
+        t[p, 1] = t[p, 1] + (nlr * mt[p, 1]) / np.float32(math.sqrt(vt[p, 1] + _EPS))
+        t[p, 2] = t[p, 2] + (nlr * mt[p, 2]) / np.float32(math.sqrt(vt[p, 2] + _EPS))
+        qn = np.float32(math.sqrt(q[p, 0] * q[p, 0] + q[p, 1] * q[p, 1] + q[p, 2] * q[p, 2]
+                                  + q[p, 3] * q[p, 3]))
+        q[p, 0] = q[p, 0] / qn; q[p, 1] = q[p, 1] / qn; q[p, 2] = q[p, 2] / qn; q[p, 3] = q[p, 3] / qn
 
 
+# =============================================================================================
+# marshalling: torch -> numpy once; per-term kernel closures
+# =============================================================================================
 def _f32c(x):
-    """torch CPU tensor -> contiguous float32 numpy (no copy when already so)."""
     return np.ascontiguousarray(x.detach().cpu().numpy(), dtype=np.float32)
+
+
+def _f64c(x):
+    return np.ascontiguousarray(x.detach().cpu().numpy(), dtype=np.float64)
 
 
 def _i64(x):
     return np.ascontiguousarray(x.detach().cpu().numpy()).astype(np.int64)
 
 
-def fine_loop_cpu(overlap_fn, q_seed, t_seed, norm, *, lr, steps,
-                  es_patience, es_tol, n_seeds=0, tail="tanimoto", tail_args=()):
-    """Run the whole fine loop on CPU with NO torch in the hot path.
+def _cast3(V, dQ, dT):
+    return V.astype(np.float32), dQ.astype(np.float32), dT.astype(np.float32)
 
-    overlap_fn(q_np, t_np) -> the kernel outputs the tail needs at the current pose:
-        tanimoto:  (O, dQ, dT)
-        vol_color: (Vs, dQs, dTs, Oc, dQc, dTc)
-    q_seed/t_seed/norm: float32 numpy (P,4)/(P,3)/(P,). Returns (best, bq, bt) float32 numpy.
-    n_seeds: seed rows per PAIR, so the early stop can reduce ``best`` per pair -- the P rows
-    are n_seeds consecutive seed poses per pair, laid out pair-major. 0 means the caller did
-    not say, which degenerates to one global row.
-    Early-stop semantics match the eager loop: per pair, checked every 5 steps.
-    """
+
+def _rotmat_np(q):
+    """float32 twin of ``drivers._common.quaternion_to_rotation_matrix`` (normalises first)."""
+    n = np.sqrt((q * q).sum(1, keepdims=True)).astype(np.float32)
+    n = np.maximum(n, np.float32(1e-12))
+    q = q / n
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    two = np.float32(2.0)
+    R = np.empty((q.shape[0], 3, 3), np.float32)
+    R[:, 0, 0] = 1 - two * (y * y + z * z); R[:, 0, 1] = two * (x * y - z * w); R[:, 0, 2] = two * (x * z + y * w)
+    R[:, 1, 0] = two * (x * y + z * w); R[:, 1, 1] = 1 - two * (x * x + z * z); R[:, 1, 2] = two * (y * z - x * w)
+    R[:, 2, 0] = two * (x * z - y * w); R[:, 2, 1] = two * (y * z + x * w); R[:, 2, 2] = 1 - two * (x * x + y * y)
+    return R
+
+
+def _term_closure(tm, params):
+    """``(q_np, t_np) -> (V, dQ, dT)`` float32 for one term, marshalled once."""
+    ti = tm.inputs
+    kind = tm.spec.kernel
+    Nr, Mr = _i64(ti.n_real), _i64(ti.m_real)
+    if kind == "shape":
+        a_f = float(params["alpha"])
+        if _USE_SOA:
+            from .cpu_soa import _overlap_grad_kernel_soa, to_soa
+            A = to_soa(_f32c(ti.ref[0])); B = to_soa(_f32c(ti.fit[0]))
+            return lambda q, t: _overlap_grad_kernel_soa(A, B, q, t, Nr, Mr, a_f, True)
+        from .cpu import _overlap_grad_kernel
+        A = _f32c(ti.ref[0]); B = _f32c(ti.fit[0])
+        return lambda q, t: _cast3(*_overlap_grad_kernel(A, B, q, t, Nr, Mr, a_f, True))
+    if kind == "esp":
+        a_f = float(params["alpha"]); inv_lam = 1.0 / float(params["lam"])
+        CA = _f32c(ti.ref[1]); CB = _f32c(ti.fit[1])
+        if _USE_SOA:
+            from .cpu_soa import _overlap_grad_esp_kernel_soa, to_soa
+            A = to_soa(_f32c(ti.ref[0])); B = to_soa(_f32c(ti.fit[0]))
+            return lambda q, t: _overlap_grad_esp_kernel_soa(A, B, CA, CB, q, t, Nr, Mr, a_f,
+                                                             inv_lam, True)
+        from .cpu import _overlap_grad_esp_kernel
+        A = _f32c(ti.ref[0]); B = _f32c(ti.fit[0])
+        return lambda q, t: _cast3(*_overlap_grad_esp_kernel(A, B, CA, CB, q, t, Nr, Mr, a_f,
+                                                             inv_lam, True))
+    if kind == "color":
+        from .cpu import _pharm_color_grad_kernel
+        A = _f32c(ti.ref[0]); B = _f32c(ti.fit[0]); At = _i64(ti.ref[1]); Bt = _i64(ti.fit[1])
+        al, Ks, cats = ti.tables
+        aln, Ksn, cn = _f64c(al), _f64c(Ks), _i64(cats)
+        return lambda q, t: _cast3(*_pharm_color_grad_kernel(A, B, q, t, At, Bt, aln, Ksn, cn,
+                                                             Nr, Mr, True))
+    if kind == "pharm":
+        from .cpu import _pharm_grad_dq_kernel
+        A, VA, TA = _f32c(ti.ref[0]), _f32c(ti.ref[1]), _i64(ti.ref[2])
+        B, VB, TB = _f32c(ti.fit[0]), _f32c(ti.fit[1]), _i64(ti.fit[2])
+        al, Ks, cats = ti.tables
+        aln, Ksn, cn = _f64c(al), _f64c(Ks), _i64(cats)
+        return lambda q, t: _cast3(*_pharm_grad_dq_kernel(A, B, q, t, TA, TB, VA, VB, aln, Ksn,
+                                                          cn, Nr, Mr, True))
+    if kind == "avoid":
+        from .cpu import _avoid_grad_kernel
+        AV = _f32c(ti.ref[0]); B = _f32c(ti.fit[0]); d0 = float(params["avoid_min_dist"])
+        return lambda q, t: _cast3(*_avoid_grad_kernel(AV, B, q, t, Nr, Mr, d0, True))
+    if kind == "esp_cmp":
+        from .cpu import _esp_comparison_kernel
+        from ...score.constants import COULOMB_SCALING, LAM_SCALING
+        cwh1, pc1, rad1, pts1, ptc1 = (_f32c(x) for x in ti.ref)
+        cwh2, pc2, rad2, pts2, ptc2 = (_f32c(x) for x in ti.fit)
+        n_surf = _i64(ti.params["_n_surf"]); m_surf = _i64(ti.params["_m_surf"])
+        nsf = n_surf.astype(np.float32); msf = m_surf.astype(np.float32)
+        inv_lam = 1.0 / (LAM_SCALING * float(params["lam"]))
+        coul = float(COULOMB_SCALING); probe = float(params["probe_radius"])
+
+        def _ev(q, t):
+            R = _rotmat_np(q)
+            cwh2_t = (np.einsum("bni,bji->bnj", cwh2, R) + t[:, None, :]).astype(np.float32)
+            pts2_t = (np.einsum("bni,bji->bnj", pts2, R) + t[:, None, :]).astype(np.float32)
+            e1 = _esp_comparison_kernel(pts1, cwh2_t, pc2, rad2, ptc1, n_surf, Mr, inv_lam, coul, probe)
+            e2 = _esp_comparison_kernel(pts2_t, cwh1, pc1, rad1, ptc2, m_surf, Nr, inv_lam, coul, probe)
+            return ((e1.astype(np.float32) + e2.astype(np.float32)) / (nsf + msf)), None, None
+        return _ev
+    raise KeyError(kind)
+
+
+# =============================================================================================
+# the loop
+# =============================================================================================
+def run_fused(pr, steps, lr, es_patience, es_tol):
+    """Run ``pr`` (an assembled :class:`~drivers.engine.Problem`, replicated layout, CPU fp32)
+    through the fused loop. Returns torch ``(best, bq, bt)`` on the problem's device."""
+    import torch
     _warn_if_no_svml()
-    P = q_seed.shape[0]
-    q = q_seed.copy(); t = t_seed.copy()
+    spec = pr.spec
+    P = int(pr.q.shape[0])
+    S = int(pr.P) or P
+    q = _f32c(pr.q); t = _f32c(pr.t)
     mq = np.zeros((P, 4), np.float32); vq = np.zeros((P, 4), np.float32)
     mt = np.zeros((P, 3), np.float32); vt = np.zeros((P, 3), np.float32)
+    gq = np.zeros((P, 4), np.float32); gt = np.zeros((P, 3), np.float32)
     best = np.full(P, -np.inf, np.float32)
-    bq = q_seed.copy(); bt = t_seed.copy()
-    S = int(n_seeds) or P
-    # Per-pair early-stop baseline: prev[k] is pair k's best as of its last recorded
-    # improvement. One entry per PAIR, not per pose.
-    prev = np.full(P // S, -np.inf, np.float32); no_improve = 0
-    lr = np.float32(lr)
-    for step in range(steps):
-        out = overlap_fn(q, t)
-        if tail == "tanimoto":
-            O, dQ, dT = out
-            _tail_tanimoto(O, dQ, dT, q, t, mq, vq, mt, vt, best, bq, bt, norm, lr)
-        else:  # vol_color
-            Vs, dQs, dTs, Oc, dQc, dTc = out
-            norm_c, w = tail_args
-            _tail_vol_color(Vs, dQs, dTs, Oc, dQc, dTc, q, t, mq, vq, mt, vt, best, bq, bt,
-                            norm, norm_c, np.float32(w), lr)
-        if step % 5 == 0:
-            # PER-PAIR convergence, matching the eager driver loop: a pair has converged
-            # when ITS OWN best (max over its own S seed rows) stops improving, and the
-            # loop may break only once EVERY pair has stalled. A bucket-global max would
-            # let one converged pair halt the optimisation of every other pair sharing
-            # the bucket -- which is the whole reason a bucket holds many pairs.
-            cur = best.reshape(-1, S).max(axis=1)
-            improved = (cur - prev) > es_tol
-            if not improved.any():
-                no_improve += 1
-                if no_improve >= es_patience:
-                    break
+    bq = q.copy(); bt = t.copy()
+    prev = np.full(P // S, -np.inf, np.float32)
+    no_improve = 0
+    lr32 = np.float32(lr)
+    evals = [_term_closure(tm, pr.params) for tm in pr.terms]
+
+    if spec.pharm_style:
+        tm = pr.terms[0]
+        tanimoto = pr.similarity == "tanimoto"
+        norm = _f32c(tm.norm) if tm.norm is not None else np.zeros(P, np.float32)
+        C = _f32c(tm.C) if tm.C is not None else np.zeros(P, np.float32)
+        ev = evals[0]
+        step = -1
+        for step in range(steps):
+            n = np.sqrt((q * q).sum(1, keepdims=True)).astype(np.float32)
+            qu = (q / np.maximum(n, np.float32(1e-12))).astype(np.float32)
+            O, dQr, dTr = ev(qu, t)
+            _tail_pharm(O, dQr, dTr, norm, C, tanimoto, q, t, best, bq, bt, gq, gt)
+            if step % 5 == 0:
+                cur = best.reshape(-1, S).max(axis=1)
+                improved = (cur - prev) > es_tol
+                if not improved.any():
+                    no_improve += 1
+                    if no_improve >= es_patience:
+                        break
+                else:
+                    no_improve = 0
+                prev = np.where(improved, cur, prev)
+            _tail_adam(q, t, gq, gt, mq, vq, mt, vt, lr32)
+    else:
+        grad_ix = [i for i, tm in enumerate(pr.terms) if tm.spec.grad]
+        val_ix = [i for i, tm in enumerate(pr.terms) if not tm.spec.grad]
+        Tg, T = len(grad_ix), len(pr.terms)
+        Vg = np.zeros((Tg, P), np.float32); dQg = np.zeros((Tg, P, 4), np.float32)
+        dTg = np.zeros((Tg, P, 3), np.float32)
+        kind = np.zeros(Tg, np.int64); kc = np.zeros(Tg, np.float32)
+        cst = np.zeros((Tg, P), np.float32); guard = np.ones((Tg, P), np.bool_)
+        useg = np.zeros(Tg, np.bool_); gpos = np.zeros(Tg, np.int64)
+        sims = np.zeros((T, P), np.float32)
+        wt = np.array([np.float32(tm.weight) for tm in pr.terms], np.float32)
+        for g, i in enumerate(grad_ix):
+            tm = pr.terms[i]
+            gpos[g] = i
+            red = tm.spec.reduction
+            if red == "tanimoto":
+                kind[g] = 0; cst[g] = _f32c(tm.norm)
+            elif red == "tversky":
+                kind[g] = 1; kc[g] = np.float32(tm.k); cst[g] = _f32c(tm.C)
             else:
-                no_improve = 0
-            # Advance a pair's baseline only where that pair actually improved, as the old
-            # rule did. At least as long as the global test it replaces in every measured
-            # case, but NOT provably never-earlier: per-check gains that straddle es_tol can
-            # spend a baseline reset the global rule still holds, costing one 5-step block.
-            prev = np.where(improved, cur, prev)
-    # Value+grad evaluations executed vs the configured budget. Unlike the eager driver loops
-    # this one applies its Adam tail BEFORE the check, so an N-iteration run here is N
-    # evaluations AND N updates. No-op unless recording was enabled.
-    #
-    # This site is why the fused CPU path reported NOTHING: it was the one call site the
-    # recorder's reinstatement missed, so shape/vol+surf, surf_esp, pharm and vol_color all
-    # returned an empty summary on the CPU float32 route -- exactly the fig2 CPU/SVML legs --
-    # and the paper harness's try/except degrades a missing key to silence rather than an error.
-    _ran = (step + 1) if steps else 0
-    _record_steps(_ran, steps, _ran < steps)
-    return best, bq, bt
-
-
-# ===========================================================================
-# Per-mode glue: marshal the torch inputs to numpy ONCE, build the overlap closure,
-# run the fused CPU loop, return torch tensors on the original device. These are what
-# the GPU drivers call on their CPU branch.
-# ===========================================================================
-def cpu_fused_shape(A_k, B_k, q_seed, t_seed, N_k, M_k, norm, alpha, lr, steps,
-                    es_patience, es_tol, n_seeds=0):
-    """vol / surf (and the shape channel): Gaussian overlap Tanimoto."""
-    import torch
-    Nr = _i64(N_k); Mr = _i64(M_k); a_f = float(alpha)
-    if _USE_SOA:
-        from .cpu_soa import _overlap_grad_kernel_soa, to_soa
-        A_np = to_soa(_f32c(A_k)); B_np = to_soa(_f32c(B_k))     # (K,3,N) fp32, contiguous in n
-
-        def _ov(qn, tn):
-            return _overlap_grad_kernel_soa(A_np, B_np, qn, tn, Nr, Mr, a_f, True)   # fp32 out
-    else:
-        from .cpu import _overlap_grad_kernel
-        A_np = _f32c(A_k); B_np = _f32c(B_k)
-
-        def _ov(qn, tn):
-            V, dQ, dT = _overlap_grad_kernel(A_np, B_np, qn, tn, Nr, Mr, a_f, True)
-            return V.astype(np.float32), dQ.astype(np.float32), dT.astype(np.float32)
-
-    bs, bq, bt = fine_loop_cpu(_ov, _f32c(q_seed), _f32c(t_seed), _f32c(norm),
-                               lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol,
-                               n_seeds=n_seeds)
-    dev = A_k.device
-    return (torch.from_numpy(bs).to(dev), torch.from_numpy(bq).to(dev),
-            torch.from_numpy(bt).to(dev))
-
-
-def cpu_fused_esp(A_k, B_k, CA_k, CB_k, q_seed, t_seed, N_k, M_k, norm, alpha, lam, lr, steps,
-                  es_patience, es_tol, n_seeds=0):
-    """vol_esp / surf_esp: ESP-weighted Gaussian overlap Tanimoto (shape kernel × charge)."""
-    import torch
-    CA = _f32c(CA_k); CB = _f32c(CB_k); Nr = _i64(N_k); Mr = _i64(M_k)
-    a_f = float(alpha); inv_lam = 1.0 / float(lam)
-    if _USE_SOA:
-        from .cpu_soa import _overlap_grad_esp_kernel_soa, to_soa
-        A_np = to_soa(_f32c(A_k)); B_np = to_soa(_f32c(B_k))     # (K,3,N) fp32; charges stay (K,N)
-
-        def _ov(qn, tn):
-            return _overlap_grad_esp_kernel_soa(A_np, B_np, CA, CB, qn, tn, Nr, Mr, a_f, inv_lam, True)
-    else:
-        from .cpu import _overlap_grad_esp_kernel
-        A_np = _f32c(A_k); B_np = _f32c(B_k)
-
-        def _ov(qn, tn):
-            V, dQ, dT = _overlap_grad_esp_kernel(A_np, B_np, CA, CB, qn, tn, Nr, Mr, a_f, inv_lam, True)
-            return V.astype(np.float32), dQ.astype(np.float32), dT.astype(np.float32)
-
-    bs, bq, bt = fine_loop_cpu(_ov, _f32c(q_seed), _f32c(t_seed), _f32c(norm),
-                               lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol,
-                               n_seeds=n_seeds)
-    dev = A_k.device
-    return (torch.from_numpy(bs).to(dev), torch.from_numpy(bq).to(dev),
-            torch.from_numpy(bt).to(dev))
-
-
-def cpu_fused_pharm(anc1_k, anc2_k, vec1_k, vec2_k, t1_k, t2_k, q_seed, t_seed,
-                    N_k, M_k, norm, al, Ks, cats, lr, steps, es_patience, es_tol, n_seeds=0):
-    """pharm: directional pharmacophore overlap Tanimoto (in-register dO/dq kernel)."""
-    import torch
-    from .cpu import _pharm_grad_dq_kernel
-    Ra = _f32c(anc1_k); Fa = _f32c(anc2_k); Rv = _f32c(vec1_k); Fv = _f32c(vec2_k)
-    Rt = _i64(t1_k); Ft = _i64(t2_k); Nr = _i64(N_k); Mr = _i64(M_k)
-    aln = np.ascontiguousarray(al.detach().cpu().numpy(), dtype=np.float64)
-    Ksn = np.ascontiguousarray(Ks.detach().cpu().numpy(), dtype=np.float64)
-    cn = np.ascontiguousarray(cats.detach().cpu().numpy()).astype(np.int64)
-
-    def _ov(qn, tn):
-        O, dQ, dT = _pharm_grad_dq_kernel(Ra, Fa, qn, tn, Rt, Ft, Rv, Fv, aln, Ksn, cn, Nr, Mr, True)
-        return O.astype(np.float32), dQ.astype(np.float32), dT.astype(np.float32)
-
-    bs, bq, bt = fine_loop_cpu(_ov, _f32c(q_seed), _f32c(t_seed), _f32c(norm),
-                               lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol,
-                               n_seeds=n_seeds)
-    dev = anc1_k.device
-    return (torch.from_numpy(bs).to(dev), torch.from_numpy(bq).to(dev),
-            torch.from_numpy(bt).to(dev))
-
-
-def cpu_fused_vol_color(A_k, B_k, anc1_k, anc2_k, pt1_k, pt2_k, q_seed, t_seed,
-                        Nc_k, Mc_k, Na_k, Ma_k, norm_s, norm_c, al, Ks, cats,
-                        alpha, color_weight, lr, steps, es_patience, es_tol, n_seeds=0):
-    """vol_color: (1-w)*shape_Tc + w*directionless-color_Tc, combined-objective descent."""
-    import torch
-    from .cpu import _pharm_color_grad_kernel                  # color channel: typed, AoS
-    An1 = _f32c(anc1_k); An2 = _f32c(anc2_k)
-    Pt1 = _i64(pt1_k); Pt2 = _i64(pt2_k)
-    Nc = _i64(Nc_k); Mc = _i64(Mc_k); Na = _i64(Na_k); Ma = _i64(Ma_k)
-    aln = np.ascontiguousarray(al.detach().cpu().numpy(), dtype=np.float64)
-    Ksn = np.ascontiguousarray(Ks.detach().cpu().numpy(), dtype=np.float64)
-    cn = np.ascontiguousarray(cats.detach().cpu().numpy()).astype(np.int64)
-    a_f = float(alpha)
-    if _USE_SOA:                                               # shape channel SoA fp32 + SVML
-        from .cpu_soa import _overlap_grad_kernel_soa, to_soa
-        A_np = to_soa(_f32c(A_k)); B_np = to_soa(_f32c(B_k))
-
-        def _shape(qn, tn):
-            return _overlap_grad_kernel_soa(A_np, B_np, qn, tn, Nc, Mc, a_f, True)
-    else:
-        from .cpu import _overlap_grad_kernel
-        A_np = _f32c(A_k); B_np = _f32c(B_k)
-
-        def _shape(qn, tn):
-            Vs, dQs, dTs = _overlap_grad_kernel(A_np, B_np, qn, tn, Nc, Mc, a_f, True)
-            return Vs.astype(np.float32), dQs.astype(np.float32), dTs.astype(np.float32)
-
-    def _ov(qn, tn):
-        Vs, dQs, dTs = _shape(qn, tn)
-        Oc, dQc, dTc = _pharm_color_grad_kernel(An1, An2, qn, tn, Pt1, Pt2, aln, Ksn, cn, Na, Ma, True)
-        return (Vs, dQs, dTs,
-                Oc.astype(np.float32), dQc.astype(np.float32), dTc.astype(np.float32))
-
-    bs, bq, bt = fine_loop_cpu(_ov, _f32c(q_seed), _f32c(t_seed), _f32c(norm_s),
-                               lr=lr, steps=steps, es_patience=es_patience, es_tol=es_tol,
-                               n_seeds=n_seeds,
-                               tail="vol_color", tail_args=(_f32c(norm_c), float(color_weight)))
-    dev = A_k.device
-    return (torch.from_numpy(bs).to(dev), torch.from_numpy(bq).to(dev),
+                kind[g] = 2
+            if tm.guard is not None:
+                useg[g] = True; guard[g] = tm.guard.detach().cpu().numpy().astype(np.bool_)
+        strided = any(tm.spec.stride for tm in pr.terms)
+        step = -1
+        for step in range(steps):
+            score_now = (not strided) or (step % 5 == 0) or (step == steps - 1)
+            for g, i in enumerate(grad_ix):
+                V, dQ, dT = evals[i](q, t)
+                Vg[g] = V; dQg[g] = dQ; dTg[g] = dT
+            if score_now:
+                for i in val_ix:
+                    V, _, _ = evals[i](q, t)
+                    tm = pr.terms[i]
+                    sims[i] = V if tm.guard is None else np.where(
+                        tm.guard.detach().cpu().numpy(), V, np.float32(0.0))
+            _tail_blend(Vg, dQg, dTg, kind, kc, cst, guard, useg, gpos, sims, wt, q, t, best,
+                        bq, bt, gq, gt, score_now)
+            if step % 5 == 0:
+                cur = best.reshape(-1, S).max(axis=1)
+                improved = (cur - prev) > es_tol
+                if not improved.any():
+                    no_improve += 1
+                    if no_improve >= es_patience:
+                        break
+                else:
+                    no_improve = 0
+                prev = np.where(improved, cur, prev)
+            _tail_adam(q, t, gq, gt, mq, vq, mt, vt, lr32)
+    ran = (step + 1) if steps else 0
+    _record_steps(ran, steps, ran < steps)
+    dev = pr.device
+    return (torch.from_numpy(best).to(dev), torch.from_numpy(bq).to(dev),
             torch.from_numpy(bt).to(dev))

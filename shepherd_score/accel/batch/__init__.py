@@ -1,10 +1,10 @@
 # shepherd_score/accel/batch/__init__.py
-"""Batched multi-GPU GPU/Triton aligners for MoleculePair, split into
-``_pad`` (bucketing / sub-batching / scatter), ``_dispatch`` (multi-GPU sharding
-+ the CPU-pool tensor spec), and ``aligners`` (the six ``_align_batch_*`` free
-functions). The full prior ``accel.batch`` attribute surface is re-exported here
-so external imports (``accel.batch._align_batch_*`` / ``._MODE_SPEC`` / etc.) are
-unchanged."""
+"""Batched multi-GPU GPU/Triton aligners for MoleculePair, split into ``_pad`` (bucketing /
+sub-batching / scatter), ``_dispatch`` (multi-GPU sharding + the process-pool tensor spec),
+``aligners`` (the generic ``_align_batch_<mode>`` functions, one generated per registry mode)
+and ``_arrays`` (the array-native screen aligner). The ``accel.batch`` attribute surface --
+``_align_batch_<mode>`` for every canonical mode and both legacy aliases, ``_MODE_SPEC``,
+``_batch_upload``, ... -- is re-exported here."""
 from ._pad import (
     _band_key, _subbatched_align, _scatter_fill, _PAIR_FOOTPRINT_BYTES, _BAND,
 )
@@ -12,18 +12,12 @@ from ._dispatch import (
     _DISPATCH_LOCAL, _dev_idx, _MIN_SHARD_PER_DEVICE, _should_distribute,
     _run_distributed, _MODE_SPEC, _ProcStandIn,
 )
-from .aligners import (
-    _align_batch_vol, _align_batch_surf, _align_batch_surf_esp, _align_batch_vol_esp,
-    _align_batch_vol_and_surf_esp, _align_batch_pharm, _align_batch_vol_color,
-    _align_batch_vol_tversky, _align_batch_vol_lipo, _align_batch_vol_esp_tversky,
-    # SI experimental modes
-    _align_batch_vol_mr, _align_batch_surf_tversky, _align_batch_surf_esp_tversky,
-    _align_batch_vol_lipo_tversky, _align_batch_vol_color_tversky, _align_batch_vol_atomtype,
-    _align_batch_vol_pharm, _align_batch_pharm_tversky, _align_batch_vol_and_surf_esp_tversky,
-    _align_batch_vol_fukui,
-    _align_batch_vol_avoid,
-    _esp_bucketed_align,
-    # legacy mode aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp)
-    _align_batch_esp, _align_batch_esp_combo,
-    _ALIGN_WORKSPACES, _INT_BUFFER_CACHE,
-)
+from . import aligners as _aligners
+from .aligners import _batch_upload, _ALIGN_WORKSPACES, _INT_BUFFER_CACHE, _seeds_for, _steps_for
+from .._modes import SPECS as _SPECS, LEGACY_MODE_ALIASES as _LEGACY
+
+for _m in _SPECS:
+    globals()[f"_align_batch_{_m}"] = getattr(_aligners, f"_align_batch_{_m}")
+for _legacy, _canon in _LEGACY.items():
+    globals()[f"_align_batch_{_legacy}"] = getattr(_aligners, f"_align_batch_{_canon}")
+del _m, _legacy, _canon

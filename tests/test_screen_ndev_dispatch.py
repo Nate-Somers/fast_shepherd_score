@@ -65,7 +65,9 @@ def _install_recorders(mp, seen, seen_kw=None):
     def builder(key):
         def build(arrs, device):
             seen.append(("build", key))
-            return "ids", "fit0", "fit1"
+            # the builder's contract is ``(ids, {channel: (flat, off)})`` -- one dict, not a
+            # varying-arity tuple, so the worker and the driver unpack it identically
+            return "ids", {"c0": ("flat", "off")}
         return build
 
     def aligner(key):
@@ -174,9 +176,9 @@ def test_worker_uses_the_canonical_stores_constant_seeds_like_the_inproc_loop(mo
     kw_w, kw_i = [], []
     with monkeypatch.context() as mp:
         _run_worker(mp, "vol", share=[0], store_cls=_CanonicalFakeStore,
-                    ref_arrays={"xyz": xyz}, seen_kw=kw_w)
+                    ref_arrays={"atoms": xyz}, seen_kw=kw_w)
     with monkeypatch.context() as mp:
-        _run_inproc(mp, "vol", store=_CanonicalFakeStore(), ref_arrays={"xyz": xyz}, seen_kw=kw_i)
+        _run_inproc(mp, "vol", store=_CanonicalFakeStore(), ref_arrays={"atoms": xyz}, seen_kw=kw_i)
     assert kw_w and kw_i, "the recorders saw no batch_kw"
     assert "const_seeds" in kw_i[0], "the in-process loop no longer sets const_seeds"
     assert "const_seeds" in kw_w[0], "the multi-GPU worker runs per-molecule seeds on a canonical store"
@@ -186,7 +188,7 @@ def test_worker_uses_the_canonical_stores_constant_seeds_like_the_inproc_loop(mo
     assert "steps_fine" in kw_w[0] and kw_w[0] is not _BATCH_KW, "batch_kw must be copied, not mutated"
     with monkeypatch.context() as mp:                  # a non-canonical store: no const_seeds
         kw_n = []
-        _run_worker(mp, "vol", share=[0], ref_arrays={"xyz": xyz}, seen_kw=kw_n)
+        _run_worker(mp, "vol", share=[0], ref_arrays={"atoms": xyz}, seen_kw=kw_n)
     assert kw_n and "const_seeds" not in kw_n[0]
 
 

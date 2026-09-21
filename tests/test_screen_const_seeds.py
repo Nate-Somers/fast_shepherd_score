@@ -47,15 +47,24 @@ from tests.test_screen_arrays import (                                          
 _CLASS_A = tuple(m for m in screenmod._ARRAY_MODES if m in CONST_SEED_MODES)
 _CLASS_B = tuple(m for m in screenmod._ARRAY_MODES if m not in CONST_SEED_MODES)
 
-#: Every module that binds ``batched_seeds_torch`` by name. The drivers import it at module level
-#: (``from ._common import batched_seeds_torch``), so patching ``_common`` alone would miss them;
-#: ``_arrays`` imports it inside each function, so ``_common`` is what catches those.
-_SEED_MODULES = ("shepherd_score.accel.drivers._common", "shepherd_score.accel.drivers.shape",
-                 "shepherd_score.accel.drivers.esp", "shepherd_score.accel.drivers.vol_color",
-                 "shepherd_score.accel.drivers.vol_lipo", "shepherd_score.accel.drivers.esp_combo",
-                 "shepherd_score.accel.drivers.vol_tversky",
-                 "shepherd_score.accel.drivers.vol_esp_tversky",
-                 "shepherd_score.accel.drivers.pharm")
+#: Every module that binds ``batched_seeds_torch`` by NAME, found rather than listed: a module
+#: that imports it at module level (``from ._common import batched_seeds_torch``) holds its own
+#: reference, so patching ``_common`` alone would miss it. The generic fine loop
+#: (``drivers.engine``) is the one caller now, but the list is computed so that a driver keeping
+#: its own binding is still caught -- a hardcoded list is how the spy silently covered nothing.
+def _seed_modules():
+    import importlib
+    import pkgutil
+    import shepherd_score.accel.drivers as _d
+    names = ["shepherd_score.accel.drivers._common"]
+    for mi in pkgutil.iter_modules(_d.__path__):
+        mod = importlib.import_module(f"shepherd_score.accel.drivers.{mi.name}")
+        if hasattr(mod, "batched_seeds_torch"):
+            names.append(mod.__name__)
+    return tuple(dict.fromkeys(names))
+
+
+_SEED_MODULES = _seed_modules()
 
 
 def test_the_two_classes_partition_the_array_modes():

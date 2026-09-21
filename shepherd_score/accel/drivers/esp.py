@@ -1,613 +1,106 @@
-# shepherd_score/accel/drivers/esp.py
-# Fast GPU-accelerated ESP alignment using the ESP Triton kernel.
-
+"""``vol_esp`` / ``surf_esp`` driver entry points (charge-weighted Gaussian overlap, Tanimoto)."""
 from __future__ import annotations
 
-import torch
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
-# Device-driven kernel dispatch (Triton on CUDA, numba on CPU); see kernel_dispatch.
-from ..kernels.dispatch import (
-    overlap_score_grad_esp_se3_batch,
-    _batch_self_overlap_esp,
-    fused_adam_qt_with_tangent_proj,
-)
-from . import _common as _fc
-from ._common import (
-    check_gpu_available,
-    build_coarse_grid,
-    batched_seeds_torch,
-    apply_se3_transform,
-    quaternion_to_rotation_matrix
-)
-from ._graphed import run_graphed, graph_cap
-from .shape import _GraphedFineSurf
-from .._stats import record as _record_steps
+import torch
+
+from ..kernels.dispatch import overlap_score_grad_esp_se3_batch, _batch_self_overlap_esp
+from ._common import (check_gpu_available, apply_se3_transform,  # noqa: F401 (re-export)
+                      quaternion_to_rotation_matrix)
+from ._shim import batch, run, se3_of
+
 
 @torch.no_grad()
-def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float,
-                           N_real: torch.Tensor,
-                           M_real: torch.Tensor,
-                           NEED_GRAD: bool = True,
-                           seeds_per_mol: int = 1,
-                           poses_per_cta: int = 1):
-    """
-    Evaluate the fused ESP overlap kernel in chunks respecting CUDA grid limits.
-
-    Parameters
-    ----------
-    A, B : torch.Tensor (K, N, 3) / (K, M, 3)
-        Padded coordinate blocks
-    CA, CB : torch.Tensor (K, N) / (K, M)
-        Charges at each point
-    q, t : torch.Tensor (K, 4) / (K, 3)
-        Quaternions and translations
-    alpha : float
-        Gaussian width parameter
-    lam : float
-        Charge scaling parameter
-    N_real, M_real : torch.Tensor (K,)
-        True point counts
-    NEED_GRAD : bool
-        Whether to compute gradients
-
-    Returns
-    -------
-    VAB : torch.Tensor (K,)
-    dQ : torch.Tensor (K, 4)
-    dT : torch.Tensor (K, 3)
-    """
-    K = q.shape[0]                      # POSES; A/CA hold K // seeds_per_mol molecules
+def _overlap_in_chunks_esp(A, B, CA, CB, q, t, *, alpha: float, lam: float, N_real, M_real,
+                           NEED_GRAD: bool = True, seeds_per_mol: int = 1, poses_per_cta: int = 1):
+    """Evaluate the fused ESP overlap kernel in grid-safe chunks."""
+    K = q.shape[0]
     N_real = N_real.to(torch.int32).contiguous()
     M_real = M_real.to(torch.int32).contiguous()
-
     out_V = torch.empty(K, device=A.device, dtype=A.dtype)
     out_dQ = torch.empty_like(q)
     out_dT = torch.empty_like(t)
-
     S = int(seeds_per_mol)
-    # keep each molecule's seed group whole in a chunk, else pid // S addresses the wrong molecule
     CHUNK = 65_535 if S == 1 else max(S, (65_535 // S) * S)
-
     for start in range(0, K, CHUNK):
         end = min(start + CHUNK, K)
         ms, me = start // S, end // S
-
         extra = {} if S == 1 else {"seeds_per_mol": S}
         if int(poses_per_cta) > 1:
             extra["poses_per_cta"] = int(poses_per_cta)
         V, dQ, dT = overlap_score_grad_esp_se3_batch(
-            A[ms:me], B[ms:me],
-            CA[ms:me], CB[ms:me],
-            q[start:end], t[start:end],
-            alpha=alpha,
-            lam=lam,
-            N_real=N_real[ms:me],
-            M_real=M_real[ms:me],
-            NEED_GRAD=NEED_GRAD,
-            **extra)
-
+            A[ms:me], B[ms:me], CA[ms:me], CB[ms:me], q[start:end], t[start:end],
+            alpha=alpha, lam=lam, N_real=N_real[ms:me], M_real=M_real[ms:me],
+            NEED_GRAD=NEED_GRAD, **extra)
         out_V[start:end] = V
         out_dQ[start:end] = dQ
         out_dT[start:end] = dT
-
     return out_V, out_dQ, out_dT
 
 
 def _self_overlap_esp_chunks(P_pad, C_pad, N_real, alpha, lam):
-    """Compute ESP self-overlap in chunks."""
     K = P_pad.size(0)
     CHUNK = 65_535
     V_all = torch.empty(K, device=P_pad.device, dtype=P_pad.dtype)
-
     for s in range(0, K, CHUNK):
         e = min(s + CHUNK, K)
-        V_all[s:e] = _batch_self_overlap_esp(
-            P_pad[s:e], C_pad[s:e], N_real[s:e], alpha, lam)
-
+        V_all[s:e] = _batch_self_overlap_esp(P_pad[s:e], C_pad[s:e], N_real[s:e], alpha, lam)
     return V_all
 
 
-class _GraphedFineEsp(_GraphedFineSurf):
-    """CUDA-graph fine loop for vol_esp/surf_esp. The ESP score is the SAME single-channel
-    Tanimoto as surf/vol -- the only difference is the overlap value VAB, produced by the
-    FUSED shape+ESP kernel (charges weight each Gaussian pair-term). So this reuses
-    _GraphedFineSurf's score/best/Adam tail verbatim and only swaps the overlap kernel,
-    adding persistent charge buffers (CA/CB) and the lam scalar."""
-
-    def __init__(self, N_pad, M_pad, P, steps, alpha, lam, lr, device, seeds=1, poses=1):
-        self.lam = float(lam)
-        _S = max(1, int(seeds))
-        self.CA = torch.empty(P // _S, N_pad, device=device, dtype=torch.float32)
-        self.CB = torch.empty(P // _S, M_pad, device=device, dtype=torch.float32)
-        super().__init__(N_pad, M_pad, P, steps, alpha, lr, device, seeds=seeds, poses=poses)
-
-    def _step(self):
-        extra = {} if self.S == 1 else {"seeds_per_mol": self.S}
-        if self.P_cta > 1:
-            extra["poses_per_cta"] = self.P_cta
-        VAB, dQ, dT = overlap_score_grad_esp_se3_batch(
-            self.A, self.B, self.CA, self.CB, self.q, self.t,
-            alpha=self.alpha, lam=self.lam, N_real=self.Nr, M_real=self.Mr, **extra)
-        self._tanimoto_adam_tail(VAB, dQ, dT)
-
-    def _load(self, A, B, CA, CB, Nr, Mr, norm, qs, ts):
-        super()._load(A, B, Nr, Mr, norm, qs, ts)
-        self.CA.copy_(CA); self.CB.copy_(CB)
-
-
-def _run_graphed_esp(A_k, B_k, CA_k, CB_k, q_seed, t_seed, N_k, M_k, norm,
-                     alpha, lam, lr, steps, N_pad, M_pad, P,
-                     es_patience=0, es_tol=1e-5, es_seeds=0, seeds=1, poses=1):
-    key = (A_k.device.index, "esp", N_pad, M_pad, P, steps,
-           round(float(alpha), 4), round(float(lam), 6), round(float(lr), 5),
-           int(seeds), int(poses))
-    return run_graphed(
-        lambda: _GraphedFineEsp(N_pad, M_pad, P, steps, alpha, lam, lr, A_k.device,
-                                seeds=seeds, poses=poses),
-        key, (A_k, B_k, CA_k, CB_k, N_k, M_k, norm, q_seed, t_seed),
-        es_patience=es_patience, es_tol=es_tol, es_seeds=es_seeds)
-
-
-def coarse_fine_esp_align_many(
-        A_batch: torch.Tensor,
-        B_batch: torch.Tensor,
-        CA_batch: torch.Tensor,
-        CB_batch: torch.Tensor,
-        VAA: torch.Tensor,
-        VBB: torch.Tensor,
-        *,
-        alpha: float = 0.81,
-        lam: float = 0.3,
-        num_seeds: int = 50,
-        trans_centers: Optional[torch.Tensor] = None,
-        trans_centers_real: Optional[torch.Tensor] = None,
-        num_repeats_per_trans: int = 10,
-        topk: int = 30,
-        steps_fine: int = 100,
-        lr: float = 0.075,
-        N_real: Optional[torch.Tensor] = None,
-        M_real: Optional[torch.Tensor] = None,
-        seeds: Optional[tuple] = None,
-        early_stop_patience: int = 5,
-        early_stop_tol: float = 1e-5) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Vectorized padding-aware ESP alignment over a batch of (A, B) pairs.
-
-    Uses coarse-to-fine strategy:
-    NOTE: by default there is NO coarse grid and NO top-k prune -- every seed is
-    fine-optimized and the per-pair max is taken (ranking seeds on raw un-optimized
-    overlap discarded the true basin for pseudo-symmetric molecules). The coarse-grid
-    path below runs ONLY when ``trans_centers`` is supplied (``trans_init=True``).
-
-    1. Build 500 pose hypotheses (250 rotations × 2 translations)
-    2. Evaluate all poses (coarse scoring)
-    3. Select top-k poses
-    4. Fine optimization with Adam
-
-    Parameters
-    ----------
-    A_batch, B_batch : torch.Tensor (B, N_pad, 3) / (B, M_pad, 3)
-        Point coordinates
-    CA_batch, CB_batch : torch.Tensor (B, N_pad) / (B, M_pad)
-        Charges at each point
-    VAA, VBB : torch.Tensor (B,)
-        Pre-computed ESP self-overlaps
-    alpha : float
-        Gaussian width parameter
-    lam : float
-        Charge scaling parameter
-    topk : int
-        Number of top poses to refine
-    steps_fine : int
-        Number of fine optimization steps
-    lr : float
-        Learning rate for Adam optimizer
-    N_real, M_real : torch.Tensor (B,)
-        Optional true point counts
-
-    Returns
-    -------
-    final_score : torch.Tensor (B,)
-        Best Tanimoto scores
-    q_best : torch.Tensor (B, 4)
-        Best quaternions
-    t_best : torch.Tensor (B, 3)
-        Best translations
-    """
-    device = A_batch.device
-    BATCH, N_pad, _ = A_batch.shape
-    _, M_pad, _ = B_batch.shape
-
-    if N_real is None:
-        N_real = A_batch.new_full((BATCH,), N_pad, dtype=torch.int32)
-    if M_real is None:
-        M_real = A_batch.new_full((BATCH,), M_pad, dtype=torch.int32)
-
-    # ------------------------------------------------------------------
-    # 1) pose hypotheses
-    # ------------------------------------------------------------------
-    if trans_centers is None:
-        # Reference seed set (identity + 4 PCA + Fibonacci, COM translation),
-        # fine-optimised in full with a per-pair max -- NO coarse-grid + top-k
-        # pruning. The raw-overlap ranking the pruning relied on is a poor
-        # predictor of post-optimisation score and repeatedly discarded the
-        # true basin for pseudo-symmetric molecules, pulling ESP scores ~5%
-        # below the reference. See coarse_fine_align_many for the full rationale.
-        if seeds is not None:
-            quats, t_seeds = seeds  # precomputed per pair (a canonical store's constant set); see batched_seeds_torch
-        else:
-            quats, t_seeds = batched_seeds_torch(A_batch, B_batch, N_real, M_real,
-                                                 num_seeds=num_seeds)
-        P = quats.size(1)
-        q_best = quats.clone()
-        t_best = t_seeds.clone()
-    else:
-        # Legacy translation-seeded path: coarse grid + top-k pruning (unchanged).
-        q_grid, t_grid = build_coarse_grid(
-            A_batch, B_batch, N_real, M_real, num_seeds=num_seeds,
-            trans_centers_batch=trans_centers, trans_centers_real=trans_centers_real,
-            num_repeats_per_trans=num_repeats_per_trans,
-        )
-        G = q_grid.size(1)
-        ORI_CHUNK = 25_000
-        PAIR_CHUNK = 65_535
-        coarse_score = torch.empty(BATCH, G, device=device, dtype=A_batch.dtype)
-        for o0 in range(0, G, ORI_CHUNK):
-            o1 = min(o0 + ORI_CHUNK, G)
-            g_len = o1 - o0
-            for p0 in range(0, BATCH, PAIR_CHUNK):
-                p1 = min(p0 + PAIR_CHUNK, BATCH)
-                slice_len = p1 - p0
-                A_rep = A_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, N_pad, 3)
-                B_rep = B_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1, -1).reshape(-1, M_pad, 3)
-                CA_rep = CA_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1).reshape(-1, N_pad)
-                CB_rep = CB_batch[p0:p1].unsqueeze(1).expand(-1, g_len, -1).reshape(-1, M_pad)
-                q_rep = q_grid[p0:p1, o0:o1].reshape(-1, 4).contiguous()
-                t_rep = t_grid[p0:p1, o0:o1].reshape(-1, 3).contiguous()
-                N_rep = N_real[p0:p1].repeat_interleave(g_len)
-                M_rep = M_real[p0:p1].repeat_interleave(g_len)
-                VAB_slice, _, _ = _overlap_in_chunks_esp(
-                    A_rep, B_rep, CA_rep, CB_rep, q_rep, t_rep,
-                    alpha=alpha, lam=lam, N_real=N_rep, M_real=M_rep, NEED_GRAD=False)
-                coarse_score[p0:p1, o0:o1] = VAB_slice.view(slice_len, g_len)
-        coarse_score = coarse_score / (VAA[:, None] + VBB[:, None] - coarse_score)
-        best_idx = coarse_score.topk(k=topk, dim=1).indices
-        q_best = torch.gather(q_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 4)).clone()
-        t_best = torch.gather(t_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 3)).clone()
-        P = topk
-
-    # ------------------------------------------------------------------
-    # 2) Fine optimization with Adam over ALL P poses
-    # ------------------------------------------------------------------
-    # Coordinates are REPLICATED per pose. The deduped layout the shape driver uses -- hand the
-    # kernel one copy per molecule and let it index ``pid // S`` -- was ported here and measured:
-    # it is worth 1.01x, and the multi-pose kernel it exists to feed is NEGATIVE on the ESP
-    # kernel (surf_esp 0.92-0.94x), so there is nothing to feed and nothing to gain.
-    A_k = A_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, N_pad, 3)
-    B_k = B_batch.unsqueeze(1).expand(-1, P, -1, -1).reshape(-1, M_pad, 3)
-    CA_k = CA_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, N_pad)
-    CB_k = CB_batch.unsqueeze(1).expand(-1, P, -1).reshape(-1, M_pad)
-    q_k = q_best.reshape(-1, 4).contiguous()
-    t_k = t_best.reshape(-1, 3).contiguous()
-
-    N_k = N_real.repeat_interleave(P)
-    M_k = M_real.repeat_interleave(P)
-    S_fine = 1
-    P_cta = 1
-    VAA_rep = VAA.repeat_interleave(P)
-    VBB_rep = VBB.repeat_interleave(P)
-    VAA_plus_VBB = VAA_rep + VBB_rep
-
-    PK = q_k.shape[0]
-    best_score = best_q = best_t = None
-
-    # --- CUDA-graph fast path: capture one fine step and replay it with ~zero per-step host
-    # launch overhead. Gated to the launch-bound small/medium-P CUDA fp32 regime; large P or a
-    # capture failure fall back to the eager loop below. See drivers/_graphed.
-    if (A_batch.is_cuda and PK <= graph_cap(N_pad * M_pad)
-            and A_batch.dtype == torch.float32):
-        try:
-            best_score, best_q, best_t = _run_graphed_esp(
-                A_k.contiguous(), B_k.contiguous(), CA_k.contiguous(), CB_k.contiguous(),
-                q_k, t_k, N_k, M_k, VAA_plus_VBB, alpha, lam, lr,
-                steps_fine, N_pad, M_pad, PK,
-                es_patience=early_stop_patience, es_tol=early_stop_tol,
-                es_seeds=P, seeds=S_fine, poses=P_cta)
-        except Exception:
-            best_score = None                              # capture failed -> eager
-
-    # --- CPU (numba) fast path: fully-fused fine loop, no torch in the hot loop --------------
-    # Restricted to vol_esp (atom-count ESP, N_pad <= 100), where the fused trajectory agrees
-    # with torch-eager to max|dscore| ~5e-5. surf_esp (200-point surface ESP) is deliberately
-    # NOT fused: it is the most shape-degenerate mode, so the fused trajectory settles in
-    # different (equally valid) basins than eager, and callers rely on pose-exact agreement.
-    if (best_score is None and not A_batch.is_cuda
-            and A_batch.dtype == torch.float32
-            and A_batch.shape[1] <= 100):
-        try:
-            from ..kernels.cpu_fused import cpu_fused_esp
-            best_score, best_q, best_t = cpu_fused_esp(
-                A_k, B_k, CA_k, CB_k, q_k, t_k, N_k, M_k, VAA_plus_VBB, alpha, lam, lr, steps_fine,
-                early_stop_patience, early_stop_tol, n_seeds=P)
-        except Exception:
-            best_score = None                              # fused failed -> eager
-
-    if best_score is None:
-        # Adam state
-        m_q = torch.zeros_like(q_k)
-        v_q = torch.zeros_like(q_k)
-        m_t = torch.zeros_like(t_k)
-        v_t = torch.zeros_like(t_k)
-
-        best_score = torch.full((len(q_k),), -float('inf'), device=device)
-        best_q = q_k.clone()
-        best_t = t_k.clone()
-
-        # Early stopping state
-        # Per-pair early-stop baseline: prev_best[k] is pair k's best score as of its
-        # last recorded improvement. One entry per PAIR, not per pose.
-        prev_best = torch.full((BATCH,), -float('inf'), device=device)
-        no_improve_count = 0
-
-        for step in range(steps_fine):
-            VAB, dQ, dT = _overlap_in_chunks_esp(
-                A_k, B_k, CA_k, CB_k, q_k, t_k,
-                alpha=alpha, lam=lam, N_real=N_k, M_real=M_k,
-                seeds_per_mol=S_fine, poses_per_cta=P_cta)
-
-            denom = VAA_plus_VBB - VAB
-            score = VAB / denom
-            scale = VAA_plus_VBB / (denom * denom)
-
-            # Track best via torch.where (fixed-shape, sync-free; boolean
-            # index-assignment was measured slower due to a per-step device sync).
-            best_score, best_q, best_t = _fc._update_best(score, q_k, t_k, best_score, best_q, best_t)
-
-            # Early-stop check every 5 steps, so the host sync it needs costs one sync per
-            # 5 steps, not one per step. Gating only makes the early stop LESS aggressive.
-            if step % 5 == 0:
-                # PER-PAIR convergence test. `best_score` is (BATCH*P,) laid out
-                # pair-major, so .view(BATCH, P) row k is pair k -- the same reshape the
-                # result gather uses below. A pair has converged when ITS OWN best (max over
-                # its own seeds) stops improving, and the loop may break only once EVERY pair
-                # has stalled. A bucket-global max would let one converged pair halt the
-                # optimisation of every other pair sharing the bucket.
-                cur = best_score.view(BATCH, P).amax(dim=1)
-                improved = (cur - prev_best) > early_stop_tol
-                # amax stays on-device; this .any() is the ONE host sync per check, exactly
-                # where the old .max().item() sync was. No per-pair sync is introduced.
-                if not improved.any():
-                    no_improve_count += 1
-                    if no_improve_count >= early_stop_patience:
-                        break
-                else:
-                    no_improve_count = 0
-                # Advance a pair's baseline only where that pair actually improved, as the old
-                # rule did. In every measured case this runs at least as long as the bucket-global
-                # test it replaces; it is NOT provably never-earlier. A trajectory whose per-check
-                # gains straddle es_tol can spend a baseline reset the global rule still holds, and
-                # stop one check block (5 steps) sooner. Never seen on real molecules.
-                prev_best = torch.where(improved, cur, prev_best)
-
-            # Fused Adam with tangent-space projection (avoids intermediate dQ_tan tensor)
-            fused_adam_qt_with_tangent_proj(
-                q_k, t_k,
-                -dQ * scale.unsqueeze(1),
-                -dT * scale.unsqueeze(1),
-                m_q, v_q, m_t, v_t, lr)
-
-        # One record per eager fine-loop invocation: value+grad evaluations actually
-        # executed (the loop breaks AFTER an evaluation, before that step's Adam update)
-        # against the configured budget. No-op unless _stats recording was enabled.
-        _ran = (step + 1) if steps_fine else 0
-        _record_steps(_ran, steps_fine, _ran < steps_fine)
-
-    # ------------------------------------------------------------------
-    # 5) Gather final results
-    # ------------------------------------------------------------------
-    final_score = best_score.view(BATCH, P)
-    best = final_score.argmax(dim=1)
-    sel = best + torch.arange(BATCH, device=device) * P
-
-    return (final_score.flatten()[sel],
-            best_q.view(BATCH, P, 4)[torch.arange(BATCH), best],
-            best_t.view(BATCH, P, 3)[torch.arange(BATCH), best])
-
-
-def fast_optimize_ROCS_esp_overlay(
-        ref_points: torch.Tensor,
-        fit_points: torch.Tensor,
-        ref_charges: torch.Tensor,
-        fit_charges: torch.Tensor,
-        alpha: float,
-        lam: float,
-        num_repeats: int = 50,
-        trans_centers: Optional[torch.Tensor] = None,
-        num_repeats_per_trans: int = 10,
-        topk: int = 30,
-        steps_fine: int = 100,
-        lr: float = 0.075,
-        **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Fast GPU-accelerated ESP alignment.
-
-    Drop-in replacement for optimize_ROCS_esp_overlay with GPU acceleration.
-    Falls back to CPU implementation if CUDA is not available.
-
-    Parameters
-    ----------
-    ref_points : torch.Tensor (N, 3)
-        Reference surface points
-    fit_points : torch.Tensor (M, 3)
-        Points to align
-    ref_charges : torch.Tensor (N,)
-        ESP values at reference points
-    fit_charges : torch.Tensor (M,)
-        ESP values at fit points
-    alpha : float
-        Gaussian width parameter
-    lam : float
-        Charge scaling parameter
-    num_repeats : int
-        Number of seeds (not directly used)
-    topk : int
-        Number of top poses to refine
-    steps_fine : int
-        Number of fine optimization steps
-    lr : float
-        Learning rate
-
-    Returns
-    -------
-    aligned_points : torch.Tensor (M, 3)
-        Transformed fit points
-    SE3_transform : torch.Tensor (4, 4)
-        Best SE(3) transformation matrix
-    score : torch.Tensor scalar
-        Best Tanimoto score
-    """
-    if not check_gpu_available():
-        # Fallback to CPU implementation
-        from ...alignment._torch import optimize_ROCS_esp_overlay
-        return optimize_ROCS_esp_overlay(
-            ref_points, fit_points, ref_charges, fit_charges,
-            alpha, lam, num_repeats, **kwargs)
-
-    device = torch.device('cuda')
-    ref_gpu = ref_points.to(device, dtype=torch.float32)
-    fit_gpu = fit_points.to(device, dtype=torch.float32)
-    ref_c = ref_charges.to(device, dtype=torch.float32)
-    fit_c = fit_charges.to(device, dtype=torch.float32)
-
-    # Batch dimension for single pair
-    A = ref_gpu.unsqueeze(0)
-    B = fit_gpu.unsqueeze(0)
-    CA = ref_c.unsqueeze(0)
-    CB = fit_c.unsqueeze(0)
-    N_real = torch.tensor([ref_gpu.shape[0]], device=device, dtype=torch.int32)
-    M_real = torch.tensor([fit_gpu.shape[0]], device=device, dtype=torch.int32)
-    trans_centers_batch = None
-    trans_centers_real = None
-    if trans_centers is not None:
-        tc = trans_centers.to(device, dtype=torch.float32)
-        trans_centers_batch = tc.unsqueeze(0)
-        trans_centers_real = torch.tensor([tc.shape[0]], device=device, dtype=torch.int32)
-
-    # Precompute self-overlaps
-    VAA = _self_overlap_esp_chunks(A, CA, N_real, alpha, lam)
-    VBB = _self_overlap_esp_chunks(B, CB, M_real, alpha, lam)
-
-    # Run coarse-fine alignment
-    score, q_best, t_best = coarse_fine_esp_align_many(
-        A, B, CA, CB, VAA, VBB,
-        alpha=alpha,
-        lam=lam,
-        trans_centers=trans_centers_batch,
-        trans_centers_real=trans_centers_real,
-        num_repeats_per_trans=num_repeats_per_trans,
-        topk=topk,
-        steps_fine=steps_fine,
-        lr=lr,
-        N_real=N_real,
-        M_real=M_real)
-
-    # Apply best transform
-    aligned = apply_se3_transform(fit_gpu, q_best[0], t_best[0])
-
-    # Build SE(3) matrix
-    R = quaternion_to_rotation_matrix(q_best[0])
-    SE3 = torch.eye(4, device=device)
-    SE3[:3, :3] = R
-    SE3[:3, 3] = t_best[0]
-
-    return aligned.cpu(), SE3.cpu(), score[0].cpu()
+def coarse_fine_esp_align_many(A_batch, B_batch, CA_batch, CB_batch, VAA=None, VBB=None, *,
+                               alpha: float = 0.81, lam: float = 0.3, num_seeds: int = 50,
+                               trans_centers=None, trans_centers_real=None,
+                               num_repeats_per_trans: int = 10, topk: int = 30,
+                               steps_fine: int = 100, lr: float = 0.075, N_real=None,
+                               M_real=None, seeds=None, early_stop_patience: int = 5,
+                               early_stop_tol: float = 1e-5):
+    """Batched ESP-weighted alignment; ``lam`` is passed to the kernel as given."""
+    b = batch(A_batch, B_batch, N_real, M_real)
+    chans = {"heavy": b, "charges": batch(CA_batch, CB_batch, b.n_real, b.m_real)}
+    return run("vol_esp", chans, alpha=alpha, lam=lam, num_seeds=num_seeds, steps_fine=steps_fine,
+               lr=lr, early_stop_patience=early_stop_patience, early_stop_tol=early_stop_tol,
+               seeds=seeds, trans_centers=trans_centers, trans_centers_real=trans_centers_real,
+               num_repeats_per_trans=num_repeats_per_trans, topk=topk)
 
 
 def fast_optimize_ROCS_esp_overlay_batch(
-        ref_batch: torch.Tensor,
-        fit_batch: torch.Tensor,
-        ref_charges_batch: torch.Tensor,
-        fit_charges_batch: torch.Tensor,
-        alpha: float,
-        lam: float,
-        N_real: Optional[torch.Tensor] = None,
-        M_real: Optional[torch.Tensor] = None,
-        trans_centers_batch: Optional[torch.Tensor] = None,
-        trans_centers_real: Optional[torch.Tensor] = None,
-        num_repeats_per_trans: int = 10,
-        num_seeds: int = 50,
-        topk: int = 30,
-        steps_fine: int = 100,
-        lr: float = 0.075,
-        seeds: Optional[tuple] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Fast GPU-accelerated batch ESP alignment.
-
-    Parameters
-    ----------
-    ref_batch : torch.Tensor (B, N, 3)
-        Batch of reference points
-    fit_batch : torch.Tensor (B, M, 3)
-        Batch of fit points
-    ref_charges_batch : torch.Tensor (B, N)
-        Charges at reference points
-    fit_charges_batch : torch.Tensor (B, M)
-        Charges at fit points
-    alpha : float
-        Gaussian width parameter
-    lam : float
-        Charge scaling parameter
-    N_real, M_real : torch.Tensor (B,)
-        True point counts (for padded batches)
-    topk : int
-        Number of top poses to refine
-    steps_fine : int
-        Fine optimization steps
-    lr : float
-        Learning rate
-
-    Returns
-    -------
-    aligned_batch : torch.Tensor (B, M, 3)
-        Transformed fit points
-    q_batch : torch.Tensor (B, 4)
-        Best quaternions
-    t_batch : torch.Tensor (B, 3)
-        Best translations
-    scores : torch.Tensor (B,)
-        Best Tanimoto scores
-    """
-    BATCH = ref_batch.shape[0]
-    N_pad = ref_batch.shape[1]
-    M_pad = fit_batch.shape[1]
-
-    if N_real is None:
-        N_real = ref_batch.new_full((BATCH,), N_pad, dtype=torch.int32)
-    if M_real is None:
-        M_real = fit_batch.new_full((BATCH,), M_pad, dtype=torch.int32)
-
-    # Precompute self-overlaps
-    VAA = _self_overlap_esp_chunks(ref_batch, ref_charges_batch, N_real, alpha, lam)
-    VBB = _self_overlap_esp_chunks(fit_batch, fit_charges_batch, M_real, alpha, lam)
-
-    # Run coarse-fine alignment
+        ref_batch, fit_batch, ref_charges_batch, fit_charges_batch, alpha: float, lam: float,
+        N_real=None, M_real=None, trans_centers_batch=None, trans_centers_real=None,
+        num_repeats_per_trans: int = 10, num_seeds: int = 50, topk: int = 30,
+        steps_fine: int = 100, lr: float = 0.075, seeds=None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched ESP alignment: ``(aligned_fit, q, t, scores)``."""
     scores, q_best, t_best = coarse_fine_esp_align_many(
-        ref_batch, fit_batch, ref_charges_batch, fit_charges_batch, VAA, VBB,
-        alpha=alpha,
-        lam=lam,
-        num_seeds=num_seeds,
-        trans_centers=trans_centers_batch,
-        trans_centers_real=trans_centers_real,
-        num_repeats_per_trans=num_repeats_per_trans,
-        topk=topk,
-        steps_fine=steps_fine,
-        lr=lr,
-        N_real=N_real,
-        M_real=M_real,
-        seeds=seeds)
+        ref_batch, fit_batch, ref_charges_batch, fit_charges_batch, alpha=alpha, lam=lam,
+        num_seeds=num_seeds, trans_centers=trans_centers_batch,
+        trans_centers_real=trans_centers_real, num_repeats_per_trans=num_repeats_per_trans,
+        topk=topk, steps_fine=steps_fine, lr=lr, N_real=N_real, M_real=M_real, seeds=seeds)
+    return apply_se3_transform(fit_batch, q_best, t_best), q_best, t_best, scores
 
-    # Apply transforms
-    aligned_batch = apply_se3_transform(fit_batch, q_best, t_best)
 
-    return aligned_batch, q_best, t_best, scores
+def fast_optimize_ROCS_esp_overlay(ref_points, fit_points, ref_charges, fit_charges, alpha: float,
+                                   lam: float, num_repeats: int = 50, trans_centers=None,
+                                   num_repeats_per_trans: int = 10, topk: int = 30,
+                                   steps_fine: int = 100, lr: float = 0.075, **kwargs):
+    """Single-pair GPU ESP alignment: ``(aligned_points, SE3 (4,4), score)`` on CPU. Falls back
+    to the eager reference optimizer when CUDA is unavailable."""
+    if not check_gpu_available():
+        from ...alignment._torch import optimize_ROCS_esp_overlay
+        return optimize_ROCS_esp_overlay(ref_points, fit_points, ref_charges, fit_charges,
+                                         alpha, lam, num_repeats, **kwargs)
+    device = torch.device("cuda")
+    f = lambda x: x.to(device, dtype=torch.float32)
+    A, B = f(ref_points).unsqueeze(0), f(fit_points).unsqueeze(0)
+    CA, CB = f(ref_charges).unsqueeze(0), f(fit_charges).unsqueeze(0)
+    tcb = tcr = None
+    if trans_centers is not None:
+        tc = f(trans_centers)
+        tcb = tc.unsqueeze(0)
+        tcr = torch.tensor([tc.shape[0]], device=device, dtype=torch.int32)
+    aligned, q, t, score = fast_optimize_ROCS_esp_overlay_batch(
+        A, B, CA, CB, alpha, lam, trans_centers_batch=tcb, trans_centers_real=tcr,
+        num_repeats_per_trans=num_repeats_per_trans, num_seeds=num_repeats, topk=topk,
+        steps_fine=steps_fine, lr=lr)
+    return aligned[0].cpu(), se3_of(q[0], t[0]).cpu(), score[0].cpu()

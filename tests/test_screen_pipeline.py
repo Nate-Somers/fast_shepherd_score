@@ -218,24 +218,26 @@ def test_pose_cap_graphs_every_chunk_on_a_narrow_fixture(monkeypatch, canon_stor
     """
     _require_fast_cuda()
     from shepherd_score.accel.batch import _arrays
-    from shepherd_score.accel.drivers import shape as shapemod
+    from shepherd_score.accel.drivers import engine as enginemod
     from shepherd_score.accel.drivers._graphed import reset_graph_cache
     from shepherd_score.accel.batch import _pad as padmod
 
     monkeypatch.setattr(_arrays, "ENABLED", True)
     seen = {"calls": 0, "graphed": 0}
-    _cfa, _rgf = shapemod.coarse_fine_align_many, shapemod._run_graphed_fine
+    # ONE fine loop serves every mode now, so the two seams are the engine's entry point and
+    # the shared CUDA-graph runner it calls -- not a per-mode driver's own pair of functions.
+    _align, _rgf = enginemod.align, enginemod.run_graphed
 
     def cfa(*a, **k):
         seen["calls"] += 1
-        return _cfa(*a, **k)
+        return _align(*a, **k)
 
     def rgf(*a, **k):
         seen["graphed"] += 1
         return _rgf(*a, **k)
 
-    monkeypatch.setattr(shapemod, "coarse_fine_align_many", cfa)
-    monkeypatch.setattr(shapemod, "_run_graphed_fine", rgf)
+    monkeypatch.setattr(enginemod, "align", cfa)
+    monkeypatch.setattr(enginemod, "run_graphed", rgf)
 
     store = ProfileStore.open(canon_store)
     q = molecules[0]

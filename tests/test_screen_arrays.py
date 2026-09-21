@@ -62,27 +62,43 @@ _BAND = 16          # mirrors accel.batch._pad._BAND; asserted against the real 
 #: silently going untested.
 _MODES = tuple(screenmod._ARRAY_MODES)
 
-#: the documented library defaults, matching aligners/fss.py::prepare_screen. vol_esp takes
-#: lam RAW (surf_esp scales it x207) and screen() refuses to run vol_esp without it.
-#: Nothing else needs an entry: ``_resolve_screen`` *requires* only ``lam`` for vol_esp and
-#: ``alpha`` for vol_and_surf_esp; surf/surf_esp take alpha from ``ALPHA(num_surf_points)`` and
-#: the Tversky / lipo / fukui modes all carry defaults in ``_fast_batch_kwargs``.
-_MODE_KW = {"vol_esp": {"lam": 0.1}, "vol_and_surf_esp": {"alpha": 0.81}}
+#: The kwargs each mode REQUIRES of ``screen()``, derived from the registry rather than listed:
+#: a spec parameter whose default is ``None`` has to be supplied (``lam`` for vol_esp, which
+#: takes it RAW where surf_esp scales it x207; ``alpha`` for the combo modes, where it selects
+#: volumetric shape at 0.81 and surface shape otherwise), and ``vol_avoid`` additionally needs
+#: the query-side avoid cloud its objective scores against. Everything else carries a default.
+#: Listing these by hand is how six modes once shipped with no coverage.
+_REQUIRED_VALUES = {"lam": 0.1, "alpha": 0.81}
+_MODE_KW = {}
+for _m, _sp in screenmod._SPECS.items():
+    _kw = {k: _REQUIRED_VALUES[k] for k, v in _sp.params.items() if v is None}
+    if _m == "vol_avoid":
+        _kw["avoid_points"] = np.array([[6.0, 0.0, 0.0], [6.0, 2.0, 0.0]], dtype=np.float32)
+    if _kw:
+        _MODE_KW[_m] = _kw
 
-#: Modes whose self-copy does NOT reach ~1.0 on THIS fixture, and why. An EXCLUSION list, not the
-#: positive list this file used to carry: a mode that joins ``_ARRAY_MODES`` is asserted at 1.0 by
-#: default and has to be excused on purpose, which is how the positive list came to silently drop
-#: six modes.
-#: ``vol_and_surf_esp`` is excused because ``_build_molecule`` gives every molecule a SYNTHETIC
-#: random surface (so the test needs no Open3D), which is fine for the shape/pharm channels but is
-#: not the surface implied by the molecule's own atoms -- and vol_and_surf_esp scores surface and
-#: ESP channels against fields derived from those atoms, so a self-copy need not reach 1.0. The
-#: repo's own ``test_screen.py::test_self_screen_recovers_one`` excludes it from exactly this
-#: assertion for the same reason. It still ranks itself FIRST; its self-score measured 0.5865
-#: (numba) / 0.5886 (triton) on an L40S, job 22642878, and 0.5864 on a Windows CPU box -- route
-#: dependent, which is why only this one mode is excused rather than the number being asserted.
-#: Every other mode, both Tversky modes included, measured EXACTLY 1.000000 on both routes there.
-_SELF_SCORE_NOT_ONE = {"vol_and_surf_esp"}
+#: Modes whose self-copy does NOT reach ~1.0 on THIS fixture, DERIVED from the objective rather
+#: than listed. Two structures cannot reach 1.0 here and both are readable off the mode's terms:
+#:
+#: * a value-only AGREEMENT term (the ShaEP surface-ESP channel). ``_build_molecule`` gives every
+#:   molecule a SYNTHETIC random surface so the suite needs no Open3D, which is fine for the
+#:   shape and pharmacophore channels but is not the surface implied by that molecule's own
+#:   atoms -- and this channel scores a surface against fields derived from those atoms, so a
+#:   self-copy need not reach 1.0. ``test_screen.py::test_self_screen_recovers_one`` excludes
+#:   ``vol_and_surf_esp`` from the same assertion for the same reason. Measured self-scores:
+#:   0.5865 (numba) / 0.5886 (triton) on an L40S (job 22642878) and 0.5864 on a Windows CPU box
+#:   -- route dependent, which is why the structure is excused rather than a number asserted.
+#: * a SUBTRACTED penalty term (``vol_avoid``'s excluded volume): the score is a shape Tanimoto
+#:   MINUS a penalty, so a molecule aligned onto itself scores 1.0 only when the avoid cloud
+#:   happens to be far from the pose the optimiser finds.
+#:
+#: Written as an EXCLUSION derived from the spec, not as the positive list this file used to
+#: carry: a mode is asserted at 1.0 by default and has to be excused by its own structure, which
+#: is how the old positive list came to silently drop six modes.
+_SELF_SCORE_NOT_ONE = {m for m, sp in screenmod._SPECS.items()
+                       if any(t.reduction == "agreement" for t in sp.terms)
+                       or any(isinstance(t.weight, str) and t.weight.startswith("-")
+                              for t in sp.terms)}
 
 
 def _scored_asymmetrically(mode: str) -> bool:

@@ -40,40 +40,31 @@ Four variants are printed per mode, plus a control:
 
 THE TWO CPU CODE PATHS
 ----------------------
-On CPU the modes do not all take the same route, and both routes carried the defect (both
-were fixed, and both are covered here):
+One generic fine loop now serves every mode (``accel/drivers/engine.py``), with two CPU
+implementations of it, and both are covered here:
 
-  * ``vol``       -> ``kernels/cpu_fused.py::fine_loop_cpu``  (fused numba loop, ``best.max()``)
-  * ``vol_color`` -> ``kernels/cpu_fused.py::fine_loop_cpu``  (fused numba loop, ``best.max()``)
-  * ``vol_lipo``  -> ``drivers/vol_lipo.py`` eager torch loop (no fused path exists for it)
+  * the FUSED numba loop (``kernels/cpu_fused.py::run_fused``) -- no torch in the hot loop;
+  * the EAGER torch loop (``engine._eager``) -- the fall-back, and the only path for the
+    pharmacophore family, whose spec sets ``cpu_fused=False``.
 
-So each mode is run twice: once on its default CPU route, and once with the ``cpu_fused``
-entry points forced to fail so the eager driver loop runs instead. That covers the eager loop
-for ``vol`` and ``vol_color`` too.
+So each mode is run twice: once on its default CPU route, and once with ``run_fused`` forced to
+fail so the eager loop runs instead.
 
 INSTRUMENTATION
 ---------------
 No driver, kernel or container file is edited. Everything is a monkeypatch of a module
 attribute, restored on exit:
 
-  * ``drivers.shape.coarse_fine_align_many`` / ``drivers.vol_color.coarse_fine_vol_color_align_many``
-    / ``drivers.vol_lipo.coarse_fine_vol_lipo_align_many`` -- wrapped only to OPEN a record,
-    one per fine-loop invocation. (``aligners.py`` imports these inside the function body, and
-    the two ``fast_optimize_*_batch`` wrappers call them as module globals, so patching the
-    module attribute is enough.) A bucket split or a sub-batch split shows up as several
-    records instead of hiding inside one total.
-  * ``drivers.shape._overlap_in_chunks`` / ``drivers.vol_color._vc_overlaps`` /
-    ``drivers.vol_lipo._vl_overlaps`` -- the value+grad symbol each EAGER loop calls exactly
-    once per iteration. Each has exactly one eager call site; the other call site is inside
-    the CUDA-graph class, which never runs on CPU.
-  * ``kernels.cpu_fused.fine_loop_cpu`` -- wraps the ``overlap_fn`` closure it is handed, so
-    the count is that FUSED loop's own iteration count.
+  * ``drivers.engine.align`` -- wrapped only to OPEN a record, one per fine-loop invocation.
+    A bucket split or a sub-batch split shows up as several records instead of hiding inside
+    one total.
+  * ``drivers.engine._eager`` / ``kernels.cpu_fused.run_fused`` -- which loop ran.
+  * ``drivers.terms.evaluate`` -- the value+grad call each EAGER iteration makes once per
+    gradient term, so the per-iteration count divides by the mode's term count.
 
-Counting convention: the reported number is VALUE+GRAD EVALUATIONS, i.e. loop iterations
-entered. The eager loops break *before* their Adam update, so an 11-iteration eager run
-applies 10 Adam updates; the fused loop applies its Adam tail before the check, so an
-11-iteration fused run applies 11. That asymmetry is a real difference between the two paths,
-not an artifact of the counter.
+Counting convention: the reported number is FINE-LOOP ITERATIONS entered. Both loops now apply
+their Adam update AFTER the early-stop check, so an 11-iteration run applies 10 updates on
+either path -- the asymmetry the old fused loop had is gone.
 """
 from __future__ import annotations
 
@@ -90,8 +81,19 @@ import torch
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
+from shepherd_score.accel import _stats
 from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS
 from shepherd_score.container import Molecule, MoleculePair
+
+
+def _stats_calls():
+    return _stats.summary().get("steps_mean", 0) * _stats.summary().get("calls", 0)
+
+
+def _stats_steps():
+    """Total value+grad evaluations the recorder has seen (0 when recording is off)."""
+    s = _stats.summary()
+    return int(s.get("steps_mean", 0) * s.get("calls", 0)) if s else 0
 
 
 MODES = ("vol", "vol_color", "vol_lipo")
@@ -160,7 +162,7 @@ def _instrumented(force_eager: bool, disable_early_stop: bool = False):
     whole configured budget runs -- the reference the fix has to reach. It changes NO search
     effort: ``MODE_SEEDS`` / ``MODE_STEPS`` are untouched, only the premature break is removed.
     """
-    from shepherd_score.accel.drivers import shape, vol_color, vol_lipo
+    from shepherd_score.accel.drivers import engine, terms
     from shepherd_score.accel.kernels import cpu_fused
 
     records: list[list] = []
@@ -174,40 +176,41 @@ def _instrumented(force_eager: bool, disable_early_stop: bool = False):
     def open_record(original):
         """Wrapper that starts a new record for each fine-loop invocation."""
         def wrapper(*args, **kwargs):
-            records.append(["-", 0])
+            records.append(["-", 0, 1])
             if disable_early_stop:
                 kwargs["early_stop_patience"] = _NO_EARLY_STOP
             return original(*args, **kwargs)
         return wrapper
 
     def count_eager(original):
-        """Wrapper on an eager loop's value+grad: one call == one iteration."""
+        """Wrapper on the value+grad evaluator: one call per gradient term per iteration."""
         def wrapper(*args, **kwargs):
-            records[-1][0] = "eager"
             records[-1][1] += 1
             return original(*args, **kwargs)
         return wrapper
 
     def count_fused(original):
-        """Wrapper on fine_loop_cpu: count the overlap closure it drives."""
-        def wrapper(overlap_fn, *args, **kwargs):
+        """Wrapper on run_fused: the fused loop reports its own iteration count."""
+        def wrapper(pr, steps, lr, es_patience, es_tol, *a, **k):
             slot = records[-1]
-
-            def counting_overlap(q, t):
-                slot[0] = "fused"
-                slot[1] += 1
-                return overlap_fn(q, t)
-
-            return original(counting_overlap, *args, **kwargs)
+            slot[0] = "fused"
+            before = _stats_calls()
+            out = original(pr, steps, lr, es_patience, es_tol, *a, **k)
+            slot[1] += _stats_steps() - before
+            return out
         return wrapper
 
-    patch(shape, "coarse_fine_align_many", open_record)
-    patch(vol_color, "coarse_fine_vol_color_align_many", open_record)
-    patch(vol_lipo, "coarse_fine_vol_lipo_align_many", open_record)
-    patch(shape, "_overlap_in_chunks", count_eager)
-    patch(vol_color, "_vc_overlaps", count_eager)
-    patch(vol_lipo, "_vl_overlaps", count_eager)
-    patch(cpu_fused, "fine_loop_cpu", count_fused)
+    def count_eager_loop(original):
+        def wrapper(pr, *a, **k):
+            records[-1][0] = "eager"
+            records[-1][2] = len([t for t in pr.terms if t.spec.grad])
+            return original(pr, *a, **k)
+        return wrapper
+
+    patch(engine, "align", open_record)
+    patch(engine, "_eager", count_eager_loop)
+    patch(terms, "evaluate", count_eager)
+    patch(cpu_fused, "run_fused", count_fused)
 
     if force_eager:
         def refuse(_original):
@@ -215,8 +218,7 @@ def _instrumented(force_eager: bool, disable_early_stop: bool = False):
                 raise RuntimeError(
                     "_es_fixture: fused CPU path disabled to force the eager loop")
             return wrapper
-        patch(cpu_fused, "cpu_fused_shape", refuse)
-        patch(cpu_fused, "cpu_fused_vol_color", refuse)
+        patch(cpu_fused, "run_fused", refuse)
 
     try:
         yield records
@@ -238,11 +240,13 @@ def run_mode(mode: str, force_eager: bool, disable_early_stop: bool = False,
     pairs = build_pairs()
     if drop_self_pair:
         pairs = pairs[1:]
+    _stats.reset()                       # the fused loop reports through the step recorder
     aligner = getattr(MoleculePair, _ALIGNER[mode])
     with _instrumented(force_eager, disable_early_stop) as records:
         aligner(pairs, steps_fine=MODE_STEPS[mode])
     scores = [float(getattr(p, _SCORE_ATTR[mode])) for p in pairs]
-    return scores, [tuple(r) for r in records]
+    # the eager counter fires once per GRADIENT TERM per iteration; divide it back out
+    return scores, [(r[0], r[1] // max(1, r[2]) if r[0] == "eager" else r[1]) for r in records]
 
 
 # (label, force_eager, disable_early_stop). The reference runs first so the two BASELINE

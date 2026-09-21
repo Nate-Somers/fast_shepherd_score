@@ -68,16 +68,22 @@ __all__ = ["MoleculeProfile", "ProfileStore", "screen", "screen_many", "Hit"]
 # disagree on attribute names or valid modes. Legacy mode names resolve via ``canonical()``.
 from shepherd_score.accel._modes import (
     MODE_ATTRS as _MODE_ATTRS, canonical as _canon_mode,
-    CONST_SEED_MODES as _CONST_SEED_MODES,
+    CONST_SEED_MODES as _CONST_SEED_MODES, SPECS as _SPECS, spec_of as _spec_of,
 )
+from shepherd_score.accel.channels import CHANNELS as _CHANNELS, SCHEMA_FLAGS as _SCHEMA_FLAGS
 _TRANSFORM_ATTR = {m: a[0] for m, a in _MODE_ATTRS.items()}
 _SCORE_ATTR = {m: a[1] for m, a in _MODE_ATTRS.items()}
 # Prebuilt score readers: ``attrgetter`` + ``map`` pulls the per-pair score in C, so the
 # K-element score vector costs one iterator pass instead of K Python ``getattr`` calls.
 _SCORE_GETTER = {m: attrgetter(a) for m, a in _SCORE_ATTR.items()}
 _VALID_MODES = tuple(_SCORE_ATTR)
-# Modes whose surface ``alpha`` should auto-default to ALPHA(num_surf_points).
-_SURF_ALPHA_MODES = {"surf", "surf_esp"}
+# Modes whose surface ``alpha`` should auto-default to ALPHA(num_surf_points): the ones whose
+# SHAPE channel is the surface cloud, which is calibrated to the point count. A mode that reads
+# surfaces for some OTHER channel (the ShaEP combo's ESP agreement) is not one of these -- its
+# alpha selects which cloud the shape term scores and has to be given explicitly.
+_SURF_ALPHA_MODES = {m for m, sp in _SPECS.items()
+                     if any(t.kernel in ("shape", "esp") and t.ref and t.ref[0] == "surf"
+                            for t in sp.terms)}
 
 
 Hit = namedtuple("Hit", ["score", "id", "transform"])
@@ -156,6 +162,8 @@ class MoleculeProfile:
                  "_nonH_atoms_idx", "pharm_types", "pharm_ancs", "pharm_vecs",
                  "lipo_pos", "lipophilicity",
                  "fukui_pos", "fukui",
+                 "mr_pos", "molar_refractivity",
+                 "atomtype_pos", "atomic_numbers",
                  "num_surf_points", "mol", "id", "rot")
 
     def __init__(self, *, atom_pos, surf_pos=None, surf_esp=None,
@@ -163,6 +171,8 @@ class MoleculeProfile:
                  pharm_types=None, pharm_ancs=None, pharm_vecs=None,
                  lipo_pos=None, lipophilicity=None,
                  fukui_pos=None, fukui=None,
+                 mr_pos=None, molar_refractivity=None,
+                 atomtype_pos=None, atomic_numbers=None,
                  centers_w_H=None, atom_pos_noH=None, id=None, rot=None):
         self.atom_pos = _f32(atom_pos)
         #: (3,3) float32 principal-axis rotation applied at build time, or None. Present only
@@ -196,6 +206,13 @@ class MoleculeProfile:
         # (f+ - f-) placed at them (already heavy-sliced), exactly like the vol_lipo channel.
         self.fukui_pos = _f32(fukui_pos)
         self.fukui = _f32(fukui)
+        # vol_mr / vol_atomtype: the same TRUE-heavy basis, their own centres + per-atom scalar
+        # (already heavy-sliced), stored under their own offset tables. ``atomic_numbers`` is a
+        # categorical label the colour kernel matches on, kept float32 like the other channels.
+        self.mr_pos = _f32(mr_pos)
+        self.molar_refractivity = _f32(molar_refractivity)
+        self.atomtype_pos = _f32(atomtype_pos)
+        self.atomic_numbers = _f32(atomic_numbers)
         self.num_surf_points = None if self.surf_pos is None else len(self.surf_pos)
         self.mol = _MolShim(_f32(centers_w_H)) if centers_w_H is not None else None
         self.id = id
@@ -215,6 +232,10 @@ class MoleculeProfile:
             self.lipo_pos = self.lipo_pos - mu                 # lipo centres move with the molecule
         if self.fukui_pos is not None:
             self.fukui_pos = self.fukui_pos - mu               # fukui centres move with the molecule
+        if self.mr_pos is not None:
+            self.mr_pos = self.mr_pos - mu
+        if self.atomtype_pos is not None:
+            self.atomtype_pos = self.atomtype_pos - mu
         if self.mol is not None:
             self.mol = _MolShim(self.mol.GetConformer().GetPositions() - mu)
 
@@ -240,6 +261,24 @@ class MoleculeProfile:
         carries the heavy slice the ``vol_fukui`` aligner reads."""
         return self.fukui
 
+    def get_mr_positions(self):
+        """TRUE-heavy molar-refractivity centres -- mirrors ``Molecule.get_mr_positions()``."""
+        return self.mr_pos
+
+    def get_molar_refractivity(self, no_H: bool = True):
+        """Per-atom Crippen molar refractivity (stored already heavy-sliced) -- mirrors
+        ``Molecule.get_molar_refractivity()``."""
+        return self.molar_refractivity
+
+    def get_atomtype_positions(self):
+        """TRUE-heavy element-label centres -- mirrors ``Molecule.get_atomtype_positions()``."""
+        return self.atomtype_pos
+
+    def get_atomic_numbers(self, no_H: bool = True):
+        """Per-atom atomic numbers (stored already heavy-sliced) -- mirrors
+        ``Molecule.get_atomic_numbers()``."""
+        return self.atomic_numbers
+
     @classmethod
     def from_molecule(cls, m, *, modes=_VALID_MODES, id=None) -> "MoleculeProfile":
         """Extract the arrays the requested ``modes`` need from a ``Molecule``
@@ -251,195 +290,169 @@ class MoleculeProfile:
 # --------------------------------------------------------------------------- #
 # storage schema helpers
 # --------------------------------------------------------------------------- #
+def _mode_flags(mode: str) -> set:
+    """The schema flags ``mode`` needs, read off its channels. A mode reading every channel of a
+    basis needs every flag those channels carry; ``atom_pos`` is unconditional and has none.
+    ``vol_and_surf_esp`` reaches ``with_H`` through its ``partial`` channel, which is why a
+    combo store keeps the with-H charges plus the ``nonH`` index rather than the heavy slice."""
+    spec = _spec_of(mode)
+    flags = set()
+    for name in spec.all_channels():
+        ch = _CHANNELS[name]
+        if ch.is_pair:
+            continue
+        if ch.flag:
+            flags.add(ch.flag)
+    return flags
+
+
 def _schema_from_modes(modes) -> dict:
+    """The store schema serving ``modes``: one boolean per channel flag, derived from what each
+    mode's channels read. Every flag in ``SCHEMA_FLAGS`` is always present (a reader may use
+    ``schema[flag]``), so only the VALUES vary with the mode set."""
     modes = {_canon_mode(m) for m in modes}            # accept legacy esp / esp_combo
     unknown = modes - set(_VALID_MODES)
     if unknown:
         raise ValueError(f"unknown modes {sorted(unknown)}; valid: {list(_VALID_MODES)}")
-    return dict(
-        surf=bool({"surf", "surf_esp", "vol_and_surf_esp"} & modes),
-        surf_esp=bool({"surf_esp", "vol_and_surf_esp"} & modes),
-        charges=bool({"vol_esp", "vol_esp_tversky", "vol_and_surf_esp"} & modes),
-        with_H=("vol_and_surf_esp" in modes),
-        radii=("vol_and_surf_esp" in modes),
-        centers_w_H=("vol_and_surf_esp" in modes),
-        pharm=bool({"pharm", "vol_color"} & modes),   # vol_color = atoms + directionless pharm
-        lipophilicity=("vol_lipo" in modes),          # vol_lipo = atoms + heavy logP centres
-        fukui=("vol_fukui" in modes),                 # vol_fukui = atoms + heavy Fukui-field centres
-    )
+    want = set()
+    for m in modes:
+        want |= _mode_flags(m)
+    return {f: (f in want) for f in _SCHEMA_FLAGS}
 
 
 def _store_supports(schema: dict, mode: str) -> bool:
+    """Whether a store with ``schema`` carries every array ``mode`` reads.
+
+    Derived from the mode's channels, so a mode is screenable the moment its data is stored.
+    ``vol_avoid`` is the one mode whose objective needs an input the per-molecule store does not
+    model -- a fixed avoid cloud that belongs to the QUERY, not to a library molecule -- and it
+    screens by carrying that cloud with the query (``screen(..., avoid_points=...)``), so its
+    per-molecule requirement is just ``atom_pos`` like ``vol``'s."""
     mode = _canon_mode(mode)                           # accept legacy esp / esp_combo
-    if mode == "vol":
-        return True                                   # atom_pos is always stored
-    if mode == "vol_esp":
-        return schema["charges"]
-    if mode == "vol_esp_tversky":
-        return schema["charges"]                        # same heavy centres + charges as vol_esp
-    if mode == "surf":
-        return schema["surf"]
-    if mode == "surf_esp":
-        return schema["surf"] and schema["surf_esp"]
-    if mode == "pharm":
-        return schema["pharm"]
-    if mode == "vol_color":
-        return schema["pharm"]                          # atoms (always) + pharm types/anchors
-    if mode == "vol_tversky":
-        return True                                     # asymmetric shape overlay; atom_pos always stored
-    if mode == "vol_lipo":
-        return schema.get("lipophilicity", False)       # atoms (always) + heavy logP centres
-    if mode == "vol_fukui":
-        return schema.get("fukui", False)               # atoms (always) + heavy Fukui-field centres
-    if mode == "vol_and_surf_esp":
-        return (schema["surf"] and schema["surf_esp"] and schema["centers_w_H"]
-                and schema["radii"] and schema["charges"] and schema["with_H"])
-    if mode == "vol_avoid":
-        return False                                    # PAIRWISE-ONLY (deliberate): the avoid
-        # cloud is a fixed non-molecule input (a query/global constant), which the per-molecule
-        # ProfileStore does not model -- use MoleculePairBatch.align_with_vol_avoid, not screen().
-    return False
+    if mode not in _SPECS:
+        return False
+    return all(schema.get(f, False) for f in _mode_flags(mode))
+
+
+#: How each extra per-molecule BASIS is carried through a shard, beyond the unconditional
+#: ``atom_pos``/``atom_off``. ``(schema flag, offset key, [(profile attr, store key), ...])``.
+#: ONE table drives extraction, pre-centring, the canonical rotation, ``_concat`` and
+#: ``_reconstruct``, so a new per-atom field is a row here plus its channel -- not five edits
+#: that must agree. The two bases with irregular layouts keep their own code below: ``surf`` is
+#: written at a FIXED width (``np.stack``, no offsets) and ``heavy``/``withH`` share one
+#: ``charges`` array whose basis depends on ``with_H``.
+_BASIS_TABLE = (
+    ("pharm", "pharm", "pharm_off", (("pharm_types", "pharm_types"), ("pharm_ancs", "pharm_ancs"),
+                                     ("pharm_vecs", "pharm_vecs"))),
+    ("lipo", "lipophilicity", "lipo_off", (("lipo_pos", "lipo_pos"),
+                                           ("lipophilicity", "lipophilicity"))),
+    ("fukui", "fukui", "fukui_off", (("fukui_pos", "fukui_pos"), ("fukui", "fukui"))),
+    ("mr", "mr", "mr_off", (("mr_pos", "mr_pos"), ("molar_refractivity", "mr"))),
+    ("atomtype", "atomtype", "atomtype_off", (("atomtype_pos", "atomtype_pos"),
+                                              ("atomic_numbers", "atomic_numbers"))),
+)
+
+#: The channel that reads each ``_BASIS_TABLE`` profile attribute off a ``Molecule``. Reusing
+#: the channel readers is what keeps the store and the aligners on ONE definition of "the
+#: molar-refractivity centres" -- the accessor, never ``atom_pos`` (the retained-H trap).
+_PROF_READER = {c.prof: c.read for c in _CHANNELS.values() if c.key}
 
 
 def _profile_from_schema(m, sch: dict, *, id, pre_center: bool, canonical: bool = False) -> "MoleculeProfile":
-    """Pull the schema's arrays off a ``Molecule``/``MoleculeProfile`` ``m``,
-    optionally centering to the heavy-atom COM. Returns a ``MoleculeProfile``."""
+    """Pull the schema's arrays off a ``Molecule``/``MoleculeProfile`` ``m``, optionally centring
+    to the heavy-atom COM and rotating into its principal frame. Returns a ``MoleculeProfile``."""
     atom_pos = _f32(m.atom_pos)
-    surf = surf_esp = charges = nonH = radii = cwh = None
-    atom_pos_noH = None
-    ph_t = ph_a = ph_v = None
-    lipo_pos = lipo_val = None
-    fukui_pos = fukui_val = None
-
+    kw = {"atom_pos": atom_pos}
     if sch["surf"]:
         if m.surf_pos is None:
             raise ValueError("store needs surfaces but molecule has none "
                              "(build Molecule with num_surf_points / surface_points)")
-        surf = _f32(m.surf_pos)
+        kw["surf_pos"] = _f32(m.surf_pos)
     if sch["surf_esp"]:
         if m.surf_esp is None:
             raise ValueError("store needs surface ESP but molecule has none")
-        surf_esp = _f32(m.surf_esp)
+        kw["surf_esp"] = _f32(m.surf_esp)
     if sch["charges"]:
         if m.partial_charges is None:
             raise ValueError("store needs partial charges but molecule has none")
         if sch["with_H"]:
-            charges = _f32(m.partial_charges)
-            nonH = np.asarray(m._nonH_atoms_idx, dtype=np.int64)
+            kw["partial_charges"] = _f32(m.partial_charges)
+            kw["nonH_atoms_idx"] = np.asarray(m._nonH_atoms_idx, dtype=np.int64)
         else:
-            # heavy charges. Index by _nonH_atoms_idx universally: it is the real
-            # heavy index for a Molecule (full charges) and the identity for a
-            # heavy MoleculeProfile, so both -- and a with-H profile -- reduce correctly.
-            charges = _f32(np.asarray(m.partial_charges)[m._nonH_atoms_idx])
-        # Heavy Gaussian centers for vol_esp, 1:1 with the heavy charges. Kept only when it
-        # actually differs from atom_pos (i.e. RemoveHs retained an H); else atom_pos serves
-        # and nothing extra is stored.
+            # heavy charges. Index by _nonH_atoms_idx universally: it is the real heavy index
+            # for a Molecule (full charges) and the identity for a heavy MoleculeProfile.
+            kw["partial_charges"] = _f32(np.asarray(m.partial_charges)[m._nonH_atoms_idx])
+        # Heavy Gaussian centres for vol_esp, 1:1 with the heavy charges. Kept only when they
+        # actually differ from atom_pos (i.e. RemoveHs retained an H).
         hp = np.asarray(_heavy_positions(m), dtype=np.float32)
         if hp.shape != atom_pos.shape or not np.array_equal(hp, atom_pos):
-            atom_pos_noH = hp
+            kw["atom_pos_noH"] = hp
     if sch["radii"]:
         if m.radii is None:
             raise ValueError("store needs vdW radii but molecule has none")
-        radii = _f32(m.radii)
+        kw["radii"] = _f32(m.radii)
     if sch["centers_w_H"]:
-        cwh = _f32(m.mol.GetConformer().GetPositions())
-    if sch["pharm"]:
-        if m.pharm_types is None:
-            raise ValueError("store needs pharmacophores but molecule has none "
-                             "(build Molecule with pharm_multi_vector set)")
-        ph_t = np.asarray(m.pharm_types, dtype=np.int32)
-        ph_a = _f32(m.pharm_ancs)
-        ph_v = _f32(m.pharm_vecs)
-    if sch.get("lipophilicity"):
-        if not hasattr(m, "get_lipo_positions") or not hasattr(m, "get_lipophilicity"):
-            raise ValueError("store needs lipophilicity but molecule cannot provide it")
-        # TRUE-heavy centres (from the with-H conformer) 1:1 with the heavy logP -- NOT atom_pos,
-        # which is the RemoveHs set and longer when an H was retained. Its own count (heavy atoms),
-        # stored under its own offset table, so a length divergence from atom_pos never desyncs.
-        lipo_pos = _f32(m.get_lipo_positions())
-        lipo_val = _f32(m.get_lipophilicity(no_H=True))
-    if sch.get("fukui"):
-        if not hasattr(m, "get_fukui_positions") or not hasattr(m, "get_fukui"):
-            raise ValueError("store needs the Fukui field but molecule cannot provide it")
-        # TRUE-heavy centres 1:1 with the heavy Fukui dual descriptor -- own count, own offset
-        # table, exactly like the lipo channel above.
-        fukui_pos = _f32(m.get_fukui_positions())
-        fukui_val = _f32(m.get_fukui(no_H=True))
+        kw["centers_w_H"] = _f32(m.mol.GetConformer().GetPositions())
+    for _basis, flag, _off, attrs in _BASIS_TABLE:
+        if not sch.get(flag, False):
+            continue
+        for attr, _key in attrs:
+            try:
+                v = _PROF_READER[attr](m)
+            except ValueError as e:
+                raise ValueError(f"store needs {flag} but molecule cannot provide it: {e}") from e
+            kw[attr] = (np.asarray(v, dtype=np.int32) if attr == "pharm_types" else _f32(v))
+
+    #: profile attributes that hold POSITIONS (translate + rotate) and DIRECTIONS (rotate only).
+    pos_attrs = ["atom_pos", "surf_pos", "centers_w_H", "atom_pos_noH"]
+    dir_attrs = []
+    for _basis, flag, _off, attrs in _BASIS_TABLE:
+        for attr, _key in attrs:
+            ch = next((c for c in _CHANNELS.values() if c.prof == attr and c.key), None)
+            if ch is None:
+                continue
+            if ch.kind == "points":
+                pos_attrs.append(attr)
+            elif ch.kind == "vectors":
+                dir_attrs.append(attr)
 
     if pre_center:
         mu = atom_pos.mean(0)
-        atom_pos = atom_pos - mu
-        if surf is not None:
-            surf = surf - mu
-        if ph_a is not None:
-            ph_a = ph_a - mu
-        if lipo_pos is not None and len(lipo_pos):
-            lipo_pos = lipo_pos - mu           # shift by the atom_pos COM (matches the in-memory
-                                               # conformer transform, not its own COM)
-        if fukui_pos is not None and len(fukui_pos):
-            fukui_pos = fukui_pos - mu         # shift by the atom_pos COM, like lipo_pos
-        if cwh is not None:
-            cwh = cwh - mu
-        if atom_pos_noH is not None:
-            atom_pos_noH = atom_pos_noH - mu   # shift by the atom_pos COM (matches the
-                                               # in-memory conformer transform, not its own COM)
+        for a in pos_attrs:
+            v = kw.get(a)
+            if v is not None and len(v):
+                # shifted by the atom_pos COM, NEVER by their own -- this matches the in-memory
+                # conformer transform, which moves every channel of a molecule together.
+                kw[a] = v - mu
 
     rot = None
     if canonical:
-        # CANONICAL FRAME: rotate every coordinate channel into the molecule's own principal axes.
-        # The screen's seeds exist to align the fit molecule's principal axes onto the query's; if
-        # the fit is ALREADY in its principal frame, that alignment is the same constant for every
-        # molecule, so the per-molecule eigensolve disappears. Measured: seed generation is 44.1%
-        # of a vol screen (0.839 us/mol), and removing it takes fss from 525,173 to 938,984
-        # aligns/s -- past ROSHAMBO2's same-node 747,896.
+        # CANONICAL FRAME: rotate every coordinate channel into the molecule's own principal
+        # axes. The screen's seeds exist to align the fit molecule's principal axes onto the
+        # query's; if the fit is ALREADY in its principal frame, that alignment is one constant
+        # for every molecule, so the per-molecule eigensolve disappears (44.1% of a vol screen).
         #
-        # Requires pre_center (axes are about the centroid). ``rot`` is kept so a returned pose can
-        # be mapped back to the molecule's original frame; without it scores would be right while
-        # transforms silently referred to the canonical frame.
+        # Requires pre_center (axes are about the centroid). ``rot`` is kept so a returned pose
+        # can be mapped back; without it scores would be right while transforms silently
+        # referred to the canonical frame -- which no score-based test can see. EVERY position
+        # channel rotates and every direction channel rotates without translating; missing one
+        # leaves a single row of that array in the raw frame while its neighbours are canonical
+        # (measured on atom_pos_noH: the retained-H molecule's pose re-scored 0.619 low).
         if not pre_center:
             raise ValueError("canonical stores require pre_center=True (axes are centroid-relative)")
-        _c = atom_pos - atom_pos.mean(0)
+        _c = kw["atom_pos"] - kw["atom_pos"].mean(0)
         _cov = _c.T @ _c
         _w, _v = np.linalg.eigh(_cov.astype(np.float64))
         _v = _v[:, ::-1]                                  # descending eigenvalue order
         if np.linalg.det(_v) < 0:                         # keep it a proper rotation
             _v[:, 2] = -_v[:, 2]
         rot = np.ascontiguousarray(_v.T, dtype=np.float32)   # maps original -> canonical
-        atom_pos = (atom_pos @ rot.T).astype(np.float32)
-        if surf is not None:
-            surf = (surf @ rot.T).astype(np.float32)
-        if ph_a is not None:
-            ph_a = (ph_a @ rot.T).astype(np.float32)
-        if ph_v is not None:
-            ph_v = (ph_v @ rot.T).astype(np.float32)      # directions rotate, no translation
-        if lipo_pos is not None and len(lipo_pos):
-            lipo_pos = (lipo_pos @ rot.T).astype(np.float32)
-        if fukui_pos is not None and len(fukui_pos):
-            fukui_pos = (fukui_pos @ rot.T).astype(np.float32)
-        if cwh is not None:
-            cwh = (cwh @ rot.T).astype(np.float32)
-        if atom_pos_noH is not None:
-            # The strict-heavy centres are a coordinate channel like any other and MUST rotate
-            # with the rest. They are only materialised when Chem.RemoveHs kept an H, and
-            # ``_concat`` fills every other molecule's xyz_noH row from its (already rotated)
-            # atom_pos -- so leaving this one unrotated puts a single row of that array in the
-            # raw centred frame while its neighbours are canonical. vol_esp then solves that
-            # row's pose in the unrotated frame and ``_compose_rot`` composes a rotation its
-            # coordinates never received, which no score-based test can see: the score still
-            # matches the pairwise path exactly (both are unrotated) while the returned pose is
-            # wrong. Measured before this line existed: the retained-H molecule's transform
-            # re-scored 0.619 below its reported score, every other molecule at 1e-7.
-            atom_pos_noH = (atom_pos_noH @ rot.T).astype(np.float32)
+        for a in pos_attrs + dir_attrs:
+            v = kw.get(a)
+            if v is not None and len(v):
+                kw[a] = (v @ rot.T).astype(np.float32)
 
-
-    return MoleculeProfile(
-        atom_pos=atom_pos, surf_pos=surf, surf_esp=surf_esp, partial_charges=charges,
-        radii=radii, nonH_atoms_idx=nonH, pharm_types=ph_t, pharm_ancs=ph_a,
-        pharm_vecs=ph_v,
-        lipo_pos=lipo_pos, lipophilicity=lipo_val,
-        fukui_pos=fukui_pos, fukui=fukui_val,
-        centers_w_H=cwh, atom_pos_noH=atom_pos_noH, id=id, rot=rot,
-    )
+    return MoleculeProfile(id=id, rot=rot, **kw)
 
 
 def _id_to_py(x):
@@ -643,6 +656,14 @@ class ProfileStore:
         self._write_manifest()
 
     def _concat(self, recs: List["MoleculeProfile"]) -> dict:
+        """Pack one shard: every basis the schema carries, as a flat array plus its own CSR
+        offset table (or a dense ``np.stack`` block for the fixed-width surface).
+
+        GIVE EACH PER-ATOM FIELD ITS OWN TABLE. ``atom_pos`` is the ``Chem.RemoveHs`` set and is
+        LONGER than the true-heavy set whenever RemoveHs retained an isotope-labelled H, so one
+        shared table would desync a field from its positions on exactly the molecules that are
+        hardest to notice.
+        """
         sch = self.manifest["schema"]
         dt = np.float16 if self.manifest["dtype"] == "float16" else np.float32
 
@@ -650,8 +671,7 @@ class ProfileStore:
             return np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
 
         out = {"ids": np.array([r.id for r in recs])}
-        atom_lens = [len(r.atom_pos) for r in recs]
-        out["atom_off"] = offsets(atom_lens)
+        out["atom_off"] = offsets([len(r.atom_pos) for r in recs])
         out["atom_pos"] = np.concatenate([r.atom_pos for r in recs]).astype(dt)
         if recs[0].rot is not None:
             # float32 REGARDLESS of the store dtype: a float16 rotation carries ~3.9e-04 of axis
@@ -664,8 +684,7 @@ class ProfileStore:
             out["surf_esp"] = np.stack([r.surf_esp for r in recs]).astype(dt)
         if sch["charges"]:
             if sch["with_H"]:
-                all_lens = [len(r.partial_charges) for r in recs]
-                out["all_off"] = offsets(all_lens)
+                out["all_off"] = offsets([len(r.partial_charges) for r in recs])
                 out["charges"] = np.concatenate([r.partial_charges for r in recs]).astype(dt)
                 out["nonH"] = np.concatenate([r._nonH_atoms_idx for r in recs]).astype(np.int64)
                 if sch["radii"]:
@@ -677,40 +696,23 @@ class ProfileStore:
             else:
                 out["charges"] = np.concatenate([r.partial_charges for r in recs]).astype(dt)
                 heavy_lens = [len(r.partial_charges) for r in recs]
-            # vol_esp needs heavy centers 1:1 with the heavy charges. When a molecule's
-            # RemoveHs kept an H, atom_pos/atom_off no longer match the heavy set, so the heavy
-            # charges (and with-H nonH index) can't be split by atom_off -- persist explicit
-            # heavy offsets + the strict-heavy centers. Emitted only when some atom_pos_noH
-            # exists, so non-retained-H stores are byte-for-byte unchanged (and legacy stores,
-            # which lack these keys, fall back to atom_off in the reader).
+            # vol_esp needs heavy centres 1:1 with the heavy charges. Emitted only when some
+            # molecule's RemoveHs retained an H, so ordinary stores stay byte-for-byte unchanged
+            # (and legacy stores, which lack these keys, fall back to atom_off in the reader).
             if any(r.atom_pos_noH is not None for r in recs):
                 out["heavy_off"] = offsets(heavy_lens)
                 out["xyz_noH"] = np.concatenate(
                     [(r.atom_pos_noH if r.atom_pos_noH is not None else r.atom_pos)
                      for r in recs]).astype(dt)
-        if sch["pharm"]:
-            ph_lens = [len(r.pharm_types) for r in recs]
-            out["pharm_off"] = offsets(ph_lens)
-            out["pharm_types"] = np.concatenate([r.pharm_types for r in recs]).astype(np.int32)
-            out["pharm_ancs"] = np.concatenate([r.pharm_ancs for r in recs]).astype(dt)
-            out["pharm_vecs"] = np.concatenate([r.pharm_vecs for r in recs]).astype(dt)
-        if sch.get("lipophilicity"):
-            # vol_lipo carries the TRUE-heavy centres + per-atom logP as their OWN variable-length
-            # set (one offset table, positions + scalar share the heavy-atom count). Independent of
-            # atom_off (the RemoveHs count), so a retained-H molecule -- whose atom_pos is longer
-            # than its heavy lipo set -- stores both channels self-consistently.
-            lipo_lens = [len(r.lipo_pos) for r in recs]
-            out["lipo_off"] = offsets(lipo_lens)
-            out["lipo_pos"] = np.concatenate([r.lipo_pos for r in recs]).astype(dt)
-            out["lipophilicity"] = np.concatenate([r.lipophilicity for r in recs]).astype(dt)
-        if sch.get("fukui"):
-            # vol_fukui: TRUE-heavy centres + per-atom Fukui dual descriptor as their OWN
-            # variable-length set (one offset table shared by positions + scalar), exactly like the
-            # lipo channel -- independent of atom_off so a retained-H molecule stays self-consistent.
-            fukui_lens = [len(r.fukui_pos) for r in recs]
-            out["fukui_off"] = offsets(fukui_lens)
-            out["fukui_pos"] = np.concatenate([r.fukui_pos for r in recs]).astype(dt)
-            out["fukui"] = np.concatenate([r.fukui for r in recs]).astype(dt)
+        for _basis, flag, off_key, attrs in _BASIS_TABLE:
+            if not sch.get(flag, False):
+                continue
+            first = attrs[0][0]
+            out[off_key] = offsets([len(getattr(r, first)) for r in recs])
+            for attr, key in attrs:
+                vals = [getattr(r, attr) for r in recs]
+                kdt = np.int32 if attr == "pharm_types" else dt
+                out[key] = np.concatenate(vals).astype(kdt)
         return out
 
     # ---- reader ---------------------------------------------------------- #
@@ -805,6 +807,10 @@ class ProfileStore:
         return self._reconstruct(arrs, sh)
 
     def _reconstruct(self, data, sh) -> List["MoleculeProfile"]:
+        """Split one shard's arrays back into ``MoleculeProfile``s (the object path). Offset
+        tables are hoisted out of the per-molecule loop; ``rot`` is deliberately NOT restored --
+        a profile read back from a canonical store is in the canonical frame with no record of
+        it, which is why the array path composes poses from the shard's ``rot`` instead."""
         sch = self.manifest["schema"]
         n = sh["n"]
         files = set(data.files) if hasattr(data, "files") else set(data.keys())
@@ -814,9 +820,8 @@ class ProfileStore:
         surf_pos = data["surf_pos"] if sch["surf"] else None
         surf_esp = data["surf_esp"] if sch["surf_esp"] else None
         all_off = data["all_off"] if (sch["charges"] and sch["with_H"]) else None
-        pharm_off = data["pharm_off"] if sch["pharm"] else None
-        lipo_off = data["lipo_off"] if sch.get("lipophilicity") else None
-        fukui_off = data["fukui_off"] if sch.get("fukui") else None
+        offs = {flag: data[off_key] for _b, flag, off_key, _a in _BASIS_TABLE
+                if sch.get(flag, False)}
 
         out = []
         for i in range(n):
@@ -837,19 +842,13 @@ class ProfileStore:
                         kw["centers_w_H"] = data["cwh"][c0:c1]
                 else:
                     kw["partial_charges"] = data["charges"][a0:a1]
-            if sch["pharm"]:
-                p0, p1 = int(pharm_off[i]), int(pharm_off[i + 1])
-                kw["pharm_types"] = data["pharm_types"][p0:p1]
-                kw["pharm_ancs"] = data["pharm_ancs"][p0:p1]
-                kw["pharm_vecs"] = data["pharm_vecs"][p0:p1]
-            if sch.get("lipophilicity"):
-                l0, l1 = int(lipo_off[i]), int(lipo_off[i + 1])
-                kw["lipo_pos"] = data["lipo_pos"][l0:l1]
-                kw["lipophilicity"] = data["lipophilicity"][l0:l1]
-            if sch.get("fukui"):
-                f0, f1 = int(fukui_off[i]), int(fukui_off[i + 1])
-                kw["fukui_pos"] = data["fukui_pos"][f0:f1]
-                kw["fukui"] = data["fukui"][f0:f1]
+            for _b, flag, _off_key, attrs in _BASIS_TABLE:
+                if not sch.get(flag, False):
+                    continue
+                off = offs[flag]
+                p0, p1 = int(off[i]), int(off[i + 1])
+                for attr, key in attrs:
+                    kw[attr] = data[key][p0:p1]
             out.append(MoleculeProfile(**kw))
         return out
 
@@ -894,383 +893,185 @@ def _centered_copy(query):
 # is swapped across a panel while the fit views stay resident -> one shard build
 # serves every query.
 # --------------------------------------------------------------------------- #
-_FAST_MODES = ("vol", "surf", "surf_esp", "pharm", "vol_color", "vol_esp", "vol_and_surf_esp",
-               "vol_tversky", "vol_lipo", "vol_esp_tversky", "vol_fukui")
-
-
-class _ArrView:
-    """Minimal numpy-array holder so the eager ``p.ref_molec.<attr>`` reads in the
-    vol_color (and esp-family) aligners succeed without a full ``Molecule``. The
-    ``_*_t`` tensors are pre-set, so these arrays are only read, never re-converted."""
-    __slots__ = ("atom_pos", "pharm_types", "pharm_ancs",
-                 "partial_charges", "surf_pos", "surf_esp", "radii", "mol")
-
-    def __init__(self, atom_pos=None, pharm_types=None, pharm_ancs=None,
-                 partial_charges=None, surf_pos=None, surf_esp=None,
-                 radii=None, mol=None):
-        self.atom_pos = atom_pos
-        self.pharm_types = pharm_types
-        self.pharm_ancs = pharm_ancs
-        self.partial_charges = partial_charges   # vol_esp/esp_combo None-guard
-        self.surf_pos = surf_pos                 # esp_combo None-guard
-        self.surf_esp = surf_esp                 # esp_combo None-guard
-        self.radii = radii                       # esp_combo _ensure source (eagerly read)
-        self.mol = mol                           # esp_combo: _MolShim for centers_w_H
+#: Modes the fast (object-stand-in or array) screen engines serve. Every registry mode does;
+#: what actually decides whether a mode can screen is ``_store_supports`` -- i.e. whether the
+#: store carries its channels -- and ``fast`` additionally needs a pre-centred store,
+#: ``trans_init=False`` and a non-jax backend.
+_FAST_MODES = tuple(_SPECS)
 
 
 class _FastPair:
-    """Cached-tensor-only stand-in a batched aligner can consume. ``ref_molec`` /
-    ``fit_molec`` are set only for modes whose aligner reads them eagerly (vol_color)."""
-    __slots__ = ("device", "ref_molec", "fit_molec",
-                 "_ref_xyz_t", "_fit_xyz_t",
-                 "_ref_surf_t", "_fit_surf_t",
-                 "_ref_surf_esp_t", "_fit_surf_esp_t",
-                 "_ref_pharm_types_t", "_fit_pharm_types_t",
-                 "_ref_pharm_ancs_t", "_fit_pharm_ancs_t",
-                 "_ref_pharm_vecs_t", "_fit_pharm_vecs_t",
-                 "_ref_xyz_esp_t", "_fit_xyz_esp_t",                 # vol_esp heavy charges
-                 "_ref_xyz_noH_t", "_fit_xyz_noH_t",                 # vol_esp heavy-atom centers (array-sourced; no .mol here)
-                 "_ref_centers_w_H_t", "_fit_centers_w_H_t",         # esp_combo with-H centers
-                 "_ref_partial_t", "_fit_partial_t",                 # esp_combo with-H charges
-                 "_ref_radii_t", "_fit_radii_t",                     # esp_combo with-H radii
-                 "_ref_lipo_pos_t", "_fit_lipo_pos_t",               # vol_lipo heavy logP centres
-                 "_ref_lipo_t", "_fit_lipo_t",                       # vol_lipo per-atom logP
-                 "_ref_fukui_pos_t", "_fit_fukui_pos_t",             # vol_fukui heavy Fukui centres
-                 "_ref_fukui_t", "_fit_fukui_t",                     # vol_fukui per-atom Fukui field
-                 "transform_vol_noH", "sim_aligned_vol_noH",
-                 "transform_surf", "sim_aligned_surf",
-                 "transform_surf_esp", "sim_aligned_surf_esp",
-                 "transform_pharm", "sim_aligned_pharm",
-                 "transform_vol_color", "sim_aligned_vol_color",
-                 "transform_vol_esp_noH", "sim_aligned_vol_esp_noH",
-                 "transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp",
-                 "transform_vol_tversky", "sim_aligned_vol_tversky",
-                 "transform_vol_lipo", "sim_aligned_vol_lipo",
-                 "transform_vol_esp_tversky", "sim_aligned_vol_esp_tversky",
-                 "transform_vol_fukui", "sim_aligned_vol_fukui")
+    """Cached-tensor-only stand-in a batched aligner can consume.
+
+    ``__slots__`` is DERIVED: one ``_ref_<attr>_t`` / ``_fit_<attr>_t`` per channel plus every
+    mode's result pair. It used to be hand-mirrored from ``MODE_ATTRS``, which is how a new
+    mode could reach this path and fail with an opaque AttributeError.
+    """
+
+    __slots__ = (("device", "ref_molec", "fit_molec")
+                 + tuple(dict.fromkeys(
+                     [a for c in _CHANNELS.values() for a in (c.ref_attr, c.fit_attr)]))
+                 + tuple(a for pair in _MODE_ATTRS.values() for a in pair))
 
     def __init__(self, device):
         self.device = device
 
 
 def _query_ref_arrays(q, mode: str) -> dict:
-    """The (centered) query's numpy arrays needed as the reference for ``mode``.
-    Plain numpy so it is cheap to ship to multi-GPU workers."""
-    if mode == "vol":
-        return {"xyz": np.asarray(q.atom_pos, np.float32)}
-    if mode == "surf":
-        return {"surf": np.asarray(q.surf_pos, np.float32)}
-    if mode == "surf_esp":
-        return {"surf": np.asarray(q.surf_pos, np.float32),
-                "surf_esp": np.asarray(q.surf_esp, np.float32)}
-    if mode == "pharm":
-        return {"ptypes": np.asarray(q.pharm_types), "pancs": np.asarray(q.pharm_ancs, np.float32),
-                "pvecs": np.asarray(q.pharm_vecs, np.float32)}
-    if mode == "vol_color":
-        return {"xyz": np.asarray(q.atom_pos, np.float32),
-                "ptypes": np.asarray(q.pharm_types), "pancs": np.asarray(q.pharm_ancs, np.float32)}
-    if mode in ("vol_esp", "vol_esp_tversky"):
-        # Strict-heavy centers (from the with-H conformer) 1:1 with the heavy charges -- NOT
-        # atom_pos, which is the RemoveHs set and longer when an H was retained. vol_esp_tversky
-        # reads the SAME data as vol_esp (only the host-side reduction differs).
-        return {"xyz": np.asarray(_heavy_positions(q), np.float32),
-                "charges": np.asarray(np.asarray(q.partial_charges)[q._nonH_atoms_idx], np.float32)}
-    if mode == "vol_and_surf_esp":
-        return {"surf": np.asarray(q.surf_pos, np.float32),
-                "surf_esp": np.asarray(q.surf_esp, np.float32),
-                "cwh": np.asarray(q.mol.GetConformer().GetPositions(), np.float32),  # with-H centers
-                "partial": np.asarray(q.partial_charges, np.float32),                # with-H charges
-                "radii": np.asarray(q.radii, np.float32),                            # with-H radii
-                "xyz": np.asarray(q.atom_pos, np.float32)}                           # heavy (alpha=0.81 shape)
-    if mode == "vol_tversky":
-        return {"xyz": np.asarray(q.atom_pos, np.float32)}                           # heavy atoms (shape reuse)
-    if mode == "vol_lipo":
-        # Shape centres = atom_pos (RemoveHs); lipo centres = the TRUE-heavy positions (own count)
-        # via the accessor (Molecule reads its conformer; a MoleculeProfile returns its lipo_pos),
-        # 1:1 with the per-atom logP.
-        return {"xyz": np.asarray(q.atom_pos, np.float32),
-                "lipo_pos": np.asarray(q.get_lipo_positions(), np.float32).reshape(-1, 3),
-                "lipo": np.asarray(q.get_lipophilicity(no_H=True), np.float32).reshape(-1)}
-    if mode == "vol_fukui":
-        # Shape centres = atom_pos (RemoveHs); Fukui centres = the TRUE-heavy positions (own count)
-        # via the accessor (Molecule reads its conformer; a MoleculeProfile returns its fukui_pos),
-        # 1:1 with the per-atom Fukui dual descriptor (f+ - f-). Mirrors vol_lipo.
-        return {"xyz": np.asarray(q.atom_pos, np.float32),
-                "fukui_pos": np.asarray(q.get_fukui_positions(), np.float32).reshape(-1, 3),
-                "fukui": np.asarray(q.get_fukui(no_H=True), np.float32).reshape(-1)}
-    raise ValueError(mode)
+    """The (centred) query's numpy arrays for ``mode``, keyed by channel. Plain numpy, so it is
+    cheap to ship to the multi-GPU workers. The readers are the channel table's, so a query
+    ``Molecule`` and a ``MoleculeProfile`` are read identically and a missing field raises a
+    clear ValueError naming it."""
+    spec = _spec_of(mode)
+    out = {}
+    for name in spec.all_channels():
+        ch = _CHANNELS[name]
+        if ch.is_pair:
+            continue                                  # supplied by the caller (avoid_points)
+        out[name] = np.ascontiguousarray(
+            np.asarray(ch.read(q), dtype=np.int64 if ch.dtype == "int64" else np.float32))
+    return out
 
 
 def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
+    """The query's device tensors, keyed by the pair attribute the aligners read
+    (``_ref_<attr>_t``). Uploaded through the same pinned staging as the fit side."""
     import torch
-    def f(a):
-        # Same pinned-staging upload the array builders use, so the modes with no array
-        # builder (surf, surf_esp, vol_lipo, the Tversky family, ...) get it too.
-        return _to_device(a, device, dtype=torch.float32)
-    if mode == "vol":
-        return {"_ref_xyz_t": f(ra["xyz"])}
-    if mode == "surf":
-        return {"_ref_surf_t": f(ra["surf"])}
-    if mode == "surf_esp":
-        return {"_ref_surf_t": f(ra["surf"]), "_ref_surf_esp_t": f(ra["surf_esp"])}
-    if mode == "pharm":
-        return {"_ref_pharm_types_t": torch.as_tensor(ra["ptypes"], dtype=torch.int64, device=device),
-                "_ref_pharm_ancs_t": f(ra["pancs"]), "_ref_pharm_vecs_t": f(ra["pvecs"])}
-    if mode == "vol_color":
-        return {"_ref_xyz_t": f(ra["xyz"]),
-                "_ref_pharm_types_t": torch.as_tensor(ra["ptypes"], dtype=torch.int64, device=device),
-                "_ref_pharm_ancs_t": f(ra["pancs"]),
-                "ref_molec": _ArrView(ra["xyz"], ra["ptypes"], ra["pancs"])}
-    if mode in ("vol_esp", "vol_esp_tversky"):
-        # ra["xyz"] is the strict-heavy centers (1:1 with the heavy charges; see
-        # _query_ref_arrays). Pre-set _ref_xyz_noH_t so the aligner reads it instead of
-        # dereferencing .mol (absent on this array-only path). vol_esp_tversky reuses this verbatim.
-        xyz = f(ra["xyz"])
-        return {"_ref_xyz_t": xyz, "_ref_xyz_noH_t": xyz, "_ref_xyz_esp_t": f(ra["charges"]),
-                "ref_molec": _ArrView(atom_pos=ra["xyz"], partial_charges=ra["charges"])}
-    if mode == "vol_and_surf_esp":
-        return {"_ref_surf_t": f(ra["surf"]), "_ref_surf_esp_t": f(ra["surf_esp"]),
-                "_ref_centers_w_H_t": f(ra["cwh"]), "_ref_partial_t": f(ra["partial"]),
-                "_ref_radii_t": f(ra["radii"]), "_ref_xyz_t": f(ra["xyz"]),
-                "ref_molec": _ArrView(surf_pos=ra["surf"], surf_esp=ra["surf_esp"],
-                                      partial_charges=ra["partial"], radii=ra["radii"],
-                                      mol=_MolShim(ra["cwh"]))}
-    if mode == "vol_tversky":
-        return {"_ref_xyz_t": f(ra["xyz"])}                     # shape-only, like vol
-    if mode == "vol_lipo":
-        # Pre-set all three ref tensors so _align_batch_vol_lipo's _batch_upload skips its
-        # p.ref_molec.get_lipo_positions()/get_lipophilicity() lambdas (no _ArrView needed).
-        return {"_ref_xyz_t": f(ra["xyz"]),
-                "_ref_lipo_pos_t": f(ra["lipo_pos"]), "_ref_lipo_t": f(ra["lipo"])}
-    if mode == "vol_fukui":
-        # Pre-set all three ref tensors so _align_batch_vol_fukui's _batch_upload skips its
-        # p.ref_molec.get_fukui_positions()/get_fukui() lambdas (no _ArrView needed). Mirrors vol_lipo.
-        return {"_ref_xyz_t": f(ra["xyz"]),
-                "_ref_fukui_pos_t": f(ra["fukui_pos"]), "_ref_fukui_t": f(ra["fukui"])}
-    raise ValueError(mode)
+    out = {}
+    for name, arr in ra.items():
+        ch = _CHANNELS[name]
+        dt = torch.int64 if ch.dtype == "int64" else torch.float32
+        out[ch.ref_attr] = _to_device(arr, device, dtype=dt)
+    return out
 
 
-def _build_fit_fast_pairs(arrs: dict, mode: str, device):
-    """Load one shard's FIT arrays as device tensors once; return (ids, [_FastPair])
-    whose fit tensors are views into them. The per-molecule views come from a single
-    ``torch.split``/``unbind`` (and ``np.split`` for the numpy holders) rather than a
-    K-iteration Python slicing loop: the views are identical, but the slicing collapses
-    into one C call."""
+def _ref_channel_tensors(ref_tensors: dict, mode: str) -> dict:
+    """Re-key ``_ref_<attr>_t`` tensors by CHANNEL, which is what the array aligner takes."""
+    spec = _spec_of(mode)
+    out = {}
+    for name in spec.all_channels():
+        ch = _CHANNELS[name]
+        if ch.is_pair or ch.ref_attr not in ref_tensors:
+            continue
+        out[name] = ref_tensors[ch.ref_attr]
+    return out
+
+
+def _build_fit_fast_pairs(arrs: dict, mode: str, device, avoid=None):
+    """Load one shard's FIT arrays as device tensors once; return ``(ids, [_FastPair])`` whose
+    fit tensors are views into them. The per-molecule views come from ONE ``torch.split`` (or
+    ``unbind`` for a dense block) per channel rather than a K-iteration slicing loop.
+
+    This is the OBJECT-fast path -- the reference leg the array-vs-object parity gate compares
+    against (it forces it by flipping ``_arrays.ENABLED``), which is why it must stay wired for
+    every mode the array path serves."""
     import torch
+    from shepherd_score.accel.channels import load_store_channel
     ids = arrs["ids"]
     K = len(ids)
     pairs = [_FastPair(device) for _ in range(K)]
-    def f(a):
-        # Same pinned-staging upload the array builders use, so the modes with no array
-        # builder (surf, surf_esp, vol_lipo, the Tversky family, ...) get it too.
-        return _to_device(a, device, dtype=torch.float32)
-    def splitT(big, off):                      # K variable device views
-        return torch.split(big, np.diff(off).tolist())
-    def splitN(arr, off):                      # K variable numpy views
-        return np.split(arr, off[1:-1])
-
-    if mode == "vol":
-        for p, c in zip(pairs, splitT(f(arrs["atom_pos"]), arrs["atom_off"])):
-            p._fit_xyz_t = c
-    elif mode == "surf":
-        for p, s in zip(pairs, torch.unbind(f(arrs["surf_pos"]))):       # (K, S, 3) -> K views
-            p._fit_surf_t = s
-    elif mode == "surf_esp":
-        for p, s, e in zip(pairs, torch.unbind(f(arrs["surf_pos"])), torch.unbind(f(arrs["surf_esp"]))):
-            p._fit_surf_t = s
-            p._fit_surf_esp_t = e
-    elif mode == "pharm":
-        off = arrs["pharm_off"]
-        bt = _to_device(arrs["pharm_types"], device, dtype=torch.int64)
-        for p, t, a, v in zip(pairs, torch.split(bt, np.diff(off).tolist()),
-                              splitT(f(arrs["pharm_ancs"]), off), splitT(f(arrs["pharm_vecs"]), off)):
-            p._fit_pharm_types_t = t
-            p._fit_pharm_ancs_t = a
-            p._fit_pharm_vecs_t = v
-    elif mode == "vol_color":
-        aoff, poff = arrs["atom_off"], arrs["pharm_off"]
-        bt = _to_device(arrs["pharm_types"], device, dtype=torch.int64)
-        np_atom, np_pt, np_pa = arrs["atom_pos"], arrs["pharm_types"], arrs["pharm_ancs"]
-        for p, at, pt, pa, an, ptn, pan in zip(
-                pairs, splitT(f(arrs["atom_pos"]), aoff),
-                torch.split(bt, np.diff(poff).tolist()), splitT(f(arrs["pharm_ancs"]), poff),
-                splitN(np_atom, aoff), splitN(np_pt, poff), splitN(np_pa, poff)):
-            p._fit_xyz_t = at
-            p._fit_pharm_types_t = pt
-            p._fit_pharm_ancs_t = pa
-            p.fit_molec = _ArrView(an, ptn, pan)        # numpy holder for the aligner's eager reads
-    elif mode in ("vol_esp", "vol_esp_tversky"):        # identical fit tensors (see _query_ref_arrays)
-        aoff = arrs["atom_off"]
-        # heavy_off + xyz_noH exist only when some molecule's RemoveHs retained an H; else
-        # atom_off/atom_pos already are the heavy set (no-op for the common case / legacy stores).
-        hoff = arrs["heavy_off"] if "heavy_off" in arrs else aoff
-        atom_t = splitT(f(arrs["atom_pos"]), aoff)
-        xnoH_t = splitT(f(arrs["xyz_noH"]) if "xyz_noH" in arrs else f(arrs["atom_pos"]), hoff)
-        if "all_off" in arrs:                       # with-H store: heavy = charges[all_off][nonH]
-            # vectorize the per-molecule gather whc[all_off[i]:all_off[i+1]][nonH[h0:h1]]:
-            # global heavy index = nonH + each heavy atom's molecule all_off start.
-            alloff, nonH = arrs["all_off"], arrs["nonH"]
-            heavy_all = arrs["charges"][nonH + np.repeat(alloff[:-1], np.diff(hoff))]
-        else:                                        # heavy charges stored directly
-            heavy_all = arrs["charges"]
-        for p, at, xn, ht, hn in zip(pairs, atom_t, xnoH_t,
-                                     splitT(f(heavy_all), hoff), splitN(heavy_all, hoff)):
-            p._fit_xyz_esp_t = ht
-            p.fit_molec = _ArrView(partial_charges=hn)
-            p._fit_xyz_noH_t = xn               # heavy centers, 1:1 with heavy charges
-            p._fit_xyz_t = at                   # RemoveHs atom_pos (trans-init centers only)
-    elif mode == "vol_and_surf_esp":
-        aoff, alloff = arrs["atom_off"], arrs["all_off"]
-        np_surf, np_se = arrs["surf_pos"], arrs["surf_esp"]
-        for i, (p, s, e, c, pa, r, at, partn, radn, cwhn) in enumerate(zip(
-                pairs, torch.unbind(f(arrs["surf_pos"])), torch.unbind(f(arrs["surf_esp"])),
-                splitT(f(arrs["cwh"]), alloff), splitT(f(arrs["charges"]), alloff),
-                splitT(f(arrs["radii"]), alloff), splitT(f(arrs["atom_pos"]), aoff),
-                splitN(arrs["charges"], alloff), splitN(arrs["radii"], alloff), splitN(arrs["cwh"], alloff))):
-            p._fit_surf_t = s
-            p._fit_surf_esp_t = e
-            p._fit_centers_w_H_t = c
-            p._fit_partial_t = pa
-            p._fit_radii_t = r
-            p._fit_xyz_t = at                   # heavy atoms (alpha=0.81 shape channel)
-            p.fit_molec = _ArrView(surf_pos=np_surf[i], surf_esp=np_se[i], partial_charges=partn,
-                                   radii=radn, mol=_MolShim(cwhn))
-    elif mode == "vol_tversky":
-        for p, c in zip(pairs, splitT(f(arrs["atom_pos"]), arrs["atom_off"])):
-            p._fit_xyz_t = c                    # shape-only, identical fit tensors to vol
-    elif mode == "vol_lipo":
-        aoff, loff = arrs["atom_off"], arrs["lipo_off"]
-        # RemoveHs shape centres (own atom_off) + the TRUE-heavy lipo centres and per-atom logP
-        # (own lipo_off), each split by its OWN offset table. The two tables diverge on a
-        # retained-H molecule, so both channels stay 1:1 with their own basis.
-        for p, at, lp, lv in zip(
-                pairs, splitT(f(arrs["atom_pos"]), aoff),
-                splitT(f(arrs["lipo_pos"]), loff), splitT(f(arrs["lipophilicity"]), loff)):
-            p._fit_xyz_t = at
-            p._fit_lipo_pos_t = lp
-            p._fit_lipo_t = lv
-    elif mode == "vol_fukui":
-        aoff, foff = arrs["atom_off"], arrs["fukui_off"]
-        # RemoveHs shape centres (own atom_off) + the TRUE-heavy Fukui centres and per-atom Fukui
-        # field (own fukui_off), each split by its OWN offset table (they diverge on a retained-H
-        # molecule, so both channels stay 1:1 with their own basis). Mirrors vol_lipo.
-        for p, at, fp, fv in zip(
-                pairs, splitT(f(arrs["atom_pos"]), aoff),
-                splitT(f(arrs["fukui_pos"]), foff), splitT(f(arrs["fukui"]), foff)):
-            p._fit_xyz_t = at
-            p._fit_fukui_pos_t = fp
-            p._fit_fukui_t = fv
-    else:
-        raise ValueError(mode)
+    spec = _spec_of(mode)
+    for name in spec.all_channels():
+        ch = _CHANNELS[name]
+        if ch.is_pair:
+            if avoid is not None:
+                t = _to_device(np.ascontiguousarray(np.asarray(avoid, np.float32)), device,
+                               dtype=torch.float32)
+                for p in pairs:
+                    setattr(p, ch.ref_attr, t)
+            continue
+        flat, off = load_store_channel(arrs, name)
+        dt = torch.int64 if ch.dtype == "int64" else torch.float32
+        big = _to_device(flat, device, dtype=dt)
+        views = (torch.unbind(big) if off is None
+                 else torch.split(big, np.diff(off).tolist()))
+        for p, v in zip(pairs, views):
+            setattr(p, ch.fit_attr, v)
     return ids, pairs
 
 
 def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
-    """Translate screen()'s align_kwargs to the ``_align_batch_<mode>`` kwargs, mirroring the
-    defaults the ``MoleculePairBatch.align_with_*`` triton path uses. The per-mode fine-step
-    count comes from the single-source ``_steps_for()`` table so the screen and pairwise paths
-    cannot drift apart."""
+    """Translate ``screen()``'s align_kwargs into the ``_align_batch_<mode>`` keywords.
+
+    The mode's own parameters and their defaults come from the registry; the fine-step count
+    from ``MODE_STEPS``; and ``lr`` from the spec's ``screen_lr`` -- which is 0.1 for the ESP /
+    pharmacophore / colour / field modes and the driver default 0.075 for the shape and Tversky
+    ones, preserved per mode because changing it would move those modes' scores.
+    """
     from shepherd_score.accel.batch.aligners import _steps_for, _seeds_for
-    steps = ak.get("max_num_steps", _steps_for(mode))
-    if mode in ("vol", "surf"):
-        return dict(alpha=ak.get("alpha", 0.81), steps_fine=steps)
-    if mode == "surf_esp":
-        return dict(alpha=ak.get("alpha", 0.81), lam=ak.get("lam", 0.3),
-                    num_repeats=ak.get("num_repeats", _seeds_for(mode)), trans_init=False,
-                    lr=ak.get("lr", 0.1), steps_fine=steps)
-    if mode == "pharm":
-        return dict(similarity=ak.get("similarity", "tanimoto"),
-                    extended_points=ak.get("extended_points", False),
-                    only_extended=ak.get("only_extended", False), trans_init=False,
-                    num_repeats=ak.get("num_repeats", _seeds_for(mode)), steps_fine=steps, lr=ak.get("lr", 0.1))
-    if mode == "vol_color":
-        return dict(alpha=ak.get("alpha", 0.81), color_weight=ak.get("color_weight", 0.5),
-                    trans_init=False, num_repeats=ak.get("num_repeats", _seeds_for(mode)),
-                    steps_fine=steps, lr=ak.get("lr", 0.1))
-    if mode == "vol_esp":   # mirrors align_with_vol_esp(backend="triton") dispatch
-        return dict(alpha=ak.get("alpha", 0.81), lam=ak["lam"],
-                    num_repeats=ak.get("num_repeats", _seeds_for(mode)), trans_init=False,
-                    lr=ak.get("lr", 0.1), steps_fine=steps)
-    if mode == "vol_and_surf_esp":  # mirrors align_with_vol_and_surf_esp(backend="triton") dispatch
-        return dict(alpha=ak["alpha"], lam=ak.get("lam", 0.001),
-                    probe_radius=ak.get("probe_radius", 1.0), esp_weight=ak.get("esp_weight", 0.5),
-                    num_repeats=ak.get("num_repeats", _seeds_for(mode)), trans_init=False,
-                    lr=ak.get("lr", 0.1), steps_fine=steps)
-    if mode == "vol_tversky":  # mirrors align_with_vol_tversky(backend="triton"); seeds are internal
-        return dict(alpha=ak.get("alpha", 0.81),
-                    tversky_alpha=ak.get("tversky_alpha", 0.95),
-                    tversky_beta=ak.get("tversky_beta", 0.05), steps_fine=steps)
-    if mode == "vol_esp_tversky":  # mirrors align_with_vol_esp_tversky(backend="triton"); seeds internal
-        return dict(alpha=ak.get("alpha", 0.81), lam=ak.get("lam", 0.1),
-                    tversky_alpha=ak.get("tversky_alpha", 0.95),
-                    tversky_beta=ak.get("tversky_beta", 0.05), steps_fine=steps)
-    if mode == "vol_lipo":     # mirrors align_with_vol_lipo(backend="triton") dispatch
-        return dict(lipo_weight=ak.get("lipo_weight", 0.5), alpha=ak.get("alpha", 0.81),
-                    lam=ak.get("lam", 0.1),
-                    num_repeats=ak.get("num_repeats", _seeds_for(mode)),
-                    lr=ak.get("lr", 0.1), steps_fine=steps)
-    if mode == "vol_fukui":    # mirrors align_with_vol_fukui(backend="triton") dispatch
-        return dict(fukui_weight=ak.get("fukui_weight", 0.5), alpha=ak.get("alpha", 0.81),
-                    lam=ak.get("lam", 0.1),
-                    num_repeats=ak.get("num_repeats", _seeds_for(mode)),
-                    lr=ak.get("lr", 0.1), steps_fine=steps)
-    raise ValueError(mode)
+    spec = _spec_of(mode)
+    kw = {"steps_fine": ak.get("max_num_steps", _steps_for(mode)), "trans_init": False}
+    for name, default in spec.params.items():
+        if name == "lr":
+            kw["lr"] = ak.get("lr", spec.screen_lr)
+        elif default is None:
+            if name not in ak:
+                raise ValueError(f"{mode} requires an explicit {name}=...; pass {name}=...")
+            kw[name] = ak[name]
+        else:
+            kw[name] = ak.get(name, default)
+    if spec.honors_num_repeats:
+        kw["num_repeats"] = ak.get("num_repeats", _seeds_for(mode))
+    return kw
 
 
-#: Modes with BOTH an array builder below and an array-native aligner in ``_arrays``. A mode
-#: joins this tuple only when both exist -- see ``_use_arrays``. This is now every mode
-#: ``_store_supports`` admits, i.e. every screen-capable mode: the object path survives only as
-#: the parity reference the gates compare against (and for a non-pre-centered / trans_init /
-#: jax-backend screen, which never reaches either array branch).
-_ARRAY_MODES = ("vol", "vol_color", "pharm", "vol_esp", "vol_and_surf_esp",
-                "vol_tversky", "vol_esp_tversky", "surf", "surf_esp",
-                "vol_lipo", "vol_fukui")
+def _with_avoid(batch_kw: dict, ak: dict, device) -> dict:
+    """Attach the query-side avoid cloud, for the one mode whose objective takes a third input.
+
+    ``vol_avoid`` scores shape Tanimoto MINUS an excluded-volume penalty against a cloud that is
+    a property of the QUERY (a pocket wall, a ligand to stay clear of), not of any library
+    molecule -- which is why the per-molecule store has nowhere to put it and why it arrives as
+    a ``screen(..., avoid_points=...)`` keyword instead. It is uploaded ONCE here and broadcast
+    over every bucket, exactly as the query's own channels are."""
+    cloud = ak.get("avoid_points")
+    if cloud is None:
+        return batch_kw
+    import torch
+    batch_kw = dict(batch_kw)
+    batch_kw["avoid_points"] = np.ascontiguousarray(np.asarray(cloud, dtype=np.float32))
+    batch_kw["avoid_points_t"] = _to_device(batch_kw["avoid_points"], device,
+                                            dtype=torch.float32)
+    return batch_kw
+
+
+#: Modes that take the array-native screen path. Every registry mode does: the aligner is one
+#: generic body over the mode's channels (``accel/batch/_arrays.py::align_arrays``), so a mode
+#: joins by existing rather than by gaining a hand-written builder here. The object path below
+#: survives as the parity reference the gates compare against (and for a non-pre-centred /
+#: trans_init / jax-backend screen, which reaches neither array branch).
+_ARRAY_MODES = tuple(_SPECS)
 
 
 def _use_arrays(mode: str) -> bool:
-    """Whether to take the array-native screen path. Opt-in, and per-mode.
+    """Whether to take the array-native screen path.
 
-    THIS DOCSTRING IS THE ONE AUTHORITATIVE RECORD OF WHAT THE ARRAY PATH IS WORTH. The same
-    numbers used to be restated above the array builders below and again in the ``SECOND WAVE``
-    header of ``accel/batch/_arrays.py``; those two now point here in a sentence instead,
-    because a single refuted figure (the ~2.6x ``vol_lipo`` ceiling, below) had to be corrected
-    in three places. This function is the gate every caller passes through and the only one of
-    the three sites that is a docstring, so it is the copy reachable from ``help()``.
-
-    Round 1 established that a PARTIAL removal of the object model is worth exactly zero, so
-    this is deliberately all-or-nothing per mode rather than a gradual migration: a mode is
-    listed in ``_ARRAY_MODES`` only once its whole path -- builder AND aligner -- is array
-    native. ``vol_color`` was added because it was the most host-bound mode measured (53.0% of
-    its screen inside ``_build_fit_fast_pairs``, in situ at N=1e5).
+    WHAT THE ARRAY PATH IS WORTH, and the jobs that measured it. Round 1 established that a
+    PARTIAL removal of the object model is worth exactly zero -- vectorising the binning alone
+    removed the O(K) loop and spent every microsecond back building the per-cell Python lists
+    ``Bucket.members`` requires (0.89 vs 0.88 us/mol, reverted) -- so this is all-or-nothing per
+    mode rather than a gradual migration.
 
     THE FIVE INCUMBENTS, measured as the cost of REMOVING the path they already have: 3.87x
     (vol), 7.28x (vol_color), 4.80x (vol_esp), 2.33x (pharm) and 2.02x (vol_and_surf_esp) at
     N=99,984 on an L40S (job 22637592), reproduced at 6.54x (vol_color) / 3.75x (vol) at N=1e5
     on a different store and node (job 22637392).
 
-    THE SIX ADDED AFTERWARDS (``vol_tversky``, ``vol_esp_tversky``, ``surf``, ``surf_esp``,
-    ``vol_lipo``, ``vol_fukui``) are MEASURED now, not estimated -- array leg against object
-    leg at N=99,984 on an L40S, every mode run in two independent jobs (22641030 / 22641516,
-    with parity from 22640575)::
+    SIX MORE were measured afterwards, array leg against object leg at N=99,984 on an L40S,
+    each in two independent jobs (22641030 / 22641516, parity from 22640575)::
 
         vol_esp_tversky  4.97x / 5.12x        vol_lipo  3.70x / 3.56x
         vol_fukui        4.05x / 3.58x        surf_esp  1.34x / 1.29x
         vol_tversky      4.04x / 4.25x        surf      1.33x / 1.29x
 
-    All six are BIT-IDENTICAL to the object path in those runs: 0 of 99,984 scores moved,
-    max|delta| exactly 0.000e+00, identical top-1000 ids, and identical 4x4 transforms element
-    for element. The five incumbents are undisturbed in the same runs (also 0 moved).
+    All six were BIT-IDENTICAL to the object path there: 0 of 99,984 scores moved, max|delta|
+    exactly 0.000e+00, identical top-1000 ids and identical 4x4 transforms.
 
-    DO NOT QUOTE ONE RANGE ACROSS ALL SIX. ``surf`` and ``surf_esp`` gain only ~1.3x, and the
-    reason is that they are OPTIMIZER-bound rather than host-bound: the recorder shows 0/1
-    graphed for them -- a single eager fine-loop call over the 200-point surface clouds for the
-    whole shard -- so the host front-end this path deletes is a small share of their screen.
-    They are a different regime from the 3.5-5x modes and belong in a different sentence.
-
-    THE OLD ~2.6x CEILING ON ``vol_lipo`` IS REFUTED, not merely exceeded. It was derived from
-    a 0.679 s fine-loop wall inside a 1.766 s OBJECT-path screen. The array leg runs its ENTIRE
-    screen in 0.405-0.423 s (jobs 22641030 / 22641516) -- below that wall -- so the 0.679 s
-    figure does not bound this configuration and cannot be quoted as a ceiling for it."""
+    DO NOT QUOTE ONE RANGE ACROSS ALL OF THEM. ``surf`` and ``surf_esp`` gain only ~1.3x because
+    they are OPTIMIZER-bound rather than host-bound (0/1 graphed: one eager fine-loop call over
+    the 200-point surface clouds for the whole shard), so the host front-end this path deletes
+    is a small share of their screen. The modes that joined later, with the generic aligner, are
+    UNMEASURED on this axis; measure before quoting a number for them.
+    """
     from shepherd_score.accel.batch import _arrays
     return mode in _ARRAY_MODES and _arrays.ENABLED
 
@@ -1329,436 +1130,82 @@ def _to_device(a, device, *, dtype=None):
     return out if dtype is None or out.dtype == dtype else out.to(dtype)
 
 
-def _build_fit_arrays_vol(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol``.
+def _build_fit_arrays(arrs: dict, mode: str, device):
+    """Array-native twin of :func:`_build_fit_fast_pairs`: ``(ids, {channel: (flat, off)})``.
 
-    Returns ``(ids, fit_flat, fit_off)`` -- the store's ALREADY-contiguous coordinate buffer
-    uploaded once, plus its CSR offsets. No ``_FastPair``, no ``torch.split``, no K-iteration
-    anything: the object path manufactured K objects and K views out of data that was already
-    array-native, then ``cat``ed them back together downstream."""
-    import torch
-    return (arrs["ids"],
-            _to_device(arrs["atom_pos"], device, dtype=torch.float32),
-            _to_device(arrs["atom_off"], device, dtype=torch.long))
+    Uploads each of the store's ALREADY-contiguous buffers once, through the pinned staging in
+    :func:`_to_device`, and hands the array aligner the buffer plus its CSR offsets -- or the
+    dense ``(K, S, ...)`` block plus ``None`` for the fixed-width surface, which needs no
+    gather at all. No ``_FastPair``, no ``torch.split``, no per-molecule Python.
 
-
-def _align_fast_arrays_vol(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``vol``. Returns ``(scores, SE3)``.
-
-    Takes the same ``(ref dict, fit tuple, batch_kw)`` shape as its four siblings so that one
-    table entry serves it too -- see :func:`_array_dispatch`. It previously sat outside the
-    tables as ``_align_fast_arrays(ref_xyz, fit_flat, fit_off, mode, batch_kw)``, whose ``mode``
-    argument was never read: it called ``align_batch_vol_arrays`` whatever was passed. The
-    tensors and the kwargs reaching that kernel are unchanged, so the gate-5 bit-identity of the
-    vol path is untouched; only the unpacking above it moved.
+    Which arrays a channel comes from is ``channels.load_store_channel``'s business, not this
+    function's: the heavy basis in particular is ``heavy_off``/``xyz_noH`` only when some
+    molecule's ``Chem.RemoveHs`` retained an H, and the heavy charges on a with-H store are a
+    vectorised gather of the with-H array. Reading the keys directly here is how a mode ends up
+    silently scoring the wrong field.
     """
-    from shepherd_score.accel.batch._arrays import align_batch_vol_arrays
-    fit_flat, fit_off = fit
-    return align_batch_vol_arrays(ref["_ref_xyz_t"], fit_flat, fit_off,
-                                  const_seeds=batch_kw.get("const_seeds"),
-                                  alpha=batch_kw.get("alpha", 0.81),
-                                  steps_fine=batch_kw["steps_fine"])
-
-
-def _build_fit_arrays_vol_color(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_color``.
-
-    TWO channels, TWO offset tables. Heavy-atom centers use ``atom_off``; the directionless
-    pharmacophore features (types + anchors) share their own ``pharm_off``. They are independent
-    -- a molecule's feature count is unrelated to its atom count -- which is exactly why the
-    object path needed six per-molecule splits here and why this needs none.
-
-    Uploads each of the store's already-contiguous buffers ONCE. No ``_FastPair``, no
-    ``_ArrView``, no ``torch.split``/``np.split``, no per-molecule Python."""
     import torch
-    f32, i64 = torch.float32, torch.int64
-    return (arrs["ids"],
-            _to_device(arrs["atom_pos"], device, dtype=f32),
-            _to_device(arrs["atom_off"], device, dtype=torch.long),
-            _to_device(arrs["pharm_types"], device, dtype=i64),
-            _to_device(arrs["pharm_ancs"], device, dtype=f32),
-            _to_device(arrs["pharm_off"], device, dtype=torch.long))
-
-
-def _align_fast_arrays_vol_color(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``vol_color``. Returns ``(scores, SE3)``."""
-    from shepherd_score.accel.batch._arrays import align_batch_vol_color_arrays
-    fit_flat, fit_off, ptypes, pancs, poff = fit
-    return align_batch_vol_color_arrays(
-        ref["_ref_xyz_t"], ref["_ref_pharm_types_t"], ref["_ref_pharm_ancs_t"],
-        fit_flat, fit_off, ptypes, pancs, poff,
-        alpha=batch_kw.get("alpha", 0.81),
-        color_weight=batch_kw.get("color_weight", 0.5),
-        num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
-        topk=batch_kw.get("topk", 30),
-        steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075),
-        const_seeds=batch_kw.get("const_seeds"))
-
-
-def _build_fit_arrays_pharm(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``pharm``.
-
-    Three channels, ONE offset table: types, anchors and vectors all index by feature."""
-    import torch
-    f32 = torch.float32
-    return (arrs["ids"],
-            _to_device(arrs["pharm_types"], device, dtype=torch.int64),
-            _to_device(arrs["pharm_ancs"], device, dtype=f32),
-            _to_device(arrs["pharm_vecs"], device, dtype=f32),
-            _to_device(arrs["pharm_off"], device, dtype=torch.long))
-
-
-def _build_fit_arrays_vol_esp(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_esp``.
-
-    Strict-heavy centers plus the heavy partial charges that are 1:1 with them, on their own
-    ``heavy_off``. The with-H store case needs the same vectorised gather the object path uses
-    -- global heavy index = ``nonH`` plus each heavy atom's molecule start -- which is already
-    array-native there, so it is reproduced verbatim rather than reinvented."""
-    import torch
-    f32 = torch.float32
-    aoff = arrs["atom_off"]
-    hoff = arrs["heavy_off"] if "heavy_off" in arrs else aoff
-    xnoH = arrs["xyz_noH"] if "xyz_noH" in arrs else arrs["atom_pos"]
-    if "all_off" in arrs:                       # with-H store: heavy = charges[all_off][nonH]
-        alloff, nonH = arrs["all_off"], arrs["nonH"]
-        heavy = arrs["charges"][nonH + np.repeat(alloff[:-1], np.diff(hoff))]
-    else:                                       # heavy charges stored directly
-        heavy = arrs["charges"]
-    return (arrs["ids"],
-            _to_device(xnoH, device, dtype=f32),
-            _to_device(heavy, device, dtype=f32),
-            _to_device(hoff, device, dtype=torch.long))
-
-
-def _align_fast_arrays_pharm(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``pharm``."""
-    from shepherd_score.accel.batch._arrays import align_batch_pharm_arrays
-    ptypes, pancs, pvecs, poff = fit
-    return align_batch_pharm_arrays(
-        ref["_ref_pharm_types_t"], ref["_ref_pharm_ancs_t"], ref["_ref_pharm_vecs_t"],
-        ptypes, pancs, pvecs, poff,
-        similarity=batch_kw.get("similarity", "tanimoto"),
-        extended_points=batch_kw.get("extended_points", False),
-        only_extended=batch_kw.get("only_extended", False),
-        num_repeats=batch_kw.get("num_repeats"),
-        topk=batch_kw.get("topk", 30),
-        steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075))
-
-
-def _align_fast_arrays_vol_esp(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``vol_esp``. ``lam`` is required and RAW."""
-    from shepherd_score.accel.batch._arrays import align_batch_vol_esp_arrays
-    pts, chg, off = fit
-    return align_batch_vol_esp_arrays(
-        ref["_ref_xyz_noH_t"], ref["_ref_xyz_esp_t"], pts, chg, off,
-        alpha=batch_kw.get("alpha", 0.81), lam=batch_kw["lam"],
-        num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
-        topk=batch_kw.get("topk", 30),
-        steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075),
-        const_seeds=batch_kw.get("const_seeds"))
-
-
-def _build_fit_arrays_vol_and_surf_esp(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_and_surf_esp``.
-
-    The heaviest branch in that function -- nine splits, six stores, an ``_ArrView`` and a nested
-    ``_MolShim`` per molecule -- becomes six whole-buffer uploads.
-
-    THREE ragged channels on ``all_off`` (atoms-with-H coordinates, their partial charges, their
-    radii), ONE on ``atom_off`` (the heavy shape centers), and TWO that are not ragged at all:
-    the store writes surfaces at a fixed width, so ``surf_pos``/``surf_esp`` upload as dense
-    ``(K, S, *)`` blocks and the aligner row-selects them instead of gathering."""
-    import torch
-    f32 = torch.float32
-    return (arrs["ids"],
-            _to_device(arrs["cwh"], device, dtype=f32),
-            _to_device(arrs["charges"], device, dtype=f32),
-            _to_device(arrs["radii"], device, dtype=f32),
-            _to_device(arrs["all_off"], device, dtype=torch.long),
-            _to_device(arrs["atom_pos"], device, dtype=f32),
-            _to_device(arrs["atom_off"], device, dtype=torch.long),
-            _to_device(arrs["surf_pos"], device, dtype=f32),
-            _to_device(arrs["surf_esp"], device, dtype=f32))
-
-
-def _align_fast_arrays_vol_and_surf_esp(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``vol_and_surf_esp``."""
-    from shepherd_score.accel.batch._arrays import align_batch_vol_and_surf_esp_arrays
-    return align_batch_vol_and_surf_esp_arrays(
-        ref, fit,
-        alpha=batch_kw["alpha"], lam=batch_kw.get("lam", 0.001),
-        probe_radius=batch_kw.get("probe_radius", 1.0),
-        esp_weight=batch_kw.get("esp_weight", 0.5),
-        num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
-        topk=batch_kw.get("topk", 30),
-        steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075),
-        const_seeds=batch_kw.get("const_seeds"))
-
-
-# --------------------------------------------------------------------------- #
-# The six remaining screen-capable modes. What the array path is worth per mode, and the jobs
-# that measured it, live in ONE place: the :func:`_use_arrays` docstring above. Do not restate
-# the numbers here -- they were duplicated across three blocks, and the stale ~2.6x vol_lipo
-# ceiling then had to be refuted in all three.
-#
-# Every fit tuple below is derived from that mode's OBJECT-path aligner in
-# accel/batch/aligners.py -- which ``_fit_*_t`` tensors it uploads, and which offset table
-# ``_build_fit_fast_pairs`` splits them on -- never by analogy with a mode that merely looks
-# alike. vol_fukui is the case in point: it rides the vol_lipo DRIVER but feeds it its OWN
-# arrays, and a store can hold both channels at once, so reading the lipo keys there would
-# silently score the wrong field instead of failing.
-# --------------------------------------------------------------------------- #
-def _build_fit_arrays_vol_tversky(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_tversky``:
-    ``(ids, fit_flat, fit_off)`` -- the ``vol`` tuple exactly.
-
-    DERIVED, not assumed. ``_align_batch_vol_tversky`` uploads two pair tensors and only two --
-    ``_ref_xyz_t``/``_fit_xyz_t`` from ``atom_pos`` -- and reads nothing else off the pair. The
-    Tversky reduction changes how ``AB`` is combined with the pose-invariant self-overlaps
-    ``VAA``/``VBB``, and both of those are computed ON THE DEVICE from these same clouds
-    (``_self_overlap_in_chunks``), so the asymmetry costs no extra input.
-
-    Delegates rather than copies: the two modes share one store layout, and two bodies that must
-    agree are two bodies that can drift apart."""
-    return _build_fit_arrays_vol(arrs, device)
-
-
-def _build_fit_arrays_vol_esp_tversky(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_esp_tversky``:
-    ``(ids, heavy_centers, heavy_charges, heavy_off)`` -- the ``vol_esp`` tuple exactly,
-    including its with-H-store gather.
-
-    DERIVED: ``_align_batch_vol_esp_tversky`` uploads ``_fit_xyz_noH_t`` (strict-heavy centres)
-    and ``_fit_xyz_esp_t`` (the charges 1:1 with them), and never touches ``_fit_xyz_t`` -- it
-    has no ``trans_init``, so the RemoveHs centres the object path also parks on the pair for
-    vol_esp are dead weight here and are not uploaded. ``_query_ref_arrays`` and
-    ``_ref_tensors_from_arrays`` already treat the two modes as one key for the same reason."""
-    return _build_fit_arrays_vol_esp(arrs, device)
-
-
-def _build_fit_arrays_surf(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``surf``: ``(ids, surf_all)``.
-
-    ONE tensor and NO offset table -- the only mode here with neither. Every profile carries
-    exactly ``num_surf_points`` surface points, so ``_concat`` writes them with ``np.stack``
-    rather than ``np.concatenate`` and the store already holds a DENSE ``(K, S, 3)`` block. The
-    object path's entire per-molecule step for this mode is a ``torch.unbind`` of that block
-    into K views, which an aligner-side row ``index_select`` replaces.
-
-    ``_align_batch_surf`` uploads ``_fit_surf_t`` and nothing else."""
-    import torch
-    return (arrs["ids"], _to_device(arrs["surf_pos"], device, dtype=torch.float32))
-
-
-def _build_fit_arrays_surf_esp(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``surf_esp``:
-    ``(ids, surf_all, surf_esp_all)``.
-
-    Two DENSE blocks on the same fixed surface width, for the reason spelled out in
-    :func:`_build_fit_arrays_surf`. ``_align_batch_surf_esp`` uploads exactly ``_fit_surf_t`` +
-    ``_fit_surf_esp_t`` before handing them to ``_esp_bucketed_align``; its ``_ref_xyz_t``
-    translation centres sit inside ``if trans_init:``, which this path excludes (``fast``
-    requires ``trans_init`` falsey and ``_fast_batch_kwargs`` pins it False), so they are not
-    part of the fit tuple.
-
-    ``lam`` is not a fit tensor but it is the trap next door: ``_align_batch_surf_esp`` scales
-    it by ``LAM_SCALING`` (x207) before the kernel where ``vol_esp`` passes its own raw, so the
-    aligner -- not this builder, and not the caller -- owns that scaling."""
-    import torch
-    f32 = torch.float32
-    return (arrs["ids"],
-            _to_device(arrs["surf_pos"], device, dtype=f32),
-            _to_device(arrs["surf_esp"], device, dtype=f32))
-
-
-def _build_fit_arrays_scalar_field(arrs: dict, device, *, pos_key: str, val_key: str,
-                                   off_key: str):
-    """Shared body for the two shape-plus-per-atom-scalar modes (``vol_lipo``, ``vol_fukui``).
-
-    Returns ``(ids, cent_flat, cent_off, field_pos_flat, field_val_flat, field_off)``.
-
-    TWO point sets on TWO offset tables, and they are not interchangeable. The shape channel is
-    ``atom_pos`` on ``atom_off`` (the ``Chem.RemoveHs`` coordinate set, the bucket merge key,
-    reusing the shape kernel); the field channel is the TRUE-heavy centres with their per-atom
-    scalar, on their own ``*_off``. The two counts DIVERGE whenever RemoveHs retained an H (an
-    isotope label), which is exactly why ``_concat`` gives the field its own offset table and why
-    ``_build_fit_fast_pairs`` splits each channel by its own -- one table for both would desync
-    the field from its positions on those molecules.
-
-    Parameterised on the key NAMES because the layout really is shared; the names themselves are
-    read off ``ProfileStore._concat``, not predicted from the mode name -- the value array is
-    ``lipophilicity`` for one mode and ``fukui`` for the other, which no single rule gives."""
-    import torch
-    f32 = torch.float32
-    return (arrs["ids"],
-            _to_device(arrs["atom_pos"], device, dtype=f32),
-            _to_device(arrs["atom_off"], device, dtype=torch.long),
-            _to_device(arrs[pos_key], device, dtype=f32),
-            _to_device(arrs[val_key], device, dtype=f32),
-            _to_device(arrs[off_key], device, dtype=torch.long))
-
-
-def _build_fit_arrays_vol_lipo(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_lipo``:
-    ``(ids, cent_flat, cent_off, lipo_pos, lipophilicity, lipo_off)``.
-
-    DERIVED from ``_align_batch_vol_lipo``, which uploads exactly three fit tensors:
-    ``_fit_xyz_t`` (``atom_pos``), ``_fit_lipo_pos_t`` (``get_lipo_positions()``) and
-    ``_fit_lipo_t`` (``get_lipophilicity(no_H=True)``) -- persisted by ``_concat`` as
-    ``atom_pos`` / ``lipo_pos`` / ``lipophilicity``. Its ``num_repeats`` kwarg is accepted and
-    IGNORED there (the seed count comes from ``MODE_SEEDS``; 4, 16 and 32 returned the same
-    4,000 scores in job 22637761), so it is no part of this tuple either."""
-    return _build_fit_arrays_scalar_field(arrs, device, pos_key="lipo_pos",
-                                          val_key="lipophilicity", off_key="lipo_off")
-
-
-def _build_fit_arrays_vol_fukui(arrs: dict, device):
-    """Array-native twin of :func:`_build_fit_fast_pairs` for ``vol_fukui``:
-    ``(ids, cent_flat, cent_off, fukui_pos, fukui, fukui_off)``.
-
-    SAME SHAPE AS vol_lipo, DIFFERENT ARRAYS -- verified against the source, not inferred from
-    the shared driver. ``_align_batch_vol_fukui`` does reach
-    ``fast_optimize_vol_lipo_overlay_batch`` (passing ``fukui_weight`` as its ``lipo_weight``),
-    but it uploads ``_fit_fukui_pos_t``/``_fit_fukui_t`` from
-    ``get_fukui_positions()``/``get_fukui(no_H=True)``, which ``_concat`` writes under
-    ``fukui_pos`` / ``fukui`` / ``fukui_off``. ``_schema_from_modes`` sets ``lipophilicity`` and
-    ``fukui`` independently, so a store built for both modes holds both channels and feeding the
-    lipo keys here would score the wrong field silently instead of raising KeyError."""
-    return _build_fit_arrays_scalar_field(arrs, device, pos_key="fukui_pos",
-                                          val_key="fukui", off_key="fukui_off")
-
-
-def _align_fast_arrays_vol_tversky(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``vol_tversky``. Returns ``(scores, SE3)``.
-
-    Kwargs mirror ``_align_batch_vol_tversky``'s own signature and defaults; the seed count is
-    internal to the driver there (``_seeds_for("vol_tversky")``) and stays internal here."""
-    from shepherd_score.accel.batch._arrays import align_batch_vol_tversky_arrays
-    return align_batch_vol_tversky_arrays(
-        ref, fit,
-        alpha=batch_kw.get("alpha", 0.81),
-        tversky_alpha=batch_kw.get("tversky_alpha", 0.95),
-        tversky_beta=batch_kw.get("tversky_beta", 0.05),
-        steps_fine=batch_kw["steps_fine"],
-        const_seeds=batch_kw.get("const_seeds"))
-
-
-def _align_fast_arrays_vol_esp_tversky(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``vol_esp_tversky``.
-
-    ``lam`` is RAW and defaults to 0.1 -- ``_align_batch_vol_esp_tversky`` declares that default
-    itself, unlike ``vol_esp``, whose ``lam`` ``screen()`` refuses to invent."""
-    from shepherd_score.accel.batch._arrays import align_batch_vol_esp_tversky_arrays
-    return align_batch_vol_esp_tversky_arrays(
-        ref, fit,
-        alpha=batch_kw.get("alpha", 0.81),
-        lam=batch_kw.get("lam", 0.1),
-        tversky_alpha=batch_kw.get("tversky_alpha", 0.95),
-        tversky_beta=batch_kw.get("tversky_beta", 0.05),
-        steps_fine=batch_kw["steps_fine"],
-        const_seeds=batch_kw.get("const_seeds"))
-
-
-def _align_fast_arrays_surf(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``surf``.
-
-    ``alpha`` here is the SURFACE alpha: ``_resolve_screen`` resolves it from
-    ``ALPHA(store.num_surf_points)`` for this mode, so it arrives in ``batch_kw`` already and the
-    0.81 fallback below is ``_align_batch_surf``'s own declared default, not a screen default."""
-    from shepherd_score.accel.batch._arrays import align_batch_surf_arrays
-    return align_batch_surf_arrays(
-        ref, fit,
-        alpha=batch_kw.get("alpha", 0.81),
-        steps_fine=batch_kw["steps_fine"])
-
-
-def _align_fast_arrays_surf_esp(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``surf_esp``.
-
-    ``lam`` is passed RAW, exactly as ``_align_batch_surf_esp`` takes it: that function applies
-    ``LAM_SCALING`` (x207) itself before ``_esp_bucketed_align``, so handing an already-scaled
-    value down would scale it twice. ``alpha``/``lam`` are indexed rather than ``.get``, because
-    ``_fast_batch_kwargs`` always supplies both for this mode and a missing one is a wiring bug
-    worth a KeyError. ``num_repeats`` is deliberately not forwarded: ``_align_batch_surf_esp``
-    accepts it and never passes it on -- ``_esp_bucketed_align`` takes its seed count from
-    ``_seeds_for("surf_esp")``."""
-    from shepherd_score.accel.batch._arrays import align_batch_surf_esp_arrays
-    return align_batch_surf_esp_arrays(
-        ref, fit,
-        alpha=batch_kw["alpha"], lam=batch_kw["lam"],
-        num_repeats_per_trans=batch_kw.get("num_repeats_per_trans", 10),
-        topk=batch_kw.get("topk", 30),
-        steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075))
-
-
-def _align_fast_arrays_vol_lipo(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``vol_lipo``.
-
-    ``lam`` is RAW (atom-centred, no ``LAM_SCALING``), matching per-pair ``align_with_vol_lipo``.
-    ``num_repeats`` is not forwarded: ``_align_batch_vol_lipo`` accepts it and no line of its body
-    reads it (job 22637761 -- 4, 16 and 32 moved 0 of 4,000 scores, while moving ``MODE_SEEDS``
-    16 -> 4 moved 2,604 of them), so forwarding it here would be a behaviour change dressed as a
-    port."""
-    from shepherd_score.accel.batch._arrays import align_batch_vol_lipo_arrays
-    return align_batch_vol_lipo_arrays(
-        ref, fit,
-        lipo_weight=batch_kw.get("lipo_weight", 0.5),
-        alpha=batch_kw.get("alpha", 0.81),
-        lam=batch_kw.get("lam", 0.1),
-        topk=batch_kw.get("topk", 30),
-        steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075),
-        const_seeds=batch_kw.get("const_seeds"))
-
-
-def _align_fast_arrays_vol_fukui(ref: dict, fit: tuple, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast` for ``vol_fukui``.
-
-    The weight keyword is ``fukui_weight``, not ``lipo_weight``: ``_align_batch_vol_fukui``
-    renames it at the boundary and only the shared DRIVER call underneath still says
-    ``lipo_weight=fukui_weight``."""
-    from shepherd_score.accel.batch._arrays import align_batch_vol_fukui_arrays
-    return align_batch_vol_fukui_arrays(
-        ref, fit,
-        fukui_weight=batch_kw.get("fukui_weight", 0.5),
-        alpha=batch_kw.get("alpha", 0.81),
-        lam=batch_kw.get("lam", 0.1),
-        topk=batch_kw.get("topk", 30),
-        steps_fine=batch_kw["steps_fine"],
-        lr=batch_kw.get("lr", 0.075),
-        const_seeds=batch_kw.get("const_seeds"))
-
-
-#: mode -> (fit-array builder, array-native aligner). Keys MUST cover ``_ARRAY_MODES`` exactly;
-#: ``vol`` is in here too now rather than in an inline branch of its own -- see _array_dispatch.
-_ARRAY_BUILDERS = {"vol": _build_fit_arrays_vol,
-                   "vol_color": _build_fit_arrays_vol_color,
-                   "pharm": _build_fit_arrays_pharm,
-                   "vol_esp": _build_fit_arrays_vol_esp,
-                   "vol_and_surf_esp": _build_fit_arrays_vol_and_surf_esp,
-                   "vol_tversky": _build_fit_arrays_vol_tversky,
-                   "vol_esp_tversky": _build_fit_arrays_vol_esp_tversky,
-                   "surf": _build_fit_arrays_surf,
-                   "surf_esp": _build_fit_arrays_surf_esp,
-                   "vol_lipo": _build_fit_arrays_vol_lipo,
-                   "vol_fukui": _build_fit_arrays_vol_fukui}
-_ARRAY_ALIGNERS = {"vol": _align_fast_arrays_vol,
-                   "vol_color": _align_fast_arrays_vol_color,
-                   "pharm": _align_fast_arrays_pharm,
-                   "vol_esp": _align_fast_arrays_vol_esp,
-                   "vol_and_surf_esp": _align_fast_arrays_vol_and_surf_esp,
-                   "vol_tversky": _align_fast_arrays_vol_tversky,
-                   "vol_esp_tversky": _align_fast_arrays_vol_esp_tversky,
-                   "surf": _align_fast_arrays_surf,
-                   "surf_esp": _align_fast_arrays_surf_esp,
-                   "vol_lipo": _align_fast_arrays_vol_lipo,
-                   "vol_fukui": _align_fast_arrays_vol_fukui}
+    from shepherd_score.accel.channels import load_store_channel
+    spec = _spec_of(mode)
+    fit = {}
+    for name in spec.all_channels():
+        ch = _CHANNELS[name]
+        if ch.is_pair:
+            continue
+        flat, off = load_store_channel(arrs, name)
+        dt = torch.int64 if ch.dtype == "int64" else torch.float32
+        fit[name] = (_to_device(flat, device, dtype=dt),
+                     None if off is None else _to_device(off, device, dtype=torch.long))
+    return arrs["ids"], fit
+
+
+def _align_fast_arrays(ref: dict, fit: dict, mode: str, batch_kw: dict):
+    """Array-native twin of :func:`_align_fast`: ``(scores, SE3)`` for one shard, one query.
+
+    ``batch_kw`` is what :func:`_fast_batch_kwargs` produced, so the mode parameters resolve
+    through the SAME ``resolve_params`` the pairwise aligner uses -- which is where the surface
+    modes' ``lam`` is scaled by ``LAM_SCALING`` exactly once.
+    """
+    from shepherd_score.accel.batch._arrays import align_arrays
+    from shepherd_score.accel.batch.aligners import resolve_params
+    spec = _spec_of(mode)
+    params = resolve_params(spec, batch_kw, f"screen({mode})")
+    return align_arrays(mode, _ref_channel_tensors(ref, mode), fit, params=params,
+                        steps_fine=int(batch_kw["steps_fine"]),
+                        num_seeds=batch_kw.get("num_repeats"),
+                        const_seeds=batch_kw.get("const_seeds"),
+                        avoid=batch_kw.get("avoid_points_t"))
+
+
+def _make_array_builder(mode: str):
+    def build(arrs, device, _m=mode):
+        return _build_fit_arrays(arrs, _m, device)
+    build.__name__ = build.__qualname__ = f"_build_fit_arrays_{mode}"
+    build.__doc__ = (f"Array-native fit builder for ``{mode}``: one name over "
+                     ":func:`_build_fit_arrays`, so a parity test can wrap this mode's builder "
+                     "alone and assert WHICH one ran.")
+    return build
+
+
+def _make_array_aligner(mode: str):
+    def align(ref, fit, batch_kw, _m=mode):
+        return _align_fast_arrays(ref, fit, _m, batch_kw)
+    align.__name__ = align.__qualname__ = f"_align_fast_arrays_{mode}"
+    align.__doc__ = f"Array-native aligner for ``{mode}``; see :func:`_align_fast_arrays`."
+    return align
+
+
+#: mode -> (fit-array builder, array-native aligner). ONE generic body per side, but a DISTINCT
+#: named function per mode: the array-vs-object parity gate wraps ``_ARRAY_BUILDERS`` entry by
+#: entry to assert which builder a screen actually entered, and a single shared function object
+#: could not tell the modes apart. Keys cover ``_ARRAY_MODES`` exactly.
+_ARRAY_BUILDERS = {m: _make_array_builder(m) for m in _ARRAY_MODES}
+_ARRAY_ALIGNERS = {m: _make_array_aligner(m) for m in _ARRAY_MODES}
+for _m, _fn in _ARRAY_BUILDERS.items():
+    globals()[_fn.__name__] = _fn
+for _m, _fn in _ARRAY_ALIGNERS.items():
+    globals()[_fn.__name__] = _fn
+del _m, _fn
 
 
 def _array_dispatch(mode: str):
@@ -1766,16 +1213,14 @@ def _array_dispatch(mode: str):
 
     The SINGLE selector for both drivers -- :func:`_run_shards_inproc` and
     :func:`_screen_worker`. It exists because they used to select independently and the
-    worker's copy did not select at all: it called ``_build_fit_arrays_vol`` and the vol
-    aligner for EVERY mode, so ``screen(ndev>1)`` silently returned vol answers under another
-    mode's name. Replaying those two lines on CPU for ``vol_color`` gave max|delta| 3.0654e-01
-    against a real vol_color screen, a completely different top-10, and results bit-identical
-    to a real vol screen; ``pharm`` raised KeyError instead, its ref dict carrying no
-    ``_ref_xyz_t``. ``_arrays.ENABLED`` is True in production and nothing reads the
-    environment, so that was every multi-GPU screen in the four non-vol array modes.
+    worker's copy did not select at all: it called the vol builder and the vol aligner for
+    EVERY mode, so ``screen(ndev>1)`` silently returned vol answers under another mode's name
+    (``vol_color`` measured max|delta| 3.0654e-01 against a real vol_color screen, with a
+    completely different top-10; ``pharm`` raised KeyError instead).
 
-    Keep it one function over one pair of tables. A second copy of the dispatch is exactly how
-    the worker drifted out of agreement with the driver in the first place.
+    It reads the TABLES rather than building closures, which is also what lets a test intercept
+    one mode's builder by patching ``_ARRAY_BUILDERS``. Keep it one function: a second copy of
+    the dispatch is exactly how the worker drifted out of agreement with the driver.
     """
     return _ARRAY_BUILDERS[mode], _ARRAY_ALIGNERS[mode]
 
@@ -1975,17 +1420,19 @@ def _resolve_screen(store, mode, alpha, align_kwargs):
     if alpha is None and mode in _SURF_ALPHA_MODES:
         from shepherd_score.score.constants import ALPHA
         alpha = float(ALPHA(store.num_surf_points))
-    if alpha is None and mode == "vol_and_surf_esp":
-        raise ValueError("vol_and_surf_esp requires an explicit alpha (it selects volumetric "
-                         "shape at alpha=0.81, otherwise surface shape); pass alpha=...")
-    if mode == "vol_esp" and "lam" not in align_kwargs:
-        # align_with_vol_esp makes lam a required positional (no default), so don't invent
-        # one here -- raise the same clear error the fast and slow paths should both give
-        # (the fast path would otherwise KeyError deep inside _fast_batch_kwargs).
-        raise ValueError("vol_esp requires an explicit lam=... (the ESP/partial-charge "
-                         "weight); pass lam=...")
     if alpha is not None:
         align_kwargs["alpha"] = alpha
+    # A parameter the registry declares REQUIRED (spec default None) must be supplied. Raise the
+    # same clear error on both the fast and the slow path, rather than letting the fast one fail
+    # deep inside _fast_batch_kwargs: ``vol_esp`` needs ``lam`` (the ESP / partial-charge weight,
+    # which the per-pair API also makes required), and ``vol_and_surf_esp`` needs ``alpha``,
+    # which selects volumetric shape at 0.81 and surface shape otherwise.
+    for _name, _default in _spec_of(mode).params.items():
+        if _default is None and _name not in align_kwargs:
+            raise ValueError(f"{mode} requires an explicit {_name}=...; pass {_name}=...")
+    if _spec_of(mode).name == "vol_avoid" and align_kwargs.get("avoid_points") is None:
+        raise ValueError("vol_avoid requires an explicit avoid_points=... (an (K,3) cloud in "
+                         "the QUERY's frame to keep library molecules out of)")
     return align_kwargs
 
 
@@ -2057,9 +1504,14 @@ def _canonical_batch_kw(store, qs_ref, mode, device, batch_kw, fast=True):
     if not (fast and _use_arrays(mode) and getattr(store, "canonical", False)
             and mode in _CONST_SEED_MODES and len(qs_ref) == 1):
         return batch_kw
-    if mode == "vol_and_surf_esp" and batch_kw.get("alpha") != 0.81:
+    _spec = _spec_of(mode)
+    # The seed channel is resolved under THIS call's keywords: the combo modes seed from the
+    # atom clouds only at alpha == 0.81 and from the surfaces otherwise, and the store
+    # canonicalises the atom frame alone.
+    _seed_ch = _spec.resolve_channel(_spec.seed_channel, batch_kw)
+    if _seed_ch not in ("atoms", "heavy"):
         return batch_kw
-    _rx = qs_ref[0].get("xyz")
+    _rx = qs_ref[0].get(_seed_ch)
     if _rx is None:
         return batch_kw
     from shepherd_score.accel.drivers._common import canonical_seed_quats
@@ -2130,14 +1582,15 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                     # align_batch_vol_arrays) and leaves _array_dispatch as the one selector
                     # this driver and the multi-GPU worker share.
                     build, align = _array_dispatch(mode)
-                    ids, *fit = build(arrs, device)
+                    ids, fit = build(arrs, device)
                     for qi, ra in enumerate(qs_ref):
                         ref = _ref_tensors_from_arrays(ra, mode, device)
-                        scores, se3 = align(ref, tuple(fit), batch_kws[qi])
+                        scores, se3 = align(ref, fit, batch_kws[qi])
                         _accumulate_arrays(heaps[qi], ids, scores, se3,
                                            scores_out, qi, start, rot)
                 else:
-                    ids, pairs = _build_fit_fast_pairs(arrs, mode, device)
+                    ids, pairs = _build_fit_fast_pairs(arrs, mode, device,
+                                                       avoid=batch_kw.get("avoid_points"))
                     for qi, ra in enumerate(qs_ref):
                         ref = _ref_tensors_from_arrays(ra, mode, device)
                         scores = _align_fast(pairs, ref, mode, batch_kw)
@@ -2262,7 +1715,9 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
     align_kwargs = _resolve_screen(store, mode, alpha, align_kwargs)
     backend = backend or _default_backend()
 
-    if mode in ("surf", "surf_esp", "vol_and_surf_esp"):
+    _spec = _spec_of(mode)
+    _chans = [_CHANNELS[c] for c in _spec.all_channels()]
+    if any(c.basis == "surf" for c in _chans):
         for q in queries:
             qn = getattr(q, "num_surf_points", None)
             if qn is not None and qn != store.num_surf_points:
@@ -2270,22 +1725,18 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
                                  f"({store.num_surf_points}); ALPHA is calibrated to it")
 
     # Fast-path query preconditions: name the missing field up front instead of crashing
-    # opaquely inside _query_ref_arrays (mirrors _profile_from_schema's clear-error convention).
-    # A bare RDKit Molecule always has these; a MoleculeProfile reconstructed without the mode's
-    # arrays does not.
-    if mode == "vol_and_surf_esp":
-        for q in queries:
-            miss = [a for a in ("surf_pos", "surf_esp", "mol", "partial_charges", "radii")
-                    if getattr(q, a, None) is None]
-            if miss:
-                raise ValueError(f"vol_and_surf_esp query is missing {miss}; build the query "
-                                 f"Molecule/MoleculeProfile with vol_and_surf_esp arrays (surface, "
-                                 f"with-H centers, partial charges, radii)")
-    elif mode == "vol_esp":
-        for q in queries:
-            if getattr(q, "partial_charges", None) is None or getattr(q, "_nonH_atoms_idx", None) is None:
-                raise ValueError("vol_esp query is missing partial_charges/_nonH_atoms_idx; "
-                                 "build the query Molecule/MoleculeProfile with partial charges")
+    # opaquely inside _query_ref_arrays. Each channel's own reader raises a ValueError naming
+    # what it needed, so the check is simply "read them all once" -- a bare RDKit-backed
+    # Molecule has everything; a MoleculeProfile reconstructed without the mode's arrays does
+    # not, and this is where that is reported rather than mid-screen.
+    for q in queries:
+        for c in _chans:
+            if c.is_pair:
+                continue
+            try:
+                c.read(q)
+            except ValueError as e:
+                raise ValueError(f"{mode} query cannot provide {c.name}: {e}") from e
 
     center = (not store.pre_centered) if do_center is None else bool(do_center)
     if store.pre_centered or center:
@@ -2324,12 +1775,15 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
                              "returns top-K hits only). Run single-process for full score vectors.")
         heaps = _screen_many_multigpu(qs, store.path, mode, ndev,
                                       _fast_batch_kwargs(mode, align_kwargs), top_k, progress)
+        # NB the multi-GPU workers rebuild their own device tensors, so the avoid cloud crosses
+        # as the plain numpy array in ``align_kwargs`` and is uploaded inside each worker.
         return [h.sorted() for h in heaps]
 
     so = _normalize_scores_out(scores_out, len(queries))
     if fast:
         qs_ref = [_query_ref_arrays(q, mode) for q in qs]
         batch_kw = _fast_batch_kwargs(mode, align_kwargs)
+        batch_kw = _with_avoid(batch_kw, align_kwargs, device)
     else:
         qs_ref = qs
         batch_kw = None
@@ -2460,13 +1914,14 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
                 # measured max|delta| 3.07e-01 and a different top-10; pharm raised KeyError).
                 # See _array_dispatch.
                 build, align = _array_dispatch(mode)
-                ids, *fit = build(arrs, dev)
+                ids, fit = build(arrs, dev)
                 for qi, ref in enumerate(ref_tensors):
-                    scores, se3 = align(ref, tuple(fit), batch_kws[qi])
+                    scores, se3 = align(ref, fit, batch_kws[qi])
                     _accumulate_arrays(heaps[qi], ids, scores, se3, None, qi, 0, rot)
                 torch.cuda.synchronize()
                 continue
-            ids, pairs = _build_fit_fast_pairs(arrs, mode, dev)
+            ids, pairs = _build_fit_fast_pairs(arrs, mode, dev,
+                                               avoid=batch_kw.get("avoid_points"))
             for qi, ref in enumerate(ref_tensors):
                 scores = _align_fast(pairs, ref, mode, batch_kw)
                 # Same pre-filtered reduce as the in-process driver (scores_out is not

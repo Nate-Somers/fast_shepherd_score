@@ -56,6 +56,7 @@ def _run_shard(bm, torch, mode, rows, kwargs):
     ``rows`` is a list of tuples-of-numpy, one per pair, ordered to match
     ``_MODE_SPEC[mode]['tensors']``. Returns numpy ``(scores (k,), transforms (k,4,4))``.
     """
+    mode = _LEGACY_MODE_ALIASES.get(mode, mode)
     spec = bm._MODE_SPEC[mode]
     tnames = spec["tensors"]
     standins = []
@@ -209,7 +210,8 @@ def align_pairs(mode, pairs, num_workers, align_kwargs):
     extract, tnames = spec["extract"], spec["tensors"]
     tf_attr, sc_attr = spec["out"]
 
-    per_pair = [tuple(np.asarray(getattr(getattr(p, m), a)) for (m, a) in extract)
+    per_pair = [tuple(np.asarray(fn(p if side == "pair" else getattr(p, side)))
+                      for (side, fn) in extract)
                 for p in pairs]
     scores, transforms = get_pool(num_workers).align(mode, per_pair, align_kwargs)
 

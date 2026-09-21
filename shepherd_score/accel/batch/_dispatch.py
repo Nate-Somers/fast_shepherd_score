@@ -24,6 +24,9 @@ import threading as _threading
 
 import torch
 
+from .._modes import SPECS
+from ..channels import CHANNELS
+
 
 # --- multi-GPU dispatch ------------------------------------------------------
 
@@ -36,10 +39,7 @@ def _dev_idx(device: torch.device) -> int:
     the multi-GPU dispatcher. Constant 0 on a single GPU -> no behaviour change.
 
     A bare ``torch.device("cuda")`` has ``index is None``; it must still resolve to
-    a concrete GPU index (the current device), NOT to the CPU sentinel -1 -- else a
-    CUDA batch built with an indexless device shares a cache key with a CPU
-    (backend="numba") batch, and the second reuses the first's wrong-device
-    workspace (RuntimeError: tensors on cuda:0 and cpu)."""
+    a concrete GPU index (the current device), NOT to the CPU sentinel -1."""
     if device.type == "cuda":
         return device.index if device.index is not None else torch.cuda.current_device()
     return -1
@@ -63,40 +63,32 @@ def _should_distribute(pairs) -> bool:
 
 
 # --- per-mode tensor spec (consumed by the CPU process pool, cpu_pool.py) -----
-# Each mode declares how to (a) pull its per-pair inputs off the Molecule objects as
-# picklable numpy arrays, (b) rebuild the cached device tensors inside a worker, and
-# (c) read the results back. ``extract`` and ``tensors`` are positional-aligned.
-# This dict is the authority for ``accel/_modes.py:PROCESS_MODES`` (a test asserts
-# ``tuple(_MODE_SPEC) == PROCESS_MODES``); modes absent here have no worker path
-# (e.g. ``vol_and_surf_esp``) and run in-process.
-_MODE_SPEC = {
-    "vol": {
-        "extract": [("ref_molec", "atom_pos"), ("fit_molec", "atom_pos")],
-        "tensors": [("_ref_xyz_t", torch.float32), ("_fit_xyz_t", torch.float32)],
-        "out": ("transform_vol_noH", "sim_aligned_vol_noH"),
-    },
-    "surf": {
-        "extract": [("ref_molec", "surf_pos"), ("fit_molec", "surf_pos")],
-        "tensors": [("_ref_surf_t", torch.float32), ("_fit_surf_t", torch.float32)],
-        "out": ("transform_surf", "sim_aligned_surf"),
-    },
-    "surf_esp": {                                  # canonical name for the legacy "esp" mode
-        "extract": [("ref_molec", "surf_pos"), ("fit_molec", "surf_pos"),
-                    ("ref_molec", "surf_esp"), ("fit_molec", "surf_esp")],
-        "tensors": [("_ref_surf_t", torch.float32), ("_fit_surf_t", torch.float32),
-                    ("_ref_surf_esp_t", torch.float32), ("_fit_surf_esp_t", torch.float32)],
-        "out": ("transform_surf_esp", "sim_aligned_surf_esp"),
-    },
-    "pharm": {
-        "extract": [("ref_molec", "pharm_types"), ("fit_molec", "pharm_types"),
-                    ("ref_molec", "pharm_ancs"), ("fit_molec", "pharm_ancs"),
-                    ("ref_molec", "pharm_vecs"), ("fit_molec", "pharm_vecs")],
-        "tensors": [("_ref_pharm_types_t", torch.int64), ("_fit_pharm_types_t", torch.int64),
-                    ("_ref_pharm_ancs_t", torch.float32), ("_fit_pharm_ancs_t", torch.float32),
-                    ("_ref_pharm_vecs_t", torch.float32), ("_fit_pharm_vecs_t", torch.float32)],
-        "out": ("transform_pharm", "sim_aligned_pharm"),
-    },
-}
+# Each mode declares how to (a) pull its per-pair inputs off the pair as picklable numpy
+# arrays -- ``extract`` is a list of ``(side, reader)`` where ``side`` is ``"ref_molec"``,
+# ``"fit_molec"`` or ``"pair"`` and ``reader`` a callable over that object -- (b) rebuild the
+# cached device tensors inside a worker (``tensors``, positional with ``extract``), and (c) read
+# the results back (``out``). DERIVED from each mode's channels, so every registry mode has a
+# worker path; ``accel/_modes.py:PROCESS_MODES`` is the same set.
+_DTYPES = {"float32": torch.float32, "int64": torch.int64}
+
+
+def _spec_entry(spec):
+    extract, tensors = [], []
+    for name in spec.all_channels():
+        ch = CHANNELS[name]
+        dt = _DTYPES[ch.dtype]
+        if ch.is_pair:
+            extract.append(("pair", ch.read))
+            tensors.append((ch.ref_attr, dt))
+        else:
+            extract.append(("ref_molec", ch.read))
+            tensors.append((ch.ref_attr, dt))
+            extract.append(("fit_molec", ch.read))
+            tensors.append((ch.fit_attr, dt))
+    return {"extract": extract, "tensors": tensors, "out": spec.attrs}
+
+
+_MODE_SPEC = {m: _spec_entry(s) for m, s in SPECS.items() if s.process}
 
 
 class _ProcStandIn:
@@ -126,8 +118,7 @@ def _run_distributed(align_fn, pairs, **kwargs):
     :func:`_should_distribute` is true.
 
     Runs on a **single GPU** (plus a one-time warning): a transparent library call must not
-    silently ``spawn`` worker processes (``spawn`` re-imports the caller's ``__main__`` and
-    breaks unguarded scripts). For real multi-GPU throughput use
+    silently ``spawn`` worker processes. For real multi-GPU throughput use
     :class:`shepherd_score.accel.multi_gpu.MultiGPUAligner`."""
     global _WARNED_SINGLE_GPU
     if not _WARNED_SINGLE_GPU:

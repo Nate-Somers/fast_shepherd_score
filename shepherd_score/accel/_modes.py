@@ -1,55 +1,377 @@
 """Single source of truth for the alignment *modes*.
 
-Pure data, zero heavy imports (no torch / numpy / container), so every layer can import
-this freely without import-cycle risk. Before this module the same facts were copied across
-``aligners.py`` (seed/step counts), ``screen.py`` / ``multi_gpu.py`` (result-attribute maps),
-and ``cpu_pool.py`` / ``multi_gpu.py`` / ``screen.py`` (legacy-alias dicts). Consumers now
-derive from here; ``tests/test_mode_registry.py`` pins the invariants (incl. agreement with the
-torch-typed ``accel/batch/_dispatch.py:_MODE_SPEC``, which stays the authority for the *process*
-path's per-mode tensor plumbing).
+Pure data, zero heavy imports (no torch / numpy / container), so every layer can import this
+freely without import-cycle risk.
 
-To add a new mode, register it here (attrs + seeds + steps, and PROCESS_MODES if it gets a
-``_MODE_SPEC`` entry); the accel layers and the screen front-end pick it up from these tables.
+Two layers of registry live here:
+
+* the flat tables every consumer already reads (``MODE_ATTRS``, ``MODE_SEEDS``, ``MODE_STEPS``,
+  ``PROCESS_MODES``, ``CONST_SEED_MODES``, ``LEGACY_MODE_ALIASES``), and
+* the :class:`ModeSpec` declarations they are DERIVED from (``SPECS``), which describe each mode
+  as data: the per-molecule input channels it reads, the objective terms it optimises, how they
+  blend, and its optimiser schedule.
+
+Everything mode-shaped downstream -- the batched pairwise aligner, the array-native screen
+aligner, the store schema, the query/fit tensor plumbing, the process-pool tensor spec and the
+fine-loop engine -- reads a :class:`ModeSpec` rather than carrying a per-mode body. To add a mode:
+register a spec here (plus a channel in ``accel/channels.py`` if it reads per-molecule data the
+library does not yet carry, and a kernel if it needs new math); the rest is derived.
+``tests/test_mode_registry.py`` pins the invariants.
 """
+from __future__ import annotations
 
-# Canonical mode id -> (transform_attr, score_attr) written in-place on a MoleculePair by
-# ``MoleculePairBatch.align_with_<mode>``. This is the full set of the 21 canonical modes; the
-# tuple order is the public mode order (preserved from screen.py's historical _VALID_MODES).
-MODE_ATTRS = {
-    "vol":              ("transform_vol_noH",          "sim_aligned_vol_noH"),
-    "vol_esp":          ("transform_vol_esp_noH",      "sim_aligned_vol_esp_noH"),
-    "surf":             ("transform_surf",             "sim_aligned_surf"),
-    "surf_esp":         ("transform_surf_esp",         "sim_aligned_surf_esp"),
-    "vol_and_surf_esp": ("transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp"),
-    "pharm":            ("transform_pharm",            "sim_aligned_pharm"),
-    "vol_color":        ("transform_vol_color",        "sim_aligned_vol_color"),
-    "vol_tversky":      ("transform_vol_tversky",      "sim_aligned_vol_tversky"),
-    "vol_lipo":         ("transform_vol_lipo",         "sim_aligned_vol_lipo"),
-    "vol_esp_tversky":  ("transform_vol_esp_tversky",  "sim_aligned_vol_esp_tversky"),
-    # SI experimental modes (accelerated; reuse existing kernels/drivers or a small new one).
-    "vol_mr":                   ("transform_vol_mr",                   "sim_aligned_vol_mr"),
-    "surf_tversky":             ("transform_surf_tversky",             "sim_aligned_surf_tversky"),
-    "surf_esp_tversky":         ("transform_surf_esp_tversky",         "sim_aligned_surf_esp_tversky"),
-    "vol_lipo_tversky":         ("transform_vol_lipo_tversky",         "sim_aligned_vol_lipo_tversky"),
-    "vol_color_tversky":        ("transform_vol_color_tversky",        "sim_aligned_vol_color_tversky"),
-    "vol_atomtype":             ("transform_vol_atomtype",             "sim_aligned_vol_atomtype"),
-    "vol_pharm":                ("transform_vol_pharm",                "sim_aligned_vol_pharm"),
-    "pharm_tversky":            ("transform_pharm_tversky",            "sim_aligned_pharm_tversky"),
-    "vol_and_surf_esp_tversky": ("transform_vol_and_surf_esp_tversky", "sim_aligned_vol_and_surf_esp_tversky"),
-    "vol_fukui":                ("transform_vol_fukui",                "sim_aligned_vol_fukui"),
-    # shape Tanimoto MINUS a linear hard-sphere excluded-volume penalty (a fixed avoid-point cloud).
-    # Pairwise-only: takes an extra non-molecule input (avoid_points), so it is NOT screen-wired and
-    # NOT in PROCESS_MODES (like all extra-input modes). New hard-sphere kernel + forked driver.
-    "vol_avoid":                ("transform_vol_avoid",                "sim_aligned_vol_avoid"),
-}
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
-# The 21 canonical mode ids, in public order.
+
+# =============================================================================================
+# Objective terms and mode specs
+# =============================================================================================
+@dataclass(frozen=True)
+class Term:
+    """One contribution to a mode's objective, computed by ONE kernel launch per fine step.
+
+    kernel : which value+gradient kernel evaluates it. One of
+        ``"shape"``   Gaussian volume overlap of two point clouds
+                       (``overlap_score_grad_se3_batch``; channels: ref points, fit points);
+        ``"esp"``     shape overlap weighted by a per-point scalar field
+                       (``overlap_score_grad_esp_se3_batch``; points + scalar per side);
+        ``"color"``   directionless typed-anchor overlap
+                       (``pharm_color_score_grad_se3_batch``; anchors + labels per side);
+        ``"pharm"``   directional pharmacophore overlap
+                       (``pharm_grad_dq_se3_batch``; anchors + vectors + labels per side);
+        ``"avoid"``   linear hard-sphere excluded-volume penalty
+                       (``overlap_score_grad_avoid_se3_batch``; a FIXED avoid cloud on the ref
+                       slot, fit points on the fit slot);
+        ``"esp_cmp"`` the ShaEP surface-ESP agreement (value only, no gradient).
+    ref / fit : channel names, in the kernel's argument order, for each side.
+    params : call-kwarg names forwarded to the kernel (``"alpha"``, ``"lam"``, ``"avoid_min_dist"``).
+    reduction : how the raw overlap becomes a similarity:
+        ``"tanimoto"``  V / (VAA + VBB - V)            scale = (VAA+VBB) / denom^2
+        ``"tversky"``   V / (k V + C), C = ta VAA + tb VBB, k = 1 - ta - tb; scale = C / denom^2
+        ``"raw"``       the value itself (a penalty); scale = 1
+        ``"agreement"`` the esp_cmp average in [0, 1]; no gradient
+        ``"pharm_sim"`` the pharmacophore family's own reduction, selected by the call's
+                        ``similarity`` keyword: a guarded Tanimoto, or a guarded Tversky
+                        ``V / (sigma VAA + (1-sigma) VBB)`` clamped to 1 with sigma from
+                        ``{tversky: 0.95, tversky_ref: 1.0, tversky_fit: 0.05}``. This is NOT
+                        the ``tversky`` reduction above: it takes no ta/tb and its gradient is
+                        the hinged ``-1(V < D)/D``.
+    weight : the blend weight -- a call-kwarg name, a float, or ``None`` for the complement of
+        the named weight of the OTHER term (``1 - w``). Negative weights subtract (penalties).
+    grad : whether the term's kernel gradient steers the pose.
+    guard : mask the term to zero for pairs where either side has no real points (the lipo
+        family), so an empty channel contributes neither score nor gradient.
+    tables : lookup-table set for the typed kernels: ``"color"`` (directionless pharmacophore),
+        ``"pharm"`` (directional pharmacophore) or ``"element"`` (atomic numbers).
+    stride_kw : for a value-only term, the name of the module constant giving the eager-loop
+        evaluation stride (the combo modes score their ESP term every ``_ESP_STRIDE`` steps).
+    """
+    kernel: str
+    ref: Tuple[str, ...]
+    fit: Tuple[str, ...]
+    params: Tuple[str, ...] = ()
+    reduction: str = "tanimoto"
+    weight: object = 1.0
+    grad: bool = True
+    guard: bool = False
+    tables: Optional[str] = None
+    stride: bool = False
+
+
+@dataclass(frozen=True)
+class ModeSpec:
+    """Everything the library needs to know about one alignment mode, as data.
+
+    name : canonical mode id (also the ``align_with_<name>`` / ``_align_batch_<name>`` suffix).
+    attrs : ``(transform_attr, score_attr)`` written on a ``MoleculePair``.
+    seeds / steps / patience : the balanced optimiser defaults (SO(3) multi-starts, fine steps,
+        early-stop patience in 5-step checks).
+    seed_channel : the point channel whose principal frames generate the seeds. Modes whose seed
+        channel is the heavy-atom cloud a canonical store rotates into its principal frame get
+        the store's CONSTANT seed set on the screen path (see ``CONST_SEED_MODES``).
+    channels : every channel the objective reads (per side; ``avoid`` is pair-side).
+    bucket : the channels whose real counts are the cost-driving pad dims. One channel means
+        ``PadSpec(merge={ref, fit})``; several means one merge dim per side per channel, with
+        ``work`` naming the cost model.
+    work : ``"product"`` (default N_pad*M_pad over the single bucket channel) or ``"combo"``
+        (the sum of the three channel products the ShaEP combo evaluates).
+    terms : the objective terms, in gradient-accumulation order.
+    params : call keyword -> default. ``None`` marks a REQUIRED keyword.
+    center_clouds : centre both seed-channel clouds on their own real-point centroids before
+        seeding and fold the shift back into the returned translation (the pharm family).
+    pharm_style : the pharm family's optimiser tail -- unit-normalise ``q`` before the kernel,
+        apply the normalisation Jacobian and the guarded/clamped pharm similarity, and use the
+        un-projected fused Adam -- reproduced exactly rather than approximated.
+    graph_budget : per-row work budget for ``drivers/_graphed.graph_cap``; ``None`` disables the
+        CUDA-graph fine loop for the mode.
+    graph_full_steps : replay the graph for the full step count instead of the blocked
+        early-stop (the combo modes, whose ESP landscape converges slowly).
+    cpu_fused : whether the fused numba fine loop is used on CPU. False for the pharmacophore
+        family ALONE, and measured: its objective is the most multi-basin in the library and it
+        runs the most seeds (32), so the float32 tail's own rounding -- not its schedule, which
+        matches the eager loop step for step -- is enough to flip which seed wins. Forced on, a
+        12-molecule screen moved 5 of 12 scores by up to 4.468e-02 (35.7% relative) against the
+        eager loop, while the eager loop reproduces the pre-refactor scores exactly. The old
+        driver excluded it for the same reason and measured the fused loop worth only 1.046x at
+        N=512 / 1.025x at N=2048 there (job 22637530), so the exclusion costs almost nothing.
+    cpu_fused_max_pad : the fused loop is used only when every padded width is at most this.
+    fused_pair : the two gradient terms can be evaluated by ONE fused kernel (the shape+colour
+        single launch in ``kernels/vol_color_triton.py``), collapsing two launches per fine step
+        into one. CUDA-only and single-tile, so the engine falls back to the two separate
+        kernels on CPU tensors or past ``VOL_COLOR_FUSED_MAX_PAD``.
+    multipose : poses per CTA for the deduplicated multi-pose shape layout (surf only).
+    pose_cap : bound the fine-loop sub-batch at ``_pad._FINE_CHUNK_POSES`` poses (vol only; a
+        measured optimum there and a measured loss elsewhere).
+    lam_scaling : multiply ``lam`` by ``score.constants.LAM_SCALING`` (the surface convention).
+    honors_num_repeats : a caller's ``num_repeats`` overrides ``seeds`` (the pharm family); the
+        other modes accept the keyword and take the registry count.
+    channel_switch : ``{virtual channel: (kwarg, value, if_equal, else)}`` -- the combo modes
+        score volumetric shape when ``alpha == 0.81`` and surface shape otherwise.
+    screen_lr : the fine-loop learning rate the SCREEN front-end uses when the caller passes
+        none. Historically 0.1 for the ESP / pharmacophore / colour / field modes and the driver
+        default 0.075 for the shape and Tversky modes; kept per mode so scores do not move.
+    process : whether the mode has a process-per-GPU / CPU-pool tensor spec.
+    """
+    name: str
+    attrs: Tuple[str, str]
+    seeds: int
+    steps: int
+    patience: int
+    seed_channel: str
+    channels: Tuple[str, ...]
+    bucket: Tuple[str, ...]
+    terms: Tuple[Term, ...]
+    params: dict = field(default_factory=dict)
+    work: str = "product"
+    center_clouds: bool = False
+    pharm_style: bool = False
+    graph_budget: Optional[int] = 300_000_000
+    graph_full_steps: bool = False
+    cpu_fused: bool = True
+    cpu_fused_max_pad: Optional[int] = None
+    fused_pair: bool = False
+    multipose: int = 1
+    pose_cap: bool = False
+    lam_scaling: bool = False
+    honors_num_repeats: bool = False
+    channel_switch: dict = field(default_factory=dict)
+    screen_lr: float = 0.075
+    process: bool = True
+
+    @property
+    def transform_attr(self) -> str:
+        return self.attrs[0]
+
+    @property
+    def score_attr(self) -> str:
+        return self.attrs[1]
+
+    def resolve_channel(self, name: str, kwargs: dict) -> str:
+        """Concrete channel for ``name`` under this call's keywords (``channel_switch``)."""
+        sw = self.channel_switch.get(name)
+        if sw is None:
+            return name
+        kw, value, if_eq, else_ = sw
+        return if_eq if kwargs.get(kw, self.params.get(kw)) == value else else_
+
+    def all_channels(self) -> Tuple[str, ...]:
+        """Every concrete channel this mode can read, switches expanded."""
+        out = []
+        for c in self.channels:
+            sw = self.channel_switch.get(c)
+            names = (sw[2], sw[3]) if sw else (c,)
+            for n in names:
+                if n not in out:
+                    out.append(n)
+        return tuple(out)
+
+
+# ---- shared building blocks ------------------------------------------------------------------
+_SHAPE = Term("shape", ("atoms",), ("atoms",), params=("alpha",))
+_SHAPE_T = Term("shape", ("atoms",), ("atoms",), params=("alpha",), reduction="tversky")
+_SURF = Term("shape", ("surf",), ("surf",), params=("alpha",))
+_SURF_T = Term("shape", ("surf",), ("surf",), params=("alpha",), reduction="tversky")
+_HEAVY_ESP = Term("esp", ("heavy", "charges"), ("heavy", "charges"), params=("alpha", "lam"))
+_HEAVY_ESP_T = Term("esp", ("heavy", "charges"), ("heavy", "charges"), params=("alpha", "lam"),
+                    reduction="tversky")
+_SURF_ESP = Term("esp", ("surf", "surf_esp"), ("surf", "surf_esp"), params=("alpha", "lam"))
+_SURF_ESP_T = Term("esp", ("surf", "surf_esp"), ("surf", "surf_esp"), params=("alpha", "lam"),
+                   reduction="tversky")
+
+
+def _field_blend(field_pos, field_val, weight, reduction="tanimoto"):
+    """shape + a per-atom scalar field carried by the ESP kernel (lipo / mr / fukui)."""
+    return (Term("shape", ("atoms",), ("atoms",), params=("alpha",), reduction=reduction,
+                 weight=None),
+            Term("esp", (field_pos, field_val), (field_pos, field_val), params=("alpha", "lam"),
+                 reduction=reduction, weight=weight, guard=True))
+
+
+def _color_blend(reduction="tanimoto"):
+    return (Term("shape", ("atoms",), ("atoms",), params=("alpha",), reduction=reduction,
+                 weight=None),
+            Term("color", ("pharm_ancs", "pharm_types"), ("pharm_ancs", "pharm_types"),
+                 reduction=reduction, weight="color_weight", tables="color"))
+
+
+_COMBO_CH = ("cwh", "partial", "radii", "surf", "surf_esp", "centers")
+_COMBO_SWITCH = {"centers": ("alpha", 0.81, "atoms", "surf")}
+
+
+def _combo_terms(reduction="tanimoto"):
+    return (Term("shape", ("centers",), ("centers",), params=("alpha",), reduction=reduction,
+                 weight=None),
+            Term("esp_cmp", ("cwh", "partial", "radii", "surf", "surf_esp"),
+                 ("cwh", "partial", "radii", "surf", "surf_esp"),
+                 params=("lam", "probe_radius"), reduction="agreement", weight="esp_weight",
+                 grad=False, stride=True))
+
+
+_TV = {"tversky_alpha": 0.95, "tversky_beta": 0.05}
+_LR = {"lr": 0.075}
+
+# ---- the 21 canonical modes, in public order ---------------------------------------------------
+SPECS = {}
+
+
+def _reg(spec: ModeSpec) -> ModeSpec:
+    SPECS[spec.name] = spec
+    return spec
+
+
+_reg(ModeSpec("vol", ("transform_vol_noH", "sim_aligned_vol_noH"), 10, 30, 2,
+              seed_channel="atoms", channels=("atoms",), bucket=("atoms",), terms=(_SHAPE,),
+              params={"alpha": 0.81, **_LR}, pose_cap=True))
+_reg(ModeSpec("vol_esp", ("transform_vol_esp_noH", "sim_aligned_vol_esp_noH"), 16, 50, 5,
+              seed_channel="heavy", channels=("heavy", "charges"), bucket=("heavy",),
+              terms=(_HEAVY_ESP,), params={"alpha": 0.81, "lam": None, **_LR},
+              cpu_fused_max_pad=100, screen_lr=0.1))
+_reg(ModeSpec("surf", ("transform_surf", "sim_aligned_surf"), 8, 40, 2,
+              seed_channel="surf", channels=("surf",), bucket=("surf",), terms=(_SURF,),
+              params={"alpha": 0.81, **_LR}, multipose=8))
+_reg(ModeSpec("surf_esp", ("transform_surf_esp", "sim_aligned_surf_esp"), 8, 40, 5,
+              seed_channel="surf", channels=("surf", "surf_esp"), bucket=("surf",),
+              terms=(_SURF_ESP,), params={"alpha": 0.81, "lam": 0.3, **_LR},
+              cpu_fused_max_pad=100, lam_scaling=True, screen_lr=0.1))
+_reg(ModeSpec("vol_and_surf_esp", ("transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp"),
+              8, 60, 5, seed_channel="centers", channels=_COMBO_CH, bucket=("cwh", "surf", "centers"),
+              work="combo", terms=_combo_terms(),
+              params={"alpha": None, "lam": 0.001, "probe_radius": 1.0, "esp_weight": 0.5, **_LR},
+              graph_budget=8_000_000, graph_full_steps=True, channel_switch=_COMBO_SWITCH,
+              screen_lr=0.1))
+_reg(ModeSpec("pharm", ("transform_pharm", "sim_aligned_pharm"), 32, 50, 5,
+              seed_channel="pharm_ancs", channels=("pharm_ancs", "pharm_vecs", "pharm_types"),
+              bucket=("pharm_ancs",),
+              terms=(Term("pharm", ("pharm_ancs", "pharm_vecs", "pharm_types"),
+                          ("pharm_ancs", "pharm_vecs", "pharm_types"), tables="pharm",
+                          reduction="pharm_sim"),),
+              params={"similarity": "tanimoto", "extended_points": False, "only_extended": False,
+                      **_LR},
+              center_clouds=True, pharm_style=True, graph_budget=10_000_000,
+              cpu_fused=False, honors_num_repeats=True, screen_lr=0.1))
+_reg(ModeSpec("vol_color", ("transform_vol_color", "sim_aligned_vol_color"), 16, 40, 2,
+              seed_channel="atoms", channels=("atoms", "pharm_ancs", "pharm_types"), bucket=("atoms",),
+              terms=_color_blend(), params={"alpha": 0.81, "color_weight": 0.5, **_LR},
+              graph_budget=30_000_000, fused_pair=True, screen_lr=0.1))
+_reg(ModeSpec("vol_tversky", ("transform_vol_tversky", "sim_aligned_vol_tversky"), 10, 40, 2,
+              seed_channel="atoms", channels=("atoms",), bucket=("atoms",), terms=(_SHAPE_T,),
+              params={"alpha": 0.81, **_TV, **_LR}))
+_reg(ModeSpec("vol_lipo", ("transform_vol_lipo", "sim_aligned_vol_lipo"), 16, 50, 2,
+              seed_channel="atoms", channels=("atoms", "lipo_pos", "lipo"), bucket=("atoms",),
+              terms=_field_blend("lipo_pos", "lipo", "lipo_weight"),
+              params={"alpha": 0.81, "lam": 0.1, "lipo_weight": 0.5, **_LR},
+              graph_budget=30_000_000, screen_lr=0.1))
+_reg(ModeSpec("vol_esp_tversky", ("transform_vol_esp_tversky", "sim_aligned_vol_esp_tversky"),
+              16, 50, 5, seed_channel="heavy", channels=("heavy", "charges"), bucket=("heavy",),
+              terms=(_HEAVY_ESP_T,), params={"alpha": 0.81, "lam": 0.1, **_TV, **_LR}))
+# SI experimental modes
+_reg(ModeSpec("vol_mr", ("transform_vol_mr", "sim_aligned_vol_mr"), 16, 50, 2,
+              seed_channel="atoms", channels=("atoms", "mr_pos", "mr"), bucket=("atoms",),
+              terms=_field_blend("mr_pos", "mr", "mr_weight"),
+              params={"alpha": 0.81, "lam": 0.1, "mr_weight": 0.5, **_LR},
+              graph_budget=30_000_000, screen_lr=0.1))
+_reg(ModeSpec("surf_tversky", ("transform_surf_tversky", "sim_aligned_surf_tversky"), 8, 40, 2,
+              seed_channel="surf", channels=("surf",), bucket=("surf",), terms=(_SURF_T,),
+              params={"alpha": 0.81, **_TV, **_LR}))
+_reg(ModeSpec("surf_esp_tversky", ("transform_surf_esp_tversky", "sim_aligned_surf_esp_tversky"),
+              8, 40, 5, seed_channel="surf", channels=("surf", "surf_esp"), bucket=("surf",),
+              terms=(_SURF_ESP_T,), params={"alpha": 0.81, "lam": 0.3, **_TV, **_LR},
+              lam_scaling=True))
+_reg(ModeSpec("vol_lipo_tversky", ("transform_vol_lipo_tversky", "sim_aligned_vol_lipo_tversky"),
+              16, 50, 2, seed_channel="atoms", channels=("atoms", "lipo_pos", "lipo"), bucket=("atoms",),
+              terms=_field_blend("lipo_pos", "lipo", "lipo_weight", reduction="tversky"),
+              params={"alpha": 0.81, "lam": 0.1, "lipo_weight": 0.5, **_TV, **_LR},
+              graph_budget=30_000_000, screen_lr=0.1))
+_reg(ModeSpec("vol_color_tversky", ("transform_vol_color_tversky", "sim_aligned_vol_color_tversky"),
+              16, 40, 2, seed_channel="atoms", channels=("atoms", "pharm_ancs", "pharm_types"),
+              bucket=("atoms",), terms=_color_blend(reduction="tversky"),
+              params={"alpha": 0.81, "color_weight": 0.5, **_TV, **_LR},
+              graph_budget=30_000_000, fused_pair=True, screen_lr=0.1))
+_reg(ModeSpec("vol_atomtype", ("transform_vol_atomtype", "sim_aligned_vol_atomtype"), 16, 40, 2,
+              seed_channel="atoms", channels=("atoms", "type_pos", "atomlabels"), bucket=("atoms",),
+              terms=(Term("shape", ("atoms",), ("atoms",), params=("alpha",), weight=None),
+                     Term("color", ("type_pos", "atomlabels"), ("type_pos", "atomlabels"),
+                          weight="atomtype_weight", tables="element", params=("alpha",))),
+              params={"alpha": 0.81, "atomtype_weight": 0.5, **_LR},
+              graph_budget=30_000_000, screen_lr=0.1))
+_reg(ModeSpec("vol_pharm", ("transform_vol_pharm", "sim_aligned_vol_pharm"), 32, 50, 2,
+              seed_channel="atoms", channels=("atoms", "pharm_ancs", "pharm_vecs", "pharm_types"),
+              bucket=("atoms",),
+              terms=(Term("shape", ("atoms",), ("atoms",), params=("alpha",), weight=None),
+                     Term("pharm", ("pharm_ancs", "pharm_vecs", "pharm_types"),
+                          ("pharm_ancs", "pharm_vecs", "pharm_types"),
+                          weight="color_weight", tables="pharm")),
+              params={"alpha": 0.81, "color_weight": 0.5, **_LR},
+              graph_budget=10_000_000, screen_lr=0.1))
+_reg(ModeSpec("pharm_tversky", ("transform_pharm_tversky", "sim_aligned_pharm_tversky"), 32, 50, 5,
+              seed_channel="pharm_ancs", channels=("pharm_ancs", "pharm_vecs", "pharm_types"),
+              bucket=("pharm_ancs",),
+              terms=(Term("pharm", ("pharm_ancs", "pharm_vecs", "pharm_types"),
+                          ("pharm_ancs", "pharm_vecs", "pharm_types"), tables="pharm",
+                          reduction="pharm_sim"),),
+              params={"similarity": "tversky", "extended_points": False, "only_extended": False,
+                      **_LR},
+              center_clouds=True, pharm_style=True, graph_budget=10_000_000,
+              cpu_fused=False, honors_num_repeats=True, screen_lr=0.1))
+_reg(ModeSpec("vol_and_surf_esp_tversky",
+              ("transform_vol_and_surf_esp_tversky", "sim_aligned_vol_and_surf_esp_tversky"),
+              8, 60, 5, seed_channel="centers", channels=_COMBO_CH, bucket=("cwh", "surf", "centers"),
+              work="combo", terms=_combo_terms(reduction="tversky"),
+              params={"alpha": 0.81, "lam": 0.001, "probe_radius": 1.0, "esp_weight": 0.5,
+                      **_TV, **_LR},
+              graph_budget=8_000_000, graph_full_steps=True, channel_switch=_COMBO_SWITCH,
+              screen_lr=0.1))
+_reg(ModeSpec("vol_fukui", ("transform_vol_fukui", "sim_aligned_vol_fukui"), 16, 50, 2,
+              seed_channel="atoms", channels=("atoms", "fukui_pos", "fukui"), bucket=("atoms",),
+              terms=_field_blend("fukui_pos", "fukui", "fukui_weight"),
+              params={"alpha": 0.81, "lam": 0.1, "fukui_weight": 0.5, **_LR},
+              graph_budget=30_000_000, screen_lr=0.1))
+# shape Tanimoto MINUS a linear hard-sphere excluded-volume penalty against a fixed avoid cloud,
+# a query-side (pair-level) third input carried by the ``avoid`` channel.
+_reg(ModeSpec("vol_avoid", ("transform_vol_avoid", "sim_aligned_vol_avoid"), 16, 50, 2,
+              seed_channel="atoms", channels=("atoms", "avoid"), bucket=("atoms",),
+              terms=(Term("shape", ("atoms",), ("atoms",), params=("alpha",), weight=1.0),
+                     Term("avoid", ("avoid",), ("atoms",), params=("avoid_min_dist",),
+                          reduction="raw", weight="-avoid_weight", guard=True)),
+              params={"alpha": 0.81, "avoid_min_dist": 2.0, "avoid_weight": 1.0, **_LR},
+              graph_budget=None, screen_lr=0.1))
+
+
+# =============================================================================================
+# Derived flat tables (the surface every consumer reads)
+# =============================================================================================
+#: Canonical mode id -> (transform_attr, score_attr) written in-place on a MoleculePair by
+#: ``MoleculePairBatch.align_with_<mode>``. Derived from SPECS, in public order.
+MODE_ATTRS = {m: s.attrs for m, s in SPECS.items()}
+
+#: The 21 canonical mode ids, in public order.
 CANONICAL_MODES = tuple(MODE_ATTRS)
 
-# Legacy (pre-rename) mode names -> canonical. The old public API keeps working through this:
-# MoleculePair.align_with_esp / align_with_esp_combo, MoleculePairBatch likewise, the screen
-# ``mode=`` arg, the cpu_pool / multi_gpu mode strings, and old pickles. Normalized at every
-# public entry point via ``canonical()``.
+#: Legacy (pre-rename) mode names -> canonical. The old public API keeps working through this:
+#: MoleculePair.align_with_esp / align_with_esp_combo, MoleculePairBatch likewise, the screen
+#: ``mode=`` arg, the cpu_pool / multi_gpu mode strings, and old pickles. Normalized at every
+#: public entry point via ``canonical()``.
 LEGACY_MODE_ALIASES = {"esp": "surf_esp", "esp_combo": "vol_and_surf_esp"}
 
 
@@ -58,66 +380,55 @@ def canonical(mode: str) -> str:
     return LEGACY_MODE_ALIASES.get(mode, mode)
 
 
-# Modes that have an ``accel/batch/_dispatch.py:_MODE_SPEC`` entry, i.e. a process-per-GPU
-# (multi_gpu) and CPU-pool (cpu_pool) path. The other modes run single-GPU only. ``_MODE_SPEC``
-# (torch-typed extract/tensors/out plumbing) remains the authority; the registry test asserts
-# ``tuple(_MODE_SPEC) == PROCESS_MODES`` so this list can never silently drift.
-PROCESS_MODES = ("vol", "surf", "surf_esp", "pharm")
+def spec_of(mode: str) -> ModeSpec:
+    """The :class:`ModeSpec` for a (possibly legacy) mode name."""
+    return SPECS[canonical(mode)]
 
-# Per-mode defaults: (SO(3) multi-start seed count, fine-optimizer step count). Read by
-# ``aligners._seeds_for`` / ``_steps_for`` and used by both backends (triton/numba) and both
-# workloads (pairwise ``MoleculePairBatch.align_with_*`` and the streaming screen).
-#
-# These are BALANCED defaults, chosen at the accuracy/throughput knee rather than for maximum
-# accuracy: seed count is cheap in retrospective-screening ROC-AUC but expensive in throughput,
-# and ROC-AUC plateaus at low seed counts for every mode.
-#
-# THE "<=0.006 ROC-AUC WHILE RECOVERING >=99% OF THE BEST ACHIEVABLE OVERLAP" CLAIM THAT STOOD
-# HERE IS UNSOURCED. No job, run or dataset is named for it anywhere in this package, and not one
-# of the 42 entries below carries a citation. Treat it as folklore until it is re-measured.
-# Exactly ONE entry has data behind it today -- vol_lipo, against a 48x150 reference over 4,000
-# pairs and a single query (job 22637392): the shipped 16x50 gives mean overlap 0.470105 vs the
-# reference's 0.471862 (deficit +0.001757), Spearman 0.9939, top-100 recall 96/100. That is
-# consistent with the OVERLAP half of the claim for that one mode, and says nothing about
-# ROC-AUC, nor about the other 20 modes.
-# Callers who want more accuracy pass ``max_num_steps`` explicitly. ``num_repeats`` does NOT
-# reach every path -- the batched vol_lipo / vol_color aligners accept and ignore it (job
-# 22637761; see accel/batch/aligners.py), so the seed count there comes from this table alone.
-MODE_SEEDS = {"vol": 10, "surf": 8, "surf_esp": 8, "vol_esp": 16, "vol_and_surf_esp": 8,
-              "pharm": 32, "vol_color": 16, "vol_tversky": 10, "vol_lipo": 16,
-              "vol_esp_tversky": 16,
-              "vol_mr": 16, "surf_tversky": 8, "surf_esp_tversky": 8, "vol_lipo_tversky": 16,
-              "vol_color_tversky": 16, "vol_atomtype": 16, "vol_pharm": 32, "pharm_tversky": 32,
-              "vol_and_surf_esp_tversky": 8, "vol_fukui": 16, "vol_avoid": 16}
-MODE_STEPS = {"vol": 30, "surf": 40, "surf_esp": 40, "vol_esp": 50, "vol_and_surf_esp": 60,
-              "pharm": 50, "vol_color": 40, "vol_tversky": 40, "vol_lipo": 50,
-              "vol_esp_tversky": 50,
-              "vol_mr": 50, "surf_tversky": 40, "surf_esp_tversky": 40, "vol_lipo_tversky": 50,
-              "vol_color_tversky": 40, "vol_atomtype": 40, "vol_pharm": 50, "pharm_tversky": 50,
-              "vol_and_surf_esp_tversky": 60, "vol_fukui": 50, "vol_avoid": 50}
 
-# Screen modes whose seed ROTATIONS come from the heavy-atom cloud -- the cloud a canonical
-# ProfileStore rotates into its principal frame -- and whose seed TRANSLATIONS are zero once both
-# sides are centred on that cloud's centroid. On a canonical store their per-molecule seed
-# eigensolve (drivers/_common.py::batched_seeds_torch, measured at 0.82-0.91 us/mol for vol,
-# vol_color and vol_esp) is redundant: every fit molecule already sits in its principal frame, so
-# the rotation that carries it onto the query is ONE constant set for the whole screen
-# (drivers/_common.py::canonical_seed_quats), broadcast over each bucket. screen.py gates the
-# constant-seed path on this tuple; before it, only ``vol`` took that path and the other modes
-# re-ran the eigensolve on already-rotated coordinates to rediscover a near-constant answer.
-#
-# NOT listed, because they seed from a cloud the store does not canonicalise: ``surf`` and
-# ``surf_esp`` (surface PCA) and ``pharm`` (anchor PCA). ``vol_and_surf_esp`` seeds from the atom
-# cloud only at alpha == 0.81 and from the surface otherwise; screen.py checks that per call.
-# ``vol_esp`` / ``vol_esp_tversky`` seed from the STRICT-heavy centres, which equal ``atom_pos``
-# except on a molecule whose RemoveHs retained an H (and are rotated by the same ``rot`` --
-# screen.py::_profile_from_schema), so the constant set is exact there and off by that one
-# molecule's own frame difference otherwise: a seed perturbation the flip/swap set covers.
-#
-# The constant seeds are NOT bit-identical to the per-molecule ones (the frames differ by each
-# molecule's own rotation), so scores move at the 1e-3 level -- the same magnitude the rotated
-# coordinates alone already moved them on a canonical store, with no enrichment change on 27
-# DUDE-Z targets for vol, vol_esp or surf (Shepherd-Score-Paper fig2_speed/validate_canonical.py,
-# results/CANONICAL_validation.json, commit 6993bef). Re-run that harness after changing this.
-CONST_SEED_MODES = ("vol", "vol_color", "vol_esp", "vol_and_surf_esp", "vol_tversky",
-                    "vol_esp_tversky", "vol_lipo", "vol_fukui")
+#: Modes with a process-per-GPU (multi_gpu) and CPU-pool (cpu_pool) path. Every mode declares
+#: its tensors through its channels now, so this is the whole registry; kept as a name because
+#: the consumers and the registry test read it.
+PROCESS_MODES = tuple(m for m, s in SPECS.items() if s.process)
+
+#: Per-mode defaults: (SO(3) multi-start seed count, fine-optimizer step count). Read by
+#: ``aligners._seeds_for`` / ``_steps_for`` and used by both backends (triton/numba) and both
+#: workloads (pairwise ``MoleculePairBatch.align_with_*`` and the streaming screen).
+#:
+#: These are BALANCED defaults, chosen at the accuracy/throughput knee rather than for maximum
+#: accuracy: seed count is cheap in retrospective-screening ROC-AUC but expensive in throughput,
+#: and ROC-AUC plateaus at low seed counts for every mode.
+#:
+#: THE "<=0.006 ROC-AUC WHILE RECOVERING >=99% OF THE BEST ACHIEVABLE OVERLAP" CLAIM THAT STOOD
+#: HERE IS UNSOURCED. No job, run or dataset is named for it anywhere in this package, and not one
+#: of the entries carries a citation. Treat it as folklore until it is re-measured. Exactly ONE
+#: entry has data behind it today -- vol_lipo, against a 48x150 reference over 4,000 pairs and a
+#: single query (job 22637392): the shipped 16x50 gives mean overlap 0.470105 vs the reference's
+#: 0.471862 (deficit +0.001757), Spearman 0.9939, top-100 recall 96/100.
+#: Callers who want more accuracy pass ``max_num_steps`` explicitly. ``num_repeats`` reaches the
+#: batched path only for the modes whose spec sets ``honors_num_repeats`` (the pharm family); the
+#: other batched aligners accept and ignore it (job 22637761).
+MODE_SEEDS = {m: s.seeds for m, s in SPECS.items()}
+MODE_STEPS = {m: s.steps for m, s in SPECS.items()}
+
+#: Channels a canonical ProfileStore rotates into the molecule's principal frame. A mode whose
+#: seed channel is one of these gets the store's constant seed set on the screen path instead of
+#: a per-molecule eigensolve (drivers/_common.py::canonical_seed_quats): every fit molecule
+#: already sits in its principal frame, so the rotation that carries it onto the query is ONE set
+#: for the whole screen. ``surf`` (surface PCA) and ``pharm_ancs`` (anchor PCA) are frames the
+#: store does not canonicalise, so their modes keep the generator. The combo modes seed from the
+#: atom cloud only at alpha == 0.81 (``channel_switch``); screen.py checks that per call.
+#:
+#: Constant seeds are NOT bit-identical to per-molecule ones (the frames differ by each
+#: molecule's own rotation), so scores move at the 1e-3 level -- the same magnitude the rotated
+#: coordinates alone already moved them on a canonical store, with no enrichment change on 27
+#: DUDE-Z targets (Shepherd-Score-Paper fig2_speed/validate_canonical.py, commit 6993bef).
+CANONICAL_SEED_CHANNELS = ("atoms", "heavy")
+
+
+def _const_seed_capable(s: ModeSpec) -> bool:
+    sw = s.channel_switch.get(s.seed_channel)
+    seed_ch = sw[2] if sw else s.seed_channel
+    return seed_ch in CANONICAL_SEED_CHANNELS
+
+
+CONST_SEED_MODES = tuple(m for m, s in SPECS.items() if _const_seed_capable(s))
