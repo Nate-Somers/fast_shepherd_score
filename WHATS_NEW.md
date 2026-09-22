@@ -667,6 +667,19 @@ pairwise path (Shepherd-Score-Paper, `paper/fig2_speed/validate_canonical.py` an
   performance-characterised, and several carry tuning constants inherited from a sibling rather than
   measured for themselves. They all screen now, on the array-native path, but **no throughput number
   has been measured for any of them** — do not quote one by analogy with a sibling.
+- **Parity was measured on SMALL batches, and two bugs lived outside that envelope.** Every
+  pairwise, screen, graph-vs-eager and array-vs-object comparison behind the sub-0.1% claims above
+  ran on 6- to 12-molecule fixtures, and every test store held all modes at once. Two real
+  regressions survived that sweep untouched: the kernel-launch slice past **65,535 poses**, which
+  put Tanimotos as high as 1.1e5 on a 30,000-pair GPU batch, and a store built for **one mode
+  alone**, which silently lacked the arrays that mode reads. Both are fixed and both now have
+  gates (`tests/test_grid_chunked_launch.py`, `tests/test_store_minimal_schema.py`), but the
+  lesson stands: before trusting a parity number here, run a GPU batch past 65,535 poses, build a
+  store per mode, and use the real harness cell size — the figure's pairwise cell is N=100,000,
+  not a toy fixture.
+- **The colour and pharmacophore kernels have no grid-limit guard**, in this tree or in 591f695.
+  Only the shape, ESP and avoid launches are sliced at `grid.z <= 65535`. They are reachable above
+  that in principle; neither tree has been measured there.
 - **`accel/` and `screen.py` have no Sphinx API pages**, so none of [§8](#8-api-reference) renders on
   the docs site. When adding them, set `autodoc_mock_imports = ["triton", "numba"]`.
 - **Bit-identity results come from non-early-stopping workloads.** A very small chunk or a
