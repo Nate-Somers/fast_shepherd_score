@@ -42,14 +42,40 @@ _PHARM_SIGMA = {"tversky": 0.95, "tversky_ref": 1.0, "tversky_fit": 0.05}
 # the assembled problem
 # =============================================================================================
 class _Term:
-    """One term's per-pose tensors + reduction constants, in the fine-loop layout."""
-    __slots__ = ("spec", "inputs", "weight", "norm", "C", "k", "guard", "vaa", "vbb", "sigma")
+    """One term's per-pose tensors + reduction constants, in the fine-loop layout.
+
+    ``scratch`` holds the reduction's own working buffers so the fine step allocates nothing.
+    Inside a captured CUDA graph every temporary is a pool allocation and its own kernel, and the
+    reduction is a FIXED cost per step, so it is paid in proportion to how cheap the mode's kernel
+    is. Measured on an L40S at N=1e5, the allocating version cost ``vol`` (a 15x15 atom overlap,
+    0.9 us/align, the cheapest mode in the library) **6.5%**, while kernel-bound modes such as
+    ``surf`` and ``pharm`` were unaffected. Allocated lazily on first use, which for the graph
+    path happens in ``_GraphedFineBase.capture``'s warmup -- OFF the capture stream -- so the
+    buffers are ordinary tensors that every replay reuses."""
+    __slots__ = ("spec", "inputs", "weight", "norm", "C", "k", "guard", "vaa", "vbb", "sigma",
+                 "scratch")
 
     def __init__(self, spec, inputs, weight):
         self.spec = spec
         self.inputs = inputs
         self.weight = weight
         self.norm = self.C = self.k = self.guard = self.vaa = self.vbb = self.sigma = None
+        self.scratch = None
+
+
+def _scratch_for(tm, V):
+    """``(den, sim, scl, d2, ng)`` sized like ``V``, or ``None`` when this call's shape is not
+    the one the buffers were cut for (``_score_poses`` and ``_coarse_topk`` evaluate a different
+    pose count, and must keep the allocating path)."""
+    s = tm.scratch
+    if s is not None and s[0].shape == V.shape and s[0].dtype == V.dtype:
+        return s
+    if s is not None:
+        return None                       # different shape: do not thrash the fine loop's buffers
+    e = lambda: torch.empty_like(V)
+    ng = (torch.empty_like(tm.guard) if tm.guard is not None else None)
+    tm.scratch = (e(), e(), e(), e(), ng)
+    return tm.scratch
 
 
 class Problem:
@@ -349,8 +375,46 @@ def _track_best(st: _State, score):
 
 
 def _reduce_grad_term(tm, V):
-    """``(sim, scale)`` for a gradient-bearing term: the similarity and d(sim)/dV."""
+    """``(sim, scale)`` for a gradient-bearing term: the similarity and d(sim)/dV.
+
+    Written through the term's persistent ``scratch`` buffers when they fit this call's shape, so
+    the captured fine step allocates nothing (see :class:`_Term`). The arithmetic is unchanged --
+    ``a - b`` and ``torch.sub(a, b, out=buf)`` compute the same value -- and the allocating branch
+    below still runs for the off-shape callers. ``~tm.guard`` is recomputed each step rather than
+    cached: ``_load`` copies a new bucket's guard into the same tensor, so a cached negation would
+    go stale on the second bucket through a captured graph."""
     red = tm.spec.reduction
+    buf = _scratch_for(tm, V)
+    if buf is not None:
+        den, sim, scl, d2, ng = buf
+        if tm.guard is not None:
+            torch.logical_not(tm.guard, out=ng)
+        if red == "tanimoto":
+            torch.sub(tm.norm, V, out=den)
+            if tm.guard is not None:
+                den.masked_fill_(ng, 1.0)
+            torch.div(V, den, out=sim)
+            torch.mul(den, den, out=d2)
+            torch.div(tm.norm, d2, out=scl)
+        elif red == "tversky":
+            torch.mul(V, tm.k, out=den)
+            den.add_(tm.C)
+            if tm.guard is not None:
+                den.masked_fill_(ng, 1.0)
+            torch.div(V, den, out=sim)
+            torch.mul(den, den, out=d2)
+            torch.div(tm.C, d2, out=scl)
+        else:                                        # "raw": the value itself, unit scale
+            if tm.guard is None:
+                return V, None
+            sim.copy_(V).masked_fill_(ng, 0.0)
+            scl.copy_(tm.guard)                      # bool -> dtype, same as guard.to(dtype)
+            return sim, scl
+        if tm.guard is not None:
+            sim.masked_fill_(ng, 0.0)
+            scl.masked_fill_(ng, 0.0)
+        return sim, scl
+
     if red == "tanimoto":
         denom = tm.norm - V
         if tm.guard is not None:
