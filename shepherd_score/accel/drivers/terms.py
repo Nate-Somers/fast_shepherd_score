@@ -58,17 +58,34 @@ def tables_for(term, device, dtype, params):
 # ---------------------------------------------------------------------------------------------
 # chunked shape-family launches
 # ---------------------------------------------------------------------------------------------
+#: ``kw`` entries that are PER-MOLECULE, not per-pose, and so must be sliced with ``args_mol``
+#: in every grid-safe chunk. Passing them whole is not a tolerance issue: the kernel reads each
+#: molecule's real-point count at the row it is given, so from the SECOND chunk on every pose is
+#: scored against another molecule's atom count. Measured before the fix, on an L40S: a
+#: 21,919-pair vol chunk (219,190 poses, so 4 grid slices) returned 8,395 of 30,000 pairs with a
+#: Tanimoto above 1, up to 7.3e3, and vol_esp up to 1.1e5. Everything at or below one chunk --
+#: every batch under 65,535 poses, which is every test in the suite and every CPU run -- was
+#: correct, which is why this survived a full parity sweep.
+_MOL_KW = ("N_real", "M_real")
+
+
 def _chunked(fn, K, S, args_mol, args_pose, kw, extra):
     """Run ``fn`` over ``K`` poses in grid-safe slices; ``args_mol`` are per-molecule (K//S
-    rows), ``args_pose`` per pose. Keeps each molecule's seed group whole in a chunk."""
+    rows), ``args_pose`` per pose. Keeps each molecule's seed group whole in a chunk, and slices
+    the per-molecule ``kw`` entries (``_MOL_KW``) with the molecules."""
     out_V = torch.empty(K, device=args_pose[0].device, dtype=args_mol[0].dtype)
     out_dQ = torch.empty_like(args_pose[0])
     out_dT = torch.empty_like(args_pose[1])
     step = _CHUNK if S == 1 else max(S, (_CHUNK // S) * S)
+    if K <= step:                                   # one launch: nothing to slice
+        V, dQ, dT = fn(*args_mol, *args_pose, **kw, **extra)
+        return V, dQ, dT
     for s in range(0, K, step):
         e = min(s + step, K)
         ms, me = s // S, e // S
-        V, dQ, dT = fn(*[a[ms:me] for a in args_mol], *[a[s:e] for a in args_pose], **kw, **extra)
+        kw_c = {n: (v[ms:me] if n in _MOL_KW and v is not None else v) for n, v in kw.items()}
+        V, dQ, dT = fn(*[a[ms:me] for a in args_mol], *[a[s:e] for a in args_pose],
+                       **kw_c, **extra)
         out_V[s:e] = V
         out_dQ[s:e] = dQ
         out_dT[s:e] = dT
