@@ -187,12 +187,16 @@ control had gone false.
 Every gate above is cheap because its fixture is small. Two shipped regressions were invisible to
 all of them, and both were found only by a benchmark-sized run:
 
-- **Past 65,535 poses** a kernel launch is sliced, and code that is correct in one launch can be
-  wrong across slices. `drivers/terms._chunked` passed the per-molecule `N_real`/`M_real` whole,
-  so from the second slice every pose was scored against another molecule's atom count —
-  Tanimotos up to 1.1e5 on a 30,000-pair `vol` batch, and nothing below the limit could show it.
-  CPU is immune, since the numba kernels have no grid limit. If your mode adds a kernel argument,
-  ask whether it is per-pose or per-molecule, and add it to `_MOL_KW` if it is the latter.
+- **Past 65,535 poses** the shape/ESP/avoid launches are sliced by `drivers/terms._chunked`, and
+  code that is correct in one launch can be wrong across slices. It passed the per-molecule
+  `N_real`/`M_real` whole, so from the second slice every pose was scored against another
+  molecule's atom count — Tanimotos up to 1.1e5 on a 30,000-pair `vol` batch, and nothing below
+  the limit could show it. CPU is immune, since the numba kernels take one call. If your mode
+  adds a kernel argument, ask whether it is per-pose or per-molecule, and add it to `_MOL_KW` if
+  it is the latter. (The 65,535 itself is conservative: every kernel launches a 1-D grid, so the
+  bound is `grid.x` = 2^31-1, and the pharmacophore kernel runs 3,167,232 poses unchunked and
+  correct. Do not add slicing to a new kernel expecting a hardware limit — add it only if you
+  measure a reason.)
 - **A store built for your mode ALONE** may lack arrays a neighbouring mode was writing.
   `_flush` emits the with-H block under one `schema["charges"]`, so a mode that reads `cwh`
   without pulling that flag got a store with none of it.
