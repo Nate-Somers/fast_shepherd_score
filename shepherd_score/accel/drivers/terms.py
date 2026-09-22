@@ -5,8 +5,9 @@ returns ``(value, dQ, dT)`` -- the overlap and its gradient in unit-quaternion s
 the dispatched kernels emit them -- or ``(value, None, None)`` for a value-only term. The
 pose-invariant self-overlaps a reduction needs come from :func:`self_overlap`.
 
-Shape-family launches are sliced at the CUDA ``grid.z <= 65535`` limit the way the old
-``_overlap_in_chunks`` did; the pharmacophore and colour kernels launch a 1-D grid and take the
+Shape-family launches are sliced only at the int32 pointer-offset ceiling ``_launch_step``
+derives from the pads -- no longer at 65,535, which was the grid.z limit and never applied to
+these 1-D grids; the pharmacophore and colour kernels launch a 1-D grid and take the
 whole batch.
 """
 from __future__ import annotations
@@ -23,7 +24,24 @@ from ..kernels.dispatch import (
 )
 from ._common import apply_se3_transform
 
-_CHUNK = 65_535
+# Poses per kernel launch. Every kernel here launches a ONE-DIMENSIONAL grid, so the bound that
+# applies is grid.x (2^31-1), and the old 65,535 -- the grid.z limit, which never entered into it
+# -- was pure overhead: at vol's 81,920-pose chunk it split each captured fine step into two
+# launches plus three output copies. The real ceiling is the int32 pointer offset the kernels form
+# as ``mol * N_pad * 3`` (``tl.program_id`` is int32), which ``_launch_step`` derives from the
+# ACTUAL pads at call time; pads round up to 16 with no fixed maximum, so it cannot be a constant.
+# ``_CHUNK`` remains as an upper bound so a test can force slicing with a small value.
+_CHUNK = 2 ** 31 - 1
+_PID_MAX = 2 ** 31 - 1
+
+
+def _launch_step(S, args_mol):
+    """Poses per launch: the int32 offset ceiling from the largest pad in ``args_mol``, capped by
+    ``_CHUNK``, and rounded DOWN to a whole seed group so a slice never splits one molecule's
+    seeds (the kernel's own ``pid // S`` would then address the wrong molecule)."""
+    pad = max((int(a.shape[1]) for a in args_mol if a.dim() >= 2), default=1)
+    ceil = max(1, min(_CHUNK, _PID_MAX // (3 * max(pad, 1))))
+    return ceil if S == 1 else max(S, (ceil // S) * S)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -73,13 +91,12 @@ def _chunked(fn, K, S, args_mol, args_pose, kw, extra):
     """Run ``fn`` over ``K`` poses in grid-safe slices; ``args_mol`` are per-molecule (K//S
     rows), ``args_pose`` per pose. Keeps each molecule's seed group whole in a chunk, and slices
     the per-molecule ``kw`` entries (``_MOL_KW``) with the molecules."""
+    step = _launch_step(S, args_mol)
+    if K <= step:                                   # one launch: nothing to slice, nothing to copy
+        return fn(*args_mol, *args_pose, **kw, **extra)
     out_V = torch.empty(K, device=args_pose[0].device, dtype=args_mol[0].dtype)
     out_dQ = torch.empty_like(args_pose[0])
     out_dT = torch.empty_like(args_pose[1])
-    step = _CHUNK if S == 1 else max(S, (_CHUNK // S) * S)
-    if K <= step:                                   # one launch: nothing to slice
-        V, dQ, dT = fn(*args_mol, *args_pose, **kw, **extra)
-        return V, dQ, dT
     for s in range(0, K, step):
         e = min(s + step, K)
         ms, me = s // S, e // S
