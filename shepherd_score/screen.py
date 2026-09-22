@@ -1,50 +1,17 @@
-"""Out-of-core *streaming* screening for libraries too large to hold in RAM.
+"""Out-of-core streaming screening for libraries too large to hold in RAM.
 
-A query (or a handful of queries) can be aligned against a library of effectively
-unbounded size by (1) precomputing each library molecule's interaction profile
-**once**, persisting it to a sharded on-disk store, and (2) streaming shards back
-through the **existing** :class:`~shepherd_score.container.MoleculePairBatch` /
-:func:`~shepherd_score.accel.multi_gpu.align_multi_gpu` API, reducing scores on
-the fly. Host RAM never holds the whole library: the screen keeps the shard it is
-aligning plus (by default) one shard being read ahead on a background thread, so
-residency is bounded at two shards. See ``_iter_shards_prefetched`` for the
-read-ahead and hold exactly one.
+Each library molecule's interaction profile is computed once and persisted to a sharded on-disk
+:class:`ProfileStore`; :func:`screen` then streams the shards past a query through the batched
+aligners, reducing to a running top-K, so host RAM holds at most two shards (the one aligning
+and one being read ahead). :class:`MoleculeProfile` is the RDKit-free stand-in for ``Molecule``
+that carries only the arrays the aligners read.
 
-Three pieces:
+Example::
 
-* :class:`MoleculeProfile` -- an RDKit-free, duck-typed stand-in for ``Molecule``
-  holding only the numeric arrays the batched aligners read. The RDKit ``Mol`` is
-  not stored, so reloading a shard is an array copy rather than a molecule
-  reconstruction.
-* :class:`ProfileStore` -- a sharded, on-disk store of profiles. Shards are
-  independent ``.npz`` files, so the (expensive) build parallelises across
-  workers/nodes with no locking, and a screen streams them back one at a time.
-* :func:`screen` -- the driver: stream shards past a query, align each with the
-  unchanged batch API, reduce to a running top-K.
-
-Why this works (verified against the code): the batched aligners read only numpy
-arrays off ``ref_molec``/``fit_molec`` (``atom_pos``, ``surf_pos``, ``surf_esp``,
-``partial_charges`` + ``_nonH_atoms_idx``, ``pharm_*``, ``radii``); the only mode
-that touches ``.mol`` is ``esp_combo`` (with-H centers), handled here by a tiny
-conformer shim. ``MoleculePair`` accepts any non-``Chem.Mol`` object verbatim, so
-a :class:`MoleculeProfile` duck-types straight in. And the GPU path is *already*
-internally streaming (band-bucketing + ``_subbatched_align``), so this layer is
-pure host-side I/O + a reduce loop — no kernel or GPU-memory changes.
-
-Example
--------
->>> from shepherd_score.container import Molecule
->>> from shepherd_score.screen import ProfileStore, screen
->>> # BUILD ONCE (parallel across the cluster; each worker writes its own shards)
->>> with ProfileStore.create("lib.fss", num_surf_points=200,
-...                           modes=("surf", "surf_esp", "pharm")) as store:
-...     for mol in library_rdkit_mols:
-...         store.add(Molecule(mol, num_surf_points=200, pharm_multi_vector=False))
->>> # SCREEN (streamed; never holds the library in RAM)
->>> query = Molecule(query_mol, num_surf_points=200, pharm_multi_vector=False)
->>> hits = screen(query, ProfileStore.open("lib.fss"), mode="surf_esp",
-...               lam=0.3, top_k=1000)   # seeds/steps default per-mode; backend auto (triton GPU / numba CPU)
->>> hits[0].score, hits[0].id            # best match
+    with ProfileStore.create("lib.fss", num_surf_points=200, modes=("surf_esp",)) as store:
+        for mol in library_rdkit_mols:
+            store.add(Molecule(mol, num_surf_points=200, pharm_multi_vector=False))
+    hits = screen(query, ProfileStore.open("lib.fss"), mode="surf_esp", lam=0.3, top_k=1000)
 """
 from __future__ import annotations
 
@@ -60,12 +27,12 @@ from typing import Iterator, List, Optional, Sequence
 
 import numpy as np
 
-__all__ = ["MoleculeProfile", "ProfileStore", "screen", "screen_many", "Hit"]
+__all__ = ["MoleculeProfile", "ProfileStore", "screen", "screen_many", "Hit",
+           "close_multigpu_pool"]
 
 
-# Per-mode result attributes written in-place by ``MoleculePairBatch.align_with_*``, sourced from
-# the mode registry (``accel/_modes.py``) so the screen front-end and the accel layers can never
-# disagree on attribute names or valid modes. Legacy mode names resolve via ``canonical()``.
+# Per-mode result attributes written in place by ``MoleculePairBatch.align_with_*``, taken from
+# the mode registry so the screen front-end and the accel layers agree on names and valid modes.
 from shepherd_score.accel._modes import (
     MODE_ATTRS as _MODE_ATTRS, canonical as _canon_mode,
     CONST_SEED_MODES as _CONST_SEED_MODES, SPECS as _SPECS, spec_of as _spec_of,
@@ -73,14 +40,11 @@ from shepherd_score.accel._modes import (
 from shepherd_score.accel.channels import CHANNELS as _CHANNELS, SCHEMA_FLAGS as _SCHEMA_FLAGS
 _TRANSFORM_ATTR = {m: a[0] for m, a in _MODE_ATTRS.items()}
 _SCORE_ATTR = {m: a[1] for m, a in _MODE_ATTRS.items()}
-# Prebuilt score readers: ``attrgetter`` + ``map`` pulls the per-pair score in C, so the
-# K-element score vector costs one iterator pass instead of K Python ``getattr`` calls.
+# Prebuilt score readers, so a shard's score vector is one ``map`` pass rather than K ``getattr``s.
 _SCORE_GETTER = {m: attrgetter(a) for m, a in _SCORE_ATTR.items()}
 _VALID_MODES = tuple(_SCORE_ATTR)
-# Modes whose surface ``alpha`` should auto-default to ALPHA(num_surf_points): the ones whose
-# SHAPE channel is the surface cloud, which is calibrated to the point count. A mode that reads
-# surfaces for some OTHER channel (the ShaEP combo's ESP agreement) is not one of these -- its
-# alpha selects which cloud the shape term scores and has to be given explicitly.
+# Modes whose ``alpha`` auto-defaults to ALPHA(num_surf_points): those whose shape channel is the
+# surface cloud. A mode that reads surfaces for another channel only must be given alpha.
 _SURF_ALPHA_MODES = {m for m, sp in _SPECS.items()
                      if any(t.kernel in ("shape", "esp") and t.ref and t.ref[0] == "surf"
                             for t in sp.terms)}
@@ -90,7 +54,7 @@ Hit = namedtuple("Hit", ["score", "id", "transform"])
 
 
 # --------------------------------------------------------------------------- #
-# RDKit-free conformer shim (only the esp_combo aligner reads ``.mol``).
+# RDKit-free conformer shim (only the vol_and_surf_esp aligner reads ``.mol``).
 # --------------------------------------------------------------------------- #
 class _ConformerShim:
     __slots__ = ("_p",)
@@ -103,9 +67,8 @@ class _ConformerShim:
 
 
 class _MolShim:
-    """Minimal stand-in so ``profile.mol.GetConformer().GetPositions()`` returns
-    the stored with-H atom centers -- the only RDKit access made by the batched
-    ``esp_combo`` aligner. ``None`` for every other mode."""
+    """Stand-in so ``profile.mol.GetConformer().GetPositions()`` returns the stored with-H atom
+    centers, the only RDKit access the batched ``vol_and_surf_esp`` aligner makes."""
     __slots__ = ("_c",)
 
     def __init__(self, centers_w_H):
@@ -116,21 +79,15 @@ class _MolShim:
 
 
 def _f32(a):
-    # Always an independent C-contiguous float32 copy. `np.array(copy=True)` matters
-    # on the reload path: an ascontiguousarray of an fp32 npz slice would be a *view*
-    # into the shard's array, pinning the whole shard's npz buffers alive for as long
-    # as any profile survives. A copy keeps each profile self-contained.
+    # Always an independent C-contiguous float32 copy: on the reload path a view into a shard
+    # slice would keep the whole shard's buffers alive for as long as any profile survives.
     return None if a is None else np.array(a, dtype=np.float32, order="C")
 
 
 def _heavy_positions(m):
-    """Strict-heavy (Z != 1) atom coordinates, ordered to match
-    ``partial_charges[_nonH_atoms_idx]`` -- exactly the Gaussian centers the vol_esp
-    aligner uses. Read from the with-H conformer when present (a ``Molecule``, or an
-    esp_combo ``MoleculeProfile`` via its ``_MolShim``); falls back to ``atom_pos`` for a
-    heavy-only profile (self-consistent only when ``Chem.RemoveHs`` kept no H). This is
-    what lets vol_esp stream correctly when RemoveHs retains an H -- ``atom_pos`` is then
-    the RemoveHs set, longer than and misaligned with the heavy charges."""
+    """Strict-heavy (Z != 1) atom coordinates ordered to match ``partial_charges[_nonH_atoms_idx]``,
+    read from the with-H conformer when present, else ``atom_pos``. ``atom_pos`` is the
+    ``RemoveHs`` set, which is longer than the heavy charges when an H was retained."""
     mol = getattr(m, "mol", None)
     idx = getattr(m, "_nonH_atoms_idx", None)
     if mol is not None and idx is not None:
@@ -144,18 +101,16 @@ def _heavy_positions(m):
 class MoleculeProfile:
     """Numeric-only, RDKit-free stand-in for :class:`~shepherd_score.container.Molecule`.
 
-    Holds exactly the arrays the batched aligners read; ``.mol`` is ``None``
-    (or a lightweight shim for ``esp_combo``). Duck-types into ``MoleculePair``
-    unchanged, so it feeds the existing ``align_with_*`` API with no edits.
+    Holds exactly the arrays the batched aligners read; ``.mol`` is ``None`` (or a lightweight
+    shim for ``vol_and_surf_esp``) and it duck-types into ``MoleculePair`` unchanged.
 
-    Heavy-atom convention mirrors ``Molecule``: ``atom_pos`` is heavy atoms;
-    ``partial_charges`` may be stored heavy (with an identity ``_nonH_atoms_idx``)
-    or with-H (with a real index), matching whatever the store was built for.
+    Heavy-atom convention mirrors ``Molecule``: ``atom_pos`` is heavy atoms; ``partial_charges``
+    may be stored heavy (with an identity ``_nonH_atoms_idx``) or with-H (with a real index),
+    matching whatever the store was built for.
 
-    Scope: this is a duck-type for the **batched aligners** and :func:`screen` only —
-    it deliberately omits ``Molecule``'s build-time fields (``density``,
-    ``probe_radius``, ``pharm_multi_vector``, the RDKit ``Mol``) and is not a general
-    ``Molecule`` replacement.
+    This is a duck-type for the batched aligners and :func:`screen` only; it omits
+    ``Molecule``'s build-time fields (``density``, ``probe_radius``, ``pharm_multi_vector``, the
+    RDKit ``Mol``) and is not a general ``Molecule`` replacement.
     """
 
     __slots__ = ("atom_pos", "atom_pos_noH", "surf_pos", "surf_esp", "partial_charges", "radii",
@@ -175,13 +130,11 @@ class MoleculeProfile:
                  atomtype_pos=None, atomic_numbers=None,
                  centers_w_H=None, atom_pos_noH=None, id=None, rot=None):
         self.atom_pos = _f32(atom_pos)
-        #: (3,3) float32 principal-axis rotation applied at build time, or None. Present only
-        #: on a CANONICAL store: the coords below are already rotated into this frame, so the
-        #: screen's seeds are constants instead of a per-molecule eigensolve. Needed to map an
-        #: alignment transform back to the molecule's ORIGINAL frame.
+        #: (3,3) float32 principal-axis rotation applied at build time (canonical stores only),
+        #: needed to map an alignment transform back to the molecule's original frame.
         self.rot = None if rot is None else np.asarray(rot, np.float32)
         # Strict-heavy vol_esp centers (1:1 with the heavy charges); None when identical to
-        # atom_pos (RemoveHs kept no H) -- callers then use atom_pos.
+        # atom_pos, in which case callers use atom_pos.
         self.atom_pos_noH = _f32(atom_pos_noH)
         self.surf_pos = _f32(surf_pos)
         self.surf_esp = _f32(surf_esp)
@@ -198,17 +151,13 @@ class MoleculeProfile:
         self.pharm_types = None if pharm_types is None else np.asarray(pharm_types)
         self.pharm_ancs = _f32(pharm_ancs)
         self.pharm_vecs = _f32(pharm_vecs)
-        # vol_lipo: the TRUE-heavy atom centres (own count, may differ from atom_pos when
-        # RemoveHs retained an H) + the per-atom Crippen logP placed at them (already heavy-sliced).
+        # Per-channel true-heavy centres and per-atom scalars (already heavy-sliced); their counts
+        # can differ from atom_pos when RemoveHs retained an H. ``atomic_numbers`` is a
+        # categorical label the colour kernel matches on, kept float32 like the other channels.
         self.lipo_pos = _f32(lipo_pos)
         self.lipophilicity = _f32(lipophilicity)
-        # vol_fukui: TRUE-heavy atom centres (own count) + the per-atom signed Fukui dual descriptor
-        # (f+ - f-) placed at them (already heavy-sliced), exactly like the vol_lipo channel.
         self.fukui_pos = _f32(fukui_pos)
         self.fukui = _f32(fukui)
-        # vol_mr / vol_atomtype: the same TRUE-heavy basis, their own centres + per-atom scalar
-        # (already heavy-sliced), stored under their own offset tables. ``atomic_numbers`` is a
-        # categorical label the colour kernel matches on, kept float32 like the other channels.
         self.mr_pos = _f32(mr_pos)
         self.molar_refractivity = _f32(molar_refractivity)
         self.atomtype_pos = _f32(atomtype_pos)
@@ -229,9 +178,9 @@ class MoleculeProfile:
         if self.pharm_ancs is not None:
             self.pharm_ancs = self.pharm_ancs - mu
         if self.lipo_pos is not None:
-            self.lipo_pos = self.lipo_pos - mu                 # lipo centres move with the molecule
+            self.lipo_pos = self.lipo_pos - mu
         if self.fukui_pos is not None:
-            self.fukui_pos = self.fukui_pos - mu               # fukui centres move with the molecule
+            self.fukui_pos = self.fukui_pos - mu
         if self.mr_pos is not None:
             self.mr_pos = self.mr_pos - mu
         if self.atomtype_pos is not None:
@@ -240,43 +189,35 @@ class MoleculeProfile:
             self.mol = _MolShim(self.mol.GetConformer().GetPositions() - mu)
 
     def get_lipo_positions(self):
-        """TRUE-heavy lipophilicity centres -- mirrors ``Molecule.get_lipo_positions()`` so the
-        ``vol_lipo`` aligner reads a profile identically to a full ``Molecule``."""
+        """True-heavy lipophilicity centres; mirrors ``Molecule.get_lipo_positions()``."""
         return self.lipo_pos
 
     def get_lipophilicity(self, no_H: bool = True):
-        """Per-atom Crippen logP (stored already heavy-sliced) -- mirrors
-        ``Molecule.get_lipophilicity()``. ``no_H`` is accepted for signature parity; the profile
-        only carries the heavy slice the ``vol_lipo`` aligner reads."""
+        """Per-atom Crippen logP, stored heavy-sliced; ``no_H`` is accepted for signature parity."""
         return self.lipophilicity
 
     def get_fukui_positions(self):
-        """TRUE-heavy Fukui centres -- mirrors ``Molecule.get_fukui_positions()`` so the
-        ``vol_fukui`` aligner reads a profile identically to a full ``Molecule``."""
+        """True-heavy Fukui centres; mirrors ``Molecule.get_fukui_positions()``."""
         return self.fukui_pos
 
     def get_fukui(self, no_H: bool = True):
-        """Per-atom Fukui dual descriptor (stored already heavy-sliced) -- mirrors
-        ``Molecule.get_fukui()``. ``no_H`` is accepted for signature parity; the profile only
-        carries the heavy slice the ``vol_fukui`` aligner reads."""
+        """Per-atom Fukui dual descriptor, stored heavy-sliced; ``no_H`` is for signature parity."""
         return self.fukui
 
     def get_mr_positions(self):
-        """TRUE-heavy molar-refractivity centres -- mirrors ``Molecule.get_mr_positions()``."""
+        """True-heavy molar-refractivity centres; mirrors ``Molecule.get_mr_positions()``."""
         return self.mr_pos
 
     def get_molar_refractivity(self, no_H: bool = True):
-        """Per-atom Crippen molar refractivity (stored already heavy-sliced) -- mirrors
-        ``Molecule.get_molar_refractivity()``."""
+        """Per-atom Crippen molar refractivity, stored heavy-sliced."""
         return self.molar_refractivity
 
     def get_atomtype_positions(self):
-        """TRUE-heavy element-label centres -- mirrors ``Molecule.get_atomtype_positions()``."""
+        """True-heavy element-label centres; mirrors ``Molecule.get_atomtype_positions()``."""
         return self.atomtype_pos
 
     def get_atomic_numbers(self, no_H: bool = True):
-        """Per-atom atomic numbers (stored already heavy-sliced) -- mirrors
-        ``Molecule.get_atomic_numbers()``."""
+        """Per-atom atomic numbers, stored heavy-sliced."""
         return self.atomic_numbers
 
     @classmethod
@@ -291,10 +232,9 @@ class MoleculeProfile:
 # storage schema helpers
 # --------------------------------------------------------------------------- #
 def _mode_flags(mode: str) -> set:
-    """The schema flags ``mode`` needs, read off its channels. A mode reading every channel of a
-    basis needs every flag those channels carry; ``atom_pos`` is unconditional and has none.
-    ``vol_and_surf_esp`` reaches ``with_H`` through its ``partial`` channel, which is why a
-    combo store keeps the with-H charges plus the ``nonH`` index rather than the heavy slice."""
+    """The schema flags ``mode`` needs, read off its channels; ``atom_pos`` is unconditional and
+    has none. ``vol_and_surf_esp`` reaches ``with_H`` through its ``partial`` channel, which is
+    why a combo store keeps the with-H charges plus the ``nonH`` index rather than the heavy slice."""
     spec = _spec_of(mode)
     flags = set()
     for name in spec.all_channels():
@@ -304,10 +244,8 @@ def _mode_flags(mode: str) -> set:
         if ch.flag:
             flags.add(ch.flag)
         if ch.basis == "withH":
-            # A with-H channel needs the store laid out on the with-H basis, which is a property
-            # of the BASIS, not of any one channel. ``_flush`` writes ``all_off`` / ``nonH`` /
-            # ``radii`` / ``cwh`` only under ``schema["with_H"]``, so a mode reading any of them
-            # must demand the flag or it can be handed a store that has none of them.
+            # A with-H channel needs the store laid out on the with-H basis: ``_flush`` writes
+            # ``all_off`` / ``nonH`` / ``radii`` / ``cwh`` only under ``schema["with_H"]``.
             flags.add("with_H")
     return flags
 
@@ -315,7 +253,7 @@ def _mode_flags(mode: str) -> set:
 def _schema_from_modes(modes) -> dict:
     """The store schema serving ``modes``: one boolean per channel flag, derived from what each
     mode's channels read. Every flag in ``SCHEMA_FLAGS`` is always present (a reader may use
-    ``schema[flag]``), so only the VALUES vary with the mode set."""
+    ``schema[flag]``); only the values vary with the mode set."""
     modes = {_canon_mode(m) for m in modes}            # accept legacy esp / esp_combo
     unknown = modes - set(_VALID_MODES)
     if unknown:
@@ -327,12 +265,8 @@ def _schema_from_modes(modes) -> dict:
 
 
 def _store_supports(schema: dict, mode: str) -> bool:
-    """Whether a store with ``schema`` carries every array ``mode`` reads.
-
-    Derived from the mode's channels, so a mode is screenable the moment its data is stored.
-    ``vol_avoid`` is the one mode whose objective needs an input the per-molecule store does not
-    model -- a fixed avoid cloud that belongs to the QUERY, not to a library molecule -- and it
-    screens by carrying that cloud with the query (``screen(..., avoid_points=...)``), so its
+    """Whether a store with ``schema`` carries every array ``mode`` reads. ``vol_avoid``'s avoid
+    cloud belongs to the query (``screen(..., avoid_points=...)``), not to the store, so its
     per-molecule requirement is just ``atom_pos`` like ``vol``'s."""
     mode = _canon_mode(mode)                           # accept legacy esp / esp_combo
     if mode not in _SPECS:
@@ -340,13 +274,9 @@ def _store_supports(schema: dict, mode: str) -> bool:
     return all(schema.get(f, False) for f in _mode_flags(mode))
 
 
-#: How each extra per-molecule BASIS is carried through a shard, beyond the unconditional
-#: ``atom_pos``/``atom_off``. ``(schema flag, offset key, [(profile attr, store key), ...])``.
-#: ONE table drives extraction, pre-centring, the canonical rotation, ``_concat`` and
-#: ``_reconstruct``, so a new per-atom field is a row here plus its channel -- not five edits
-#: that must agree. The two bases with irregular layouts keep their own code below: ``surf`` is
-#: written at a FIXED width (``np.stack``, no offsets) and ``heavy``/``withH`` share one
-#: ``charges`` array whose basis depends on ``with_H``.
+#: How each extra per-molecule basis is carried through a shard, as ``(basis, schema flag,
+#: offset key, [(profile attr, store key), ...])``; drives extraction, centring, rotation,
+#: ``_concat`` and ``_reconstruct``. ``surf`` (fixed width) and ``charges`` are handled inline.
 _BASIS_TABLE = (
     ("pharm", "pharm", "pharm_off", (("pharm_types", "pharm_types"), ("pharm_ancs", "pharm_ancs"),
                                      ("pharm_vecs", "pharm_vecs"))),
@@ -358,9 +288,8 @@ _BASIS_TABLE = (
                                               ("atomic_numbers", "atomic_numbers"))),
 )
 
-#: The channel that reads each ``_BASIS_TABLE`` profile attribute off a ``Molecule``. Reusing
-#: the channel readers is what keeps the store and the aligners on ONE definition of "the
-#: molar-refractivity centres" -- the accessor, never ``atom_pos`` (the retained-H trap).
+#: The channel reader for each ``_BASIS_TABLE`` profile attribute, so the store and the aligners
+#: share one definition of each centre set (the accessor, never ``atom_pos``).
 _PROF_READER = {c.prof: c.read for c in _CHANNELS.values() if c.key}
 
 
@@ -385,8 +314,8 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool, canonical: bool 
             kw["partial_charges"] = _f32(m.partial_charges)
             kw["nonH_atoms_idx"] = np.asarray(m._nonH_atoms_idx, dtype=np.int64)
         else:
-            # heavy charges. Index by _nonH_atoms_idx universally: it is the real heavy index
-            # for a Molecule (full charges) and the identity for a heavy MoleculeProfile.
+            # Heavy charges. _nonH_atoms_idx is the real heavy index for a Molecule (full
+            # charges) and the identity for a heavy MoleculeProfile.
             kw["partial_charges"] = _f32(np.asarray(m.partial_charges)[m._nonH_atoms_idx])
         # Heavy Gaussian centres for vol_esp, 1:1 with the heavy charges. Kept only when they
         # actually differ from atom_pos (i.e. RemoveHs retained an H).
@@ -409,7 +338,7 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool, canonical: bool 
                 raise ValueError(f"store needs {flag} but molecule cannot provide it: {e}") from e
             kw[attr] = (np.asarray(v, dtype=np.int32) if attr == "pharm_types" else _f32(v))
 
-    #: profile attributes that hold POSITIONS (translate + rotate) and DIRECTIONS (rotate only).
+    # Profile attributes holding positions (translate and rotate) and directions (rotate only).
     pos_attrs = ["atom_pos", "surf_pos", "centers_w_H", "atom_pos_noH"]
     dir_attrs = []
     for _basis, flag, _off, attrs in _BASIS_TABLE:
@@ -427,23 +356,15 @@ def _profile_from_schema(m, sch: dict, *, id, pre_center: bool, canonical: bool 
         for a in pos_attrs:
             v = kw.get(a)
             if v is not None and len(v):
-                # shifted by the atom_pos COM, NEVER by their own -- this matches the in-memory
+                # Shifted by the atom_pos COM, never by their own, matching the in-memory
                 # conformer transform, which moves every channel of a molecule together.
                 kw[a] = v - mu
 
     rot = None
     if canonical:
-        # CANONICAL FRAME: rotate every coordinate channel into the molecule's own principal
-        # axes. The screen's seeds exist to align the fit molecule's principal axes onto the
-        # query's; if the fit is ALREADY in its principal frame, that alignment is one constant
-        # for every molecule, so the per-molecule eigensolve disappears (44.1% of a vol screen).
-        #
-        # Requires pre_center (axes are about the centroid). ``rot`` is kept so a returned pose
-        # can be mapped back; without it scores would be right while transforms silently
-        # referred to the canonical frame -- which no score-based test can see. EVERY position
-        # channel rotates and every direction channel rotates without translating; missing one
-        # leaves a single row of that array in the raw frame while its neighbours are canonical
-        # (measured on atom_pos_noH: the retained-H molecule's pose re-scored 0.619 low).
+        # Canonical frame: rotate every position channel and every direction channel into the
+        # molecule's principal axes, so the screen can use one constant seed set. ``rot`` is
+        # kept to map a returned pose back; requires pre_center (axes are centroid-relative).
         if not pre_center:
             raise ValueError("canonical stores require pre_center=True (axes are centroid-relative)")
         _c = kw["atom_pos"] - kw["atom_pos"].mean(0)
@@ -514,13 +435,13 @@ class ProfileStore:
             time; kept in ``[50, 400]`` for ``ALPHA`` calibration).
         modes : sequence of str
             Which alignment modes this store must support. Only the arrays those
-            modes need are stored (``"vol"`` works from any store -- ``atom_pos``
-            is always kept). Valid: ``vol vol_esp surf surf_esp pharm vol_color vol_and_surf_esp``
-            (legacy ``esp``/``esp_combo`` also accepted).
+            modes need are stored (``"vol"`` works from any store, since ``atom_pos``
+            is always kept). Any registry mode (``accel._modes.SPECS``) is valid;
+            legacy ``esp``/``esp_combo`` are also accepted.
         dtype : {"float16", "float32"}
-            On-disk dtype for coordinate/charge arrays. ``float16`` halves disk +
-            IO at ~0.01 A error (the surface resampling noise floor); reconstructed
-            to float32 in RAM. Default ``"float16"``.
+            On-disk dtype for coordinate/charge arrays. ``float16`` halves disk and
+            I/O at about 0.01 A coordinate precision; reconstructed to float32 in RAM.
+            Default ``"float16"``.
         shard_size : int
             Molecules per shard file. Default 100k.
         pre_centered : bool
@@ -531,24 +452,14 @@ class ProfileStore:
             If True, delete any existing shards + manifest in ``path`` first.
         canonical : bool, optional
             Store every profile rotated into its own principal-axis frame (the
-            centroid-relative eigenframe of its heavy atoms), with the rotation kept so
-            that returned transforms are composed back to the original centred frame.
-            A screen in any mode that seeds from the heavy-atom cloud
-            (``accel._modes.CONST_SEED_MODES``: ``vol``, ``vol_color``, ``vol_esp``,
-            ``vol_lipo``, ``vol_fukui``, the volumetric Tversky modes, and
-            ``vol_and_surf_esp`` at ``alpha=0.81``) then runs one constant seed set instead
-            of a per-molecule eigensolve -- roughly 1.5-2x faster for ``vol`` on GPU, less
-            for the heavier modes, whose seed generation is a smaller share. ``surf``,
-            ``surf_esp`` and ``pharm`` seed from the surface / anchor clouds and still run
-            their own generator on the rotated coordinates. Either way the scores move at
-            the 1e-3 level against a non-canonical store (which matches the pairwise path
-            to ~1e-4). Requires ``pre_centered``.
-            Default (``None``): canonical when the store serves any constant-seed mode
-            and is pre-centred, raw centred coordinates otherwise. Pass ``True`` or
-            ``False`` to decide explicitly. Screening scores and DUDE-Z enrichment on canonical
-            stores were validated against non-canonical stores and the pairwise path
-            before this became the default (Shepherd-Score-Paper,
-            fig2_speed/validate_canonical.py, results/CANONICAL_validation.json).
+            centroid-relative eigenframe of its heavy atoms), keeping the rotation so that
+            returned transforms are composed back to the original centred frame. A screen
+            in a mode that seeds from the heavy-atom cloud (``accel._modes.CONST_SEED_MODES``)
+            then uses one constant seed set instead of a per-molecule eigensolve; modes that
+            seed from the surface or anchor clouds still run their own generator on the
+            rotated coordinates. Scores differ slightly from a non-canonical store.
+            Requires ``pre_centered``. Default (``None``): canonical when the store serves
+            any constant-seed mode and is pre-centred, raw centred coordinates otherwise.
 
         Notes
         -----
@@ -562,13 +473,8 @@ class ProfileStore:
             raise ValueError("dtype must be 'float16' or 'float32'")
         modes = tuple(modes)
         if canonical is None:
-            # The library default: canonical when the store serves a mode that seeds from the
-            # heavy-atom cloud (``_CONST_SEED_MODES``) and is pre-centred, because those are the
-            # modes whose screen swaps the per-molecule seed eigensolve for one constant set.
-            # ``surf``/``surf_esp``/``pharm`` seed from other clouds and still run their generator
-            # on the rotated coordinates, so a store serving only them keeps raw centred
-            # coordinates, which match the pairwise path to ~1e-4 (a canonical store moves scores
-            # at the 1e-3 level; Shepherd-Score-Paper fig2_speed/validate_canonical.py).
+            # Canonical when the store serves a constant-seed mode and is pre-centred; a store
+            # serving only surface- or anchor-seeded modes keeps raw centred coordinates.
             canonical = bool(pre_centered) and any(_canon_mode(m) in _CONST_SEED_MODES
                                                    for m in modes)
         elif canonical and not pre_centered:
@@ -580,9 +486,8 @@ class ProfileStore:
             raise FileExistsError(
                 f"{manifest_path} already exists; pass overwrite=True to replace it")
         if overwrite:
-            # Remove only THIS store's own files (its manifest + its shard sequence, in
-            # either format), never every ``.npz`` in the directory -- the target may hold
-            # unrelated data the caller did not mean to lose.
+            # Remove only this store's own files (manifest and shard sequence, either format),
+            # never every ``.npz`` in the directory, which may hold unrelated data.
             for f in os.listdir(path):
                 if (f == cls.MANIFEST or re.fullmatch(r"shard_\d{5}\.npz", f)
                         or re.fullmatch(r"shard_\d{5}__\w+\.npy", f)):
@@ -638,14 +543,9 @@ class ProfileStore:
             return
         arrs = self._concat(self._buf)
         if self.manifest.get("shard_format") == "npy":
-            # One .npy per array instead of one .npz per shard, so the reader can memory-map
-            # them. An .npz is a ZIP, and Python's zipfile CRC-checks every member as it is
-            # read: measured on an L40S (job 22596303), a 20.9 MB shard costs 13.30 ms to read
-            # with the check and 5.08 ms without, i.e. **62% of the read is CRC** -- and at
-            # N=100,000 the store is a single shard, so the read-ahead thread has nothing to
-            # overlap it with and the whole 0.133 us/mol sits on the critical path. np.save
-            # pads its header so the data begins 64-byte aligned, which is what lets np.load
-            # hand back a real mmap rather than a copy.
+            # One .npy per array rather than one .npz per shard, so the reader can memory-map
+            # them: an .npz is a ZIP whose members are CRC-checked on every read. np.save aligns
+            # the data start, which is what lets np.load return a real mmap.
             name = f"shard_{self._shard_id:05d}"
             for k, v in arrs.items():
                 np.save(os.path.join(self.path, f"{name}__{k}.npy"), v)
@@ -662,13 +562,9 @@ class ProfileStore:
         self._write_manifest()
 
     def _concat(self, recs: List["MoleculeProfile"]) -> dict:
-        """Pack one shard: every basis the schema carries, as a flat array plus its own CSR
-        offset table (or a dense ``np.stack`` block for the fixed-width surface).
-
-        GIVE EACH PER-ATOM FIELD ITS OWN TABLE. ``atom_pos`` is the ``Chem.RemoveHs`` set and is
-        LONGER than the true-heavy set whenever RemoveHs retained an isotope-labelled H, so one
-        shared table would desync a field from its positions on exactly the molecules that are
-        hardest to notice.
+        """Pack one shard: every basis the schema carries as a flat array plus its own CSR offset
+        table (a dense ``np.stack`` block for the fixed-width surface). Each per-atom field keeps
+        its own table because ``atom_pos`` (the ``RemoveHs`` set) can be longer than the true-heavy set.
         """
         sch = self.manifest["schema"]
         dt = np.float16 if self.manifest["dtype"] == "float16" else np.float32
@@ -680,8 +576,7 @@ class ProfileStore:
         out["atom_off"] = offsets([len(r.atom_pos) for r in recs])
         out["atom_pos"] = np.concatenate([r.atom_pos for r in recs]).astype(dt)
         if recs[0].rot is not None:
-            # float32 REGARDLESS of the store dtype: a float16 rotation carries ~3.9e-04 of axis
-            # error, which is enough to move a pose. 36 bytes/molecule (3.6 MB at N=1e5).
+            # float32 regardless of the store dtype; a float16 rotation is too coarse to keep a pose.
             out["rot"] = np.stack([r.rot for r in recs]).astype(np.float32)
 
         if sch["surf"]:
@@ -702,9 +597,8 @@ class ProfileStore:
             else:
                 out["charges"] = np.concatenate([r.partial_charges for r in recs]).astype(dt)
                 heavy_lens = [len(r.partial_charges) for r in recs]
-            # vol_esp needs heavy centres 1:1 with the heavy charges. Emitted only when some
-            # molecule's RemoveHs retained an H, so ordinary stores stay byte-for-byte unchanged
-            # (and legacy stores, which lack these keys, fall back to atom_off in the reader).
+            # Heavy centres 1:1 with the heavy charges, emitted only when some molecule's RemoveHs
+            # retained an H; the reader falls back to atom_off when the keys are absent.
             if any(r.atom_pos_noH is not None for r in recs):
                 out["heavy_off"] = offsets(heavy_lens)
                 out["xyz_noH"] = np.concatenate(
@@ -766,44 +660,27 @@ class ProfileStore:
         return len(self.manifest["shards"])
 
     def _load_raw(self, sh) -> dict:
-        """Materialize one shard's arrays into a plain ``{name: np.ndarray}`` dict
-        (npz closed before return). Cheaper than :meth:`iter_shards` -- it skips the
-        per-molecule ``MoleculeProfile`` split, which the fast screen path does on
-        the GPU/device side instead.
-
-        A ``shard_format="npy"`` store is MEMORY-MAPPED instead of unzipped, which skips both
-        the ZIP CRC (62% of a 20.9 MB shard read, measured) and the copy into fresh arrays.
-        The returned arrays are copy-on-write mappings of the page cache; every consumer here
-        (the array builders' uploads, ``_reconstruct``'s slicing, ``_canonical_rot``) only
-        reads, so nothing is ever copied back. Stores written before this format are still ``.npz`` and take the branch below,
-        so nothing on disk is invalidated."""
+        """Materialise one shard's arrays as ``{name: np.ndarray}`` without the per-molecule
+        split. An ``npy``-format store is memory-mapped copy-on-write (nothing here writes, so
+        nothing is copied); an ``.npz`` store is read and closed before returning."""
         if sh.get("keys") is not None:
             base = os.path.join(self.path, sh["name"])
-            # mmap_mode="c" (copy-on-write), not "r": a read-only mapping makes numpy hand back
-            # a non-writable array, and ``torch.from_numpy`` warns on those every call. Nothing
-            # here writes, so "c" costs nothing and reads come straight from the page cache.
+            # mmap_mode="c" rather than "r": a read-only mapping gives a non-writable array,
+            # and ``torch.from_numpy`` warns on those every call.
             return {k: np.load(f"{base}__{k}.npy", mmap_mode="c") for k in sh["keys"]}
         with np.load(os.path.join(self.path, sh["name"])) as data:
             return {k: data[k] for k in data.files}
 
     def read_shard(self, idx: int) -> tuple:
-        """Return ``(shard_meta, arrays_dict)`` for shard ``idx`` (random access; the
-        multi-GPU shard pool uses it so each worker reads only its assigned shards, and
-        the in-process screen reads every shard through it).
-
-        Must stay free of shared mutable state: :func:`_iter_shards_prefetched` calls this
-        on a background thread to read the next shard while the current one aligns. It only
-        indexes the (read-only) manifest and opens its own file handle, so it is safe to."""
+        """Return ``(shard_meta, arrays_dict)`` for shard ``idx``. Called on a background thread
+        by :func:`_iter_shards_prefetched`, so it must touch no shared mutable state: it only
+        indexes the read-only manifest and opens its own file handle."""
         sh = self.manifest["shards"][idx]
         return sh, self._load_raw(sh)
 
     def iter_shards(self) -> Iterator[List["MoleculeProfile"]]:
-        """Yield one shard at a time as a ``list[MoleculeProfile]``.
-
-        Goes through :meth:`_load_raw` rather than opening the shard itself: that is the ONE
-        place that knows how a shard is stored, and duplicating the path arithmetic here is
-        what broke every ``.npy``-format store (a second reader kept opening ``shard_00000``
-        with the ``.npz`` reader's assumptions and got FileNotFoundError)."""
+        """Yield one shard at a time as ``list[MoleculeProfile]``, via :meth:`_load_raw`, the one
+        place that knows how a shard is stored."""
         for sh in self.manifest["shards"]:
             yield self._reconstruct(self._load_raw(sh), sh)
 
@@ -813,10 +690,9 @@ class ProfileStore:
         return self._reconstruct(arrs, sh)
 
     def _reconstruct(self, data, sh) -> List["MoleculeProfile"]:
-        """Split one shard's arrays back into ``MoleculeProfile``s (the object path). Offset
-        tables are hoisted out of the per-molecule loop; ``rot`` is deliberately NOT restored --
-        a profile read back from a canonical store is in the canonical frame with no record of
-        it, which is why the array path composes poses from the shard's ``rot`` instead."""
+        """Split one shard's arrays back into ``MoleculeProfile``s. ``rot`` is not restored: a
+        profile read from a canonical store is in the canonical frame, and the array path composes
+        poses from the shard's ``rot`` instead."""
         sch = self.manifest["schema"]
         n = sh["n"]
         files = set(data.files) if hasattr(data, "files") else set(data.keys())
@@ -890,29 +766,19 @@ def _centered_copy(query):
 
 
 # --------------------------------------------------------------------------- #
-# Fast engine: contiguous store arrays -> device tensors -> batched aligner,
-# bypassing the per-molecule MoleculeProfile/MoleculePair objects. The batched
-# ``_align_batch_{vol,surf,esp,pharm}`` only read cached ``_*_t`` tensors (never
-# ``.ref_molec``) when those are pre-set and trans_init=False, so a lightweight
-# ``_FastPair`` whose FIT tensors are *views* into one device-resident shard tensor
-# and whose REF tensors are the *shared* query feeds them directly. The query (ref)
-# is swapped across a panel while the fit views stay resident -> one shard build
-# serves every query.
+# Fast engine: store arrays go straight to device tensors and the batched aligner, with no
+# per-molecule MoleculeProfile/MoleculePair. The aligners read only cached ``_*_t`` tensors when
+# trans_init=False, so ``_FastPair`` views into one resident shard tensor feed them directly and
+# one shard build serves every query of a panel.
 # --------------------------------------------------------------------------- #
-#: Modes the fast (object-stand-in or array) screen engines serve. Every registry mode does;
-#: what actually decides whether a mode can screen is ``_store_supports`` -- i.e. whether the
-#: store carries its channels -- and ``fast`` additionally needs a pre-centred store,
-#: ``trans_init=False`` and a non-jax backend.
+#: Modes the fast screen engines serve (every registry mode). Whether a mode can screen a store
+#: is ``_store_supports``; ``fast`` also needs a pre-centred store, trans_init=False, non-jax.
 _FAST_MODES = tuple(_SPECS)
 
 
 class _FastPair:
-    """Cached-tensor-only stand-in a batched aligner can consume.
-
-    ``__slots__`` is DERIVED: one ``_ref_<attr>_t`` / ``_fit_<attr>_t`` per channel plus every
-    mode's result pair. It used to be hand-mirrored from ``MODE_ATTRS``, which is how a new
-    mode could reach this path and fail with an opaque AttributeError.
-    """
+    """Cached-tensor-only stand-in a batched aligner can consume. ``__slots__`` is derived from
+    the channel table (``_ref_<attr>_t`` / ``_fit_<attr>_t``) plus every mode's result pair."""
 
     __slots__ = (("device", "ref_molec", "fit_molec")
                  + tuple(dict.fromkeys(
@@ -924,10 +790,9 @@ class _FastPair:
 
 
 def _query_ref_arrays(q, mode: str) -> dict:
-    """The (centred) query's numpy arrays for ``mode``, keyed by channel. Plain numpy, so it is
-    cheap to ship to the multi-GPU workers. The readers are the channel table's, so a query
-    ``Molecule`` and a ``MoleculeProfile`` are read identically and a missing field raises a
-    clear ValueError naming it."""
+    """The (centred) query's numpy arrays for ``mode``, keyed by channel; plain numpy so they are
+    cheap to ship to the multi-GPU workers. The channel readers treat a ``Molecule`` and a
+    ``MoleculeProfile`` identically and raise a ValueError naming any missing field."""
     spec = _spec_of(mode)
     out = {}
     for name in spec.all_channels():
@@ -952,7 +817,7 @@ def _ref_tensors_from_arrays(ra: dict, mode: str, device) -> dict:
 
 
 def _ref_channel_tensors(ref_tensors: dict, mode: str) -> dict:
-    """Re-key ``_ref_<attr>_t`` tensors by CHANNEL, which is what the array aligner takes."""
+    """Re-key ``_ref_<attr>_t`` tensors by channel, which is what the array aligner takes."""
     spec = _spec_of(mode)
     out = {}
     for name in spec.all_channels():
@@ -964,13 +829,9 @@ def _ref_channel_tensors(ref_tensors: dict, mode: str) -> dict:
 
 
 def _build_fit_fast_pairs(arrs: dict, mode: str, device, avoid=None):
-    """Load one shard's FIT arrays as device tensors once; return ``(ids, [_FastPair])`` whose
-    fit tensors are views into them. The per-molecule views come from ONE ``torch.split`` (or
-    ``unbind`` for a dense block) per channel rather than a K-iteration slicing loop.
-
-    This is the OBJECT-fast path -- the reference leg the array-vs-object parity gate compares
-    against (it forces it by flipping ``_arrays.ENABLED``), which is why it must stay wired for
-    every mode the array path serves."""
+    """Load one shard's fit arrays as device tensors once; return ``(ids, [_FastPair])`` whose
+    fit tensors are per-molecule views (one ``torch.split`` or ``unbind`` per channel). This is
+    the object path, kept wired for every mode as the reference the array path is compared to."""
     import torch
     from shepherd_score.accel.channels import load_store_channel
     ids = arrs["ids"]
@@ -997,13 +858,9 @@ def _build_fit_fast_pairs(arrs: dict, mode: str, device, avoid=None):
 
 
 def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
-    """Translate ``screen()``'s align_kwargs into the ``_align_batch_<mode>`` keywords.
-
-    The mode's own parameters and their defaults come from the registry; the fine-step count
-    from ``MODE_STEPS``; and ``lr`` from the spec's ``screen_lr`` -- which is 0.1 for the ESP /
-    pharmacophore / colour / field modes and the driver default 0.075 for the shape and Tversky
-    ones, preserved per mode because changing it would move those modes' scores.
-    """
+    """Translate ``screen()``'s align_kwargs into the ``_align_batch_<mode>`` keywords. The mode's
+    parameters and defaults come from the registry, the fine-step count from ``_steps_for`` and
+    ``lr`` from the spec's ``screen_lr``."""
     from shepherd_score.accel.batch.aligners import _steps_for, _seeds_for
     spec = _spec_of(mode)
     kw = {"steps_fine": ak.get("max_num_steps", _steps_for(mode)), "trans_init": False}
@@ -1022,13 +879,9 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
 
 
 def _with_avoid(batch_kw: dict, ak: dict, device) -> dict:
-    """Attach the query-side avoid cloud, for the one mode whose objective takes a third input.
-
-    ``vol_avoid`` scores shape Tanimoto MINUS an excluded-volume penalty against a cloud that is
-    a property of the QUERY (a pocket wall, a ligand to stay clear of), not of any library
-    molecule -- which is why the per-molecule store has nowhere to put it and why it arrives as
-    a ``screen(..., avoid_points=...)`` keyword instead. It is uploaded ONCE here and broadcast
-    over every bucket, exactly as the query's own channels are."""
+    """Attach the query-side avoid cloud for ``vol_avoid`` (shape Tanimoto minus an excluded-volume
+    penalty against a cloud that belongs to the query, e.g. a pocket wall). It arrives as
+    ``screen(..., avoid_points=...)`` and is uploaded once here, like the query's own channels."""
     cloud = ak.get("avoid_points")
     if cloud is None:
         return batch_kw
@@ -1040,78 +893,27 @@ def _with_avoid(batch_kw: dict, ak: dict, device) -> dict:
     return batch_kw
 
 
-#: Modes that take the array-native screen path. Every registry mode does: the aligner is one
-#: generic body over the mode's channels (``accel/batch/_arrays.py::align_arrays``), so a mode
-#: joins by existing rather than by gaining a hand-written builder here. The object path below
-#: survives as the parity reference the gates compare against (and for a non-pre-centred /
-#: trans_init / jax-backend screen, which reaches neither array branch).
+#: Modes taking the array-native screen path (every registry mode; the aligner is one generic
+#: body over channels). The object path remains for non-pre-centred / trans_init / jax screens.
 _ARRAY_MODES = tuple(_SPECS)
 
 
 def _use_arrays(mode: str) -> bool:
-    """Whether to take the array-native screen path.
-
-    WHAT THE ARRAY PATH IS WORTH, and the jobs that measured it. Round 1 established that a
-    PARTIAL removal of the object model is worth exactly zero -- vectorising the binning alone
-    removed the O(K) loop and spent every microsecond back building the per-cell Python lists
-    ``Bucket.members`` requires (0.89 vs 0.88 us/mol, reverted) -- so this is all-or-nothing per
-    mode rather than a gradual migration.
-
-    THE FIVE INCUMBENTS, measured as the cost of REMOVING the path they already have: 3.87x
-    (vol), 7.28x (vol_color), 4.80x (vol_esp), 2.33x (pharm) and 2.02x (vol_and_surf_esp) at
-    N=99,984 on an L40S (job 22637592), reproduced at 6.54x (vol_color) / 3.75x (vol) at N=1e5
-    on a different store and node (job 22637392).
-
-    SIX MORE were measured afterwards, array leg against object leg at N=99,984 on an L40S,
-    each in two independent jobs (22641030 / 22641516, parity from 22640575)::
-
-        vol_esp_tversky  4.97x / 5.12x        vol_lipo  3.70x / 3.56x
-        vol_fukui        4.05x / 3.58x        surf_esp  1.34x / 1.29x
-        vol_tversky      4.04x / 4.25x        surf      1.33x / 1.29x
-
-    All six were BIT-IDENTICAL to the object path there: 0 of 99,984 scores moved, max|delta|
-    exactly 0.000e+00, identical top-1000 ids and identical 4x4 transforms.
-
-    DO NOT QUOTE ONE RANGE ACROSS ALL OF THEM. ``surf`` and ``surf_esp`` gain only ~1.3x because
-    they are OPTIMIZER-bound rather than host-bound (0/1 graphed: one eager fine-loop call over
-    the 200-point surface clouds for the whole shard), so the host front-end this path deletes
-    is a small share of their screen. The modes that joined later, with the generic aligner, are
-    UNMEASURED on this axis; measure before quoting a number for them.
-    """
+    """Whether to take the array-native screen path (``_arrays.ENABLED`` is the switch)."""
     from shepherd_score.accel.batch import _arrays
     return mode in _ARRAY_MODES and _arrays.ENABLED
 
 
-#: Persistent pinned staging buffers for the shard upload, keyed by (dtype, device index).
-#: One per dtype, grown to the largest shard seen; each carries the event that says when the
-#: last copy out of it landed, so it can be reused without a blanket stream sync.
+#: Persistent pinned staging buffers for the shard upload, keyed by (dtype, device index) and
+#: grown to the largest shard seen; each carries the event that marks its last copy-out done.
 _PIN_STAGE: dict = {}
 
 
 def _to_device(a, device, *, dtype=None):
-    """Upload one store array, staged through PINNED host memory, asynchronously.
-
-    Two things, both measured on an L40S vol screen:
-
-    * **stage through pinned memory.** ``torch.as_tensor(numpy_array, device="cuda")`` copies
-      from PAGEABLE memory, which the driver must bounce through its own staging buffers while
-      the calling thread waits. ``_build_fit_arrays_vol`` measured 0.149 us/mol = 12.1% of the
-      wall at N=1,000,000 (job 22594805) doing exactly that, at an effective ~1.2 GB/s. A copy
-      out of a pinned buffer is a real asynchronous DMA, so the host hands it to the copy
-      engine and goes straight on to enqueue the alignment kernels behind it.
-    * **retype on the DEVICE.** A store holds coordinates as float16
-      (``ProfileStore.create(dtype="float16")``, the default), so asking for float32 here would
-      widen on the host first and push twice the bytes. float16 -> float32 is exact, so doing
-      it on the GPU is bit-identical.
-
-    This is deliberately on the CALLING thread. The obvious-looking alternative -- upload the
-    next shard from the read-ahead thread -- was built and measured SLOWER twice (0.688x
-    pageable, then 0.849x and 0.921x pinned, against 1.02x for the same configuration without
-    it), and it cannot be made safe: ``cudaStreamSynchronize`` from a second thread raises
-    "operation not permitted when stream is capturing" whenever the main thread is capturing a
-    fine-loop CUDA graph, and ``coarse_fine_align_many`` swallows that into a silent fall back
-    to the eager loop. See :func:`_iter_shards_prefetched`, which stays I/O-only.
-    """
+    """Upload one store array asynchronously, staged through pinned host memory, and retype on
+    the device (a float16 store widens to float32 on the GPU, which is exact and halves the bytes
+    pushed). Runs on the calling thread: a stream synchronise from a second thread raises while
+    the main thread is capturing a CUDA graph, so the read-ahead thread stays I/O-only."""
     import torch
     if device.type != "cuda":
         t = torch.as_tensor(a, device=device)
@@ -1126,7 +928,7 @@ def _to_device(a, device, *, dtype=None):
         ent = (torch.empty(src.numel(), dtype=src.dtype, pin_memory=True), torch.cuda.Event())
         _PIN_STAGE[key] = ent
     else:
-        ent[1].synchronize()          # the previous copy OUT of this buffer has landed
+        ent[1].synchronize()          # the previous copy out of this buffer has landed
     buf, ev = ent
     flat = buf[:src.numel()]
     flat.copy_(src.reshape(-1))
@@ -1138,18 +940,9 @@ def _to_device(a, device, *, dtype=None):
 
 def _build_fit_arrays(arrs: dict, mode: str, device):
     """Array-native twin of :func:`_build_fit_fast_pairs`: ``(ids, {channel: (flat, off)})``.
-
-    Uploads each of the store's ALREADY-contiguous buffers once, through the pinned staging in
-    :func:`_to_device`, and hands the array aligner the buffer plus its CSR offsets -- or the
-    dense ``(K, S, ...)`` block plus ``None`` for the fixed-width surface, which needs no
-    gather at all. No ``_FastPair``, no ``torch.split``, no per-molecule Python.
-
-    Which arrays a channel comes from is ``channels.load_store_channel``'s business, not this
-    function's: the heavy basis in particular is ``heavy_off``/``xyz_noH`` only when some
-    molecule's ``Chem.RemoveHs`` retained an H, and the heavy charges on a with-H store are a
-    vectorised gather of the with-H array. Reading the keys directly here is how a mode ends up
-    silently scoring the wrong field.
-    """
+    Each contiguous store buffer is uploaded once with its CSR offsets (``None`` for the dense
+    fixed-width surface). Which store keys feed a channel is ``channels.load_store_channel``'s
+    business, since the heavy basis and the heavy charges depend on the store layout."""
     import torch
     from shepherd_score.accel.channels import load_store_channel
     spec = _spec_of(mode)
@@ -1166,12 +959,9 @@ def _build_fit_arrays(arrs: dict, mode: str, device):
 
 
 def _align_fast_arrays(ref: dict, fit: dict, mode: str, batch_kw: dict):
-    """Array-native twin of :func:`_align_fast`: ``(scores, SE3)`` for one shard, one query.
-
-    ``batch_kw`` is what :func:`_fast_batch_kwargs` produced, so the mode parameters resolve
-    through the SAME ``resolve_params`` the pairwise aligner uses -- which is where the surface
-    modes' ``lam`` is scaled by ``LAM_SCALING`` exactly once.
-    """
+    """Array-native twin of :func:`_align_fast`: ``(scores, SE3)`` for one shard, one query. The
+    mode parameters resolve through the same ``resolve_params`` as the pairwise aligner, which is
+    where the surface modes' ``lam`` is scaled by ``LAM_SCALING`` exactly once."""
     from shepherd_score.accel.batch._arrays import align_arrays
     from shepherd_score.accel.batch.aligners import resolve_params
     spec = _spec_of(mode)
@@ -1201,10 +991,8 @@ def _make_array_aligner(mode: str):
     return align
 
 
-#: mode -> (fit-array builder, array-native aligner). ONE generic body per side, but a DISTINCT
-#: named function per mode: the array-vs-object parity gate wraps ``_ARRAY_BUILDERS`` entry by
-#: entry to assert which builder a screen actually entered, and a single shared function object
-#: could not tell the modes apart. Keys cover ``_ARRAY_MODES`` exactly.
+#: mode -> (fit-array builder, array-native aligner): one generic body per side but a distinct
+#: named function per mode, so a test can wrap one mode's builder and assert which one ran.
 _ARRAY_BUILDERS = {m: _make_array_builder(m) for m in _ARRAY_MODES}
 _ARRAY_ALIGNERS = {m: _make_array_aligner(m) for m in _ARRAY_MODES}
 for _m, _fn in _ARRAY_BUILDERS.items():
@@ -1215,52 +1003,27 @@ del _m, _fn
 
 
 def _array_dispatch(mode: str):
-    """The ``(builder, aligner)`` pair the array-native path uses for ``mode``.
-
-    The SINGLE selector for both drivers -- :func:`_run_shards_inproc` and
-    :func:`_screen_worker`. It exists because they used to select independently and the
-    worker's copy did not select at all: it called the vol builder and the vol aligner for
-    EVERY mode, so ``screen(ndev>1)`` silently returned vol answers under another mode's name
-    (``vol_color`` measured max|delta| 3.0654e-01 against a real vol_color screen, with a
-    completely different top-10; ``pharm`` raised KeyError instead).
-
-    It reads the TABLES rather than building closures, which is also what lets a test intercept
-    one mode's builder by patching ``_ARRAY_BUILDERS``. Keep it one function: a second copy of
-    the dispatch is exactly how the worker drifted out of agreement with the driver.
-    """
+    """The ``(builder, aligner)`` pair for ``mode``: the single selector shared by
+    :func:`_run_shards_inproc` and :func:`_screen_worker`. It reads the tables at call time so
+    a test can patch ``_ARRAY_BUILDERS``."""
     return _ARRAY_BUILDERS[mode], _ARRAY_ALIGNERS[mode]
 
 
 def _canonical_rot(store, arrs):
-    """The per-molecule rotation a CANONICAL store applies at build time, or ``None``.
-
-    ``None`` for a legacy or ``canonical=False`` store, which is what makes every composition
-    below a no-op on those -- the returned pose is already in the molecule's own frame there.
-    """
+    """The per-molecule rotation a canonical store applied at build time, or ``None`` for a legacy
+    or ``canonical=False`` store (which makes every composition below a no-op)."""
     if not getattr(store, "canonical", False):
         return None
     return arrs.get("rot") if hasattr(arrs, "get") else None
 
 
 def _compose_rot(T, R):
-    """Map one pose out of the CANONICAL frame and back into the molecule's own.
+    """Map a pose solved in the canonical frame back into the molecule's own frame.
 
-    A canonical store holds ``x_canon = (x_orig - mu) @ R.T`` (``_profile_from_schema`` centres
-    first, and refuses ``canonical`` without ``pre_center``), so a transform solved against
-    ``x_canon`` satisfies
-
-        x_aligned = x_canon @ T_R.T + T_t = (x_orig - mu) @ (T_R @ R).T + T_t
-
-    -- the rotation composes as ``T_R @ R`` and the translation is unchanged, because both store
-    kinds share the same centred origin. Convention is ``points @ R.T + t``, matching
-    ``alignment/utils/se3.py::apply_SE3_transform``.
-
-    Without this the SCORES and the RANKING are still right while ``Hit.transform`` silently
-    refers to the canonical frame -- a failure no score-based test can see, which is why
-    ``tests/test_screen_arrays.py`` re-scores a returned pose instead.
-
-    Called per SURVIVOR, not per molecule: a screen keeps ~k of K, so composing here costs ~1000
-    3x3 products instead of one (K,3,3) batched product per shard.
+    A canonical store holds ``x_canon = (x_orig - mu) @ R.T``, so a transform ``T`` solved
+    against it gives ``x_aligned = (x_orig - mu) @ (T_R @ R).T + T_t``: the rotation composes
+    as ``T_R @ R`` and the translation is unchanged (convention ``points @ R.T + t``, as in
+    ``alignment/utils/se3.py``). Called per survivor rather than per molecule.
     """
     if R is None or T is None:
         return T
@@ -1270,14 +1033,8 @@ def _compose_rot(T, R):
 
 
 def _accumulate_arrays(heap, ids, scores, transforms, scores_out, qi, start, rot=None):
-    """Array-native twin of :func:`_accumulate`.
-
-    Character-for-character the same reduce -- same block size, same ``threshold()``
-    pre-filter, same ascending-index offer order, same ``scores_out`` slice -- except the
-    survivor's transform is read from row ``i`` of the (K,4,4) array rather than from a pair
-    object. The exactness argument in :func:`_accumulate` carries over unchanged, because it
-    rests on ``threshold()`` monotonicity and on a rejected offer mutating nothing, neither of
-    which depends on where the transform came from."""
+    """Array-native twin of :func:`_accumulate`: the same block reduce, except the survivor's
+    transform is row ``i`` of the ``(K,4,4)`` array rather than a pair attribute."""
     n = len(ids)
     lo = 0
     while lo < n:
@@ -1289,13 +1046,8 @@ def _accumulate_arrays(heap, ids, scores, transforms, scores_out, qi, start, rot
             sel = np.arange(lo, hi)
         else:
             sel = np.flatnonzero(scores[lo:hi] > thr) + lo
-        # Convert the surviving candidates' scores and ids in ONE vectorised call each,
-        # instead of a numpy-scalar access plus ``float()``/``_id_to_py()`` per candidate.
-        # ``ndarray.tolist()`` is elementwise ``.item()``, which is exactly what ``_id_to_py``
-        # does for a numpy scalar and a no-op for anything else, so the values handed to the
-        # heap are unchanged. This is the hot loop: the accumulate is 17.4% of a vol screen's
-        # wall at N=100,000 once the canonical composition is deferred (job 22596802), and it
-        # runs ~5,200 times for a 1,000-entry heap.
+        # One vectorised conversion per block: ``ndarray.tolist()`` is elementwise ``.item()``,
+        # which is what ``_id_to_py`` does for a numpy scalar, so the heap sees the same values.
         cs = scores[sel].tolist()
         cid = ids[sel].tolist()
         for j, i in enumerate(sel.tolist()):
@@ -1306,20 +1058,17 @@ def _accumulate_arrays(heap, ids, scores, transforms, scores_out, qi, start, rot
 
 
 def _align_fast(pairs, ref_tensors: dict, mode: str, batch_kw: dict):
-    """Set the shared query ref tensors on the resident fit-pairs and run the batched
-    aligner; return the per-pair scores (np). Transforms are NOT built here -- they are
-    materialized lazily for top-K survivors only (``_TopK.offer_pair``), since building
-    all K per shard is the dominant overhead and a screen keeps only ~top_k."""
+    """Set the shared query ref tensors on the resident fit pairs, run the batched aligner and
+    return the per-pair scores. Transforms are materialised lazily for top-K survivors only
+    (``_TopK.offer_pair``), since a screen keeps only ~top_k of K."""
     from shepherd_score.accel.batch import aligners
-    items = tuple(ref_tensors.items())          # materialize the view ONCE, not per pair
+    items = tuple(ref_tensors.items())          # materialise the view once, not per pair
     for p in pairs:
         for k, v in items:
             setattr(p, k, v)
     getattr(aligners, "_align_batch_" + mode)(pairs, **batch_kw)
-    # The batched aligners write plain Python floats (``scores_cpu.tolist()``), so reading
-    # them through ``map(attrgetter(...))`` into a preallocated ``fromiter`` is the same
-    # float64 vector as a ``[float(getattr(...)) for p in pairs]`` list comprehension --
-    # minus K Python-level ``getattr``/``float`` calls and the intermediate list.
+    # The aligners write plain Python floats, so ``fromiter`` over ``attrgetter`` is the same
+    # float64 vector as a list comprehension without K Python-level calls.
     return np.fromiter(map(_SCORE_GETTER[mode], pairs), dtype=float, count=len(pairs))
 
 
@@ -1342,36 +1091,16 @@ class _TopK:
             heapq.heapreplace(self.heap, item)
 
     def offer_pair(self, score, id_, pair, tf_attr, rot=None):
-        """Offer a candidate, materializing its transform from ``pair`` ONLY if the
-        score makes the top-K. A screen keeps ~k of K, so this builds ~k transforms
-        instead of K (the dominant per-shard overhead). Must be called while ``pair``
-        still holds this query's pose (before the next query/shard re-aligns it).
-
-        The MATERIALIZATION has to happen now -- the pair is about to be re-aligned -- but the
-        canonical-frame COMPOSITION does not, so it is deferred to :meth:`_materialize` for the
-        same reason as :meth:`offer_row`: acceptance into the heap is not survival, and ~4 of
-        every 5 accepted candidates are evicted before the screen ends."""
+        """Offer a candidate, materialising its transform from ``pair`` only if the score makes
+        the top-K. Must be called while ``pair`` still holds this query's pose. The canonical-frame
+        composition is deferred to :meth:`_materialize`, since most accepted candidates are evicted."""
         if len(self.heap) < self.k or score > self.heap[0][0]:
             self._push(score, id_, (_transform_of(pair, tf_attr), rot))
 
     def offer_row(self, score, id_, transforms, i, rot=None):
-        """Array-native twin of :meth:`offer_pair`: the transform comes from row ``i`` of a
-        (K,4,4) array instead of an attribute on a pair object.
-
-        Identical acceptance test, identical push, identical ``_c`` tie-break advance -- the
-        ONLY difference is where the transform is read from, so the heap state after a shard is
-        the same as the object path's down to ties.
-
-        The canonical-frame composition is DEFERRED to :meth:`_materialize`, not done here.
-        Acceptance into the heap is not survival: a vol screen at N=100,000 for top_k=1000
-        accepts 5,238 candidates, so ~4 of every 5 compositions were being done for a molecule
-        evicted before the screen ended. ``_compose_rot`` is a numpy copy plus a 3x3 matmul,
-        ~2.7 us of interpreter and allocator time, and it measured at 0.1405 us/mol = **9.7% of
-        the whole vol screen's wall clock** (job 22594805, L40S, N=100,000) -- the single
-        largest host item in the screen. Storing the pending ``(row, rot_row)`` pair costs two
-        numpy views. The rows are views into the shard's arrays, which is exactly what a
-        non-canonical store already stores here (``_compose_rot`` returns ``T`` unchanged when
-        ``rot`` is None), so this changes nothing about lifetime that was not already true."""
+        """Array-native twin of :meth:`offer_pair`: the transform is row ``i`` of a ``(K,4,4)``
+        array. Same acceptance test and tie-break, so the heap matches the object path's down to
+        ties. Composition with ``rot`` is deferred to :meth:`_materialize`; the rows are views."""
         if len(self.heap) < self.k or score > self.heap[0][0]:
             self._push(score, id_, (transforms[i], None if rot is None else rot[i]))
 
@@ -1384,19 +1113,13 @@ class _TopK:
         return _compose_rot(t[0], t[1]) if type(t) is tuple else t
 
     def threshold(self):
-        """Score a candidate must **strictly exceed** to change this heap at all, or
-        ``-inf`` while the heap has not yet filled (every offer is accepted then).
+        """Score a candidate must strictly exceed to change this heap, or ``-inf`` until it fills.
 
-        Exactness of the pre-filter in :func:`_accumulate` rests on this being monotone
-        non-decreasing once the heap is full: ``_push`` then only ever ``heapreplace``s
-        the minimum with a *strictly larger* score, so the minimum never falls. A
-        candidate scoring ``<= threshold()`` is therefore guaranteed to be rejected by
-        every later ``offer_pair`` in the batch too -- and a rejected ``offer_pair``
-        mutates nothing (no push, no ``_c`` increment), so skipping it is a bit-exact
-        no-op rather than an approximation.
+        The pre-filter in :func:`_accumulate` is exact because this is monotone non-decreasing
+        once the heap is full (``_push`` only replaces the minimum with a strictly larger score)
+        and a rejected offer mutates nothing.
         """
-        # ``self.k`` guard keeps a degenerate k=0 heap failing exactly where it does today
-        # (inside offer_pair), instead of raising from here.
+        # The ``self.k`` guard keeps a degenerate k=0 heap failing inside offer_pair, not here.
         return self.heap[0][0] if (self.k and len(self.heap) >= self.k) else float("-inf")
 
     def merge_raw(self, raw):
@@ -1404,9 +1127,8 @@ class _TopK:
             self._push(s, i, t)
 
     def raw(self):
-        # Composed on the way OUT, so what crosses a process boundary (multi_gpu merges heaps
-        # through raw()/merge_raw) is a plain (4,4) array, never a view that would drag its
-        # whole shard along through pickle.
+        # Composed on the way out, so what crosses a process boundary is a plain (4,4) array,
+        # never a view that would drag its whole shard through pickle.
         return [(s, i, self._materialize(t)) for (s, _, i, t) in self.heap]
 
     def sorted(self):
@@ -1428,11 +1150,8 @@ def _resolve_screen(store, mode, alpha, align_kwargs):
         alpha = float(ALPHA(store.num_surf_points))
     if alpha is not None:
         align_kwargs["alpha"] = alpha
-    # A parameter the registry declares REQUIRED (spec default None) must be supplied. Raise the
-    # same clear error on both the fast and the slow path, rather than letting the fast one fail
-    # deep inside _fast_batch_kwargs: ``vol_esp`` needs ``lam`` (the ESP / partial-charge weight,
-    # which the per-pair API also makes required), and ``vol_and_surf_esp`` needs ``alpha``,
-    # which selects volumetric shape at 0.81 and surface shape otherwise.
+    # A parameter the registry declares required (spec default None) must be supplied; raise the
+    # same error on the fast and the slow path (e.g. vol_esp needs lam, vol_and_surf_esp alpha).
     for _name, _default in _spec_of(mode).params.items():
         if _default is None and _name not in align_kwargs:
             raise ValueError(f"{mode} requires an explicit {_name}=...; pass {_name}=...")
@@ -1443,24 +1162,13 @@ def _resolve_screen(store, mode, alpha, align_kwargs):
 
 
 def _iter_shards_prefetched(store, shard_idxs):
-    """Yield ``(shard_meta, arrays)`` for ``shard_idxs`` **in order**, reading the next shard
-    on a single background thread so the disk read overlaps the current shard's alignment.
+    """Yield ``(shard_meta, arrays)`` for ``shard_idxs`` in order, reading the next shard on one
+    background thread so the disk read overlaps the current shard's alignment.
 
-    Pure I/O overlap, and deliberately ONLY that: the obvious extension -- have this thread do
-    the host-to-device upload as well -- was built and measured SLOWER twice (0.688x pageable,
-    0.849x/0.921x pinned, against 1.02x without it), and it cannot be made safe. A second
-    thread calling ``cudaStreamSynchronize`` raises "operation not permitted when stream is
-    capturing" whenever the main thread is capturing a fine-loop CUDA graph, and
-    ``coarse_fine_align_many`` swallows that into a silent fall back to the eager loop. The
-    upload stays on the calling thread; see :func:`_to_device`.
-
-    The worker touches no shared mutable state: :meth:`ProfileStore.read_shard` opens its own
-    file handle and returns fresh arrays. The consumer still sees shards strictly in
-    ``shard_idxs`` order; a read that raises is re-raised in the caller's thread by
-    ``Future.result()`` before the shard is yielded, and the executor is shut down (joining the
-    in-flight read) on any exit path, including the generator being closed early.
-
-    Costs one extra resident shard.
+    I/O only: the thread must not touch CUDA, because a stream synchronise from a second thread
+    raises while the main thread is capturing a fine-loop graph (see :func:`_to_device`). A
+    failed read is re-raised in the caller's thread, in order, and the executor is shut down on
+    every exit path. Costs one extra resident shard.
     """
     idxs = list(shard_idxs)
     if len(idxs) < 2:
@@ -1482,38 +1190,19 @@ def _iter_shards_prefetched(store, shard_idxs):
 
 
 def _canonical_batch_kw(store, qs_ref, mode, device, batch_kw, fast=True):
-    """``batch_kw`` plus ``const_seeds`` when this screen can use them: a CANONICAL store, the
-    array path, ONE query, and a mode that seeds from the heavy-atom cloud
-    (``_CONST_SEED_MODES``). Seeds are then one constant set for the whole screen (see
-    _common.canonical_seed_quats) instead of a per-molecule eigensolve, which is the 1.5-2x the
-    canonical store exists for on ``vol``. Unchanged ``batch_kw`` otherwise.
-
-    One query, because the set depends on the query's frame: :func:`_canonical_batch_kws` is the
-    per-panel form, one ``batch_kw`` per query.
-
-    ``vol_and_surf_esp`` qualifies only at ``alpha == 0.81``, where its driver seeds from the atom
-    clouds; at any other alpha it seeds from the surfaces, which the store does not canonicalise.
-
-    ONE helper for the in-process shard loop AND the multi-GPU worker, deliberately: the worker
-    used to take ``batch_kw`` as handed to it, so on the same canonical store it ran the
-    per-molecule seeds and cost 2.1x the in-process screen per shard (measured 2026-09-14,
-    Shepherd-Score-Paper fig2_speed/p6_gpu_probe.py: 1.98 s against 0.94 s for 1e6 vol
-    conformers on one L40S, whatever the host-thread cap or socket), which is why two devices
-    screened no faster than one.
-
-    Gated on ``fast and _use_arrays`` because ``const_seeds`` is a parameter of
-    ``align_batch_vol_arrays`` ALONE -- the object path's ``_align_batch_vol`` has no such
-    keyword and raises TypeError on it. Those routes keep the per-molecule PCA seeds, which stay
-    CORRECT on a canonical store (they are derived from whatever coordinates it holds); they
-    just forgo the speedup.
+    """``batch_kw`` plus ``const_seeds`` when this screen can use them: a canonical store, the
+    array path, one query and a mode that seeds from the heavy-atom cloud (``_CONST_SEED_MODES``);
+    unchanged otherwise. The seed set depends on the query's frame, hence one query
+    (:func:`_canonical_batch_kws` is the per-panel form). Shared by the in-process loop and the
+    multi-GPU worker. Gated on the array path because ``const_seeds`` is a keyword of the array
+    aligner alone; the object path keeps per-molecule seeds, which stay correct on a canonical store.
     """
     if not (fast and _use_arrays(mode) and getattr(store, "canonical", False)
             and mode in _CONST_SEED_MODES and len(qs_ref) == 1):
         return batch_kw
     _spec = _spec_of(mode)
-    # The seed channel is resolved under THIS call's keywords: the combo modes seed from the
-    # atom clouds only at alpha == 0.81 and from the surfaces otherwise, and the store
-    # canonicalises the atom frame alone.
+    # Resolve the seed channel under this call's keywords: the combo modes seed from the atom
+    # clouds only at alpha == 0.81, and the store canonicalises the atom frame alone.
     _seed_ch = _spec.resolve_channel(_spec.seed_channel, batch_kw)
     if _seed_ch not in ("atoms", "heavy"):
         return batch_kw
@@ -1529,14 +1218,9 @@ def _canonical_batch_kw(store, qs_ref, mode, device, batch_kw, fast=True):
 
 
 def _canonical_batch_kws(store, qs_ref, mode, device, batch_kw, fast=True):
-    """One ``batch_kw`` per query of a panel: :func:`_canonical_batch_kw` applied per query.
-
-    The constant seed set is a function of the QUERY's principal frame alone, so a panel simply
-    gets one set per query; the single-query gate above is about deriving one set from one
-    frame, not a limit of the method. Every entry is the caller's own ``batch_kw`` object when the
-    store or mode does not qualify, so the object path (which has no ``const_seeds`` keyword)
-    never sees it.
-    """
+    """One ``batch_kw`` per query of a panel: :func:`_canonical_batch_kw` applied per query. Every
+    entry is the caller's own ``batch_kw`` object when the store or mode does not qualify, so the
+    object path never sees ``const_seeds``."""
     return [_canonical_batch_kw(store, [ra], mode, device, batch_kw, fast) for ra in qs_ref]
 
 
@@ -1545,14 +1229,9 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                        n_total):
     """Process ``shard_idxs`` against the query panel, one shard load per shard,
     aligning every query against it. Returns a ``_TopK`` per query."""
-    # This driver shards the library itself (one shard per call), so the aligner's
-    # transparent multi-GPU dispatch must be suppressed for the duration: the pairs here
-    # are lightweight ``_FastPair`` stand-ins that carry only cached tensors -- no
-    # ``Molecule`` -- so any dispatch path that re-materializes per-pair Molecule arrays
-    # (``p.ref_molec.atom_pos``) would raise AttributeError, and on a multi-GPU host a
-    # large shard would otherwise trip the dispatcher's single-GPU warning mid-screen.
-    # Restore the previous value afterwards: this runs in the caller's process/thread and
-    # may itself be nested inside a per-GPU worker that already set the flag.
+    # Suppress the aligner's transparent multi-GPU dispatch for the duration: the ``_FastPair``
+    # stand-ins carry only cached tensors, so a dispatch path that re-reads ``ref_molec`` would
+    # raise. Restore the previous flag afterwards, since this may run inside a per-GPU worker.
     try:
         from shepherd_score.accel.batch import _DISPATCH_LOCAL
     except Exception:
@@ -1562,31 +1241,23 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
     try:
         heaps = [_TopK(top_k) for _ in qs_ref]
         tf_attr = _TRANSFORM_ATTR[mode]
-        # CANONICAL store: one constant seed set per QUERY for the whole screen, computed once
-        # here instead of per molecule per bucket. The same helper serves the multi-GPU worker.
+        # Canonical store: one constant seed set per query for the whole screen.
         batch_kws = _canonical_batch_kws(store, qs_ref, mode, device, batch_kw, fast)
         done = 0
         if not fast:
             from shepherd_score.container import MoleculePair, MoleculePairBatch
-        # Shards arrive in order from the read-ahead reader; ``arrs`` is exactly what
-        # ``store.read_shard(idx)`` returned, just read one shard earlier.
+        # Shards arrive in order from the read-ahead reader, one shard early.
         for sh, arrs in _iter_shards_prefetched(store, shard_idxs):
-            # A canonical store's coordinates are rotated into each molecule's principal frame,
-            # so every pose below is solved in THAT frame and has to be composed back. ``None``
-            # for every other store, which makes each composition a no-op there. See _compose_rot.
+            # Poses are solved in the canonical frame and composed back with ``rot``; ``None``
+            # for a non-canonical store makes each composition a no-op. See _compose_rot.
             rot = _canonical_rot(store, arrs)
             if fast:
                 # ``ids`` stays the raw store array: _accumulate applies ``_id_to_py`` to
                 # top-K survivors only, instead of converting every library molecule here.
                 start = sh["start"]
                 if _use_arrays(mode):
-                    # ARRAY-NATIVE PATH: no per-molecule Python objects
-                    # anywhere between the store and the heap. See accel/batch/_arrays.py.
-                    # vol used to be an inline branch here so its gate-5 bit-identity stayed
-                    # visibly untouched; it is a table entry like the rest now, which moves no
-                    # arithmetic (same builder, same tensors, same kwargs into
-                    # align_batch_vol_arrays) and leaves _array_dispatch as the one selector
-                    # this driver and the multi-GPU worker share.
+                    # Array-native path: no per-molecule Python objects between the store and
+                    # the heap. See accel/batch/_arrays.py.
                     build, align = _array_dispatch(mode)
                     ids, fit = build(arrs, device)
                     for qi, ra in enumerate(qs_ref):
@@ -1625,38 +1296,20 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
         _DISPATCH_LOCAL.active = _prev_active
 
 
-# Candidates are pre-filtered against the heap threshold in blocks of this many, so the
-# threshold used is refreshed as the heap tightens instead of being read once per shard
-# (a 100k-molecule shard would otherwise pre-filter its whole tail against the stale
-# threshold it had before its own first molecule was offered). Block size only trades a
-# handful of numpy calls against a few wasted offers; it never changes the result.
+# Candidates are pre-filtered against the heap threshold in blocks of this many, so the threshold
+# is refreshed as the heap tightens. The block size never changes the result.
 _ACCUM_BLOCK = 4096
 
 
 def _accumulate(heap, ids, scores, pairs, tf_attr, scores_out, qi, start, rot=None):
-    """Reduce one shard's scores for one query: full score vector out, top-K heap in.
+    """Reduce one shard's scores for one query: every score into ``scores_out`` (library order),
+    survivors into the top-K heap.
 
-    ``scores_out`` still receives EVERY score, in library order, via the same single
-    vectorised slice assignment as before.
-
-    The heap, by contrast, is only ever changed by a candidate that strictly beats its
-    current minimum, so the per-molecule Python offer loop is pre-selected in C: a
-    numpy ``> threshold`` comparison plus ``flatnonzero`` picks the candidates that can
-    actually enter, and only those pay a ``float()``, an ``_id_to_py()`` and a heap call.
-    On a large screen the heap threshold sits near the k-th best score seen so far, so
-    this is a handful of survivors per block instead of one Python iteration per library
-    molecule.
-
-    **This is exact, not approximate.** ``_TopK.threshold()`` is ``-inf`` until the heap
-    fills (nothing is skipped during that phase) and non-decreasing afterwards, so a
-    candidate scoring ``<= threshold`` at the start of a block still scores ``<=`` the
-    heap minimum when its turn comes and would be rejected by ``offer_pair``. A rejected
-    ``offer_pair`` performs no push and does not advance the ``_c`` tie-break counter, so
-    it leaves *no* trace: skipping it reproduces the old push sequence, the old counters,
-    the old heap array layout and therefore the old hit order down to ties. Survivors are
-    still offered in ascending library index, and still inside this query/shard iteration
-    so ``offer_pair`` materialises each transform while its ``pair`` holds THIS query's
-    pose.
+    Candidates are pre-selected in numpy against ``heap.threshold()`` so only those that can
+    enter pay a Python-level offer. This is exact: the threshold is ``-inf`` until the heap fills
+    and non-decreasing afterwards, and a rejected ``offer_pair`` mutates nothing (no push, no
+    ``_c`` advance), so the hit order matches an unfiltered offer loop down to ties. Survivors
+    are offered in ascending library index while ``pair`` still holds this query's pose.
     """
     n = len(ids)
     lo = 0
@@ -1669,10 +1322,8 @@ def _accumulate(heap, ids, scores, pairs, tf_attr, scores_out, qi, start, rot=No
             sel = np.arange(lo, hi)                  # heap not full: every offer is taken
         else:
             sel = np.flatnonzero(scores[lo:hi] > thr) + lo
-        # One vectorised conversion per BLOCK instead of a numpy-scalar access plus
-        # ``float()``/``_id_to_py()`` per candidate. ``ndarray.tolist()`` is elementwise
-        # ``.item()``, which is exactly what ``_id_to_py`` does for a numpy scalar, so the
-        # values reaching the heap are unchanged. Same change as in _accumulate_arrays.
+        # One vectorised conversion per block: ``ndarray.tolist()`` is elementwise ``.item()``,
+        # which is what ``_id_to_py`` does for a numpy scalar, so the heap sees the same values.
         cs = scores[sel].tolist()
         cid = np.asarray(ids)[sel].tolist()
         for j, i in enumerate(sel.tolist()):
@@ -1699,21 +1350,20 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
                 top_k: int = 1000, ndev: Optional[int] = None,
                 scores_out=None, alpha: Optional[float] = None,
                 progress: bool = False, **align_kwargs) -> List[List["Hit"]]:
-    """Screen a **panel** of queries against ``store`` in a single streaming pass.
+    """Screen a panel of queries against ``store`` in a single streaming pass.
 
-    Each shard is read from disk **once** and aligned against *every* query (so the
-    library is streamed once for the whole panel, not once per query). For the fast
-    modes (all of ``vol/vol_esp/surf/surf_esp/pharm/vol_color/vol_and_surf_esp``) on a pre-centered
-    store, the shard's fit tensors are built once on-device and reused across the panel
-    via the direct array->kernel path (no per-molecule ``MoleculeProfile``/``MoleculePair``).
+    Each shard is read from disk once and aligned against every query, so the library is
+    streamed once for the whole panel. On a pre-centered store (``trans_init=False``, non-jax
+    backend) the shard's fit tensors are built once on-device and reused across the panel via
+    the direct array->kernel path, with no per-molecule ``MoleculeProfile``/``MoleculePair``.
 
-    Returns a list aligned with ``queries``: ``out[j]`` is query ``j``'s ``top_k``
-    ``Hit``s (sorted, descending).
+    Returns a list aligned with ``queries``: ``out[j]`` is query ``j``'s ``top_k`` ``Hit``s
+    (sorted, descending).
 
-    See :func:`screen` for the per-query parameters. ``scores_out`` may be a list of
-    one preallocated array per query (single-process only). ``ndev>1`` streams shards
-    across one worker process per GPU, spawned on the first such call and kept until
-    :func:`close_multigpu_pool` or interpreter exit (fast modes only).
+    See :func:`screen` for the per-query parameters. ``scores_out`` may be a list of one
+    preallocated array per query (single-process only). ``ndev>1`` streams shards across one
+    worker process per GPU, spawned on the first such call and kept until
+    :func:`close_multigpu_pool` or interpreter exit (fast path only).
     """
     import torch
     queries = list(queries)
@@ -1730,11 +1380,8 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
                 raise ValueError(f"query num_surf_points ({qn}) != store "
                                  f"({store.num_surf_points}); ALPHA is calibrated to it")
 
-    # Fast-path query preconditions: name the missing field up front instead of crashing
-    # opaquely inside _query_ref_arrays. Each channel's own reader raises a ValueError naming
-    # what it needed, so the check is simply "read them all once" -- a bare RDKit-backed
-    # Molecule has everything; a MoleculeProfile reconstructed without the mode's arrays does
-    # not, and this is where that is reported rather than mid-screen.
+    # Fast-path query preconditions: read every channel once so a missing field is reported
+    # here, by name, rather than mid-screen.
     for q in queries:
         for c in _chans:
             if c.is_pair:
@@ -1757,10 +1404,8 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
     device = (torch.device("cpu") if backend in ("numba", "cpu")
               else torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
 
-    # The fast CPU path runs the batched kernels through numba. Without it the aligner falls
-    # into a per-pair fallback that calls p.align_with_<mode>() -- which the lightweight
-    # _FastPair stand-ins on the fast screen path don't have, so it dies with a confusing
-    # AttributeError deep inside the aligner. Fail clearly up front instead.
+    # The fast CPU path runs the batched kernels through numba; without it the aligner falls
+    # into a per-pair fallback the ``_FastPair`` stand-ins cannot serve. Fail clearly up front.
     if fast and device.type == "cpu":
         try:
             import numba  # noqa: F401
@@ -1774,15 +1419,14 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
             raise ValueError("ndev>1 requires the fast path (a pre-centered store, a "
                              f"{sorted(_FAST_MODES)} mode, trans_init=False, GPU backend)")
         if scores_out is not None:
-            # The multi-GPU workers return only per-query top-K heaps; there is no path
-            # for a full score vector back to the parent. Fail loudly rather than silently
-            # leave the caller's preallocated array unwritten.
+            # The multi-GPU workers return only per-query top-K heaps, so a preallocated score
+            # array could not be filled; fail rather than leave it silently unwritten.
             raise ValueError("scores_out is not supported with ndev>1 (multi-GPU screening "
                              "returns top-K hits only). Run single-process for full score vectors.")
         heaps = _screen_many_multigpu(qs, store.path, mode, ndev,
                                       _fast_batch_kwargs(mode, align_kwargs), top_k, progress)
-        # NB the multi-GPU workers rebuild their own device tensors, so the avoid cloud crosses
-        # as the plain numpy array in ``align_kwargs`` and is uploaded inside each worker.
+        # The multi-GPU workers rebuild their own device tensors, so the avoid cloud crosses as
+        # the plain numpy array in ``align_kwargs`` and is uploaded inside each worker.
         return [h.sorted() for h in heaps]
 
     so = _normalize_scores_out(scores_out, len(queries))
@@ -1817,12 +1461,9 @@ def screen(query, store: "ProfileStore", mode: str = "surf_esp", *,
     store : ProfileStore
         Opened for reading.
     mode : str
-        One of ``vol vol_esp surf surf_esp pharm vol_and_surf_esp vol_color`` (legacy
-        ``esp``/``esp_combo`` accepted; must be supported by
-        the store). **All seven** take the fast direct array->kernel path on a pre-centered
-        store (``trans_init=False``, non-jax backend). ``vol_color`` (ROCS/ROSHAMBO-style
-        shape + directionless pharmacophore color) needs only a pharm store (atoms +
-        anchors), no surfaces.
+        Any registry mode the store supports (see :meth:`ProfileStore.create`; legacy
+        ``esp``/``esp_combo`` accepted). Every mode takes the direct array->kernel path on a
+        pre-centered store with ``trans_init=False`` and a non-jax backend.
     backend : str, optional
         Default auto: ``"triton"`` on CUDA, else ``"numba"``.
     do_center : bool, optional
@@ -1838,9 +1479,10 @@ def screen(query, store: "ProfileStore", mode: str = "surf_esp", *,
         Preallocated ``(len(store),)`` array (e.g. an ``np.memmap``) written with every
         score in library order. Single-process only.
     alpha : float, optional
-        Shape Gaussian width; auto-fills ``ALPHA(num_surf_points)`` for ``surf``/``esp``,
-        required for ``vol_and_surf_esp`` (``alpha=0.81`` selects volumetric shape, else surface),
-        defaults to ``0.81`` for ``vol``/``vol_esp``, ignored only for ``pharm``.
+        Shape Gaussian width. Auto-fills ``ALPHA(num_surf_points)`` for the surface-shape
+        modes; required for ``vol_and_surf_esp`` (``0.81`` selects volumetric shape, else
+        surface); otherwise the registry default (``0.81`` for the volumetric modes); ignored
+        by ``pharm``.
     **align_kwargs
         Passed to the aligner (``lam``, ``num_repeats``, ``max_num_steps``, ``lr``,
         ``similarity``, ...). ``trans_init=True`` falls back off the fast path.
@@ -1856,29 +1498,19 @@ def screen(query, store: "ProfileStore", mode: str = "surf_esp", *,
 
 
 # --------------------------------------------------------------------------- #
-# Multi-GPU: ONE persistent worker process per GPU, spawned on first use and kept for the life
-# of the calling process, each holding its device and receiving whole screens as jobs. Within a
-# screen a worker owns a static share of the shards -- r, r+ndev, r+2*ndev, ... -- and streams
-# them with the same read-ahead thread the single-process screen uses, so the disk read of one
-# shard overlaps the alignment of the previous one. Both halves were measured before they were
-# written (Shepherd-Score-Paper, SI): with a fresh pool per call and a serial read-then-align loop
-# per worker, four L40S screened 10^7 vol conformers no faster than one (9.2 s either way) and two
-# were slower (13.4 s), because the ~4 s spawn was paid every call and a serial worker cost ~2.2x
-# the pipelined single process per shard.
+# Multi-GPU: one persistent worker process per GPU, spawned on first use and kept for the life
+# of the calling process. Within a screen each worker owns a static share of the shards
+# (r, r+ndev, r+2*ndev, ...) and streams them with the same read-ahead thread as the single-process screen.
 # --------------------------------------------------------------------------- #
 _MGPU_POOL = None                        # {"key": (ndev, threads), "procs", "job_qs", "out_q"}
 
 
 def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, top_k,
                    shard_q, out_q):
-    """One device's share of one screen, run inside its worker process.
-
-    ``shard_q`` is either this worker's static LIST of shard indices -- streamed through
-    :func:`_iter_shards_prefetched`, so shard i+1 is read while shard i aligns -- or a queue
-    yielding indices and then ``None`` (the original work-stealing form, kept for callers and
-    tests that drive a worker by hand; it reads and aligns serially). Results go to ``out_q`` as
-    ``(rank, per_query_raw_heaps)``; an exception goes there as ``(rank, "__ERR__", traceback)``.
-    """
+    """One device's share of one screen, inside its worker process. ``shard_q`` is either a
+    static list of shard indices (streamed with read-ahead) or a queue yielding indices then
+    ``None`` (serial reads). Results go to ``out_q`` as ``(rank, per_query_raw_heaps)`` or
+    ``(rank, "__ERR__", traceback)``."""
     try:
         import torch
         from shepherd_score.accel.multi_gpu import _cap_threads
@@ -1894,9 +1526,7 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
         ref_tensors = [_ref_tensors_from_arrays(ra, mode, dev) for ra in ref_arrays_list]
         heaps = [_TopK(top_k) for _ in ref_arrays_list]
         tf_attr = _TRANSFORM_ATTR[mode]
-        # The canonical store's constant seeds, exactly as the in-process loop sets them (one set
-        # per query); without this the worker ran per-molecule seeds on the same store at 2.1x
-        # the cost per shard.
+        # The canonical store's constant seeds, one set per query, as the in-process loop sets them.
         batch_kws = _canonical_batch_kws(store, ref_arrays_list, mode, dev, batch_kw)
 
         def _drain(q):                                     # the queue form: serial reads
@@ -1914,11 +1544,7 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
         for _sh, arrs in shards:
             rot = _canonical_rot(store, arrs)      # canonical-frame stores; None otherwise
             if _use_arrays(mode):
-                # THE SAME selector the in-process driver uses, deliberately: this branch was
-                # hardwired to the vol builder and the vol aligner, so every non-vol mode
-                # screened here came back with vol answers under its own name (vol_color
-                # measured max|delta| 3.07e-01 and a different top-10; pharm raised KeyError).
-                # See _array_dispatch.
+                # The same selector the in-process driver uses; see _array_dispatch.
                 build, align = _array_dispatch(mode)
                 ids, fit = build(arrs, dev)
                 for qi, ref in enumerate(ref_tensors):
@@ -1930,8 +1556,7 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
                                                avoid=batch_kw.get("avoid_points"))
             for qi, ref in enumerate(ref_tensors):
                 scores = _align_fast(pairs, ref, mode, batch_kw)
-                # Same pre-filtered reduce as the in-process driver (scores_out is not
-                # supported with ndev>1, hence the None).
+                # Same pre-filtered reduce as the in-process driver; scores_out is unsupported here.
                 _accumulate(heaps[qi], ids, scores, pairs, tf_attr, None, qi, 0, rot)
             torch.cuda.synchronize()
         out_q.put((rank, [h.raw() for h in heaps]))
@@ -1971,9 +1596,8 @@ def close_multigpu_pool():
 
 
 def _mgpu_pool(ndev, threads):
-    """The pool for ``(ndev, threads)``: reused while it is alive, (re)spawned otherwise. Spawning
-    ndev CUDA processes costs seconds (about 4 s for four L40S) and used to be paid on every
-    call; a screen now pays it once per process lifetime."""
+    """The pool for ``(ndev, threads)``: reused while alive, (re)spawned otherwise, so the CUDA
+    process spawn is paid once per process lifetime."""
     global _MGPU_POOL
     pool = _MGPU_POOL
     if pool is not None and pool["key"] == (ndev, threads) and all(p.is_alive() for p in pool["procs"]):

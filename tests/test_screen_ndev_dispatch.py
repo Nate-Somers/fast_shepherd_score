@@ -1,22 +1,6 @@
-"""Regression: the multi-GPU screen worker must dispatch PER MODE, like the in-process driver.
-
-``screen(ndev>1)`` fans shards out to :func:`shepherd_score.screen._screen_worker`, one process
-per GPU. On the array-native path that worker called ``_build_fit_arrays_vol`` and the vol
-aligner UNCONDITIONALLY -- it had no mode branch at all -- while :func:`_run_shards_inproc`
-branched correctly. Every non-vol array mode therefore came back with vol answers under its own
-name. Replaying the worker's two lines on CPU for ``vol_color`` gave max|delta| 3.0654e-01
-against a real vol_color screen, a completely different top-10, and results bit-identical to a
-real vol screen; ``pharm`` was the only mode that failed loudly (KeyError, its ref dict carrying
-no ``_ref_xyz_t``). ``_arrays.ENABLED`` is True in production and nothing reads the environment,
-so that was every multi-GPU screen in the four non-vol array modes -- silently wrong, not slow.
-
-WHY THIS RUNS WITHOUT A GPU. The defect is a dispatch defect, not a kernel defect, and the lines
-that carry it sit above every CUDA call in the worker. So the worker is driven here IN PROCESS
-with its GPU-facing edges stubbed (device selection, thread capping, the store read, the
-builders, the aligners, the reduce), and the assertion is on WHICH CALLABLE PAIR it selected --
-which must be the pair :func:`_run_shards_inproc` selects for the same mode. A test that needed
-two real GPUs would never have run on the machine this bug was found on, and is worth little as
-the guard; the one genuinely end-to-end check below is marked ``cuda`` and skipped without two.
+"""The multi-GPU screen worker (``_screen_worker``) must dispatch per mode, selecting the same
+builder/aligner pair as ``_run_shards_inproc``. The worker is driven in process with its
+GPU-facing edges stubbed, so this runs without a GPU; the one end-to-end check needs two.
 """
 import os
 
@@ -32,8 +16,7 @@ try:                                    # same two-step import screen.py itself 
 except Exception:                                                 # pragma: no cover
     from shepherd_score.container._core import _DISPATCH_LOCAL    # noqa: E402
 
-#: Only ``steps_fine`` is read unconditionally by the real aligners; the recorders below ignore
-#: it. Present so the call shape matches what ``_fast_batch_kwargs`` hands the drivers.
+#: Only ``steps_fine`` is read unconditionally by the real aligners; the recorders ignore it.
 _BATCH_KW = {"steps_fine": 1}
 
 
@@ -55,30 +38,25 @@ class _FakeStore:
 
 
 def _install_recorders(mp, seen, seen_kw=None):
-    seen_kw = [] if seen_kw is None else seen_kw
-    """Point every builder and aligner at a recorder that reports WHICH MODE's entry ran.
+    """Point every builder and aligner at a recorder that reports which mode's entry ran.
 
-    The tables are replaced wholesale AND the two pre-fix module globals are replaced with the
-    same recorders, so the pre-fix code records its (wrong) choice and fails on the assertion
-    instead of dying inside a Triton kernel it could never reach on a CPU box.
+    The tables and the two module globals are replaced together, so a dispatch mistake
+    fails on the assertion rather than inside a Triton kernel a CPU box cannot reach.
     """
+    seen_kw = [] if seen_kw is None else seen_kw
     def builder(key):
         def build(arrs, device):
             seen.append(("build", key))
-            # the builder's contract is ``(ids, {channel: (flat, off)})`` -- one dict, not a
-            # varying-arity tuple, so the worker and the driver unpack it identically
+            # the builder's contract is ``(ids, {channel: (flat, off)})``
             return "ids", {"c0": ("flat", "off")}
         return build
 
     def aligner(key):
-        # ``*a`` on purpose: the pre-fix vol aligner took
-        # ``(ref_xyz, fit_flat, fit_off, mode, batch_kw)`` and the fixed one takes
-        # ``(ref, fit, batch_kw)``. The recorder has to survive both call shapes or a
-        # regression would surface as a TypeError rather than as the assertion below.
+        # ``*a``: the recorder must survive any call shape, or a regression would surface as
+        # a TypeError rather than as the assertion below
         def align(*a, **k):
             seen.append(("align", key))
-            # The fixed call shape is (ref, fit, batch_kw); keep batch_kw so a test can check
-            # what the driver put in it (the canonical store's const_seeds).
+            # keep batch_kw so a test can inspect it (the canonical store's const_seeds)
             if len(a) >= 3 and isinstance(a[2], dict):
                 seen_kw.append(a[2])
             return np.zeros(1), np.zeros((1, 4, 4), dtype=np.float32)
@@ -87,28 +65,23 @@ def _install_recorders(mp, seen, seen_kw=None):
     mp.setattr(scr, "_ARRAY_BUILDERS", {m: builder(m) for m in scr._ARRAY_MODES}, raising=True)
     mp.setattr(scr, "_ARRAY_ALIGNERS", {m: aligner(m) for m in scr._ARRAY_MODES}, raising=True)
     mp.setattr(scr, "_build_fit_arrays_vol", builder("vol"), raising=True)
-    mp.setattr(scr, "_align_fast_arrays", aligner("vol"), raising=False)   # gone post-fix
+    mp.setattr(scr, "_align_fast_arrays", aligner("vol"), raising=False)   # may not exist
     mp.setattr(scr, "_accumulate_arrays", lambda *a, **k: None, raising=True)
     mp.setattr(scr, "_ref_tensors_from_arrays",
                lambda ra, mode, device: {"_ref_xyz_t": None}, raising=True)
 
 
 def _run_worker(mp, mode, share=None, store_cls=_FakeStore, ref_arrays=None, seen_kw=None):
-    """Drive ``_screen_worker`` for one mode and return what it selected: on one shard pulled
-    off a queue (the hand-driven form), or on ``share``, a static LIST of shard indices (the
-    form the persistent pool hands its workers, streamed with read-ahead)."""
+    """Drive ``_screen_worker`` for one mode, by queue or by ``share`` list; return what it selected."""
     seen = []
     _install_recorders(mp, seen, seen_kw)
     mp.setattr(scr, "ProfileStore", store_cls, raising=True)
     mp.setattr(torch.cuda, "set_device", lambda *a, **k: None, raising=True)
     mp.setattr(torch.cuda, "synchronize", lambda *a, **k: None, raising=True)
-    # _cap_threads calls torch.set_num_threads, which is process-global. The worker normally
-    # owns its own spawned process; here it is running inside the test process.
+    # _cap_threads calls the process-global torch.set_num_threads; the worker is in-process here
     import shepherd_score.accel.multi_gpu as mg
     mp.setattr(mg, "_cap_threads", lambda threads: None, raising=True)
-    # The worker addresses cuda:<rank>; the canonical store's seed set is the one real
-    # computation it now runs, so on a CPU-only box it is built on the CPU instead. The values
-    # are what the const_seeds test compares.
+    # on a CPU-only box the canonical seed set is built on the CPU instead of cuda:<rank>
     import shepherd_score.accel.drivers._common as _dc
     _real_seeds = _dc.canonical_seed_quats
     mp.setattr(_dc, "canonical_seed_quats",
@@ -129,8 +102,7 @@ def _run_worker(mp, mode, share=None, store_cls=_FakeStore, ref_arrays=None, see
             self.msgs.append(msg)
 
     out = _OutQ()
-    # The worker sets _DISPATCH_LOCAL.active and never restores it -- correct in the spawned
-    # process it was written for, not here.
+    # the worker sets _DISPATCH_LOCAL.active and never restores it
     prev = getattr(_DISPATCH_LOCAL, "active", False)
     try:
         scr._screen_worker(0, 1, "<fake>", [{} if ref_arrays is None else ref_arrays], mode,
@@ -166,11 +138,7 @@ class _CanonicalFakeStore(_FakeStore):
 
 
 def test_worker_uses_the_canonical_stores_constant_seeds_like_the_inproc_loop(monkeypatch):
-    """On a canonical store the in-process vol loop passes ``const_seeds`` (one seed set for the
-    whole screen, the 1.5-2x the store exists for). The worker did not: it ran per-molecule seeds
-    on the same store at 2.1x the in-process cost per shard, so two GPUs screened no faster than
-    one (Shepherd-Score-Paper fig2_speed/p6_gpu_probe.py, 2026-09-14). Both must hand the
-    aligner the same seed tensor."""
+    """On a canonical store the worker passes the same ``const_seeds`` as the in-process loop."""
     rng = np.random.default_rng(0)
     xyz = rng.standard_normal((12, 3)).astype(np.float32)
     kw_w, kw_i = [], []
@@ -193,12 +161,7 @@ def test_worker_uses_the_canonical_stores_constant_seeds_like_the_inproc_loop(mo
 
 
 def test_array_tables_cover_every_array_mode():
-    """``_array_dispatch`` is the one selector, so the tables it reads must be complete.
-
-    A mode added to ``_ARRAY_MODES`` without both entries would raise KeyError mid-screen, and
-    the identity check pins the helper to the tables -- tests/test_screen_arrays.py intercepts
-    the builders by patching ``_ARRAY_BUILDERS``, which only works while the dispatch reads it.
-    """
+    """The tables ``_array_dispatch`` reads must cover every array mode."""
     assert set(scr._ARRAY_BUILDERS) == set(scr._ARRAY_MODES)
     assert set(scr._ARRAY_ALIGNERS) == set(scr._ARRAY_MODES)
     for mode in scr._ARRAY_MODES:
@@ -208,11 +171,7 @@ def test_array_tables_cover_every_array_mode():
 
 @pytest.mark.parametrize("mode", scr._ARRAY_MODES)
 def test_worker_selects_the_same_pair_as_the_inproc_driver(monkeypatch, mode):
-    """THE regression. The ndev>1 worker must pick the mode's own builder and aligner.
-
-    Pre-fix this failed for every mode but ``vol``: the worker recorded
-    ``[("build", "vol"), ("align", "vol")]`` whatever mode it was handed.
-    """
+    """The ndev>1 worker must pick the mode's own builder and aligner."""
     with monkeypatch.context() as mp:
         worker_seen = _run_worker(mp, mode)
     with monkeypatch.context() as mp:
@@ -226,10 +185,7 @@ def test_worker_selects_the_same_pair_as_the_inproc_driver(monkeypatch, mode):
 
 @pytest.mark.parametrize("mode", scr._ARRAY_MODES)
 def test_worker_static_share_dispatches_like_the_queue_form(monkeypatch, mode):
-    """The persistent pool gives each worker its shard share as a list, streamed through
-    ``_iter_shards_prefetched`` (two shards here, so the read-ahead thread really runs); that
-    branch must dispatch exactly as the queue form does, once per shard, and an empty share
-    must still report (empty) heaps so the parent's collection completes."""
+    """The list-share form dispatches once per shard like the queue form; an empty share still reports."""
     with monkeypatch.context() as mp:
         seen = _run_worker(mp, mode, share=[0, 0])
     assert seen == [("build", mode), ("align", mode)] * 2
@@ -238,8 +194,7 @@ def test_worker_static_share_dispatches_like_the_queue_form(monkeypatch, mode):
 
 
 def test_use_arrays_is_on_for_every_mode_this_file_drives():
-    """Both drivers only reach the dispatch behind ``_use_arrays``; if that is off in this
-    environment the parametrized test above is asserting on a branch nobody took."""
+    """The dispatch under test sits behind ``_use_arrays``, which must be on here."""
     from shepherd_score.accel.batch import _arrays
     assert _arrays.ENABLED, "the array path is disabled; the dispatch test would be vacuous"
     for mode in scr._ARRAY_MODES:
@@ -296,12 +251,7 @@ def two_gpu_store(tmp_path_factory):
 
 @pytest.mark.cuda
 def test_two_gpu_screen_matches_the_single_process_screen(two_gpu_store):
-    """A vol_color screen must not depend on how many GPUs it was spread across.
-
-    The vacuousness guard matters here: pre-fix, ndev=2 vol_color returned the VOL answer, so
-    the test also asserts the two modes disagree on this library. If they ever agree, this
-    check proves nothing and should be given a harder query.
-    """
+    """ndev=2 must match ndev=1, and vol must differ from vol_color so the check is not vacuous."""
     _require_two_gpus()
     store_path, mols = two_gpu_store
     query = mols[1]

@@ -23,10 +23,9 @@ from shepherd_score.container._batch_utils import (
 
 
 def _resolve_backend(backend):
-    """Resolve ``backend=None`` to the device-aware default: ``triton`` when CUDA is
-    available, else ``numba``. Explicit values (including ``"jax"``) pass through. Shares
-    the single source of truth with the screening front-end (``screen._default_backend``)
-    via a lazy import (no circular import at module load)."""
+    """Resolve ``backend=None`` to ``screen._default_backend()`` (``triton`` when CUDA is
+    available, else ``numba``); explicit values pass through. Imported lazily to avoid a
+    circular import."""
     if backend is not None:
         return backend
     from shepherd_score.screen import _default_backend
@@ -34,19 +33,16 @@ def _resolve_backend(backend):
 
 
 def _default_steps(mode: str) -> int:
-    """Per-mode default fine-step count from the single-source table in
-    ``accel.batch.aligners`` (``_steps_for``). Lazy-imported so this module stays importable
-    without the accel/torch stack. Used to resolve ``max_num_steps=None`` in ``align_with_*``."""
+    """Per-mode default fine-step count (``MODE_STEPS``), resolving ``max_num_steps=None`` in
+    ``align_with_*``. Imported lazily so this module imports without the accel/torch stack."""
     from shepherd_score.accel.batch.aligners import _steps_for
     return _steps_for(mode)
 
 
 def _default_seeds(mode: str) -> int:
-    """Per-mode default SE(3) seed count (``MODE_SEEDS``) from the single-source table in
-    ``accel.batch.aligners`` (``_seeds_for``). Lazy-imported, same as ``_default_steps``. Used to
-    resolve ``num_repeats=None`` in ``align_with_*`` so the shipped per-mode default is what
-    actually runs. Resolved to an int here (rather than passing ``None`` down) because the JAX,
-    cpu_pool and per-pair fallback branches all require a concrete count."""
+    """Per-mode default SE(3) seed count (``MODE_SEEDS``), resolving ``num_repeats=None`` in
+    ``align_with_*``; see ``_default_steps``. Resolved to an int here because the JAX, cpu_pool
+    and per-pair branches all need a concrete count."""
     from shepherd_score.accel.batch.aligners import _seeds_for
     return _seeds_for(mode)
 
@@ -85,27 +81,13 @@ def _compute_bucket_splits(sizes_a, sizes_b, num_buckets):
 
 @contextmanager
 def _pinned_torch_threads(pairs):
-    """Pin torch to ONE intra-op thread for the duration of a CPU batch alignment.
+    """Pin torch to one intra-op thread for the duration of a CPU batch alignment.
 
-    The numba kernels own the cores on this path -- they run ``parallel=True`` over
-    ``NUMBA_NUM_THREADS`` -- while torch's own pool is only doing the small tails around them.
-    Left unpinned the two pools oversubscribe and the tails spin-wait against the kernels.
-
-    MEASURED (cluster, numba 0.59.1 + SVML, aligns/sec, unpinned -> pinned):
-        numba=1 thread   vol 2,804 -> 3,677 (1.31x) | pharm 550 -> 718 (1.31x)
-                         vol_tversky 455 -> 619 (1.36x) | surf 55.8 -> 56.1 (1.00x)
-        numba=96 threads vol 7,533 -> 11,035 (1.47x) | pharm 1,774 -> 3,635 (2.05x)
-                         surf 617 -> 851 (1.38x) | vol_tversky 3,664 -> 5,033 (1.37x)
-    Bit-identical over the full score vector, 4 modes x 2 thread regimes, max_abs 0.0 -- this
-    changes scheduling, never arithmetic.
-
-    ``accel/cpu_pool.py`` and ``accel/screen_parallel.py`` already do this in their workers; the
-    single-process align path was the one CPU entry point that did not, which is why it was the
-    slow one. SCOPED rather than set once at import: ``torch.set_num_threads`` is PROCESS-GLOBAL,
-    so a library that set it permanently would silently reconfigure the caller's torch for
-    everything else they do afterwards. Restored on every exit path, exception included.
-
-    A no-op on CUDA, where torch's CPU pool is not in the loop at all.
+    The numba kernels own the cores on this path (``parallel=True`` over ``NUMBA_NUM_THREADS``)
+    and torch only runs the small tails around them; left unpinned the two pools oversubscribe
+    and the tails spin-wait against the kernels. Scoped rather than set once at import because
+    ``torch.set_num_threads`` is process-global and would silently reconfigure the caller's
+    torch. Restored on every exit path. A no-op on CUDA.
     """
     import torch
     if not pairs or pairs[0].device.type != "cpu":
@@ -138,20 +120,13 @@ class MoleculePairBatch:
 
     # Backend names that route to the Triton/CUDA MoleculePair._align_batch_* path.
     _TRITON_BACKENDS = ("triton", "cuda", "gpu")
-    # Backend names that force the batched **CPU numba** path: the *same*
-    # coarse-to-fine drivers the Triton path uses, with the numba kernels in place
-    # of Triton. This is the explicit, portable counterpart to relying on the
-    # Triton path's import-time CPU fallback.
+    # Backend names that run the same batched drivers on CPU with the numba kernels.
     _NUMBA_BACKENDS = ("numba", "cpu")
 
     def _prepare_numba(self):
-        """Force the batched CPU numba path for a ``backend="numba"`` call.
-
-        Moves every pair onto CPU. Kernel selection is per-call and device-driven
-        (see :mod:`shepherd_score.accel.kernels.dispatch`), so the CPU
-        tensors run the numba kernels **even in a process that also has the Triton
-        GPU kernels loaded** -- e.g. to reserve the GPU for another task or to run a
-        deterministic CPU pass on a GPU box.
+        """Move every pair onto CPU for a ``backend="numba"`` call. Kernel selection is
+        device-driven (:mod:`shepherd_score.accel.kernels.dispatch`), so CPU tensors run the
+        numba kernels even in a process that has the Triton kernels loaded.
         """
         import torch
         try:
@@ -168,14 +143,12 @@ class MoleculePairBatch:
                                  transform_attr, fit_attr, return_aligned, *,
                                  num_workers: int = 1, precheck=None):
         """Shared ``backend=`` dispatch for the modes whose fast path is a single
-        ``_triton_align`` call (vol/vol_esp/surf/esp/esp_combo).
+        ``_triton_align`` call.
 
-        Returns ``(handled, result)``: on a triton/numba backend it runs the batched
-        path and returns ``(True, result)``; on ``"jax"`` it returns ``(False, None)``
-        so the caller runs the original JAX path; any other value raises ``ValueError``.
-        ``precheck`` (if given) runs AFTER ``_prepare_numba`` for the numba backend,
-        preserving the original ordering of mode-specific guards (e.g. the ``no_H``
-        check).
+        Returns ``(handled, result)``: a triton/numba backend runs the batched path and returns
+        ``(True, result)``; ``"jax"`` returns ``(False, None)`` so the caller runs its own path;
+        any other value raises ``ValueError``. ``precheck`` runs after ``_prepare_numba`` so
+        mode-specific guards (e.g. ``no_H``) see the prepared pairs.
         """
         backend = _resolve_backend(backend)
         if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
@@ -192,31 +165,18 @@ class MoleculePairBatch:
 
     def _triton_align(self, align_fn, align_kwargs, score_attr, transform_attr,
                       fit_attr, return_aligned, num_workers: int = 1):
-        """Route a batch alignment through the Triton ``MoleculePair._align_batch_*``
-        path with ZERO extra alignment work.
+        """Run a batch alignment through ``MoleculePair._align_batch_*`` and collect its
+        in-place results.
 
-        ``num_workers > 1`` on the CPU (numba) path shards the pairs across a persistent
-        single-threaded process pool (:mod:`shepherd_score.accel.cpu_pool`) for
-        near-linear multi-core scaling. Pairs are independent, so sharding does not
-        change the optimization problem, but results agree to convergence tolerance
-        rather than bitwise: the fine loop's early-stop runs until every pair in the
-        batch has stopped improving, so a pair's step count depends on which pairs
-        share its shard. It is ignored on CUDA
-        tensors and for modes the pool does not cover -- only ``vol``, ``surf``,
-        ``surf_esp`` and ``pharm`` have a pool path; the rest run the single call.
+        ``num_workers > 1`` on the CPU path shards the pairs across the persistent process
+        pool (:mod:`shepherd_score.accel.cpu_pool`) for modes in ``cpu_pool.POOL_MODES``;
+        it is ignored on CUDA tensors. Sharding does not change the optimization problem, but
+        the fine loop's early stop runs until every pair in a shard has converged, so results
+        agree to convergence tolerance rather than bitwise.
 
-        ``align_fn(self.pairs, **align_kwargs)`` is byte-identical to calling the
-        Triton static method directly, so alignment throughput is unchanged (and it
-        inherits the same multi-GPU sharding via ``_should_distribute``). Scores +
-        SE(3) transforms are read from the in-place results the Triton path writes
-        (also populated in-place by the multi-GPU path).
-
-        ``aligned_list`` (transformed fit points) is OFF by default — the Triton
-        path's primary outputs are the score and the stored transform, and a user
-        can apply the transform themselves. When ``return_aligned=True`` it is built
-        GPU-batched from the already-cached fit tensor (``fit_attr``), grouped by
-        device so multi-GPU shards (whose tensors live on different devices) are
-        handled correctly.
+        Scores and SE(3) transforms are read from the results the batched path stores on each
+        pair. ``aligned_list`` is only built when ``return_aligned=True``, batched per device
+        from the cached fit tensor (``fit_attr``) so multi-GPU shards are handled.
         """
         pairs = self.pairs
         mode = align_fn.__name__.replace("_align_batch_", "")
@@ -229,7 +189,7 @@ class MoleculePairBatch:
                 align_fn(pairs, **align_kwargs)          # mode not pooled -> single call
         else:
             with _pinned_torch_threads(pairs):
-                align_fn(pairs, **align_kwargs)          # <- identical to standalone Triton call
+                align_fn(pairs, **align_kwargs)          # single-process call
         scores = np.array([float(getattr(p, score_attr)) for p in pairs])
         if not return_aligned:
             return scores, [None] * len(pairs)
@@ -378,6 +338,15 @@ class MoleculePairBatch:
             beneficial for large heterogeneous molecule sets.
         verbose : bool
             Print scores per pair. Default is False.
+        backend : str, optional
+            ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
+            (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_vol`` path (heavy atoms only, multi-GPU-aware);
+            ``"jax"`` runs the path below. ``max_num_steps`` is the batched path's ``steps_fine``.
+        alpha : float
+            Gaussian width for the batched path. Default is 0.81.
+        return_aligned : bool
+            Build ``aligned_list`` on the batched path. Default is False (entries are ``None``).
 
         Returns
         -------
@@ -385,17 +354,6 @@ class MoleculePairBatch:
             Scores for each pair. Shape: (N,).
         aligned_list : list of np.ndarray
             Aligned fit atom coordinates (unpadded) for each pair.
-        backend : str
-            ``"jax"`` (default) uses the JAX/XLA path below. ``"triton"`` (aliases
-            ``"cuda"``/``"gpu"``) routes to the Triton ``MoleculePair._align_batch_vol``
-            kernel path (heavy-atom only), which also handles multi-GPU internally via
-            ``_should_distribute``. ``"numba"`` (alias ``"cpu"``) runs that *same*
-            batched driver on CPU with the numba kernels -- it forces every pair onto
-            CPU and requires a Triton-free process (otherwise use ``"triton"``).
-            ``max_num_steps`` maps to the ``steps_fine`` count.
-        return_aligned : bool
-            For the Triton backend, skip building ``aligned_list`` when ``False``
-            (pure delegation, zero overhead over a direct ``_align_batch_vol`` call).
         """
         def _no_H_guard():
             if not no_H:
@@ -601,6 +559,15 @@ class MoleculePairBatch:
             beneficial for large heterogeneous molecule sets.
         verbose : bool
             Print scores per pair. Default is False.
+        backend : str, optional
+            ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
+            (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_vol_esp`` path (heavy atoms only, multi-GPU-aware);
+            ``"jax"`` runs the path below. ``max_num_steps`` is the batched path's ``steps_fine``.
+        alpha : float
+            Gaussian width for the batched path. Default is 0.81.
+        return_aligned : bool
+            Build ``aligned_list`` on the batched path. Default is False (entries are ``None``).
 
         Returns
         -------
@@ -836,6 +803,13 @@ class MoleculePairBatch:
             Performance is better when use_shmap is False on cpu.
         verbose : bool
             Print scores per pair. Default is False.
+        backend : str, optional
+            ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
+            (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_surf`` path (multi-GPU-aware); ``"jax"`` runs the path
+            below. ``max_num_steps`` is the batched path's ``steps_fine``.
+        return_aligned : bool
+            Build ``aligned_list`` on the batched path. Default is False (entries are ``None``).
 
         Returns
         -------
@@ -843,10 +817,6 @@ class MoleculePairBatch:
             Scores for each pair. Shape: (N,).
         aligned_list : list of np.ndarray
             Aligned fit surface coordinates for each pair.
-        backend : str
-            ``"jax"`` (default) or ``"triton"`` (aliases ``"cuda"``/``"gpu"``) which
-            routes to ``MoleculePair._align_batch_surf`` (multi-GPU-aware). ``return_aligned``
-            controls building the aligned-surface list (off by default = pure delegation).
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("surf")
@@ -941,7 +911,7 @@ class MoleculePairBatch:
         size-sorting is needed.  It is not recommended to use multiprocessing
         due to this reason.
 
-        ``surf_esp`` is the canonical name for the legacy ``esp`` mode (alias kept).
+        Formerly ``align_with_esp``, which is kept as an alias.
         Results are stored in-place on each MoleculePair:
         - ``pair.transform_surf_esp`` and ``pair.sim_aligned_surf_esp``
 
@@ -976,6 +946,14 @@ class MoleculePairBatch:
             Performance is better when use_shmap is False on cpu.
         verbose : bool
             Print scores per pair. Default is False.
+        backend : str, optional
+            ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
+            (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_surf_esp`` path (multi-GPU-aware; applies the same
+            ``LAM_SCALING`` to ``lam``); ``"jax"`` runs the path below. ``max_num_steps`` is the
+            batched path's ``steps_fine``.
+        return_aligned : bool
+            Build ``aligned_list`` on the batched path. Default is False (entries are ``None``).
 
         Returns
         -------
@@ -983,11 +961,6 @@ class MoleculePairBatch:
             Scores for each pair. Shape: (N,).
         aligned_list : list of np.ndarray
             Aligned fit surface coordinates for each pair.
-        backend : str
-            ``"jax"`` (default) or ``"triton"`` (aliases ``"cuda"``/``"gpu"``) which
-            routes to ``MoleculePair._align_batch_surf_esp`` (multi-GPU-aware; it applies the
-            same internal LAM_SCALING as this path, so ``lam`` is consistent across
-            backends). ``return_aligned`` controls the aligned-surface list.
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("surf_esp")
@@ -1082,8 +1055,8 @@ class MoleculePairBatch:
                              backend: Optional[str] = None,
                              return_aligned: bool = False,
                              ) -> Tuple[np.ndarray, List[np.ndarray]]:
-        """Align all pairs using ShaEP-style ESP-combo similarity. ``vol_and_surf_esp``
-        is the canonical name for the legacy ``esp_combo`` mode (alias kept).
+        """Align all pairs using ShaEP-style ESP-combo similarity (formerly
+        ``align_with_esp_combo``, which is kept as an alias).
 
         Results are stored in-place on each MoleculePair:
         - ``pair.transform_vol_and_surf_esp`` and ``pair.sim_aligned_vol_and_surf_esp``
@@ -1094,15 +1067,13 @@ class MoleculePairBatch:
             ShaEP combo parameters (see ``MoleculePair.align_with_vol_and_surf_esp``).
         num_repeats, trans_init, lr, max_num_steps, verbose
             Standard optimization controls.
-        backend : str
-            ``"jax"`` (default) runs the per-pair CPU/torch path sequentially via
-            ``MoleculePair.align_with_vol_and_surf_esp``. ``"triton"`` (aliases
-            ``"cuda"``/``"gpu"``) routes to the batched
-            ``MoleculePair._align_batch_vol_and_surf_esp`` GPU kernel (multi-GPU-aware).
-            ``"numba"`` (alias ``"cpu"``) runs the same batched path on CPU via the
-            numba kernels (the ESP channel is the fused ``esp_comparison_batch``).
+        backend : str, optional
+            ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
+            (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_vol_and_surf_esp`` driver (multi-GPU-aware); ``"jax"``
+            runs the per-pair path via ``MoleculePair.align_with_vol_and_surf_esp``.
         return_aligned : bool
-            For the Triton backend, build the aligned-fit-surface list when ``True``.
+            For the batched backend, build the aligned-fit-surface list when ``True``.
 
         Returns
         -------
@@ -1110,7 +1081,7 @@ class MoleculePairBatch:
             Shape: (N,).
         aligned_list : list of np.ndarray
             Aligned fit surface coordinates per pair (``None`` entries unless
-            ``return_aligned=True`` on the Triton backend).
+            ``return_aligned=True`` on the batched backend).
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_and_surf_esp")
@@ -1168,17 +1139,12 @@ class MoleculePairBatch:
             Gaussian width for the shape overlap (default 0.81, volumetric).
         num_repeats, trans_init, lr, max_num_steps, verbose
             Standard optimization controls.
-        backend : str
-            ``"jax"`` (default) runs the per-pair torch path sequentially via
-            ``MoleculePair.align_with_vol_color``. ``"triton"`` (aliases ``"cuda"``/
-            ``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
-            ``MoleculePair._align_batch_vol_color`` driver — BOTH the shape channel and
-            the directionless color channel run on the device-dispatched kernels (Triton
-            on CUDA, numba on CPU; where every cloud is small they fuse into one launch),
-            so the batched path runs on either device. The batched
-            path descends on the JOINT weighted gradient -- both the shape and the color
-            channel steer the pose. NOTE ``backend="jax"`` is a misnomer for this mode:
-            there is no JAX kernel, so it runs the per-pair PyTorch path sequentially.
+        backend : str, optional
+            ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
+            (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_vol_color`` driver, which descends on the joint weighted
+            gradient of both channels. ``"jax"`` runs the per-pair PyTorch path sequentially
+            (there is no JAX kernel for this mode).
         return_aligned : bool
             For the batched backend, build the aligned-fit-atom list when ``True``.
 
@@ -1231,9 +1197,8 @@ class MoleculePairBatch:
         **Tversky** reduction ``AB / (AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))`` instead
         of Tanimoto. With the defaults (``tversky_alpha=0.95``, ``tversky_beta=0.05``) missing
         reference volume is penalized heavily and extra fit volume barely, so the score rewards
-        the *reference* (query) being contained in the fit. The score is NOT bounded to [0, 1] --
-        a small dense query inside a larger molecule can legitimately exceed 1.0 -- and is never
-        clamped.
+        the *reference* (query) being contained in the fit. The score is not bounded to [0, 1]
+        and is never clamped.
 
         Results are stored in-place on each MoleculePair:
         - ``pair.transform_vol_tversky`` and ``pair.sim_aligned_vol_tversky``
@@ -1250,12 +1215,11 @@ class MoleculePairBatch:
         num_repeats, lr, max_num_steps, verbose
             Standard optimization controls. ``num_repeats`` / ``max_num_steps`` default
             (``None``) to the per-mode ``MODE_SEEDS`` / ``MODE_STEPS`` in ``accel/_modes.py``.
-        backend : str
-            ``None`` (default) resolves device-aware (Triton on CUDA else numba). ``"triton"``
+        backend : str, optional
+            ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
             (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
-            ``MoleculePair._align_batch_vol_tversky`` driver, which reuses the shape kernel and
-            applies the Tversky reduction on the host. ``"jax"`` falls back to the per-pair
-            PyTorch path (there is no JAX kernel for this mode).
+            ``MoleculePair._align_batch_vol_tversky`` driver. ``"jax"`` runs the per-pair PyTorch
+            path (there is no JAX kernel for this mode).
         return_aligned : bool
             For the batched backend, build the aligned-fit-atom list when ``True``.
 
@@ -1307,11 +1271,11 @@ class MoleculePairBatch:
 
         The ``vol_esp`` electrostatic-weighted heavy-atom Gaussian overlap (``VAB_2nd_order_esp``,
         ``lam`` RAW/atom-centred), scored with a **Tversky** reduction
-        ``AB / (AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))`` instead of Tanimoto. It is to
-        ``vol_esp`` EXACTLY what ``vol_tversky`` is to ``vol``. With the defaults
-        (``tversky_alpha=0.95``, ``tversky_beta=0.05``) missing reference volume is penalized
-        heavily and extra fit volume barely, so the score rewards the *reference* (query) being
-        contained in the fit. The score is NOT bounded to [0, 1] and is never clamped.
+        ``AB / (AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))`` instead of Tanimoto, as
+        ``vol_tversky`` is to ``vol``. With the defaults (``tversky_alpha=0.95``,
+        ``tversky_beta=0.05``) missing reference volume is penalized heavily and extra fit volume
+        barely, so the score rewards the *reference* (query) being contained in the fit. The
+        score is not bounded to [0, 1] and is never clamped.
 
         Results are stored in-place on each MoleculePair:
         - ``pair.transform_vol_esp_tversky`` and ``pair.sim_aligned_vol_esp_tversky``
@@ -1326,16 +1290,15 @@ class MoleculePairBatch:
         alpha : float
             Gaussian width for the overlap (default 0.81, volumetric heavy atoms).
         lam : float
-            RAW partial-charge weighting for the ESP kernel (default 0.1; NOT ``LAM_SCALING``-scaled).
+            Width of the ESP kernel, used raw (default 0.1; not ``LAM_SCALING``-scaled).
         num_repeats, lr, max_num_steps, verbose
             Standard optimization controls. ``num_repeats`` / ``max_num_steps`` default
             (``None``) to the per-mode ``MODE_SEEDS`` / ``MODE_STEPS`` in ``accel/_modes.py``.
-        backend : str
-            ``None`` (default) resolves device-aware (Triton on CUDA else numba). ``"triton"``
+        backend : str, optional
+            ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
             (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
-            ``MoleculePair._align_batch_vol_esp_tversky`` driver, which reuses the fused shape+ESP
-            kernel and applies the Tversky reduction on the host. ``"jax"`` falls back to the
-            per-pair PyTorch path (there is no JAX kernel for this mode).
+            ``MoleculePair._align_batch_vol_esp_tversky`` driver. ``"jax"`` runs the per-pair
+            PyTorch path (there is no JAX kernel for this mode).
         return_aligned : bool
             For the batched backend, build the aligned-fit-atom list when ``True``.
 
@@ -1355,7 +1318,7 @@ class MoleculePairBatch:
             backend, MoleculePair._align_batch_vol_esp_tversky,
             dict(alpha=alpha, lam=lam, tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
                  steps_fine=max_num_steps),
-            "sim_aligned_vol_esp_tversky", "transform_vol_esp_tversky", "_fit_xyz_noH_t",
+            "sim_aligned_vol_esp_tversky", "transform_vol_esp_tversky", "_fit_xyz_t",
             return_aligned)
         if handled:
             return _result
@@ -1387,13 +1350,10 @@ class MoleculePairBatch:
         (volume) + per-atom *lipophilicity* overlap, blended
         ``(1-lipo_weight)*shape_Tanimoto + lipo_weight*lipo_Tanimoto``.
 
-        The shape channel is the heavy-atom Gaussian volume overlap (identical to ``vol``); the
-        lipophilicity channel overlays the per-atom Crippen atomic logP contributions -- placed
-        at the TRUE-heavy atom centres -- like an ESP/partial-charge field (matched by value so
-        hydrophobic overlaps hydrophobic), with the atom-centred ``lam=0.1`` (raw). Both the fit
-        shape centres AND the fit lipophilicity centres move rigidly under the same SE(3) pose,
-        and BOTH channels steer the pose (joint weighted gradient). Each channel self-normalises
-        to a Tanimoto, so a self-copy scores 1.000.
+        The shape channel is the heavy-atom Gaussian volume overlap of ``vol``; the lipophilicity
+        channel overlays the per-atom Crippen logP contributions at the heavy-atom centres like a
+        partial-charge field, so hydrophobic overlaps hydrophobic. Both fit point sets move under
+        the same SE(3) pose and both channels steer it.
 
         Results are stored in-place on each MoleculePair:
         - ``pair.transform_vol_lipo`` and ``pair.sim_aligned_vol_lipo``
@@ -1407,18 +1367,16 @@ class MoleculePairBatch:
             Gaussian width for the shape AND lipophilicity overlaps (default 0.81, volumetric
             heavy atoms).
         lam : float
-            Value ("charge") weighting for the lipophilicity ESP overlap (default 0.1, raw /
-            atom-centred, NOT LAM_SCALING-scaled).
+            Width of the value-matching kernel in the lipophilicity overlap, used raw
+            (default 0.1).
         num_repeats, lr, max_num_steps, verbose
             Standard optimization controls. ``num_repeats`` / ``max_num_steps`` default
             (``None``) to the per-mode ``MODE_SEEDS`` / ``MODE_STEPS`` in ``accel/_modes.py``.
-        backend : str
-            ``None`` (default) resolves device-aware (Triton on CUDA else numba). ``"triton"``
+        backend : str, optional
+            ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
             (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
-            ``MoleculePair._align_batch_vol_lipo`` driver, which reuses the shape kernel (shape
-            channel) and the fused ESP kernel (lipophilicity channel, logP as charges).
-            ``"jax"`` falls back to the per-pair PyTorch path (there is no JAX kernel for this
-            mode).
+            ``MoleculePair._align_batch_vol_lipo`` driver. ``"jax"`` runs the per-pair PyTorch
+            path (there is no JAX kernel for this mode).
         return_aligned : bool
             For the batched backend, build the aligned-fit-atom list when ``True``.
 
@@ -1517,7 +1475,7 @@ class MoleculePairBatch:
 
         return entries, max_ref_len, max_fit_len
 
-    # ---- SI experimental modes (reuse existing drivers) ------------------------------------
+    # ---- Experimental modes ----------------------------------------------------------------
     def align_with_vol_mr(self, mr_weight: float = 0.5, alpha: float = 0.81, lam: float = 0.1,
                           num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
                           verbose: bool = False, backend: Optional[str] = None,
@@ -1563,13 +1521,12 @@ class MoleculePairBatch:
                              num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
                              verbose: bool = False, backend: Optional[str] = None,
                              return_aligned: bool = False):
-        """Batched shape Tanimoto MINUS a linear-hard-sphere excluded-volume (avoid) penalty.
+        """Batched shape Tanimoto minus a linear hard-sphere excluded-volume penalty.
 
-        ``avoid_points`` is the FIXED reference-frame cloud to keep the fit molecule out of: either
-        a single ``(K,3)`` array applied to EVERY pair, or a list of per-pair ``(K_i,3)`` arrays. It
-        is attached to each MoleculePair (``p.avoid_points``) and read by the batched aligner; the
-        fit-avoid cloud defaults to the fit shape atoms. Unlike the other modes this input is not
-        molecule data, so ``vol_avoid`` is pairwise-only (not wired into ``screen``)."""
+        ``avoid_points`` is the fixed reference-frame cloud to keep the fit out of: a single
+        ``(K,3)`` array applied to every pair, or a list of per-pair ``(K_i,3)`` arrays. It is
+        attached to each pair as ``p.avoid_points`` and read by the batched aligner; the penalty
+        is evaluated on the fit shape atoms."""
         import numpy as np
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_avoid")
@@ -1593,7 +1550,7 @@ class MoleculePairBatch:
             "sim_aligned_vol_avoid", "transform_vol_avoid", "_fit_xyz_t", return_aligned)
         if handled:
             return _result
-        # jax / fallback backend: per-pair eager autograd reference (each pair carries its own cloud)
+        # "jax" backend: per-pair eager path (each pair carries its own cloud)
         scores = []
         for p in self.pairs:
             p.align_with_vol_avoid(p.avoid_points, avoid_weight=avoid_weight,
@@ -1650,7 +1607,7 @@ class MoleculePairBatch:
                                     lr: float = 0.1, max_num_steps: int = None,
                                     verbose: bool = False, backend: Optional[str] = None,
                                     return_aligned: bool = False):
-        """Batched vol_lipo scored with Tversky on both channels (new vol_lipo_tversky driver)."""
+        """Batched vol_lipo scored with Tversky on both channels."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_lipo_tversky")
         if num_repeats is None:
@@ -1674,7 +1631,7 @@ class MoleculePairBatch:
                                      num_repeats: int = None, lr: float = 0.1,
                                      max_num_steps: int = None, verbose: bool = False,
                                      backend: Optional[str] = None, return_aligned: bool = False):
-        """Batched vol_color scored with Tversky on both channels (new vol_color_tversky driver)."""
+        """Batched vol_color scored with Tversky on both channels."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_color_tversky")
         if num_repeats is None:
@@ -1696,7 +1653,7 @@ class MoleculePairBatch:
                                 num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
                                 verbose: bool = False, backend: Optional[str] = None,
                                 return_aligned: bool = False):
-        """Batched shape + element-identity alignment (element-table + directionless color kernel)."""
+        """Batched shape + element-identity alignment."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_atomtype")
         if num_repeats is None:
@@ -1717,7 +1674,7 @@ class MoleculePairBatch:
                              num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
                              verbose: bool = False, backend: Optional[str] = None,
                              return_aligned: bool = False):
-        """Batched shape + directional-pharmacophore alignment (new vol_pharm driver)."""
+        """Batched shape + directional-pharmacophore alignment."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_pharm")
         if num_repeats is None:
@@ -1845,6 +1802,15 @@ class MoleculePairBatch:
             beneficial for large heterogeneous molecule sets.
         verbose : bool
             Print scores per pair.
+        backend : str, optional
+            ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
+            (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
+            ``MoleculePair._align_batch_pharm`` path (multi-GPU-aware); ``"jax"`` runs the path
+            below. ``max_num_steps`` is the batched path's ``steps_fine``.
+        return_aligned : bool
+            Build the aligned anchors (rotated and translated) and vectors (rotated only) on
+            the batched path from the cached fit tensors. Default is False (entries are
+            ``None``).
 
         Returns
         -------
@@ -1854,11 +1820,6 @@ class MoleculePairBatch:
             Aligned fit pharmacophore anchors (unpadded) for each pair.
         aligned_vectors_list : list of np.ndarray
             Aligned fit pharmacophore vectors (unpadded) for each pair.
-        backend : str
-            ``"jax"`` (default) or ``"triton"`` (aliases ``"cuda"``/``"gpu"``) which
-            routes to ``MoleculePair._align_batch_pharm`` (multi-GPU-aware). With
-            ``return_aligned=True`` the aligned anchors (rotate+translate) and vectors
-            (rotate only) are rebuilt GPU-batched from the cached fit tensors.
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("pharm")
@@ -1874,7 +1835,7 @@ class MoleculePairBatch:
             if (num_workers and num_workers > 1 and self.pairs
                     and self.pairs[0].device.type == "cpu"):
                 # CPU multi-core: shard pairs across the persistent single-threaded pool
-                # (bit-identical; align_pairs also caches _*_pharm_*_t for return_aligned).
+                # (align_pairs also caches the _*_pharm_*_t tensors for return_aligned).
                 from shepherd_score.accel import cpu_pool as _cpu_pool
                 _cpu_pool.align_pairs("pharm", self.pairs, num_workers, _pharm_kw)
             else:

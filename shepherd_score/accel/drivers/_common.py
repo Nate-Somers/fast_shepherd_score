@@ -1,5 +1,5 @@
 # shepherd_score/accel/drivers/_common.py
-# Common utilities shared across fast GPU-accelerated alignment methods.
+# Utilities shared by the accelerated alignment drivers.
 
 import math
 import os
@@ -9,28 +9,10 @@ from typing import Tuple, Optional
 
 _TWO_PI_3 = 2.0 * math.pi / 3.0
 
-# Shared early-stop patience override for the esp/pharm fine loops (None -> use the
-# call's default). Lever 2: patience=5 over-runs ~25 steps after convergence on the
-# fast-converging self-copy benchmark. Set via speedlab; accuracy-gated. (surf/vol
-# uses fast_se3._ES_PATIENCE.)
-
 
 def check_gpu_available() -> bool:
     """Check if CUDA is available for GPU acceleration."""
     return torch.cuda.is_available()
-
-
-def _update_best(score, q_k, t_k, best_score, best_q, best_t):
-    """Track the best (q, t) per pose by score. Uses ``torch.where`` so the update is
-    fixed-shape and sync-free, and RETURNS new ``(best_score, best_q, best_t)`` tensors
-    rather than mutating in place -- the fine loops are CUDA-graph captured and must not
-    do data-dependent or in-place best-pose updates."""
-    better = score > best_score
-    best_score = torch.where(better, score, best_score)
-    mask_q = better.unsqueeze(1)
-    best_q = torch.where(mask_q, q_k, best_q)
-    best_t = torch.where(mask_q, t_k, best_t)
-    return best_score, best_q, best_t
 
 
 def quat_mul(q: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
@@ -188,7 +170,7 @@ def legacy_seeds_with_translations_torch(
 
 
 def _fallback_quats(num: int, device, dtype) -> torch.Tensor:
-    """Deterministic set of 'reasonable' rotations (matches fast_se3._fallback_quats)."""
+    """Deterministic fallback rotation set for degenerate pairs."""
     import math
     s2 = math.sqrt(0.5)
     base = torch.tensor([
@@ -206,18 +188,13 @@ def _fallback_quats(num: int, device, dtype) -> torch.Tensor:
 
 
 def _analytic_sym3x3_axes(M: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """Eigenvectors (rows, descending eigenvalue) of a batch of symmetric 3x3
-    matrices ``M`` (K,3,3), returned as (K,3,3) with rows = longest-axis-first.
-    Closed form, fully vectorized, no host sync:
+    """Eigenvectors (rows, descending eigenvalue) of a batch of symmetric 3x3 matrices ``M``
+    (K,3,3), returned as (K,3,3) with the longest axis first.
 
-      * eigenvalues via the trigonometric (Cardano) solution of the characteristic
-        cubic of a symmetric 3x3 (Smith 1961);
-      * each eigenvector as the max-norm column of ``(M - lam_j I)(M - lam_k I)``
-        (whose columns are all parallel to the remaining eigenvector), with the
-        middle axis recovered by a cross product so the frame is orthonormal;
-      * near-spherical / rank-deficient rows (both product norms ~0) fall back to
-        the identity frame -- their axes are ill-defined anyway and the downstream
-        Fibonacci seeds + fine optimizer recover them (score-parity validated).
+    Closed form and sync-free: eigenvalues from the trigonometric solution of the characteristic
+    cubic (Smith 1961); each eigenvector as the max-norm column of ``(M - lam_j I)(M - lam_k I)``
+    with the middle axis from a cross product so the frame is orthonormal; near-spherical or
+    rank-deficient rows fall back to the identity frame.
     """
     a00 = M[:, 0, 0]; a11 = M[:, 1, 1]; a22 = M[:, 2, 2]
     a01 = M[:, 0, 1]; a02 = M[:, 0, 2]; a12 = M[:, 1, 2]
@@ -258,7 +235,7 @@ def _analytic_sym3x3_axes(M: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
 
 def _masked_principal_axes(points: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Per-row principal axes (rows = axes, longest first) computed over the
-    REAL (unmasked) points only.
+    real (unmasked) points only.
 
     points : (K, P, 3)   mask : (K, P) in {0,1}
     Returns (K, 3, 3). Division by N is omitted because it scales eigenvalues
@@ -272,10 +249,8 @@ def _masked_principal_axes(points: torch.Tensor, mask: torch.Tensor) -> torch.Te
     Bmat = torch.bmm(centered.transpose(1, 2), centered)            # (K,3,3)
     eye = torch.eye(3, device=points.device, dtype=points.dtype)
     inertia = A.view(-1, 1, 1) * eye - Bmat                         # (K,3,3)
-    # Closed-form eigensolver, not ``torch.linalg.eigh``: batched cuSOLVER eigh is a
-    # stream-synchronizing barrier that stalls the otherwise-async seed-gen prologue,
-    # and it fails with CUSOLVER_STATUS_INVALID_VALUE for K > ~8192 (the fit-side call
-    # below passes a 4K-row batch, so that limit is routinely exceeded).
+    # Closed-form eigensolver rather than ``torch.linalg.eigh``: batched cuSOLVER eigh is a
+    # stream-synchronising barrier and fails with CUSOLVER_STATUS_INVALID_VALUE at large K.
     return _analytic_sym3x3_axes(inertia)
 
 
@@ -286,69 +261,26 @@ def batched_seeds_torch(A_batch: torch.Tensor,
                         num_seeds: int = 50,
                         *,
                         ref_shared: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
-    """GPU-native, fully batched replacement for the per-pair seed loop.
+    """GPU-native, fully batched seed generation for a cohort of pairs.
 
-    Seed set: identity + 4 principal-component-alignment quaternions + up to 6
-    STRUCTURED seeds (+/-90 degree rotations about each reference principal axis, which
-    cover the axis SWAPS that PCA alignment alone misses) + a Fibonacci fill for any
-    remaining budget -- all with COM-aligning translations.
-
-    NOTE: this is NOT the same seed set as ``alignment._torch._initialize_se3_params``
-    (the per-pair / JAX path), which goes straight from the 4 PCA quaternions to a
-    Fibonacci fill with no structured axis-swap seeds. At the shipped per-mode seed
-    counts the structured seeds absorb most of the budget, so the accelerated backends
-    explore DIFFERENT orientations than ``backend="jax"`` and return different (not
-    worse) scores. Do not expect cross-backend score equality.
-
-    Computed for the whole cohort in one vectorized pass with NO ``.cpu()``/numpy
-    round-trip. The principal-axis
-    PCA is done in float64 for near-degenerate stability, via an analytic closed-form
-    3x3 eigensolver rather than a synchronizing cuSOLVER call.
-
-    Pairs with < 3 real points or non-finite coordinates fall back to a fixed
-    deterministic rotation set + COM-to-COM translation (matching the per-pair
-    fallback in ``fast_se3._legacy_seeds_torch``).
+    Seed set: identity + 4 principal-component-alignment quaternions + up to 6 structured seeds
+    (+/-90 degree rotations about each reference principal axis, covering the axis swaps that
+    PCA alignment misses) + a Fibonacci fill for the remaining budget, all with COM-aligning
+    translations. This is not the seed set of ``alignment._torch._initialize_se3_params`` (the
+    per-pair / JAX path), so scores are not comparable across backends. The PCA runs in float64
+    through an analytic 3x3 eigensolver with no host round-trip. Pairs with fewer than 3 real
+    points or non-finite coordinates fall back to a fixed rotation set + COM-to-COM translation.
 
     Parameters
     ----------
     A_batch, B_batch : (K, Npad, 3) / (K, Mpad, 3)  padded coordinates
     N_real, M_real   : (K,)  true point counts
     num_seeds        : int   number of base seeds per pair (default 50)
-    ref_shared       : bool  CALLER GUARANTEE that every row of ``A_batch`` (and of ``N_real``)
-        is identical -- a screen broadcasting ONE query across the bucket. The reference
-        principal axes are then solved on row 0 and expanded instead of being solved K times.
-        Default False, which is byte-identical to the pre-existing code path.
-
-        On CUDA this is NOT bit-identical to the K-row solve. MEASURED on an L40S over a
-        100,000-molecule ``vol`` screen, twice, identically: 8 scores of 100,000 move, max
-        |delta| 4.1723e-07 (0.00006% of a score), top-1000 unchanged in membership AND
-        bit-identical in value. Throughput 2.542 -> 2.462 us/mol.
-
-        On CPU it IS bitwise exact -- 0.0 over a full screen and over K = 8..257 in
-        ``tests/test_seed_dedup.py`` -- so the numba backend and the CPU figure panels are
-        untouched.
-
-        THE MECHANISM IS NOT ESTABLISHED. Do not repeat the plausible story. A dedicated probe
-        (results/batchdep.json, job 21977539) recomputed every intermediate of
-        ``_masked_principal_axes`` on a real molecule row at K = 1 vs 300 / 3050 / 12200 /
-        96650 and found EVERY stage bitwise identical, and a second probe found all K output
-        rows equal to each other and to the K=1 solve at P = 32 and 40. So neither "batch size
-        changes the reduction order" nor "row position changes it" reproduces in isolation:
-        the effect is specific to some reference clouds and has not been isolated. What is
-        established is the magnitude, its reproducibility, and its absence on CPU.
-
-        Callers must establish the guarantee by OBJECT IDENTITY of the tensor they actually
-        pass here (``a is b``), not by value and not by mode. ``_scatter_fill`` is a pure copy,
-        so one shared source object provably yields bitwise-identical rows. A value-based check
-        would be self-validating but would force a host sync HERE, stalling the async prologue;
-        the identity check is free host-side. (Note the function already syncs once, at the
-        ``bool(valid.all())`` degenerate-pair guard near the end -- that is not a licence to add
-        an EARLIER one.)
-
-        ``tests/test_seed_dedup.py`` runs the full K-row solve alongside the deduped one and
-        compares. That is the
-        only check that tests the CALLER'S PREDICATE rather than this function's handling of the
-        flag; a wrongly-broadcast reference shows up as O(1) axis disagreement, not rounding.
+    ref_shared       : bool  caller guarantee that every row of ``A_batch`` (and ``N_real``) is
+        identical, as when a screen broadcasts one query across the bucket; the reference axes
+        are then solved on row 0 and expanded. Establish it by object identity of the tensor
+        passed, not by value (a value check would force a host sync here). On CUDA the row-0
+        solve can differ from the K-row solve at rounding level.
 
     Returns
     -------
@@ -387,11 +319,9 @@ def batched_seeds_torch(A_batch: torch.Tensor,
     # ---- 4 principal-component-alignment quaternions per pair ----
     # PCA runs in float64 for near-degenerate stability.
     _wd = torch.float64
-    # ---- reference axes: solved ONCE when the caller guarantees a shared query ----
-    # In a screen every row of A_batch is the same broadcast query, so the K-row eigensolve
-    # returns K copies of one answer. A_batch/mask_n reach the eigensolve at exactly this one
-    # site (A64 and mask_n64 have no other consumer), so slicing to row 0 here is complete and
-    # nothing downstream sees a shape change -- ref_axes is expanded back to (K,3,3) below.
+    # ---- reference axes: solved once when the caller guarantees a shared query ----
+    # Every row of A_batch is then the same broadcast query, so the eigensolve runs on row 0
+    # and ref_axes is expanded back to (K,3,3) below.
     _dedup = bool(ref_shared) and K > 1
     A64 = torch.nan_to_num((A_batch[:1] if _dedup else A_batch).to(_wd))
     B64 = torch.nan_to_num(B_batch.to(_wd))
@@ -417,21 +347,9 @@ def batched_seeds_torch(A_batch: torch.Tensor,
     quat_order = [None, None]
     for ax in range(2):
         if ax == 0:
-            # ax=0 ONLY: fit4 is still four IDENTICAL copies of fit_c here (it is first rotated
-            # at the bottom of this loop), so the (4K,Mpad,3) eigensolve computes the same answer
-            # four times per molecule. Solve the K distinct rows and expand.
-            #
-            # BIT-IDENTICAL, verified: torch.equal(_masked_principal_axes(fit4, mask_m4),
-            # _masked_principal_axes(fit_c, mask_m64).unsqueeze(1).repeat(1,4,1,1).reshape(4K,3,3))
-            # over randomized clouds -- max|diff| exactly 0.
-            #
-            # This is float64 work on a GPU that runs fp64 at 1/64 the fp32 rate, and seed
-            # generation measured 2.079 device us/mol -- 49% of fss's entire GPU budget for a vol
-            # screen, more than the optimizer it feeds. At ax=1 the four copies HAVE been rotated
-            # by four different ref sign-flips, so that solve is genuine work and stays.
-            #
-            # fit_c depends only on the library molecule (its own coords and COM), never on the
-            # query, so this same tensor is also precomputable at store-build time.
+            # At ax=0 fit4 is still four identical copies of fit_c (it is first rotated at the
+            # bottom of this loop), so solve the K distinct rows once and expand. At ax=1 the
+            # copies have been rotated by different sign flips and the 4K solve is real work.
             _K = fit_c.shape[0]
             fit_axes = (_masked_principal_axes(fit_c, mask_m64)
                         .unsqueeze(1).repeat(1, 4, 1, 1).reshape(4 * _K, 3, 3))
@@ -443,9 +361,8 @@ def batched_seeds_torch(A_batch: torch.Tensor,
         angle = torch.acos(cos)                                    # (4K,1)
         axis = torch.linalg.cross(v1, v2, dim=1)                   # (4K,3)
         axis_norm = axis.norm(dim=1, keepdim=True)
-        # Degenerate (parallel/antiparallel) axes -> safe default [1,0,0]; these
-        # few seeds are non-optimal but recovered by the Fibonacci seeds + the
-        # coarse grid + fine optimisation (validated by the score-parity gate).
+        # Degenerate (parallel/antiparallel) axes -> default [1,0,0]; the Fibonacci seeds and
+        # the fine optimisation recover these few poses.
         axis = torch.where(axis_norm < 1e-8,
                            torch.tensor([1.0, 0.0, 0.0], dtype=axis.dtype, device=device),
                            axis / axis_norm.clamp(min=1e-12))
@@ -461,11 +378,8 @@ def batched_seeds_torch(A_batch: torch.Tensor,
     identity = torch.zeros(K, 1, 4, device=device, dtype=dtype)
     identity[:, :, 0] = 1.0
 
-    # Structured seeds: +/-90deg rotations about each ref principal axis, composed onto
-    # the base PCA alignment. The 4 PCA quats already cover axis SIGN-flips (180deg); these
-    # add the axis SWAPS that PCA-alignment alone misses. Vectorized and reuses the
-    # already-computed principal axes, so the cost is negligible next to the float64 PCA
-    # eigensolve it rides on.
+    # Structured seeds: +/-90deg rotations about each ref principal axis composed onto the base
+    # PCA alignment. The 4 PCA quats cover axis sign flips; these add the axis swaps.
     n_struct = min(max(num_seeds - 5, 0), 6)
     if n_struct > 0:
         base_pca = pca_quats[:, 0]                                  # (K,4) no-sign-flip PCA align
@@ -607,40 +521,28 @@ def build_coarse_grid(A_batch: torch.Tensor,
 
 
 # --------------------------------------------------------------------------------------------
-# Canonical-frame seeds: the same rotations for EVERY library molecule.
+# Canonical-frame seeds: the same rotations for every library molecule.
 # --------------------------------------------------------------------------------------------
-#: Proper sign-flip combinations of a principal frame. PCA fixes the axes only up to sign, which
-#: is exactly what batched_seeds_torch's "4 principal-component-alignment quaternions" enumerate.
-#: det = +1 for all four, so each is a rotation rather than a reflection.
+#: Proper sign-flip combinations of a principal frame (PCA fixes axes only up to sign); all
+#: four have det = +1, so each is a rotation rather than a reflection.
 _SIGN_FLIPS = (
     ((1, 1, 1)), ((1, -1, -1)), ((-1, 1, -1)), ((-1, -1, 1)),
 )
-#: +/-90 degree rotations about each canonical axis -- the axis SWAPS that sign flips alone miss.
-#: Same role as the "STRUCTURED seeds" in the per-molecule generator.
+#: +/-90 degree rotations about each canonical axis: the axis swaps that sign flips miss.
 _AXIS_SWAPS = (
     (0, 90), (0, -90), (1, 90), (1, -90), (2, 90), (2, -90),
 )
 
 
 def canonical_seed_quats(ref_points, n_real, num_seeds: int, device):
-    """Constant seed rotations for a CANONICAL store, returned as ``(num_seeds, 4)``.
+    """Constant seed rotations for a canonical store, returned as ``(num_seeds, 4)``.
 
-    On a canonical store every library molecule is already expressed in its own principal frame,
-    so the rotation that carries a fit molecule's axes onto the query's is the SAME for all of
-    them: ``R_query^T`` composed with a sign-flip / axis-swap. The per-molecule eigensolve that
-    ``batched_seeds_torch`` performs -- measured at 44.1% of a vol screen, 0.839 us/mol -- is
-    therefore redundant, and these seeds cost one 3x3 solve per SCREEN instead of one per
-    molecule.
-
-    Seed ORDER and composition deliberately mirror the per-molecule generator: the four proper
-    sign flips first (its "4 PCA quaternions"), then the +/-90 axis swaps (its "STRUCTURED
-    seeds"), then a Fibonacci fill for any remaining budget. Same coverage, constant cost.
-
-    This is NOT bit-identical to the per-molecule seeds -- the frames differ by each molecule's
-    own rotation -- so scores move and enrichment has to be revalidated.
-
-    Serves every mode in ``accel._modes.CONST_SEED_MODES`` (all seed from the heavy-atom cloud
-    the store canonicalises), with ``num_seeds`` taken from that mode's ``MODE_SEEDS`` entry.
+    On a canonical store every library molecule is already in its own principal frame, so the
+    rotation carrying a fit molecule's axes onto the query's is the same for all of them:
+    ``R_query^T`` composed with a sign flip or axis swap. One 3x3 solve per screen replaces the
+    per-molecule eigensolve of ``batched_seeds_torch``. Seed order mirrors that generator (the
+    four proper sign flips, the +/-90 axis swaps, then a Fibonacci fill), but the seeds are not
+    the per-molecule ones, so scores differ. Serves every mode in ``_modes.CONST_SEED_MODES``.
     """
     import numpy as np
     import torch

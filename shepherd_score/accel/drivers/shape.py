@@ -1,7 +1,7 @@
 """``vol`` / ``surf`` driver entry points (Gaussian volume overlap, Tanimoto).
 
 The fine loop lives in :mod:`engine`; this module keeps the chunked kernel wrappers and the
-historical ``coarse_fine_align_many`` signature.
+``coarse_fine_align_many`` signature.
 """
 from __future__ import annotations
 
@@ -12,12 +12,6 @@ from ._common import apply_se3_transform, quaternion_to_rotation_matrix  # noqa:
 from ._shim import batch, run
 
 torch.backends.cuda.matmul.allow_tf32 = True
-
-#: Poses of ONE molecule per CTA for the deduplicated multi-pose shape kernel; measured to pay
-#: for surf only (contention-insensitive ~36k aligns/s; vol 1.04-1.07x for a larger divergence;
-#: the ESP kernel negative). Mirrors ``ModeSpec.multipose``.
-_MODE_POSES = {"surf": 8}
-
 
 @torch.no_grad()
 def _overlap_in_chunks(A, B, q, t, *, alpha: float = 0.81, N_real=None, M_real=None,
