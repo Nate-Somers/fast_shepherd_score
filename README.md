@@ -33,6 +33,8 @@ The formulation of the interaction profile representation, scoring, alignment, a
 6. [Scoring and Alignment Examples](#scoring-and-alignment-examples)
 7. [Evaluation Examples and Scripts](#evaluation-examples-and-scripts)
 8. [Data](#data)
+9. [License](#license)
+10. [Citation](#citation)
 
 ## Documentation
 
@@ -43,6 +45,15 @@ Full documentation is available at [shepherd-score.readthedocs.io](https://sheph
 ```
 .
 ├── shepherd_score/
+│   ├── accel/                            # Batched alignment kernels (Triton GPU, numba CPU)
+│   │   ├── kernels/                      # Triton kernels and their numba CPU mirrors
+│   │   ├── drivers/                      # Per-mode coarse-to-fine SE(3) optimizers
+│   │   ├── batch/                        # Padding, bucketing, and batched dispatch
+│   │   ├── _modes.py                     # Registry describing every alignment mode as data
+│   │   ├── channels.py                   # Per-molecule inputs the modes read
+│   │   ├── cpu_pool.py                   # Worker pool for the CPU backend
+│   │   ├── multi_gpu.py                  # Data-parallel alignment across several GPUs
+│   │   └── screen_parallel.py            # Shard-parallel CPU screening
 │   ├── alignment/                        # Alignment package with PyTorch, JAX, and utilities
 │   │   ├── utils/                        # SE(3) and PCA utilities (torch, numpy, jax)
 │   │   │   ├── se3*.py                   # SE(3) transformations (torch, numpy, jax)
@@ -66,18 +77,23 @@ Full documentation is available at [shepherd-score.readthedocs.io](https://sheph
 │   ├── score/                            # Scoring related functions and constants
 │   │   ├── analytical_gradients/         # Analytical gradient implementations
 │   │   │   └── _torch.py                 # PyTorch analytical gradients for shape, ESP, pharmacophore
+│   │   ├── atomtype_scoring.py           # Atom-identity (element-matched) overlap scoring
 │   │   ├── constants.py
 │   │   ├── electrostatic_scoring.py
 │   │   ├── gaussian_overlap.py
 │   │   └── pharmacophore_scoring.py
 │   ├── conformer_generation.py           # RDKit and xtb related functions for conformers
 │   ├── container/                        # Molecule, MoleculePair, MoleculePairBatch classes
+│   │   └── profiles.py                   # Surface and Pharmacophore containers
 │   ├── extract_profiles.py               # Functions to extract interaction profiles
 │   ├── generate_point_cloud.py
 │   ├── objective.py                      # Objective function used for REINVENT
+│   ├── screen.py                         # ProfileStore and streaming virtual screening
+│   ├── surface_diagnostics.py            # Quality checks for generated surface point clouds
 │   └── visualize.py                      # Visualization tools
 ├── scripts/                              # Scripts for running evaluations
 ├── examples/                             # Jupyter notebook tutorials/examples
+├── docs/                                 # Sphinx documentation sources
 ├── tests/
 └── README.md
 ```
@@ -95,7 +111,10 @@ xTB will need to be installed manually since there are no PyPi bindings. This ca
 from [source](https://xtb-docs.readthedocs.io/en/latest/setup.html) and adding it to `PATH`.
 ### With optional dependencies
 ```bash
-# JAX support (for faster scoring and alignment)
+# GPU kernels (Triton)
+pip install "shepherd-score[gpu]"
+
+# JAX implementations of scoring and alignment
 pip install "shepherd-score[jax]"
 
 # Include docking evaluation tools
@@ -104,15 +123,25 @@ pip install "shepherd-score[docking]"
 # Everything
 pip install "shepherd-score[all]"
 ```
+The `gpu` extra installs `triton>=3.6` and needs `torch>=2.6` built against CUDA. The CPU
+kernels need no extra: `numba` is a core dependency.
 
-### Fast CPU alignment (numba SVML kernels)
-The accelerated CPU backend (`MoleculePairBatch.align_with_*(backend="numba")` and
-`screen(..., backend="numba")`) reaches full speed only when numba can emit Intel SVML
-vector `exp` calls, which requires **numba ≤ 0.59 + `icc_rt`**. Build the dedicated env
-the conda [`environment.yml`](environment.yml) for this (numba 0.61+ dropped SVML, so
-the default GPU stack cannot vectorize the kernels). With SVML absent the overlap kernels run
-unvectorized — ~3–6× slower — and a one-time `RuntimeWarning` is emitted so the slow regime is
-never silent. Verify with `python -c "import numba.core.config as c; print(c.USING_SVML)"`.
+
+### Fast CPU alignment (numba kernels)
+The CPU backend (`MoleculePairBatch.align_with_*(backend="numba")` and
+`screen(..., backend="numba")`) reaches full speed only with an SVML-enabled numba build, which
+lets numba emit Intel SVML vector `exp` calls in the overlap kernels. That build is
+`numba<=0.59` together with `icc_rt`; the conda [`environment.yml`](environment.yml) provides it.
+Without SVML the kernels give the same results, run slower, and emit one `RuntimeWarning` the
+first time they are used, so the slower regime is never silent. Check which build is active with:
+
+```bash
+python -c "import numba.core.config as c; print(c.USING_SVML)"
+```
+
+Measured CPU and GPU throughput per mode is in
+[`docs/performance/timings.md`](docs/performance/timings.md).
+
 
 ### For local development
 ```bash
@@ -135,7 +164,11 @@ pandas>=2.0
 scipy>=1.10
 py3Dmol
 molscrub
+numba
+tqdm
+threadpoolctl
 ```
+
 
 > **Note**: If using `torch<=2.4`, ensure that `mkl==2024.0` with conda since there is a known [issue](https://github.com/pytorch/pytorch/issues/123097) that prevents importing torch.
 
@@ -157,6 +190,45 @@ The package has convenience wrappers and base functions. Most users should reach
     - `shepherd_score.container.MoleculePair` operates on two `Molecule` objects and prepares their `Surface`/`Pharmacophore` profiles for scoring and alignment
 - `MoleculePairBatch` class
     - `shepherd_score.container.MoleculePairBatch` operates on a list of `MoleculePair` objects and enables accelerated alignment by padding all profile arrays to a common shape so a single compiled kernel is reused across every pair. Supports optional multi-CPU parallelism.
+
+### Alignment modes
+Every mode below is reachable as `MoleculePair.align_with_<mode>`, as
+`MoleculePairBatch.align_with_<mode>`, and as the `mode=` argument of `screen`. Each mode carries
+its own default number of SO(3) seeds and optimizer steps (`MODE_SEEDS` and `MODE_STEPS` in
+`shepherd_score/accel/_modes.py`); pass `max_num_steps` for a different budget. A `_tversky` mode
+is its parent with the symmetric Tanimoto replaced by an asymmetric Tversky reduction, weighted
+toward the reference by default (`tversky_alpha=0.95`, `tversky_beta=0.05`).
+
+| Mode | What it scores |
+| :------- | :------- |
+| `vol` | Gaussian volume overlap of the heavy-atom clouds |
+| `vol_esp` | Heavy-atom volume overlap weighted by the atomic partial charges |
+| `surf` | Gaussian overlap of the molecular surface point clouds |
+| `surf_esp` | Surface overlap weighted by the surface electrostatic potential |
+| `vol_and_surf_esp` | Volumetric or surface shape overlap (selected by `alpha`) blended with the ShaEP surface-ESP agreement |
+| `pharm` | Directional pharmacophore overlap over anchors, vectors, and types |
+| `vol_color` | Shape overlap blended with directionless pharmacophore ("color") overlap |
+| `vol_tversky` | `vol` with a Tversky reduction |
+| `vol_lipo` | Shape overlap blended with the per-atom Crippen logP field |
+| `vol_esp_tversky` | `vol_esp` with a Tversky reduction |
+| `vol_mr` | Shape overlap blended with the per-atom Crippen molar-refractivity field |
+| `surf_tversky` | `surf` with a Tversky reduction |
+| `surf_esp_tversky` | `surf_esp` with a Tversky reduction |
+| `vol_lipo_tversky` | `vol_lipo` with a Tversky reduction |
+| `vol_color_tversky` | `vol_color` with a Tversky reduction |
+| `vol_atomtype` | Shape overlap blended with element-matched atom overlap |
+| `vol_pharm` | Shape overlap blended with directional pharmacophore overlap |
+| `pharm_tversky` | `pharm` with the asymmetric pharmacophore similarity |
+| `vol_and_surf_esp_tversky` | `vol_and_surf_esp` with a Tversky reduction |
+| `vol_fukui` | Shape overlap blended with the per-atom condensed Fukui field |
+| `vol_avoid` | Shape overlap minus an excluded-volume penalty against a fixed avoid cloud |
+
+The mode formerly called `esp` is now `surf_esp` and `esp_combo` is now `vol_and_surf_esp`; both
+old names are still accepted.
+
+`MoleculePairBatch.align_with_*` and `screen` take a `backend=` argument whose default (`None`)
+resolves per device: the Triton kernels on CUDA, the numba kernels on CPU, with `backend="jax"`
+selecting the JAX implementation when the `[jax]` extra is installed.
 
 ### Base functions
 #### Conformer generation
@@ -202,7 +274,7 @@ ref_molec = Molecule(
     ref_mol,
     # optional options otherwise .surface/.pharmacophore stay empty
     num_surf_points=200,
-    partial_charges=partial_charges, # If None, MMFF charges
+    partial_charges=partial_charges, # If None, computed lazily with gfn2-xTB
     pharm_multi_vector=False # recommended
     # e.g., carbonyls get one HBA vector rather than two
 )
@@ -263,54 +335,59 @@ mp = MoleculePair(ref_molec, fit_molec, num_surf_points=200, do_center=True)
 # By default we use automatic differentiation via pytorch
 surf_points_aligned = mp.align_with_surf(ALPHA(mp.num_surf_points),
                                          num_repeats=50)
-surf_points_esp_aligned = mp.align_with_esp(ALPHA(mp.num_surf_points),
-                                            lam=0.3,
-                                            num_repeats=50)
+surf_points_esp_aligned = mp.align_with_surf_esp(ALPHA(mp.num_surf_points),
+                                                 lam=0.3,
+                                                 num_repeats=50)
 pharm_pos_aligned, pharm_vec_aligned = mp.align_with_pharm(num_repeats=50)
 
 # Optimal scores and SE(3) transformation matrices are stored as attributes
-mp.sim_aligned_{surf/esp/pharm}
-mp.transform_{surf/esp/pharm}
+# mp.sim_aligned_surf, mp.sim_aligned_surf_esp, mp.sim_aligned_pharm
+# mp.transform_surf, mp.transform_surf_esp, mp.transform_pharm
 
 # Get a copy of the optimally aligned fit Molecule object
 transformed_fit_molec = mp.get_transformed_molecule(
-    se3_transform=mp.transform_{surf/esp/pharm}
+    se3_transform=mp.transform_surf
 )
 ```
 
-Alignment of multiple `MoleculePair` objects can be accelerated with `MoleculePairBatch` with Jax installed.
+Alignment of many `MoleculePair` objects at once is accelerated by `MoleculePairBatch`, which pads
+every pair's arrays to a common shape so one compiled kernel is reused across the batch.
 
 ```python
 from shepherd_score.container import MoleculePairBatch
 
 batch = MoleculePairBatch(pairs)  # `pairs` is a list of MoleculePair objects
 
-# accelerated JAX-based volumetric alignment via padding
-scores, aligned = batch.align_with_vol()
+# backend=None (the default) picks Triton on a CUDA device and numba on CPU
+scores, aligned = batch.align_with_vol(return_aligned=True)
+scores, aligned = batch.align_with_vol_esp(lam=0.1, return_aligned=True)
+scores, aligned = batch.align_with_surf(ALPHA(200), return_aligned=True)
 
-# Multi-CPU parallel via shard_map (must set XLA_FLAGS *before* importing JAX)
-scores, aligned = batch.align_with_vol(num_workers=4, num_buckets=4, use_shmap=True)
+# The JAX path stays available when the [jax] extra is installed. Its multi-CPU shard_map
+# mode requires XLA_FLAGS to be set *before* JAX is imported.
+scores, aligned = batch.align_with_vol(backend="jax", num_workers=4, num_buckets=4,
+                                       use_shmap=True)
 ```
+
 
 ### Virtual screening (`ProfileStore` + `screen`)
 For one query against a large library, featurise the library once into an on-disk `ProfileStore`
 and stream it past the query with `screen`. The store keeps only the arrays the requested modes
-need (float16 by default, about 200 bytes per molecule for `vol`), in shards, so the library is
-never held in RAM and a screen of ten million conformers runs from disk.
+need (float16 by default, about 200 bytes per molecule for `vol`) in independent shards, so the
+library is never held in RAM.
 
 ```python
 import numpy as np
-from shepherd_score.container import Molecule
 from shepherd_score.screen import ProfileStore, screen
 
 # Build once. Each library entry is a featurised Molecule (conformer, charges, surface,
 # pharmacophores -- see "Extraction" above). One store serves every mode listed at creation.
 store = ProfileStore.create("library.fss", num_surf_points=200, modes=("vol", "vol_esp"))
-for m in library_molecules:            # any iterable; nothing accumulates in RAM
-    store.add(m)
+for molecule in library_molecules:     # any iterable; nothing accumulates in RAM
+    store.add(molecule)
 store.close()
 
-# Screen as often as you like. backend=None resolves to triton on a CUDA machine, numba otherwise.
+# Screen as often as you like. backend=None resolves to Triton on a CUDA machine, numba otherwise.
 store = ProfileStore.open("library.fss")
 hits = screen(query_molecule, store, mode="vol", top_k=1000)      # [Hit(score, id, transform), ...]
 hits = screen(query_molecule, store, mode="vol_esp", top_k=1000, lam=0.1)
@@ -324,20 +401,20 @@ screen(query_molecule, store, mode="vol", top_k=1, scores_out=scores)
 hits = screen(query_molecule, store, mode="vol", ndev=4)
 ```
 
-- `num_surf_points` and the mode-specific kwargs (`alpha` for the surface modes, `lam` for the
-  ESP modes) must match how the query was built; `screen` raises if a required kwarg is missing.
-- A store that serves `vol` is **canonical** by default: each molecule is stored rotated into its
-  principal-axis frame, which lets the `vol` screen run one constant seed set instead of a
-  per-molecule eigensolve (roughly 1.5-2x faster on GPU). Returned transforms are composed back
-  to the centred frame, so hits read the same either way. The seed set differs from the pairwise
-  path's, so `vol` scores from a canonical store differ from `MoleculePair` scores at the 1e-3
-  level on average (rankings agree: top-1000 overlap 99%); stores without `vol` keep raw centred
-  coordinates, which match the pairwise path to ~1e-4. Pass `canonical=True/False` to
+- `num_surf_points` and the mode-specific keyword arguments (`alpha` for the surface modes, `lam`
+  for the ESP modes) must match how the query was built; `screen` raises if a required one is
+  missing.
+- A store that serves a mode seeded from the heavy-atom cloud, such as `vol`, is canonical by
+  default: each molecule is stored rotated into its own principal-axis frame, which lets the screen
+  run one constant seed set instead of a per-molecule eigensolve. Returned transforms are composed
+  back to the centred frame, so hits read the same either way. Scores from a canonical store move
+  at the 1e-3 level against a non-canonical one; pass `canonical=True` or `canonical=False` to
   `ProfileStore.create` to decide explicitly.
 - A store directory is single-writer. For a parallel build, give each worker its own store and
   screen the parts in turn.
 - On CPU, `screen(..., backend="numba")` reaches full speed only with the SVML build described
-  under *Fast CPU alignment* above.
+  under [Fast CPU alignment](#fast-cpu-alignment-numba-kernels) above.
+
 
 ## Evaluation Examples and Scripts
 

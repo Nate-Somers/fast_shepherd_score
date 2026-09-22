@@ -301,5 +301,3 @@ CPU fine loops, the array-native screen, the multi-GPU path and constant seeds a
 - **One clear name per concept.** No back-compat aliases for a name only this mode uses.
 
 See `seams.md` for the file map and the reuse tables, and `pitfalls.md` for the recurring traps.
-`evals/` holds grading rubrics for these paths — they state expected answers, so they are for
-reviewing work, not for doing it.

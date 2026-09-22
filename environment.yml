@@ -1,19 +1,9 @@
-# fast_shepherd_score — single conda environment (CPU stack + SVML numba kernels).
-#
-# numba is now a core dependency and the default CPU backend for the batched aligners, so
-# this env pins the SVML-vectorized numba build that makes those kernels fast. TWO traps this
-# env exists to handle:
-#   1. SVML requires the SVML-patched LLVM that ships ONLY in numba <= 0.59 + icc_rt on the
-#      `numba` conda channel (numba 0.61+ / llvmlite 0.44+ dropped it). numba 0.59 caps
-#      numpy < 1.27, hence numpy=1.26.
-#      Verify:  python -c "import numba.core.config as c; print(c.USING_SVML)"  -> True
-#      Without SVML the CPU kernels are correct but slower and emit a one-time RuntimeWarning.
-#      NOTE: the SVML path is fp32 SoA (values ~1e-6 rel, gradients ~1e-4), so enabling SVML
-#      changes CPU results slightly as well as speeding them up.
-#   2. GPU (Triton) kernels are NOT in this env. They need a CUDA build of torch AND Triton
-#      >= 3.6 (the overlap kernels use `@triton.autotune(cache_results=...)`, an API added in
-#      3.6). Install those on top with pip:  pip install "shepherd-score[gpu]"  plus a
-#      +cuXXX torch build (a known-good pairing is torch==2.11.0+cu128 with triton==3.6.0).
+# Conda environment for shepherd-score with the SVML-enabled numba build used by the CPU kernels.
+# SVML needs numba <= 0.59 + icc_rt from the `numba` channel (later numba dropped it); without
+# SVML the CPU kernels still run, several times slower, and warn once.
+# Check:  python -c "import numba.core.config as c; print(c.USING_SVML)"
+# GPU (Triton) kernels are not in this env: install a CUDA build of torch plus
+# `pip install "shepherd-score[gpu]"` on top.
 name: shepherd_score
 channels:
   - numba

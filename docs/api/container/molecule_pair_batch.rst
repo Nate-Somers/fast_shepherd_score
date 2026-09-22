@@ -4,14 +4,21 @@ MoleculePairBatch
 :class:`~shepherd_score.container.MoleculePairBatch` accepts a list of
 :class:`~shepherd_score.container.MoleculePair` objects and aligns them
 efficiently by padding all atom/pharmacophore arrays to a common maximum
-length.  Because every call shares the same padded array shape, JAX's XLA
-compiler produces **a single compiled kernel** that is reused for every
-pair in the batch — avoiding the per-pair recompilation overhead that
-occurs when array shapes differ.
+length.  Because every call shares the same padded array shape, one compiled
+kernel is reused for every pair in the batch, avoiding the per-pair
+recompilation overhead that occurs when array shapes differ.
+
+Backends
+--------
+
+Every ``align_with_*`` method takes a ``backend`` argument. The default, ``None``, resolves per
+device: the Triton GPU kernels when CUDA is available, the numba CPU kernels otherwise.
+``backend="jax"`` selects the JAX implementation, which requires the ``jax`` extra and is no
+longer the default. The sections below describe the JAX backend.
 
 .. note::
 
-   While ``shard_map`` is recommended for all cases, it requires
+   While ``shard_map`` is recommended for all JAX-backend cases, it requires
    ``jax>=0.9.0`` and thus ``python>=3.11``. An alternative is to use
    ``multiprocessing`` with ``'spawn'`` context by setting
    ``use_shmap=False``. However, this is known to NOT work on Linux HPC
@@ -95,31 +102,24 @@ computation at the cost of multiple sequential ``shard_map`` calls:
 Available batch alignment methods
 ----------------------------------
 
-.. list-table::
-   :header-rows: 1
-   :widths: 30 15 55
+Every alignment mode in the registry has a matching ``align_with_<mode>`` method, under the same
+name it carries on :class:`~shepherd_score.container.MoleculePair`: ``align_with_vol``,
+``align_with_vol_esp``, ``align_with_surf``, ``align_with_surf_esp``,
+``align_with_vol_and_surf_esp``, ``align_with_pharm``, ``align_with_vol_color``,
+``align_with_vol_tversky``, ``align_with_vol_lipo``, ``align_with_vol_esp_tversky``,
+``align_with_vol_mr``, ``align_with_surf_tversky``, ``align_with_surf_esp_tversky``,
+``align_with_vol_lipo_tversky``, ``align_with_vol_color_tversky``, ``align_with_vol_atomtype``,
+``align_with_vol_pharm``, ``align_with_pharm_tversky``,
+``align_with_vol_and_surf_esp_tversky``, ``align_with_vol_fukui`` and ``align_with_vol_avoid``.
 
-   * - Method
-     - Backend
-     - Notes
-   * - ``align_with_vol``
-     - JAX
-     - Padded masked volumetric alignment; sequential or parallel (``use_shmap=True``)
-   * - ``align_with_vol_esp``
-     - JAX
-     - Padded masked volumetric + ESP alignment
-   * - ``align_with_pharm``
-     - JAX
-     - Padded masked pharmacophore alignment
-   * - ``align_with_vol_analytical``
-     - PyTorch
-     - Padded masked volumetric alignment via analytical gradients; uses ``torch.compile``
-   * - ``align_with_surf``
-     - PyTorch/JAX
-     - Delegates to each ``MoleculePair`` (surface arrays are same-sized, no padding needed). Not recommended to use ``use_shmap=True`` with this method.
-   * - ``align_with_surf_esp``
-     - PyTorch/JAX
-     - Delegates to each ``MoleculePair`` (surface arrays are same-sized, no padding needed). Not recommended to use ``use_shmap=True`` with this method.
+``align_with_esp`` and ``align_with_esp_combo`` remain as aliases for ``align_with_surf_esp``
+and ``align_with_vol_and_surf_esp``.
+
+Each method returns the per-pair scores followed by the aligned arrays (built only when
+``return_aligned=True``) and writes the mode's transform and score attributes back onto every
+:class:`~shepherd_score.container.MoleculePair` in the batch, for example
+``transform_vol_noH`` and ``sim_aligned_vol_noH`` for ``vol``. The per-mode defaults for the
+number of SO(3) seeds and optimizer steps are in ``shepherd_score/accel/_modes.py``.
 
 For the low-level parallel kernel see :doc:`../alignment/jax_parallel`.
 For the full scoring and alignment theory see :doc:`../../theory`.

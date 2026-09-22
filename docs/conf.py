@@ -113,6 +113,8 @@ autodoc_default_options = {
 autodoc_typehints = 'description'
 autodoc_mock_imports = [
     'torch',
+    'numba',
+    'triton',
     'jax',
     'jaxlib',
     'optax',

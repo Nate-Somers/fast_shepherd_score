@@ -262,5 +262,4 @@ through — a reader otherwise cannot tell "deliberately pairwise-only" from "so
 
 See `seams.md` for the file map, `kernel_anatomy.md` for kernel/engine/graph mechanics,
 `screen_wiring.md` for what the store still needs from you, and `parity_gates.md` for the validation
-contract. `evals/` holds grading rubrics — they state expected answers, so they are for reviewing
-work, not for doing it.
+contract.

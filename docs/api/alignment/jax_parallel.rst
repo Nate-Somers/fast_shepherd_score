@@ -37,8 +37,7 @@ molecule pairs across virtual CPU devices without any Python-level
   ``(max_num_steps, n_devices)`` so the XLA kernel is compiled only once
   per unique ``(steps, device-count)`` combination.
 * Uses ``lax.scan`` for a fixed number of steps (no convergence-based early
-  stopping).  This enables full ahead-of-time compilation; typical speedup is
-  ~2.8× on 4 CPU cores compared to sequential JAX alignment.
+  stopping), which enables full ahead-of-time compilation.
 
 Usage via the high-level API
 -----------------------------
@@ -60,7 +59,7 @@ The recommended entry point is
    scores, aligned = batch.align_with_vol(num_workers=4, use_shmap=True)
 
    # Bucketed: useful for >10k pairs with diverse molecule sizes
-   scores, aligned = batch.align_with_vol(num_workers=4, use_shmap=True, n_buckets=8)
+   scores, aligned = batch.align_with_vol(num_workers=4, use_shmap=True, num_buckets=8)
 
 See :doc:`../container/molecule_pair_batch` for details on bucketing and masking strategy.
 

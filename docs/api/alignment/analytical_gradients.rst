@@ -2,7 +2,7 @@ Analytical Gradients
 ====================
 
 PyTorch analytical gradient implementations for shape, ESP, and pharmacophore alignment.
-These replace autograd with hand-derived gradients for ~2–3.5x speedup.
+These replace autograd with hand-derived gradients.
 
 .. automodule:: shepherd_score.score.analytical_gradients
    :members:

@@ -44,18 +44,8 @@ dependencies = [
     "scipy>=1.10",
     "molscrub",
     "tqdm",
-    # numba is a CORE dependency: it is the default CPU backend for the batched aligners
-    # (``backend=None`` resolves to ``numba`` on a CPU host). Unpinned here -- pip cannot
-    # deliver the SVML-patched build; for the ~2-4x SVML CPU kernels use the conda
-    # ``environment.yml`` (numba 0.59.1 + icc_rt). Without SVML the kernels are correct but
-    # slower and emit a one-time RuntimeWarning.
-    "numba",
-    # threadpoolctl is imported by ``accel/multi_gpu.py`` to cap a worker's MKL/OpenBLAS/OMP
-    # pools at RUNTIME. With the ``fork`` start method a worker inherits the parent's
-    # already-sized pools, which env vars cannot resize after import, and uncapped workers
-    # oversubscribe until multi-GPU scaling falls below 1x. The import is best-effort
-    # (try/except), so the package runs without it -- but then the cap covers ATen only.
-    "threadpoolctl",
+    "numba",            # default CPU backend for the batched aligners (see environment.yml for the SVML build)
+    "threadpoolctl",    # caps BLAS/OpenMP threads in the multi-GPU worker processes
 ]
 
 [project.urls]
@@ -77,23 +67,11 @@ docs = [
     "sphinx-copybutton>=0.5",
     "myst-nb>=1.0",
 ]
-# Retained for backwards compatibility only: numba is now a CORE dependency, so this
-# extra is redundant (installing ``.[cpu]`` is equivalent to the base install).
-cpu = [
+cpu = [                 # kept for compatibility; numba is a core dependency
     "numba",
 ]
-# GPU (Triton) kernels. TWO install traps:
-#   1. Needs a CUDA build of torch. The default CPU torch wheel has no GPU and bundles no
-#      Triton, so `pip install torch` alone is not enough -- install a +cuXXX torch build.
-#   2. Needs Triton >= 3.6. The overlap kernels use `@triton.autotune(cache_results=...)`,
-#      an API that only exists in Triton 3.6+. On older Triton every GPU kernel dies at
-#      compile with a missing-attribute error and there is no CPU fallback.
-#   3. Needs a torch whose ``torch.cuda.graph`` accepts ``capture_error_mode``, which the
-#      graphed fine loop in ``accel/drivers/_graphed.py`` passes. A capture failure that is
-#      not an OOM is re-raised rather than falling back to eager, so an older torch does not
-#      degrade -- it crashes the alignment. The base ``torch>=1.12`` floor is left alone
-#      because nothing on the CPU path reaches graph capture. Verified: 2.11.0+cu128 with
-#      triton 3.6.0 on CUDA, 2.6.0+cpu for the CPU path.
+# GPU kernels need a CUDA build of torch (>= 2.6, for torch.cuda.graph(capture_error_mode=...))
+# and Triton >= 3.6 (for @triton.autotune(cache_results=...)).
 gpu = [
     "triton>=3.6",
     "torch>=2.6",
@@ -156,17 +134,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # unused imports in __init__
-# The accelerated kernels and their drivers use numerical-code idioms that pycodestyle flags
-# but that read better here than the alternatives: semicolon-grouped assignments so one
-# matrix/vector row occupies one line (E702), single-capital names for standard math objects
-# such as O for an overlap matrix and I for the identity (E741), and short lambdas used as
-# local buffer factories (E731). The rest of the package keeps the project's full strictness.
+# Numerical-kernel idioms: one matrix row per line (E702), single-letter math names (E741),
+# lambda buffer factories (E731); tests add imports behind pytest.importorskip (E401/E402).
 "shepherd_score/accel/**" = ["E702", "E741", "E731"]
-# The kernel/backend tests build small numeric fixtures with the same dense idioms as the
-# kernels they exercise: semicolon-grouped assignments (E702), single-capital math names
-# (E741), lambda buffer factories (E731), function-local grouped imports behind a
-# pytest.importorskip (E401/E402). One entry rather than a per-file list, which grew with
-# every new mode. ``shepherd_score/`` outside ``accel/`` keeps full strictness.
 "tests/**" = ["E401", "E402", "E702", "E741", "E731"]
 
 [tool.ruff.lint.isort]

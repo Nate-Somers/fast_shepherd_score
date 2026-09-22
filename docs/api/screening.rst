@@ -17,6 +17,13 @@ for the end-to-end example.
 
 .. autofunction:: shepherd_score.screen.close_multigpu_pool
 
+.. autoclass:: shepherd_score.screen.MoleculeProfile
+   :members:
+   :undoc-members:
+
+``shepherd_score.screen.Hit`` is the ``namedtuple("Hit", ["score", "id", "transform"])``
+returned by both screening functions.
+
 Shard-parallel CPU screening
 ----------------------------
 
@@ -26,3 +33,15 @@ core each; the pool is kept for later calls against the same library.
 .. autofunction:: shepherd_score.accel.screen_parallel.screen_parallel
 
 .. autofunction:: shepherd_score.accel.screen_parallel.screen_parallel_close
+
+Multi-GPU alignment
+-------------------
+
+Data-parallel alignment of an in-memory list of pairs across every visible GPU. Also re-exported
+from :mod:`shepherd_score.container`.
+
+.. autofunction:: shepherd_score.accel.multi_gpu.align_multi_gpu
+
+.. autoclass:: shepherd_score.accel.multi_gpu.MultiGPUAligner
+   :members:
+   :undoc-members:

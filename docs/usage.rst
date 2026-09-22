@@ -65,13 +65,13 @@ Interaction Profile Extraction
      - Function
      - Returns
    * - Shape
-     - :func:`shepherd_score.extract_profiles.get_molecular_surface`
+     - :func:`shepherd_score.generate_point_cloud.get_molecular_surface`
      - ``np.ndarray`` (M,3) surface positions
    * - Electrostatics
      - :func:`shepherd_score.extract_profiles.get_electrostatic_potential`
      - ``np.ndarray`` (M,) ESP per surface point
    * - Pharmacophores
-     - :func:`shepherd_score.extract_profiles.get_pharmacophores`
+     - :func:`shepherd_score.pharm_utils.pharmacophore.get_pharmacophores`
      - :class:`~shepherd_score.pharm_utils.pharmacophore.Pharmacophore`
 
 :class:`~shepherd_score.pharm_utils.pharmacophore.Pharmacophore` is a lightweight dataclass; it also 
@@ -120,7 +120,7 @@ Extraction of interaction profiles via the :class:`~shepherd_score.container.Mol
        ref_mol,
        # optional options otherwise .surface/.pharmacophore stay empty
        num_surf_points=200,
-       partial_charges=partial_charges,  # If None, MMFF charges
+       partial_charges=partial_charges,  # If None, computed lazily with gfn2-xTB
        pharm_multi_vector=False  # recommended
        # e.g., carbonyls get one HBA vector rather than two
    )
@@ -201,8 +201,12 @@ Next we show alignment using the same :class:`~shepherd_score.container.Molecule
        se3_transform=mp.transform_surf  # or mp.transform_surf_esp, mp.transform_pharm
    )
 
-Alignment of multiple :class:`~shepherd_score.container.MoleculePair` objects can be accelerated 
-with :class:`~shepherd_score.container.MoleculePairBatch` with JAX installed.
+Alignment of many :class:`~shepherd_score.container.MoleculePair` objects at once is
+accelerated by :class:`~shepherd_score.container.MoleculePairBatch`, which pads every pair's
+arrays to a common shape so one compiled kernel is reused across the batch. The ``backend``
+argument defaults to ``None``, which resolves per device: the Triton kernels on CUDA, the numba
+kernels on CPU. JAX is not required; ``backend="jax"`` selects it when the ``jax`` extra is
+installed.
 
 .. code-block:: python
 
@@ -210,11 +214,56 @@ with :class:`~shepherd_score.container.MoleculePairBatch` with JAX installed.
 
    batch = MoleculePairBatch(pairs)  # `pairs` is a list of MoleculePair objects
 
-   # accelerated JAX-based volumetric alignment via padding
-   scores, aligned = batch.align_with_vol()
+   # Device-aware default backend
+   scores, aligned = batch.align_with_vol(return_aligned=True)
+   scores, aligned = batch.align_with_vol_esp(lam=0.1, return_aligned=True)
+   scores, aligned = batch.align_with_surf(ALPHA(200), return_aligned=True)
 
-   # Multi-CPU parallel via shard_map (must set XLA_FLAGS *before* importing JAX)
-   scores, aligned = batch.align_with_vol(num_workers=4, num_buckets=4, use_shmap=True)
+   # JAX path; its multi-CPU shard_map mode needs XLA_FLAGS set before JAX is imported
+   scores, aligned = batch.align_with_vol(backend="jax", num_workers=4, num_buckets=4,
+                                          use_shmap=True)
+
+Every alignment mode is reachable as ``align_with_<mode>`` on both
+:class:`~shepherd_score.container.MoleculePair` and
+:class:`~shepherd_score.container.MoleculePairBatch`. The canonical mode names, their default
+seed and step counts, and the legacy aliases ``esp`` (now ``surf_esp``) and ``esp_combo`` (now
+``vol_and_surf_esp``) live in ``shepherd_score/accel/_modes.py``.
+
+Virtual Screening
+-----------------
+
+For one query against a large library, featurise the library once into an on-disk
+:class:`~shepherd_score.screen.ProfileStore` and stream it past the query with
+:func:`~shepherd_score.screen.screen`. The store keeps only the arrays the requested modes need
+(``float16`` by default) in independent shards, so the library is never held in RAM.
+
+.. code-block:: python
+
+   import numpy as np
+   from shepherd_score.screen import ProfileStore, screen
+
+   # Build once; one store serves every mode listed at creation
+   store = ProfileStore.create("library.fss", num_surf_points=200, modes=("vol", "vol_esp"))
+   for molecule in library_molecules:   # featurised Molecule objects
+       store.add(molecule)
+   store.close()
+
+   # Screen as often as you like
+   store = ProfileStore.open("library.fss")
+   hits = screen(query_molecule, store, mode="vol", top_k=1000)
+   hits = screen(query_molecule, store, mode="vol_esp", top_k=1000, lam=0.1)
+
+   # Every score in library order, not only the top-K
+   scores = np.empty(len(store), dtype=np.float32)
+   screen(query_molecule, store, mode="vol", top_k=1, scores_out=scores)
+
+   # One worker process per GPU; close_multigpu_pool() releases them
+   hits = screen(query_molecule, store, mode="vol", ndev=4)
+
+``num_surf_points`` and the mode-specific keyword arguments must match how the query was built;
+:func:`~shepherd_score.screen.screen` raises if a required one is missing. A store directory is
+single-writer, so for a parallel build give each worker its own store and screen the parts in
+turn. See :doc:`api/screening` for the full API.
 
 Visualization
 -------------

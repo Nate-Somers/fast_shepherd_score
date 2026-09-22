@@ -33,7 +33,8 @@ Quick Install
    pip install shepherd-score
 
    # With optional dependencies
-   pip install "shepherd-score[jax]"      # JAX support for faster scoring
+   pip install "shepherd-score[gpu]"      # Triton GPU kernels (needs a CUDA build of PyTorch)
+   pip install "shepherd-score[jax]"      # JAX implementations of scoring and alignment
    pip install "shepherd-score[docking]"  # Docking evaluation tools
    pip install "shepherd-score[all]"      # Everything
 
