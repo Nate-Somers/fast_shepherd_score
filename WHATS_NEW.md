@@ -714,8 +714,9 @@ pairwise path (Shepherd-Score-Paper, `paper/fig2_speed/validate_canonical.py` an
   bit-identical (2,000 Platinum molecules, 3 queries, 200 pairs, compared within one compile
   state). Laptop pharm screen: +7% at one numba thread, +19% to +75% at eight depending on SVML;
   the cluster number is pending. Only the CPU eager path changes: `pharm` and `pharm_tversky` by
-  default, `vol_color` / `vol_color_tversky` only when their fused loop is bypassed, and one
-  self-overlap call per bucket in `vol_pharm`. The GPU and fused-loop paths are untouched.
+  default; `vol_color`, `vol_color_tversky` and `vol_atomtype` (the colour wrapper) and
+  `vol_pharm` (the pharm wrapper) only in their once-per-bucket self-overlap call, or when
+  their fused loop is bypassed. The GPU and fused-loop paths are untouched.
 - **`accel/` and `screen.py` have no Sphinx API pages**, so none of [§8](#8-api-reference) renders on
   the docs site. When adding them, set `autodoc_mock_imports = ["triton", "numba"]`.
 - **Bit-identity results come from non-early-stopping workloads.** A very small chunk or a
