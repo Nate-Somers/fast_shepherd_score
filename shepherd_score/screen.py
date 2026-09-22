@@ -303,6 +303,12 @@ def _mode_flags(mode: str) -> set:
             continue
         if ch.flag:
             flags.add(ch.flag)
+        if ch.basis == "withH":
+            # A with-H channel needs the store laid out on the with-H basis, which is a property
+            # of the BASIS, not of any one channel. ``_flush`` writes ``all_off`` / ``nonH`` /
+            # ``radii`` / ``cwh`` only under ``schema["with_H"]``, so a mode reading any of them
+            # must demand the flag or it can be handed a store that has none of them.
+            flags.add("with_H")
     return flags
 
 

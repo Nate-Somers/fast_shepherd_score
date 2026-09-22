@@ -238,9 +238,14 @@ _reg(Channel("atomlabels", "labels", "atomtype", "atomlabels",
 _reg(Channel("cwh", "points", "withH", "centers_w_H",
              lambda m: np.asarray(_need(m, "mol", "With-H conformer").GetConformer().GetPositions()),
              "cwh", flag="centers_w_H"))
+# flag="charges" because this channel IS the store's ``charges`` array; the with-H BASIS is what
+# additionally implies the ``with_H`` flag (see ``screen._mode_flags``). Declaring only "with_H"
+# here let a combo-only store claim to support the mode while ``_flush`` -- which writes the whole
+# with-H block under ``if schema["charges"]`` -- wrote none of it, so screening raised
+# ``KeyError: 'cwh'``.
 _reg(Channel("partial", "scalar", "withH", "partial",
              lambda m: np.asarray(_need(m, "partial_charges", "Partial charges")), "charges",
-             flag="with_H", profile="partial_charges"))
+             flag="charges", profile="partial_charges"))
 _reg(Channel("radii", "scalar", "withH", "radii",
              lambda m: np.asarray(_need(m, "radii", "vdW radii")), "radii", flag="radii"))
 # The one pair-level channel: a fixed avoid cloud in the reference frame, attached to the pair
