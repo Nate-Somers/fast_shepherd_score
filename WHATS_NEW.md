@@ -313,10 +313,20 @@ own the cores there; unpinned, torch's pool spin-waits against them. Scoped rath
 does not reconfigure the caller's torch; if you already export `OMP_NUM_THREADS=1`, nothing changes.
 
 **The fused CPU loop now serves 19 of the 21 modes** (it served 4). It is generic over a mode's
-terms and reductions, so a mode joins it by existing. Two exclusions remain, both on the mode's own
-`ModeSpec`: `surf_esp` above 100 padded points (the most shape-degenerate mode, whose fused
-trajectory settles in different but equally valid basins), and the pharmacophore family entirely
-([B12](#b12-pharm-cpu-scores-changed)). The numba kernels run `fastmath=True, parallel=True` over `NUMBA_NUM_THREADS` (default: *all*
+terms and reductions, so a mode joins it by existing. One exclusion remains, on the mode's own
+`ModeSpec`: the pharmacophore family, entirely ([B12](#b12-pharm-cpu-scores-changed)). `vol_esp`
+keeps a `cpu_fused_max_pad=100` bound, which its cloud never approaches.
+
+**`surf_esp` lost its fused-loop exclusion, worth 13.4x on CPU.** It used to carry the same
+`cpu_fused_max_pad=100`, not as a size bound but as a way of excluding the mode: the number was
+chosen because atom clouds fall below it and 200-point surface clouds above it. The stated reason
+was that the library's most shape-degenerate mode might settle in a different, equally valid basin
+under the fused loop, while callers rely on pose-exact agreement. That does not happen. Measured on
+real surfaces with MMFF charges, lifting it moves scores 0.0005% and poses 0.045 deg at 200 surface
+points, and 0.0011% / 0.045 deg at 400. The exclusion always bound, refusing the fused loop above
+about 96 surface points, so it never once fired at the 200-point default and `surf_esp` was the only
+mode declaring `cpu_fused=True` while always running eager. **Any CPU `surf_esp` throughput number
+measured before this is stale**; GPU numbers are unaffected, since the fused loop is a CPU path. The numba kernels run `fastmath=True, parallel=True` over `NUMBA_NUM_THREADS` (default: *all*
 cores), which oversubscribes alongside the process pool — hence `screen_parallel` pinning it to 1.
 
 **The fused loop and the eager loop agree, and that is now tested.** `engine.align` falls back to

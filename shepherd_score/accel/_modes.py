@@ -116,6 +116,18 @@ class ModeSpec:
         driver excluded it for the same reason and measured the fused loop worth only 1.046x at
         N=512 / 1.025x at N=2048 there (job 22637530), so the exclusion costs almost nothing.
     cpu_fused_max_pad : the fused loop is used only when every padded width is at most this.
+        Only ``vol_esp`` sets it, and there it is a real bound: the pre-registry driver measured
+        the fused trajectory agreeing with eager to max|dscore| ~5e-5 for atom-count ESP at
+        ``N_pad <= 100`` and claimed nothing above that. ``surf_esp`` USED to carry the same 100,
+        but as a way of excluding that mode rather than as a size bound -- the number was chosen
+        because atom clouds fall below it and 200-point surface clouds above it, and the stated
+        reason was that the most shape-degenerate mode might settle in a different (equally valid)
+        basin while callers rely on pose-exact agreement. Measured on real open3d surfaces with
+        MMFF charges (SVML, node3105): the basin flip does not occur. Scores move 0.0005% and
+        poses 0.045 deg at 200 surface points, 0.0011% / 0.045 deg at 400, while the exclusion
+        cost **13.4x** at 200 and 16.5x at 400, because it always bound (it refused the fused loop
+        above ~96 surface points, so it never once fired at the 200-point default). Lifted
+        deliberately; ``tests/test_cpu_fine_loops_agree.py`` gates the regime it opened.
     fused_pair : the two gradient terms can be evaluated by ONE fused kernel (the shape+colour
         single launch in ``kernels/vol_color_triton.py``), collapsing two launches per fine step
         into one. CUDA-only and single-tile, so the engine falls back to the two separate
@@ -263,7 +275,7 @@ _reg(ModeSpec("surf", ("transform_surf", "sim_aligned_surf"), 8, 40, 2,
 _reg(ModeSpec("surf_esp", ("transform_surf_esp", "sim_aligned_surf_esp"), 8, 40, 5,
               seed_channel="surf", channels=("surf", "surf_esp"), bucket=("surf",),
               terms=(_SURF_ESP,), params={"alpha": 0.81, "lam": 0.3, **_LR},
-              cpu_fused_max_pad=100, lam_scaling=True, screen_lr=0.1))
+              lam_scaling=True, screen_lr=0.1))
 _reg(ModeSpec("vol_and_surf_esp", ("transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp"),
               8, 60, 5, seed_channel="centers", channels=_COMBO_CH, bucket=("cwh", "surf", "centers"),
               work="combo", terms=_combo_terms(),
