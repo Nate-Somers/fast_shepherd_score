@@ -35,6 +35,27 @@ from ...score.constants import COULOMB_SCALING, LAM_SCALING
 _K_PI = math.pi ** 1.5
 
 
+def _np_cached(x, dtype):
+    """``x`` as a numpy array of ``dtype``, converted once per tensor object.
+
+    The eager fine loop hands the typed kernels the same invariant type, table and count
+    tensors every step, and ``astype`` on the ``(K, N_pad)`` type arrays alone was 13% of a
+    threaded pharm screen. The converted copy is stashed on the tensor and keyed by storage
+    pointer, shape and in-place version counter, so a rebuilt or mutated tensor converts
+    again. Always a copy, never a view, so the stash holds no reference back to the tensor.
+    """
+    key = (x.data_ptr(), tuple(x.shape), x._version, dtype)
+    hit = getattr(x, "_fss_np", None)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    arr = x.detach().cpu().numpy().astype(dtype)
+    try:
+        x._fss_np = (key, arr)
+    except AttributeError:                       # a tensor type that refuses attributes
+        pass
+    return arr
+
+
 @njit(parallel=True, fastmath=True, cache=True)
 def _overlap_grad_kernel(A, B, q, t, Nr, Mr, alpha, need_grad):
     """Fused overlap value + SE(3) gradient, one pose per prange iteration.
@@ -467,16 +488,14 @@ def pharm_score_grad_se3_batch(R, t, ref_types, fit_types, ref_anchors, fit_anch
         return np.ascontiguousarray(x.detach().cpu().numpy())
     RaA = _np(ref_anchors); FaB = _np(fit_anchors)
     RvA = _np(ref_vectors); FvB = _np(fit_vectors)
-    RtA = ref_types.detach().cpu().numpy().astype(np.int64)
-    FtB = fit_types.detach().cpu().numpy().astype(np.int64)
+    RtA = _np_cached(ref_types, np.int64)
+    FtB = _np_cached(fit_types, np.int64)
     Rn = _np(R); tn = _np(t)
-    al = alphas.detach().cpu().numpy().astype(np.float64)
-    Ksn = Ks.detach().cpu().numpy().astype(np.float64)
-    cn = cats.detach().cpu().numpy().astype(np.int64)
-    Nr = (np.full(P, N_pad, np.int64) if N_real is None
-          else N_real.detach().cpu().numpy().astype(np.int64))
-    Mr = (np.full(P, M_pad, np.int64) if M_real is None
-          else M_real.detach().cpu().numpy().astype(np.int64))
+    al = _np_cached(alphas, np.float64)
+    Ksn = _np_cached(Ks, np.float64)
+    cn = _np_cached(cats, np.int64)
+    Nr = np.full(P, N_pad, np.int64) if N_real is None else _np_cached(N_real, np.int64)
+    Mr = np.full(P, M_pad, np.int64) if M_real is None else _np_cached(M_real, np.int64)
     O, gR, gt = _pharm_grad_kernel(RaA, FaB, RvA, FvB, RtA, FtB, Rn, tn, al, Ksn, cn, Nr, Mr, bool(NEED_GRAD))
     return (torch.as_tensor(O, device=dev, dtype=dt),
             torch.as_tensor(gR, device=dev, dtype=dt),
@@ -557,15 +576,13 @@ def pharm_color_score_grad_se3_batch(A, B, q, t, ref_types, fit_types, alphas, K
     Bn = np.ascontiguousarray(B.detach().cpu().numpy())
     qn = np.ascontiguousarray(q.detach().cpu().numpy())
     tn = np.ascontiguousarray(t.detach().cpu().numpy())
-    At = ref_types.detach().cpu().numpy().astype(np.int64)
-    Bt = fit_types.detach().cpu().numpy().astype(np.int64)
-    al = alphas.detach().cpu().numpy().astype(np.float64)
-    Ksn = Ks.detach().cpu().numpy().astype(np.float64)
-    cn = cats.detach().cpu().numpy().astype(np.int64)
-    Nr = (np.full(P, N_pad, np.int64) if N_real is None
-          else N_real.detach().cpu().numpy().astype(np.int64))
-    Mr = (np.full(P, M_pad, np.int64) if M_real is None
-          else M_real.detach().cpu().numpy().astype(np.int64))
+    At = _np_cached(ref_types, np.int64)
+    Bt = _np_cached(fit_types, np.int64)
+    al = _np_cached(alphas, np.float64)
+    Ksn = _np_cached(Ks, np.float64)
+    cn = _np_cached(cats, np.int64)
+    Nr = np.full(P, N_pad, np.int64) if N_real is None else _np_cached(N_real, np.int64)
+    Mr = np.full(P, M_pad, np.int64) if M_real is None else _np_cached(M_real, np.int64)
     O, dQ, dT = _pharm_color_grad_kernel(An, Bn, qn, tn, At, Bt, al, Ksn, cn, Nr, Mr, bool(NEED_GRAD))
     return (torch.as_tensor(O, device=dev, dtype=dt),
             torch.as_tensor(dQ, device=dev, dtype=dt),
@@ -682,16 +699,14 @@ def pharm_grad_dq_se3_batch(q, t, ref_types, fit_types, ref_anchors, fit_anchors
         return np.ascontiguousarray(x.detach().cpu().numpy())
     RaA = _np(ref_anchors); FaB = _np(fit_anchors)
     RvA = _np(ref_vectors); FvB = _np(fit_vectors)
-    RtA = ref_types.detach().cpu().numpy().astype(np.int64)
-    FtB = fit_types.detach().cpu().numpy().astype(np.int64)
+    RtA = _np_cached(ref_types, np.int64)
+    FtB = _np_cached(fit_types, np.int64)
     qn = _np(q); tn = _np(t)
-    al = alphas.detach().cpu().numpy().astype(np.float64)
-    Ksn = Ks.detach().cpu().numpy().astype(np.float64)
-    cn = cats.detach().cpu().numpy().astype(np.int64)
-    Nr = (np.full(P, N_pad, np.int64) if N_real is None
-          else N_real.detach().cpu().numpy().astype(np.int64))
-    Mr = (np.full(P, M_pad, np.int64) if M_real is None
-          else M_real.detach().cpu().numpy().astype(np.int64))
+    al = _np_cached(alphas, np.float64)
+    Ksn = _np_cached(Ks, np.float64)
+    cn = _np_cached(cats, np.int64)
+    Nr = np.full(P, N_pad, np.int64) if N_real is None else _np_cached(N_real, np.int64)
+    Mr = np.full(P, M_pad, np.int64) if M_real is None else _np_cached(M_real, np.int64)
     O, dQ, dT = _pharm_grad_dq_kernel(RaA, FaB, qn, tn, RtA, FtB, RvA, FvB, al, Ksn, cn, Nr, Mr, bool(NEED_GRAD))
     return (torch.as_tensor(O, device=dev, dtype=dt),
             torch.as_tensor(dQ, device=dev, dtype=dt),

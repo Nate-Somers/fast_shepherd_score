@@ -704,6 +704,18 @@ pairwise path (Shepherd-Score-Paper, `paper/fig2_speed/validate_canonical.py` an
   once per bucket and the chunk loop slices it (`self_overlaps=` on `align`/`assemble`); a caller
   that passes nothing keeps the per-call behaviour. Six of the seven modes measured were already
   faster than the baseline before any of this, `pharm` by 10.8%.
+- **The typed CPU kernel wrappers convert their invariant inputs once per bucket.** The pharm and
+  colour wrappers in `kernels/cpu.py` converted the type arrays, the alpha/K/category tables and
+  the real-atom counts to numpy int64/float64 on every call, and the eager fine loop calls them
+  every step with the same tensors; on a threaded pharm screen the per-step copies of the
+  `(K, N_pad)` type arrays alone were 13% of the wall time. `_np_cached` now stashes the converted
+  copy on the tensor, keyed by storage pointer, shape and in-place version counter, so it is
+  redone only when the tensor is rebuilt or written. Screen scores, pairwise scores and poses are
+  bit-identical (2,000 Platinum molecules, 3 queries, 200 pairs, compared within one compile
+  state). Laptop pharm screen: +7% at one numba thread, +19% to +75% at eight depending on SVML;
+  the cluster number is pending. Only the CPU eager path changes: `pharm` and `pharm_tversky` by
+  default, `vol_color` / `vol_color_tversky` only when their fused loop is bypassed, and one
+  self-overlap call per bucket in `vol_pharm`. The GPU and fused-loop paths are untouched.
 - **`accel/` and `screen.py` have no Sphinx API pages**, so none of [§8](#8-api-reference) renders on
   the docs site. When adding them, set `autodoc_mock_imports = ["triton", "numba"]`.
 - **Bit-identity results come from non-early-stopping workloads.** A very small chunk or a

@@ -212,6 +212,13 @@ The screen path never exercises this: the fit builders pre-warm the attributes, 
 - The numba kernels run `fastmath=True, parallel=True` over `NUMBA_NUM_THREADS` (all cores by
   default), which oversubscribes alongside a process pool. That is why `screen_parallel` pins it
   to 1 and pins each worker to a physical core.
+- **A CPU wrapper converts invariant inputs through `cpu._np_cached`, never a per-call `astype`.**
+  The eager fine loop calls the wrapper every step with the same type, table and count tensors;
+  converting the `(K, N_pad)` type arrays per step cost 13% of a threaded pharm screen. The stash
+  is keyed by storage pointer, shape and in-place version counter, so it survives in-place writes
+  and object reuse; keep it a copy, never a view (a view would hold a reference cycle). Gate a new
+  wrapper the same way: two snapshots in ONE compile state, scores and poses `np.array_equal`
+  (`tests/test_cpu_wrapper_conversion_cache.py` pins the helper's contract).
 - **SVML changes precision.** With `numba 0.59.1 + llvmlite 0.42 + icc_rt`, the shape and ESP inner
   loops switch to fp32 structure-of-arrays kernels (`cpu_soa.py`): values ~1e-6 relative, gradients
   ~1e-4. Without it they are correct but much slower, and emit a one-time `RuntimeWarning`.
