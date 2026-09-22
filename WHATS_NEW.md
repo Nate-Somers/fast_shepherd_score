@@ -695,9 +695,15 @@ pairwise path (Shepherd-Score-Paper, `paper/fig2_speed/validate_canonical.py` an
   engine commit — b3599dc, d3bf4bf and 591f695 are flat. Two changes recover most of it: the
   launch ceiling above (~3.5 points on the screen path) and buffering the fine-loop reduction so
   the captured step allocates nothing (~0.8 points on the screen path, roughly 8 on the pairwise
-  cell, where per-step allocation across many steps of one large batch mattered most). About two
-  points remain unexplained. Six of the seven modes measured were already faster than the
-  baseline before either change, `pharm` by 10.8%.
+  cell, where per-step allocation across many steps of one large batch mattered most). A profile
+  of the tree after both changes put GPU time EQUAL to the base (75,585 vs 75,439 us per screen)
+  and the whole remaining gap in host work between launches, of which the largest named piece
+  was `assemble` recomputing every term's self-overlaps for every chunk the sub-batcher handed
+  it -- two eager kernel launches per chunk, each building an identity quaternion on the host,
+  where the old driver hoisted them once per bucket. `engine.term_self_overlaps` now does that
+  once per bucket and the chunk loop slices it (`self_overlaps=` on `align`/`assemble`); a caller
+  that passes nothing keeps the per-call behaviour. Six of the seven modes measured were already
+  faster than the baseline before any of this, `pharm` by 10.8%.
 - **`accel/` and `screen.py` have no Sphinx API pages**, so none of [§8](#8-api-reference) renders on
   the docs site. When adding them, set `autodoc_mock_imports = ["triton", "numba"]`.
 - **Bit-identity results come from non-early-stopping workloads.** A very small chunk or a

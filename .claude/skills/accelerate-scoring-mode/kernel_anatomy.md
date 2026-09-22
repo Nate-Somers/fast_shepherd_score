@@ -91,7 +91,11 @@ raises `KeyError` at the first fine step.
 
 One body serves every mode. `align()`:
 
-1. **`assemble`** — resolve the spec's channels under this call's keywords (`channel_switch`),
+1. **`assemble`** — resolve the spec's channels under this call's keywords (`channel_switch`).
+   Anything that SUB-BATCHES a bucket must hoist the per-term self-overlaps with
+   `engine.term_self_overlaps(spec, chans, params, ref_shared)` once per bucket and pass the
+   chunk's slice as `self_overlaps=`; left to `assemble`, they cost two eager launches per chunk
+   (measured: 78 dispatches per 3 screens where the old driver made 6). Then it does the rest:
    centre the seed clouds if `center_clouds`, build each term's inputs, compute the pose-invariant
    self-overlaps each reduction needs, generate (or accept) the seeds, and expand everything into
    the per-pose layout.
