@@ -1,4 +1,4 @@
-"""``vol_pharm`` driver entry points (shape + DIRECTIONAL pharmacophore overlap, joint gradient)."""
+"""``vol_pharm`` driver entry points (shape + directional pharmacophore overlap, joint gradient)."""
 from __future__ import annotations
 
 import torch
@@ -11,7 +11,7 @@ from .vol_color import _PHARM_PAD_TYPE  # noqa: F401  (same pad type)
 
 @torch.no_grad()
 def _pharm_self_overlap(anc, vec, labels, N_real, tables):
-    """Pose-invariant DIRECTIONAL pharmacophore self-overlap via the pharm kernel at identity."""
+    """Pose-invariant directional pharmacophore self-overlap via the pharm kernel at identity."""
     al, Ks, cats = tables
     P = anc.shape[0]
     q0 = torch.zeros(P, 4, device=anc.device, dtype=anc.dtype); q0[:, 0] = 1.0

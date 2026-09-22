@@ -1,27 +1,12 @@
-"""Generic CUDA-graph fine-loop: capture ONE Adam optimisation step, replay it N times.
+"""Generic CUDA-graph fine loop: capture one Adam optimisation step, replay it N times.
 
-The per-pose fine loop is launch-bound at small/medium batch. One in-place fine step is
-captured into a CUDA graph and replayed ``steps`` times -- replay carries loop state between
-steps through persistent buffers, so N replays == N eager steps, with ~zero per-step host
-launch overhead.
-
-The capture/replay machinery is mode-agnostic and lives in the base class here: a subclass
-supplies only its persistent buffers (``__init__``), the per-step body (``_step``), how a
-bucket's inputs load into the buffers (``_load``), the loop-state reset (``_reset``), and the
-result (``_result``).
-
-Why intra-capture kernel allocations are fine
----------------------------------------------
-The value+grad kernels (``overlap_score_grad_se3_batch`` etc.) allocate their output
-tensors internally each call. That is *not* a capture blocker: under ``torch.cuda.graph``
-those allocations come from the graph's private memory pool and get fixed addresses reused
-on every replay. The two things that DO break capture -- and that every ``_step`` must
-avoid -- are (1) host syncs / data-dependent control flow inside the captured step (the
-blocked early-stop's host sync therefore happens OUTSIDE the graph, between replays)
-and (2) Python rebinding of loop-carried tensors (so a ``_step`` must not use the functional
-``_update_best``, which returns new tensors; it updates ``best``/``best_q``/``best_t`` in
-place via ``where(..., out=)``). Autotune/JIT must also be warmed BEFORE capture --
-``capture()`` does three warmup steps in a side stream for exactly this.
+The per-pose fine loop is launch-bound at small and medium batch. One in-place step is captured
+into a CUDA graph and replayed ``steps`` times; loop state lives in persistent buffers, so N
+replays equal N eager steps with no per-step launch overhead. The base class owns capture and
+replay; a subclass supplies its buffers, the step body (``_step``), bucket loading (``_load``),
+the reset (``_reset``) and the result (``_result``). Kernels may allocate their outputs inside
+the capture; what breaks it is a host sync or data-dependent control flow inside the step and
+Python rebinding of loop-carried tensors. Autotune/JIT is warmed before capture in a side stream.
 """
 from __future__ import annotations
 
@@ -32,19 +17,9 @@ from .._stats import record as _record_steps
 
 
 # --- compute-aware P-cap ----------------------------------------------------------------
-# The graph's win is launch-bound: its per-step launch savings are ~fixed, while its cost
-# grows with the per-row kernel work. So the P at which it stops beating eager scales as
-# budget / (per-row work): cap = clamp(BUDGET // (N_pad*M_pad), MIN, CEIL) graphs each
-# mode/bucket only where it wins and falls back to the eager loop (the baseline -- never a
-# regression) where it would lose. One formula therefore covers the light-cloud and
-# heavy-cloud splits that share a kernel (vol/surf, vol_esp/surf_esp) automatically.
-# CEIL is a fixed per-graph memory ceiling on P (buffers are ~1KB/row, so 256k rows is a
-# ~270MB graph); lower it on memory-constrained GPUs.
-# NO JOB ID: none of the constants in this module (the three below, _GRAPH_ES_BLOCK,
-# _GRAPH_ES_MARGIN, _GRAPH_CACHE_MAX) records the run that set it, so none can be re-checked.
-# Same gap as drivers/shape.py:_MODE_POSES. Cite the job id when you change one. The budget's
-# premise -- that a crossover exists to stay below -- is REFUTED for vol_color, vol_lipo and
-# pharm and INVERTED for vol_and_surf_esp (jobs 22637452 / 22637626); see those drivers.
+# The graph's per-step launch saving is roughly fixed while its cost grows with per-row kernel
+# work, so the P at which it stops beating eager scales as budget / work; graph_cap() clamps
+# that to [MIN, CEIL]. CEIL bounds one graph's persistent buffers (about 1 KB per row).
 _GRAPH_WORK_BUDGET = 300_000_000
 _GRAPH_CAP_CEIL = 262144
 _GRAPH_CAP_MIN = 2000
@@ -55,24 +30,15 @@ def graph_cap(work, budget=None):
     N_pad*M_pad). Below this the graph wins; above it the gating falls back to eager."""
     b = _GRAPH_WORK_BUDGET if budget is None else budget
     return max(_GRAPH_CAP_MIN, min(_GRAPH_CAP_CEIL, int(b) // max(int(work), 1)))
-# Blocked early-stop for the replay loop: test convergence every _GRAPH_ES_BLOCK replays (one
-# host sync per block, NOT per step) on the same patience/tol schedule as the eager loop. The
-# test is PER PAIR, like eager's: each pair's own best (max over its own seed rows) must stall
-# before the loop may break, so one converged pair cannot halt the rest of the bucket. The
-# blocked early-stop MUST reproduce the eager schedule: otherwise the graph runs a fixed step
-# count, OVER-RUNS the eager early-stop, and the compute-bound modes (surf, esp_combo, pharm
-# at large batch) regress on the extra kernel time.
+# Replays between convergence tests in the blocked early-stop (one host sync per block). The
+# test is per pair, like the eager loop's, so one converged pair cannot halt the bucket.
 _GRAPH_ES_BLOCK = 5
-# Extra early-stop margin, in blocks, ADDED to the eager patience for the graph replay loop.
-# The multi-basin modes (surf, surf_esp) land in different near-equal optima under tiny
-# numerical perturbations, so they need this margin for the graph never to score below eager.
+# Extra patience, in blocks, added to the eager patience for the replay loop; the multi-basin
+# modes (surf, surf_esp) land in near-equal optima and need it to not score below eager.
 _GRAPH_ES_MARGIN = 2
 
-# Process-wide LRU cache of captured graphs, keyed by (device, mode, shapes, P, steps, params).
-# It MUST stay bounded: each cached graph pins persistent GPU buffers (~P*buffers bytes), so an
-# unbounded cache lets a long/large workload accumulate GPU memory until fragmentation/OOM makes
-# new captures fail and the driver silently falls back to eager. Evicting the least-recently-used
-# graph frees its buffers; _GRAPH_CACHE_MAX caps how many live at once.
+# Process-wide LRU cache of captured graphs keyed by (device, mode, shapes, P, steps, params).
+# Bounded because each graph pins persistent GPU buffers; unbounded growth ends in OOM.
 _FINE_GRAPH_CACHE: "OrderedDict" = OrderedDict()
 _GRAPH_CACHE_MAX = 24
 
@@ -85,11 +51,9 @@ def _evict_lru():
 
 
 def reset_graph_cache():
-    """Free every cached graph (and its persistent buffers) and return the blocks to the
-    CUDA allocator. Use between independent measurements (e.g. benchmark cells) so each
-    starts from a clean, unfragmented GPU state -- accumulated graph buffers + freed-block
-    fragmentation otherwise degrade later cells. Leaves the Triton autotune cache intact
-    (that is cheap compiled code, not the memory problem)."""
+    """Free every cached graph and its persistent buffers and return the blocks to the CUDA
+    allocator, so independent runs start from an unfragmented GPU. The Triton autotune cache
+    is left intact."""
     _FINE_GRAPH_CACHE.clear()
     torch.cuda.empty_cache()
 
@@ -119,9 +83,8 @@ class _GraphedFineBase:
         self.es_patience = 0
         self.es_tol = 1e-5
         self.es_block = _GRAPH_ES_BLOCK
-        # Seed rows per PAIR, so the early-stop can reduce `best` per pair. Set by
-        # run_graphed from the driver; 0 == caller did not say, which degenerates to the
-        # whole buffer as a single row (the bucket-global test this replaced).
+        # Seed rows per pair, so the early-stop can reduce `best` per pair; set by run_graphed.
+        # 0 means the whole buffer is treated as one row.
         self.es_seeds = 0
 
     # --- subclass hooks (no-ops here so a mis-specified subclass fails loudly) ---
@@ -148,25 +111,12 @@ class _GraphedFineBase:
         early-stop when enabled), and return the best pose."""
         self._load(*inputs); self._reset()
         if self.es_patience:
-            # Mirror the eager early-stop SCHEDULE exactly, not just its patience/tol. Eager
-            # checks at steps 0, 5, 10, ... and seeds its baseline `prev` with the STEP-0
-            # value (the best of the seed poses). `best` is a max over past poses, so after
-            # one replay it equals eager's step-0 best: replay one step, seed `prev` from it,
-            # then check every es_block replays. The graph then stops at the same step as
-            # eager and `best` is equivalent.
-            #
-            # PER-PAIR, exactly as the eager loop is. `self.best` is the pose-row buffer the
-            # driver filled from its own expansion -- S seed rows per pair, laid out
-            # pair-major -- so .view(-1, S) row k is pair k, the same reshape the driver uses
-            # to gather its result. A pair has converged when ITS OWN best stalls, and the
-            # loop may break only once EVERY pair has. S comes from the driver (es_seeds); it
-            # is not derivable here, since the buffers only ever see the flat pose-row count.
-            #
-            # Safe in a replay loop: every op here runs BETWEEN graph.replay() calls, never
-            # inside the capture, so there is no graph-illegal control flow and no allocation
-            # from the graph's private pool. amax stays on-device and the `improved.any()`
-            # below is the SAME single host sync per block that best.max().item() cost --
-            # going per-pair adds no sync.
+            # Mirror the eager early-stop schedule: eager checks at steps 0, 5, 10, ... and
+            # seeds its baseline with the step-0 best, so replay one step, seed `prev` from it,
+            # then check every es_block replays. The test is per pair: `best` holds S seed rows
+            # per pair, pair-major, so .view(-1, S) row k is pair k, and the loop may break only
+            # once every pair has stalled. Everything here runs between replays, outside the
+            # capture; `improved.any()` is the one host sync per block.
             S = self.es_seeds or self.best.numel()
             self.graph.replay()
             done = 1
@@ -184,21 +134,15 @@ class _GraphedFineBase:
                         break
                 else:
                     no_improve = 0
-                # Advance a pair's baseline only where that pair improved, matching the eager
-                # rule. At least as long as the global test it replaced in every measured case,
-                # but NOT provably never-earlier: per-check gains that straddle es_tol can spend
-                # a baseline reset the global rule still holds, costing one block (es_block).
+                # Advance a pair's baseline only where that pair improved, as the eager rule does.
                 prev = torch.where(improved, cur, prev)
         else:
             for _ in range(self.steps):
                 self.graph.replay()
             done = self.steps
-        # Replays executed == value+grad evaluations, against the configured budget. One
-        # record per bucket run, tagged graphed=True: this is the ONLY site that can say a
-        # bucket took the replay loop rather than the eager fall-back, and the two run
-        # different early-stop schedules (eager patience vs patience + _GRAPH_ES_MARGIN), so
-        # a rate change is not attributable without knowing which one ran. No-op unless
-        # _stats recording was enabled.
+        # Replays executed == value+grad evaluations. Tagged graphed=True because the replay
+        # loop and the eager loop run different early-stop schedules. No-op unless _stats
+        # recording is enabled.
         _record_steps(done, self.steps, done < self.steps, graphed=True)
         return self._result()
 
@@ -211,13 +155,13 @@ def run_graphed(make, key, inputs, *, es_patience=0, es_tol=1e-5, es_seeds=0):
     captured graph serves every bucket of the same key (same shapes/P/steps/params).
     ``es_patience``/``es_tol`` set the replay-loop blocked early-stop to match the driver's
     eager early-stop (0 -> run a fixed ``steps`` replays), and ``es_seeds`` is the
-    driver's seed count per PAIR, which that early-stop needs to reduce ``best`` per
+    driver's seed count per pair, which that early-stop needs to reduce ``best`` per
     pair rather than over the whole bucket.
     """
     gf = _FINE_GRAPH_CACHE.get(key)
     if gf is not None:
         _FINE_GRAPH_CACHE.move_to_end(key)       # mark most-recently-used
-        gf.es_seeds = int(es_seeds)              # a property of THIS call, not of
+        gf.es_seeds = int(es_seeds)              # a property of this call, not of
         return gf.run(*inputs)                   # the cached graph
     gf = make()
     gf.es_seeds = int(es_seeds)

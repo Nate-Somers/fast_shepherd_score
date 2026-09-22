@@ -1,18 +1,7 @@
-"""Reference-mode tests for the asymmetric "fits-inside" ``vol_esp_tversky`` overlay.
-
-``vol_esp_tversky`` is the ``vol_esp`` electrostatic-weighted volumetric overlap scored with a
-**Tversky** reduction instead of Tanimoto -- exactly what ``vol_tversky`` is to ``vol``.
-
-Correctness gates (per the design-scoring-mode skill):
-  * self-overlap == 1.000 (Tversky(A,A) = 1 for any weights),
-  * autograd gradient matches central finite differences at a NON-identity pose (float32),
-  * the multi-start optimizer recovers a planted rotation (score -> ~1.0),
-  * determinism given a fixed seed,
-  * retained-H molecule (deuterium survives ``Chem.RemoveHs``): heavy centres come from the
-    with-H conformer indexed by ``_nonH_atoms_idx`` (1:1 with the heavy charges), NOT ``atom_pos``
-    -- REQUIRED because this mode reads per-atom partial charges,
-  * Tversky asymmetry: a small query contained in a bigger molecule scores HIGHER when the small
-    molecule is the REFERENCE (query -> big fit) than in the reverse direction.
+"""Reference-mode gates for the asymmetric ``vol_esp_tversky`` overlay (``vol_esp`` with a Tversky
+reduction): self-overlap = 1.0, autograd vs finite difference at a non-identity pose, planted-pose
+recovery, determinism, the retained-H basis (heavy centres indexed by ``_nonH_atoms_idx``), and
+Tversky asymmetry (a small query scores higher as the reference than as the fit).
 """
 import warnings
 
@@ -63,8 +52,7 @@ def _make_pair(ibuprofen):
 
 
 def _heavy_pos_charges(ibuprofen):
-    """Strict-heavy centres (with-H conformer indexed by _nonH_atoms_idx) + heavy charges,
-    the exact inputs the mode consumes -- centred to the heavy COM."""
+    """Strict-heavy centres and heavy charges, centred to the heavy COM."""
     m = Molecule(ibuprofen)
     pos = m.mol.GetConformer().GetPositions()[m._nonH_atoms_idx].astype(np.float32)
     pos = pos - pos.mean(0)
@@ -148,10 +136,7 @@ def test_deterministic_given_seed(ibuprofen):
 
 # --- Gate 5: retained-H molecule (REQUIRED -- this mode reads per-atom charges) ----------------
 def test_retained_h_molecule():
-    """A molecule whose ``Chem.RemoveHs`` RETAINS an H (isotope-labelled deuterium) has
-    ``atom_pos`` longer than the true-heavy set ``_nonH_atoms_idx`` selects. This mode pairs
-    heavy charges with heavy centres taken from ``GetConformer().GetPositions()[_nonH_atoms_idx]``
-    (never ``atom_pos``), so it must not desync/crash -- and the self-copy still scores ~1.0."""
+    """A retained-H molecule must not desync heavy charges from centres, and self-copy scores ~1.0."""
     from rdkit import Chem
     from rdkit.Chem import AllChem
     m = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))       # deuterium survives RemoveHs
@@ -170,8 +155,7 @@ def test_retained_h_molecule():
 
 # --- Gate 6: Tversky asymmetry (fits-inside) --------------------------------------------------
 def test_tversky_asymmetry_fits_inside():
-    """A small query contained in a larger molecule should score HIGHER when it is the
-    REFERENCE (query -> big fit) than in the reverse direction, under the default weights."""
+    """A small query contained in a larger molecule scores higher as the reference than as the fit."""
     phenol = _embed("Oc1ccccc1")
     naphthol = _embed("Oc1ccc2ccccc2c1")
 

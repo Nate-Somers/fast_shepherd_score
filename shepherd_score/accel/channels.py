@@ -1,24 +1,12 @@
-"""The per-molecule data CHANNELS the alignment modes read, as one table.
+"""The per-molecule data channels the alignment modes read, as one table.
 
-A channel is one named per-molecule array -- the heavy-atom cloud, the surface points, the
-per-atom partial charges, the pharmacophore anchors, ... -- together with everything every layer
-needs to know about it:
-
-* how to READ it off a ``Molecule`` (or the RDKit-free ``MoleculeProfile``),
-* which cached tensor attribute carries it on a ``MoleculePair`` (``_ref_<attr>_t`` /
-  ``_fit_<attr>_t``),
-* how a ``ProfileStore`` PERSISTS it (array key, offset-table key or dense, schema flag),
-* how it behaves under the store's pre-centring and canonical rotation, and
-* what a padded slot holds.
-
-Every mode-shaped consumer -- the batched pairwise aligner, the array-native screen aligner,
-the store schema / profile / concat / reconstruct, the query and fit tensor plumbing, and the
-process-pool tensor spec -- reads this table through a :class:`ModeSpec`'s channel names instead
-of carrying a per-mode body. A mode that needs data the library does not yet carry adds ONE row
-here (plus the ``Molecule`` accessor quartet the ``design-scoring-mode`` skill describes), and
-every layer picks it up.
-
-Pure Python + numpy; no torch, so ``_modes.py`` and this module stay importable everywhere.
+A channel is one named per-molecule array (heavy-atom cloud, surface points, partial
+charges, pharmacophore anchors, ...) together with how to read it off a ``Molecule`` or
+``MoleculeProfile``, which cached tensor attribute carries it on a ``MoleculePair``
+(``_ref_<attr>_t`` / ``_fit_<attr>_t``), how a ``ProfileStore`` persists it, how it
+behaves under the store's centring and canonical rotation, and what a padded slot holds.
+Every mode-shaped consumer reads this table through a :class:`ModeSpec`'s channel names;
+a mode that needs new data adds one row here. Pure Python + numpy, no torch.
 """
 from __future__ import annotations
 
@@ -39,7 +27,7 @@ BASES = {
     "surf": None,              # fixed-width surface (dense (K, S, ...) block in the store)
     "pharm": "pharm_off",      # pharmacophore features
     "withH": "all_off",        # every atom of the with-H conformer
-    "lipo": "lipo_off",        # strict heavy, own table (see _concat: retained-H trap)
+    "lipo": "lipo_off",        # strict heavy, own table (Chem.RemoveHs may retain an H)
     "fukui": "fukui_off",
     "mr": "mr_off",
     "atomtype": "atomtype_off",
@@ -52,12 +40,12 @@ class Channel:
     """One per-molecule array.
 
     name : the channel id a :class:`ModeSpec` term refers to.
-    kind : ``"points"`` (N,3) coordinates that rotate AND translate; ``"vectors"`` (N,3)
+    kind : ``"points"`` (N,3) coordinates that rotate and translate; ``"vectors"`` (N,3)
         directions that rotate only; ``"scalar"`` (N,) per-point values; ``"labels"`` (N,) int
         type indices.
     basis : see :data:`BASES`; ``"pair"`` for a pair-level input read off the MoleculePair.
     attr : the pair tensor stem: ``_ref_<attr>_t`` / ``_fit_<attr>_t`` (``_<attr>_t`` for a
-        pair-level channel), the names the aligners have always used.
+        pair-level channel).
     read : ``molecule -> np.ndarray`` (host); raises ``ValueError`` when the molecule lacks it.
     key : the store array key; ``None`` for a channel the store never holds.
     flag : the schema flag that says a store carries it; ``None`` = always stored.
@@ -121,11 +109,9 @@ def _need(m, attr, what):
 
 
 def _heavy_positions(m):
-    """Strict-heavy (Z != 1) atom coordinates, ordered to match ``partial_charges[_nonH_atoms_idx]``
-    -- the Gaussian centres of every heavy-atom field channel. Read from the with-H conformer
-    when present (a ``Molecule``, or a combo ``MoleculeProfile`` via its conformer shim); a
-    heavy-only profile falls back to its stored strict-heavy set, or to ``atom_pos`` when the two
-    coincide (Chem.RemoveHs kept no H)."""
+    """Strict-heavy (Z != 1) atom coordinates ordered to match ``partial_charges[_nonH_atoms_idx]``.
+    Read from the with-H conformer when present; a heavy-only profile falls back to its stored
+    strict-heavy set, or to ``atom_pos`` when Chem.RemoveHs kept no H."""
     mol = getattr(m, "mol", None)
     idx = getattr(m, "_nonH_atoms_idx", None)
     if mol is not None and idx is not None:
@@ -179,8 +165,8 @@ def _read_surf(attr, what):
     return _r
 
 
-# Padding label for pharmacophore slots: the 'Dummy' family (lookup category 3 -> skipped by the
-# kernel). Derived by NAME so an upstream reorder of P_TYPES stays correct.
+# Padding label for pharmacophore slots: the 'Dummy' family (lookup category 3, skipped by the
+# kernel). Derived by name so an upstream reorder of P_TYPES stays correct.
 def _pharm_pad_type() -> int:
     from ..score.constants import P_TYPES
     return P_TYPES.index("Dummy")
@@ -238,11 +224,8 @@ _reg(Channel("atomlabels", "labels", "atomtype", "atomlabels",
 _reg(Channel("cwh", "points", "withH", "centers_w_H",
              lambda m: np.asarray(_need(m, "mol", "With-H conformer").GetConformer().GetPositions()),
              "cwh", flag="centers_w_H"))
-# flag="charges" because this channel IS the store's ``charges`` array; the with-H BASIS is what
-# additionally implies the ``with_H`` flag (see ``screen._mode_flags``). Declaring only "with_H"
-# here let a combo-only store claim to support the mode while ``_flush`` -- which writes the whole
-# with-H block under ``if schema["charges"]`` -- wrote none of it, so screening raised
-# ``KeyError: 'cwh'``.
+# flag="charges" because this channel is the store's ``charges`` array; the with-H basis is what
+# additionally implies the ``with_H`` flag (see ``screen._mode_flags``).
 _reg(Channel("partial", "scalar", "withH", "partial",
              lambda m: np.asarray(_need(m, "partial_charges", "Partial charges")), "charges",
              flag="charges", profile="partial_charges"))
@@ -277,12 +260,10 @@ SCHEMA_FLAGS = ("surf", "surf_esp", "charges", "with_H", "radii", "centers_w_H",
 def load_store_channel(arrs: dict, name: str):
     """``(flat_or_dense array, offsets or None)`` for channel ``name`` out of one shard's arrays.
 
-    Two channels need more than a key lookup, and both are the same trap seen twice: the heavy
-    basis. ``heavy`` / ``charges`` live on ``heavy_off`` + ``xyz_noH`` only when some molecule's
-    ``Chem.RemoveHs`` retained an H (then ``atom_off`` no longer matches the heavy set); otherwise
-    ``atom_off`` + ``atom_pos`` already ARE the heavy set and nothing extra was written. And on a
-    with-H store the heavy charges are the with-H array gathered by ``nonH`` plus each molecule's
-    ``all_off`` start -- the vectorised twin of ``charges[all_off[i]:all_off[i+1]][nonH[h0:h1]]``.
+    The heavy basis needs more than a key lookup: ``heavy`` / ``charges`` live on ``heavy_off``
+    + ``xyz_noH`` only when some molecule's ``Chem.RemoveHs`` retained an H; otherwise
+    ``atom_off`` + ``atom_pos`` already are the heavy set. On a with-H store the heavy charges
+    are the with-H array gathered by ``nonH`` plus each molecule's ``all_off`` start.
     """
     c = CHANNELS[name]
     if c.is_pair:

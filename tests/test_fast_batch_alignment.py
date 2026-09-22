@@ -226,8 +226,7 @@ def test_fast_esp_combo_padding_masks_stable():
 
 
 def _esp_combo_synth_batch(device):
-    """Two synthetic esp_combo pairs of different sizes (padding required), built
-    on ``device``. Reseeds per call so CPU and CUDA runs get identical inputs."""
+    """Two synthetic esp_combo pairs of different sizes on ``device``, reseeded per call."""
     torch.manual_seed(0)
     device = torch.device(device)
     K = 2
@@ -262,8 +261,7 @@ def _esp_combo_synth_batch(device):
 
 
 def test_esp_combo_numba_cpu_and_matches_triton():
-    """esp_combo on the CPU/numba backend (via the fused esp_comparison_batch kernel):
-    runs, gives finite in-range scores, and matches the Triton path when CUDA is present."""
+    """esp_combo on numba gives finite in-range scores and matches Triton when CUDA is present."""
     pytest.importorskip("numba")
     from shepherd_score.accel.drivers.esp_combo import (
         fast_optimize_esp_combo_score_overlay_batch,

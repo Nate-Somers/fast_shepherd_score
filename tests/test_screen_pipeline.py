@@ -1,19 +1,7 @@
-"""Gate for the screen's pipeline changes: pose-capped sub-batching, deferred canonical
-composition, pinned device-side shard upload, and the memory-mappable shard format.
-
-Every one of these is a claim of the form "same answer, less time", so what has to be pinned is
-the SAME ANSWER half. Three of them cannot change a score even in principle (they move work
-between host and device, defer it, or change where bytes are stored) and one -- the pose cap --
-changes WHICH FINE LOOP RUNS,
-which is exactly why it needs a test: before it, a sub-batch was sized from free GPU memory
-alone, so a bucket that happened to fit in one chunk exceeded ``graph_cap`` and silently took
-the eager loop instead of the CUDA graph. The two paths do not agree (the graph replay carries
-``_GRAPH_ES_MARGIN`` extra blocks of early-stop patience), so the screen's scores depended on
-what the allocator was holding. ``test_pose_cap_graphs_every_chunk_on_a_narrow_fixture`` is the
-assertion that the choice is now a function of the band alone -- note it is NOT an assertion that
-everything graphs, which is false above N_pad*M_pad = 3,662; see that test's docstring.
-
-The CPU-only tests here run everywhere; the rest need CUDA + Triton and skip without them.
+"""Gate for the screen's pipeline levers: pose-capped sub-batching, deferred canonical
+composition, pinned shard upload and the memory-mappable shard format. Each must give the same
+answer; the pose cap also decides which fine loop runs, so it must be a function of the band
+alone. CPU-only tests run everywhere; the rest need CUDA + Triton.
 """
 import os
 
@@ -40,9 +28,7 @@ def _require_fast_cuda():
         pytest.skip("Triton not available")
 
 
-# Alkanes so the library crosses _band_key's multiples of 16 (bands 16/32/48), the only place
-# the span/pad arithmetic differs -- see test_screen_arrays.py for why drug-like sizes alone
-# leave that untested.
+# Alkanes so the library crosses _band_key's multiples of 16 (see test_screen_arrays.py).
 _SMILES = ["CCO", "c1ccccc1O", "CC(=O)Oc1ccccc1C(=O)O", "CC(C)Cc1ccc(cc1)C(C)C(=O)O"] + \
           ["C" * n for n in (12, 18, 20, 26, 30, 34)]
 
@@ -79,13 +65,7 @@ def canon_store(tmp_path_factory, molecules):
 # ---------------------------------------------------------------------------------------
 
 def test_deferred_composition_matches_composing_at_offer_time():
-    """``offer_row`` now stores the pending ``(row, rot_row)``; ``sorted()`` composes it.
-
-    The check is against the old behaviour computed inline, and it is only meaningful if the
-    composition actually does something -- so the rotation is deliberately non-identity and the
-    test asserts the composed transform DIFFERS from the raw row. Without that, a regression
-    that dropped the composition entirely would still pass.
-    """
+    """Composing at ``sorted()`` must equal composing at offer time, with a non-identity rotation."""
     rng = np.random.default_rng(0)
     K = 25
     T = rng.standard_normal((K, 4, 4)).astype(np.float32)
@@ -165,12 +145,7 @@ def test_to_device_matches_host_widening_exactly():
 
 @pytest.mark.cuda
 def test_pose_cap_bounds_the_subbatch_and_only_when_asked():
-    """``pose_cap`` is what arms it; without it the schedule is memory-derived as before.
-
-    Opt-in matters here, not just tidiness: armed on every mode the cap measured 1.2985x on
-    vol, 0.9981x on vol_esp and **0.6496x on pharm** (job 22598857), because each driver graphs
-    below its own ``graph_cap`` budget. A cap that defaulted on would be a regression for two
-    of the three."""
+    """``pose_cap`` bounds the sub-batch and is opt-in; without it the schedule is memory-derived."""
     _require_fast_cuda()
     from shepherd_score.accel.batch import _pad as padmod
 
@@ -201,21 +176,7 @@ def test_pose_cap_bounds_the_subbatch_and_only_when_asked():
 
 @pytest.mark.cuda
 def test_pose_cap_graphs_every_chunk_on_a_narrow_fixture(monkeypatch, canon_store, molecules):
-    """With the cap, every fine-loop call of THIS fixture reaches the CUDA graph.
-
-    The regression the cap exists for: with the memory-derived schedule alone, whether a bucket
-    graphs or falls back to eager depends on free GPU memory at that moment, and the two paths
-    score differently (the graph replay carries the early-stop margin).
-
-    READ THE PRECONDITION. This does NOT show that the cap makes graphing unconditional -- that
-    is false and was measured false: a capped chunk is 81,920 poses, graph_cap(work) =
-    max(2000, min(262144, 300_000_000 // work)), so it fits only while N_pad*M_pad <= 3,662.
-    Band 48 graphs; band 64 (work 4,096) and band 112 both run EAGER under the same cap.
-    This fixture's molecules are all narrow enough to pad to band 48, which is the ONLY reason
-    graphed == calls holds here -- so the precondition is asserted below rather than assumed.
-    Widen the fixture past 48 heavy atoms and this test SHOULD go red; that is the signal, not
-    a bug.
-    """
+    """With the cap every fine-loop call on this band-48 fixture reaches the CUDA graph."""
     _require_fast_cuda()
     from shepherd_score.accel.batch import _arrays
     from shepherd_score.accel.drivers import engine as enginemod
@@ -224,8 +185,7 @@ def test_pose_cap_graphs_every_chunk_on_a_narrow_fixture(monkeypatch, canon_stor
 
     monkeypatch.setattr(_arrays, "ENABLED", True)
     seen = {"calls": 0, "graphed": 0}
-    # ONE fine loop serves every mode now, so the two seams are the engine's entry point and
-    # the shared CUDA-graph runner it calls -- not a per-mode driver's own pair of functions.
+    # one fine loop serves every mode: the seams are the engine entry and the shared graph runner
     _align, _rgf = enginemod.align, enginemod.run_graphed
 
     def cfa(*a, **k):
@@ -242,9 +202,8 @@ def test_pose_cap_graphs_every_chunk_on_a_narrow_fixture(monkeypatch, canon_stor
     store = ProfileStore.open(canon_store)
     q = molecules[0]
 
-    # The precondition this test rests on, asserted rather than assumed: every molecule must
-    # pad to band 48 (work 2,304 <= 3,662) or a capped chunk legitimately runs eager and the
-    # graphed == calls assertion below would be testing a false claim.
+    # precondition: every molecule pads to band 48; above that a capped chunk legitimately runs
+    # eager and graphed == calls would be a false claim
     _heavy = max(int((m.atom_pos_noH if hasattr(m, "atom_pos_noH") else m.atom_pos).shape[0])
                  for m in molecules + [q])
     assert _heavy <= 48, (
@@ -281,12 +240,7 @@ def test_pose_cap_graphs_every_chunk_on_a_narrow_fixture(monkeypatch, canon_stor
 
 @pytest.mark.cuda
 def test_shard_upload_stages_through_pinned_memory(monkeypatch, canon_store):
-    """The shard upload must go through a PINNED buffer and retype on the device.
-
-    Not a style point. Pageable is what made it slow (0.149 us/mol = 12.1% of the wall at
-    N=1,000,000 at an effective ~1.2 GB/s), and a float32 request here would widen on the host
-    and push twice the bytes. The float16 -> float32 result must still be exact.
-    """
+    """The shard upload must stage through pinned memory and widen float16 on the device, exactly."""
     _require_fast_cuda()
     store = ProfileStore.open(canon_store)
     _, arrs = store.read_shard(0)
@@ -317,11 +271,7 @@ def test_shard_upload_stages_through_pinned_memory(monkeypatch, canon_store):
 
 @pytest.mark.cuda
 def test_memory_mapped_shards_match_the_zip_format(tmp_path, molecules):
-    """The .npy shard format must hand back exactly what the .npz one did.
-
-    It is a format change, so the check is on the BYTES, and on both shards' worth: a store
-    written either way must read back identical arrays and screen to identical scores.
-    """
+    """The .npy shard format must read back the same bytes and screen to the same scores as .npz."""
     out = {}
     for fmt in ("npz", "npy"):
         p = os.path.join(str(tmp_path), f"{fmt}.fss")

@@ -1,43 +1,13 @@
 # shepherd_score/accel/batch/_arrays.py
-"""Array-native screen path: the same alignment, with no per-molecule Python objects.
+"""Array-native screen path: the batched alignment with no per-molecule Python objects.
 
-WHY THIS EXISTS. The batched aligners take a LIST OF PAIR OBJECTS -- a pairwise library's
-contract -- and the streaming screen wears it. Screening K molecules manufactures K
-``_FastPair`` instances and K ``torch.split`` views, bins them in a per-item Python loop,
-rebuilds per-bucket lists from them, then ``cat``s the coordinates back into exactly the dense
-padded array the store could have handed over directly. Measured at N=100,000 (L40S, mode vol):
-
-    build_fit 2.59 + plan_buckets 1.38 + scatter_fill 0.62 + residual_inline 1.40
-      = 5.99 us/mol, 59% of a 10.07 us/mol screen
-
-ROSHAMBO2 runs the same algorithm through ONE native call with zero per-molecule Python, which
-is the entire reason it is ~8x faster on the screen while having the SLOWER kernel per useful
-atom pair (3.74 ps vs fss's 2.22).
-
-A PARTIAL VERSION IS WORTH EXACTLY ZERO. That is measured, not cautionary: vectorising the
-binning alone removed the O(K) loop and spent every microsecond back building the per-cell
-Python lists that ``Bucket.members`` requires (0.89 vs 0.88 us/mol, reverted). The objects have
-to stop existing along the whole path -- which is why bucket membership here is a SPAN over an
-index array, and why the transforms come back as one (K,4,4) array instead of being written
-onto K objects.
-
-BIT-IDENTITY. Every step below is a re-expression, not a re-derivation:
-  * the bucket PARTITION is reproduced exactly -- ``_merge_group`` and ``_cap_upfront`` are
-    reused verbatim, so the merge policy cannot drift, and the cells they consume are built by
-    the same band arithmetic;
-  * the padded workspace is filled from the same source memory by the same index arithmetic as
-    ``_scatter_fill``, just gathering from the store's contiguous buffer instead of ``cat``ing
-    K views of it;
-  * the ref side is broadcast rather than replicated, which is what the existing VAA fast path
-    already does for the identical reason (every screen pair shares one query tensor).
-
-ONE ALIGNER FOR EVERY MODE. :func:`align_arrays` reads the mode's :class:`ModeSpec` channels,
-so a mode joins this path by existing in the registry rather than by gaining a hand-written
-body here; ``align_batch_<mode>_arrays`` wrappers are generated for callers that name one.
-
-ON by default. The gates are tests/test_screen_arrays.py and tests/test_screen_pipeline.py;
-``ENABLED`` survives only as the seam those parity tests flip to force the object path for
-comparison -- it is not a runtime switch and nothing reads the environment.
+The object aligners take a list of pair objects; a streaming screen would otherwise build K
+pair objects, bin them in a Python loop and ``cat`` their coordinates back into the padded
+array the store already holds. Here bucket membership is a span over an index array, the
+workspace is gathered straight from the store's contiguous buffer, the reference side is
+broadcast rather than replicated, and the transforms come back as one (K,4,4) array. The
+partition reuses ``_merge_group`` / ``_cap_upfront``; :func:`align_arrays` reads the mode's
+:class:`ModeSpec`, so every registry mode takes this path. ``ENABLED`` is a test seam only.
 """
 from __future__ import annotations
 
@@ -49,26 +19,20 @@ from ._pad import _band_key, _BAND, _subbatched_align, _FINE_CHUNK_POSES
 from .._modes import SPECS, MODE_SEEDS
 from ..channels import CHANNELS
 
-#: Test seam only -- see the module docstring. Production always takes this path.
+#: Test seam: the parity tests flip this to force the object path. Not a runtime switch.
 ENABLED = True
 
-#: Modes whose fine-loop sub-batch is capped at ``_FINE_CHUNK_POSES``. Measured per mode, and
-#: ``vol`` is the only one it has ever helped: vol 1.2985x kept; vol_esp 0.9981x; pharm 0.6496x
-#: (job 22598857); vol_color 0.6523x (job 22599113); vol_lipo 0.871x/0.939x/1.028x at
-#: 29,296/81,920/262,144 poses (job 22637392). What the cap buys ``vol`` is a graph/eager
-#: decision that is a function of the band rather than of allocator state.
+#: Modes whose fine-loop sub-batch is capped at ``_FINE_CHUNK_POSES``; the cap makes the
+#: graph-vs-eager choice a function of the band rather than of allocator state.
 _POSE_CAP_MODES = ("vol",)
 
 
 class Span:
     """A contiguous ``[lo, hi)`` slice of a precomputed ordering, standing in for a Bucket's
-    member LIST.
+    member list.
 
-    ``Bucket.K`` is ``len(self.members)`` and ``_merge`` builds ``Bucket(a.members + b.members,
-    ...)``, so supporting ``__len__``, ``__add__`` and slicing is the entire contract needed to
-    reuse the real merge policy unchanged. Merges are provably adjacent: ``_merge_group`` sorts
-    by pad and folds each bucket into its PREDECESSOR, and cells are emitted in ascending band
-    order, so ``a.hi == b.lo`` always holds.
+    ``__len__``, ``__add__`` and slicing are all ``_merge_group`` needs. Merges are always
+    adjacent: buckets fold into their predecessor in ascending band order, so ``a.hi == b.lo``.
     """
 
     __slots__ = ("lo", "hi")
@@ -95,13 +59,10 @@ class Span:
 
 
 class IdxSet:
-    """Bucket members as an index ARRAY, for keys that are not one-dimensional.
+    """Bucket members as an index array, for keys with several dimensions.
 
-    :class:`Span` is cheaper but requires every merge to be ADJACENT, which holds only because a
-    1-D band key makes the emitted cell order identical to the order ``_merge_group`` sorts into.
-    Once the key has several dims, ``_merge_group`` re-sorts after each fold and that guarantee is
-    gone. ``IdxSet`` drops the requirement: ``__add__`` concatenates. The cost is one numpy concat
-    per MERGE, over the small occupied-cell set, never per molecule.
+    ``_merge_group`` re-sorts after each fold once the key has several dims, so merges are no
+    longer adjacent and :class:`Span` cannot serve; ``__add__`` concatenates instead.
     """
 
     __slots__ = ("arr",)
@@ -119,20 +80,16 @@ class IdxSet:
         return IdxSet(self.arr[sl])
 
     def idx(self, order=None) -> np.ndarray:
-        """Absolute shard indices. ``order`` is accepted and ignored so a caller can treat this
-        interchangeably with :meth:`Span.idx`."""
+        """Absolute shard indices; ``order`` is accepted and ignored to match :meth:`Span.idx`."""
         return self.arr
 
 
 def plan_spans(m_sizes: np.ndarray, n_ref: int, seeds: int, device):
-    """Partition K library molecules into padded buckets WITHOUT touching them individually.
+    """Partition K library molecules into padded buckets without touching them individually.
 
-    Returns ``(order, buckets)`` where ``order`` is a stable argsort by fit band and each
-    bucket's ``.members`` is a :class:`Span` into it.
-
-    On the screen path the ref size is constant (one query), so the cell key collapses to the
-    fit band alone and the whole binning is ``((m+15)//16)*16`` plus one stable argsort --
-    versus ~20 interpreted operations per molecule in ``plan_buckets``.
+    Returns ``(order, buckets)``: ``order`` is a stable argsort by fit band and each bucket's
+    ``.members`` is a :class:`Span` into it. The ref size is constant on the screen path, so
+    the cell key is the fit band alone.
     """
     K = int(m_sizes.shape[0])
     bands = ((m_sizes.astype(np.int64) + 15) // 16) * 16          # == _band_key, vectorized
@@ -149,15 +106,12 @@ def plan_spans(m_sizes: np.ndarray, n_ref: int, seeds: int, device):
 
 
 def plan_spans_multi(fit_dims: dict, const_dims: dict, spec, device, partition: dict = None):
-    """Multi-dimensional twin of :func:`plan_spans`, for modes whose PadSpec keys several dims.
+    """Multi-dimensional twin of :func:`plan_spans`, for PadSpecs that key several dims.
 
-    ``fit_dims``  : name -> (K,) int array of per-molecule sizes (the dims that VARY).
-    ``const_dims``: name -> int, dims fixed for the whole screen (the single query's clouds, and
-                    anything the store stores at a fixed width, e.g. surface points).
-    ``partition`` : name -> exact value, uniform across the screen.
-
-    Cells are keyed on the banded value of every merge dim, in ``spec.merge`` order, and merged
-    with the REAL policy: ``_merge_group`` then ``_cap_upfront``, unchanged.
+    ``fit_dims``: name -> (K,) per-molecule sizes; ``const_dims``: name -> int, fixed for the
+    whole screen; ``partition``: name -> exact value, uniform across the screen. Cells are keyed
+    on the banded value of every merge dim in ``spec.merge`` order, then merged with
+    ``_merge_group`` and ``_cap_upfront``.
     """
     names = list(spec.merge)
     K = int(next(iter(fit_dims.values())).shape[0]) if fit_dims else int(next(iter(const_dims.values())))
@@ -168,8 +122,8 @@ def plan_spans_multi(fit_dims: dict, const_dims: dict, spec, device, partition: 
         else:
             cols.append(np.full(K, _band_key(int(const_dims[n])), dtype=np.int64))
     key = np.stack(cols, axis=1)                                  # (K, nm)
-    # lexsort takes the LAST key as primary, so reverse to sort by names order left-to-right --
-    # the same order _merge_group sorts buckets into.
+    # lexsort takes the last key as primary; reverse so the sort follows names order, as
+    # _merge_group does.
     order = np.lexsort(tuple(key[:, i] for i in range(len(names) - 1, -1, -1)))
     sk = key[order]
     cuts = np.flatnonzero((np.diff(sk, axis=0) != 0).any(axis=1)) + 1
@@ -189,11 +143,8 @@ def gather_fill(out: torch.Tensor, src: torch.Tensor,
     """Fill a pre-zeroed ``(k, P_pad, ...)`` workspace directly from the store's contiguous
     buffer.
 
-    Replaces ``torch.split`` into k views followed by ``_scatter_fill``'s ``torch.cat`` of
-    those views -- a round trip back to the layout ``src`` already has. Same destination
-    arithmetic as ``_scatter_fill``; the only change is that ``flat`` is an ``index_select``
-    from ``src`` instead of a ``cat`` of slices of it, so it reads identical memory and the
-    result is bit-identical.
+    Same destination arithmetic as ``_scatter_fill``; the source rows are an ``index_select``
+    from ``src`` instead of a ``cat`` of per-molecule views.
     """
     k, P_pad = out.shape[0], out.shape[1]
     tot = int(counts.sum())
@@ -211,13 +162,10 @@ def gather_fill(out: torch.Tensor, src: torch.Tensor,
 def _const_seed_batch(const_seeds: torch.Tensor, k: int, device):
     """A canonical store's constant seed set, broadcast over a bucket of ``k`` molecules.
 
-    Returns ``(quats (k,S,4), trans (k,S,3))`` in the layout ``batched_seeds_torch`` produces, so
-    the engine's ``seeds=`` argument takes either without knowing which. The translations are
-    ZERO: a canonical store is pre-centred on the heavy-atom centroid and the query is centred
-    the same way, so the COM-aligning translation the per-molecule generator computes is
-    identically zero for every mode that seeds from the atom cloud -- which is what
-    ``_modes.CONST_SEED_MODES`` lists. The expand is materialised because the engine reshapes
-    the seeds into pose rows and a stride-0 view cannot serve that.
+    Returns ``(quats (k,S,4), trans (k,S,3))`` in the ``batched_seeds_torch`` layout. The
+    translations are zero: a canonical store and the query are both centred on the heavy-atom
+    centroid, so the COM-aligning translation vanishes for every ``CONST_SEED_MODES`` mode. The
+    expand is materialised because the engine reshapes the seeds into pose rows.
     """
     S = int(const_seeds.shape[0])
     return (const_seeds.unsqueeze(0).expand(k, -1, -1).contiguous(),
@@ -241,11 +189,10 @@ def align_arrays(mode: str, ref: dict, fit: dict, *, params: dict, steps_fine: i
                  early_stop_tol: float = 1e-5):
     """Array-native alignment of one shard against one query, for any registry mode.
 
-    ``ref``: concrete channel name -> the query's (N, ...) device tensor.
-    ``fit``: concrete channel name -> ``(flat, off)`` (CSR) or ``(dense, None)``.
-    ``avoid``: the query-side ``(K_a, 3)`` avoid cloud for ``vol_avoid``, else None.
-
-    Returns ``(scores (K,) float64 numpy, SE3 (K,4,4) float32 numpy)`` in SHARD order.
+    ``ref``: channel name -> the query's (N, ...) device tensor. ``fit``: channel name ->
+    ``(flat, off)`` (CSR) or ``(dense, None)``. ``avoid``: the query-side ``(K_a, 3)`` avoid
+    cloud for ``vol_avoid``, else None. Returns ``(scores (K,) float64, SE3 (K,4,4) float32)``
+    as numpy arrays in shard order.
     """
     from ..drivers.engine import Batch, align, term_self_overlaps
     from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
@@ -329,7 +276,7 @@ def align_arrays(mode: str, ref: dict, fit: dict, *, params: dict, steps_fine: i
             else:
                 r_pad = torch.full((k, n_pad) + feat, ch.pad, device=device, dtype=dt)
                 f_pad = torch.full((k, m_pad) + feat, ch.pad, device=device, dtype=dt)
-            r_pad[:, :N] = ref[n]                              # BROADCAST: one query, k rows
+            r_pad[:, :N] = ref[n]                              # one query broadcast over k rows
             c = cnt[n].index_select(0, rows)
             if start[n] is None:                               # dense block: a row select
                 S = int(src[n].shape[1])

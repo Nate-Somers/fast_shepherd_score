@@ -1,14 +1,9 @@
 """The one batched coarse-to-fine SE(3) optimiser, driven by a :class:`~..._modes.ModeSpec`.
 
-Every mode used to carry its own driver module: seed generation, the per-pose expansion, the
-self-overlaps its reduction needs, a CUDA-graph subclass, an eager loop and a CPU-fused hookup,
-each a near-copy of a sibling with the arithmetic of its terms inlined. This module is that
-driver once, reading the mode's terms, reductions, blend weights and schedule from its spec.
-The arithmetic is reproduced operation for operation, so a mode's scores do not move when its
-old driver is replaced by this one (measured per mode; see ``tests/test_engine_parity.py``).
-
-Inputs are padded per-PAIR tensors per channel (:class:`Batch`); the result is the per-pair
-best ``(score, q, t)`` over the seeds.
+Seed generation, per-pose expansion, self-overlaps, the CUDA-graph fine loop, the eager loop and
+the fused CPU hookup are written once here and read the mode's terms, reductions, blend weights
+and schedule from its spec. Inputs are padded per-pair tensors per channel (:class:`Batch`); the
+result is the per-pair best ``(score, q, t)`` over the seeds.
 """
 from __future__ import annotations
 
@@ -42,16 +37,11 @@ _PHARM_SIGMA = {"tversky": 0.95, "tversky_ref": 1.0, "tversky_fit": 0.05}
 # the assembled problem
 # =============================================================================================
 class _Term:
-    """One term's per-pose tensors + reduction constants, in the fine-loop layout.
+    """One term's per-pose tensors and reduction constants, in the fine-loop layout.
 
-    ``scratch`` holds the reduction's own working buffers so the fine step allocates nothing.
-    Inside a captured CUDA graph every temporary is a pool allocation and its own kernel, and the
-    reduction is a FIXED cost per step, so it is paid in proportion to how cheap the mode's kernel
-    is. Measured on an L40S at N=1e5, the allocating version cost ``vol`` (a 15x15 atom overlap,
-    0.9 us/align, the cheapest mode in the library) **6.5%**, while kernel-bound modes such as
-    ``surf`` and ``pharm`` were unaffected. Allocated lazily on first use, which for the graph
-    path happens in ``_GraphedFineBase.capture``'s warmup -- OFF the capture stream -- so the
-    buffers are ordinary tensors that every replay reuses."""
+    ``scratch`` holds the reduction's working buffers so the captured fine step allocates
+    nothing. It is allocated lazily on first use, which on the graph path is the warmup in
+    ``_GraphedFineBase.capture``, off the capture stream, so every replay reuses it."""
     __slots__ = ("spec", "inputs", "weight", "norm", "C", "k", "guard", "vaa", "vbb", "sigma",
                  "scratch")
 
@@ -87,7 +77,7 @@ class Problem:
 def _weight_of(term, spec, params, terms):
     """Blend weight of ``term`` as a Python float (negative for a subtracted penalty)."""
     w = term.weight
-    if w is None:                                    # complement of the OTHER named weight
+    if w is None:                                    # complement of the other named weight
         other = next(x.weight for x in terms if isinstance(x.weight, str))
         return 1.0 - float(params[other.lstrip("-")])
     if isinstance(w, str):
@@ -125,11 +115,8 @@ def _masked_centroid(x, n_real):
 
 def term_self_overlaps(spec, chans: dict, params: dict, ref_shared: bool = False):
     """``[(vaa, vbb) | None]`` per term over a whole bucket, so a caller that sub-batches the
-    bucket computes them ONCE and slices per chunk, instead of paying two eager kernel launches
-    per chunk. Measured on an L40S (vol screen, N=1e5, 13 chunks per screen): the per-chunk
-    version made 78 Triton dispatches per 3 screens where the pre-registry driver, which hoisted
-    per bucket, made 6 -- about 1.2% of wall time. Values are identical: the same kernel on the
-    same rows, and under ``ref_shared`` every chunk's row 0 IS the bucket's row 0."""
+    bucket computes them once and slices per chunk. Under ``ref_shared`` the reference
+    self-overlap is solved on row 0 and expanded."""
     res = {c: spec.resolve_channel(c, params) for c in spec.channels}
     seed = chans[res.get(spec.seed_channel, spec.seed_channel)].ref
     B, device, dtype = int(seed.shape[0]), seed.device, seed.dtype
@@ -156,7 +143,7 @@ def assemble(spec, chans: dict, *, params: dict, num_seeds: int, seeds=None,
              ref_shared: bool = False, trans_centers=None, trans_centers_real=None,
              num_repeats_per_trans: int = 10, topk: int = 30, self_overlaps=None) -> Problem:
     """Resolve channels, centre (pharm family), seed, expand per pose, and precompute every
-    reduction constant. ``chans`` maps CONCRETE channel names to :class:`Batch`."""
+    reduction constant. ``chans`` maps concrete channel names to :class:`Batch`."""
     res = {c: spec.resolve_channel(c, params) for c in spec.channels}
     seed_ch = res[spec.seed_channel] if spec.seed_channel in res else spec.resolve_channel(
         spec.seed_channel, params)
@@ -182,7 +169,7 @@ def assemble(spec, chans: dict, *, params: dict, num_seeds: int, seeds=None,
         if trans_centers is not None:
             trans_centers = trans_centers - c_ref[:, None, :]
 
-    # ---- term inputs (per PAIR, before expansion) + reduction constants -------------------
+    # ---- term inputs (per pair, before expansion) + reduction constants -------------------
     term_objs = []
     for tm in spec.terms:
         ref_names = [res.get(n, n) for n in tm.ref]
@@ -252,7 +239,7 @@ def _finish(spec, chans, term_objs, params, B, quats, t_seeds, device, dtype, c_
     pr.P = P
     pr.q = quats.reshape(-1, 4).contiguous()
     pr.t = t_seeds.reshape(-1, 3).contiguous()
-    # DEDUP layout (surf): hand the kernel the molecule blocks once and let it index
+    # Dedup layout (surf): hand the kernel the molecule blocks once and let it index
     # ``pid // S``; needs the multi-pose shape kernel, so CUDA fp32 single-shape-term only.
     want = int(spec.multipose)
     dedup = (want > 1 and device.type == "cuda" and dtype == torch.float32 and P > 1
@@ -331,7 +318,7 @@ def _reduce_value(tm, V, pr):
 def _coarse_topk(pr0, cb, num_seeds, trans_centers, trans_centers_real, nrpt, topk):
     """Legacy ``trans_init`` path: a coarse grid of poses scored value-only, top-k kept.
 
-    ``cb`` is the mode's ``coarse_channel`` batch, which is the SEED channel for every mode but
+    ``cb`` is the mode's ``coarse_channel`` batch, which is the seed channel for every mode but
     the combo pair (see ``ModeSpec.coarse_channel``)."""
     q_grid, t_grid = build_coarse_grid(cb.ref, cb.fit, cb.n_real, cb.m_real, num_seeds=num_seeds,
                                        trans_centers_batch=trans_centers,
@@ -381,7 +368,7 @@ def _coarse_topk(pr0, cb, num_seeds, trans_centers, trans_centers_real, nrpt, to
 # the fine step: value+grad of every term -> score, best-pose tracking, descent gradient, Adam
 # =============================================================================================
 class _State:
-    """Loop-carried buffers (updated IN PLACE, so one body serves eager and graph replay)."""
+    """Loop-carried buffers (updated in place, so one body serves eager and graph replay)."""
     __slots__ = ("q", "t", "mq", "vq", "mt", "vt", "best", "bq", "bt", "gq", "gt", "lr")
 
     def __init__(self, q0, t0, lr):
@@ -411,12 +398,10 @@ def _track_best(st: _State, score):
 def _reduce_grad_term(tm, V):
     """``(sim, scale)`` for a gradient-bearing term: the similarity and d(sim)/dV.
 
-    Written through the term's persistent ``scratch`` buffers when they fit this call's shape, so
-    the captured fine step allocates nothing (see :class:`_Term`). The arithmetic is unchanged --
-    ``a - b`` and ``torch.sub(a, b, out=buf)`` compute the same value -- and the allocating branch
-    below still runs for the off-shape callers. ``~tm.guard`` is recomputed each step rather than
-    cached: ``_load`` copies a new bucket's guard into the same tensor, so a cached negation would
-    go stale on the second bucket through a captured graph."""
+    Written through the term's ``scratch`` buffers when they fit this call's shape, so the
+    captured step allocates nothing; the allocating branch serves off-shape callers.
+    ``~tm.guard`` is recomputed each step because ``_load`` copies a new bucket's guard into
+    the same tensor, so a cached negation would go stale."""
     red = tm.spec.reduction
     buf = _scratch_for(tm, V)
     if buf is not None:
@@ -567,7 +552,7 @@ def _apply_adam_pharm(st: _State):
 class _GraphedFineTerms(_GraphedFineBase):
     """Capture one generic fine step; replay = N steps. Persistent buffers hold every term's
     inputs and constants for the bucket shape; ``_load`` copies a bucket in. Value-only terms
-    are scored EVERY step here (no stride), as the old combo graph did."""
+    are scored every step here (no stride)."""
 
     def __init__(self, pr: Problem, steps, lr):
         f = lambda x: torch.empty_like(x)
@@ -663,7 +648,7 @@ def _eager(pr: Problem, steps_fine, lr, es_patience, es_tol):
             _step_pharm(pr, st, update=False)
         else:
             _step_generic(pr, st, score_terms=score_now, update=False)
-        # Early-stop check every 5 steps: PER PAIR (each pair's own best over its seeds), so
+        # Early-stop check every 5 steps, per pair (each pair's own best over its seeds), so
         # one converged pair cannot halt the rest of the bucket. One host sync per check.
         if step % 5 == 0:
             cur = st.best.view(B, P).amax(dim=1)
@@ -739,7 +724,7 @@ def align(spec, chans: dict, *, params: dict, num_seeds: int, steps_fine: int, l
     out_q = bq.view(B, P, 4)[ar, idx]
     out_t = bt.view(B, P, 3)[ar, idx]
     if pr.c_ref is not None:
-        # fold the centring back so the transform maps ORIGINAL fit -> ORIGINAL ref
+        # fold the centring back so the transform maps original fit -> original ref
         R = _rotation_matrix_from_unit_quat(F.normalize(out_q, dim=1))
         out_t = out_t - torch.einsum("bij,bj->bi", R, pr.c_fit) + pr.c_ref
     return out_score, out_q, out_t

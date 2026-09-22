@@ -101,9 +101,7 @@ def test_kernel_dispatch_routes_by_device():
 
 
 def test_numba_vol_tversky_matches_reference_and_self_copy():
-    """vol_tversky numba backend: batched driver matches the per-pair reference on DISTINCT
-    molecules (~4 decimals) and self-copy scores ~1.0. The Tversky score is NOT bounded to
-    [0, 1] and is never clamped -- only the reduction differs from vol (shape kernel reused)."""
+    """vol_tversky numba: batched matches per-pair on distinct molecules; self-copy scores 1.0."""
     from shepherd_score.conformer_generation import embed_conformer_from_smiles
     from shepherd_score.container import Molecule, MoleculePair, MoleculePairBatch
 
@@ -143,11 +141,7 @@ def test_numba_vol_tversky_matches_reference_and_self_copy():
 
 
 def test_numba_vol_esp_tversky_matches_reference_and_self_copy():
-    """vol_esp_tversky numba backend (gates 1 + 4): the batched driver reproduces the per-pair
-    eager reference on DISTINCT molecules (~3 decimals -- validates the ESP-kernel reuse + the
-    host-side Tversky reduction/scaling) and self-copy scores ~1.0. NO new kernel: the fused
-    shape+ESP value+grad kernel (same as vol_esp) is dispatched to numba, only the reduction
-    differs from vol_esp."""
+    """vol_esp_tversky numba: batched matches per-pair on distinct molecules; self-copy scores 1.0."""
     from shepherd_score.conformer_generation import embed_conformer_from_smiles
     from shepherd_score.container import Molecule, MoleculePair, MoleculePairBatch
 
@@ -176,9 +170,8 @@ def test_numba_vol_esp_tversky_matches_reference_and_self_copy():
     scores, _ = MoleculePairBatch(pairs).align_with_vol_esp_tversky(backend="numba", lam=0.1)
     assert abs(float(scores[0]) - ref_fwd) < 1e-2, (float(scores[0]), ref_fwd)
     assert abs(float(scores[1]) - ref_rev) < 1e-2, (float(scores[1]), ref_rev)
-    # (the fits-inside asymmetry itself is charge-dependent under ESP weighting, so it is asserted
-    # in test_vol_esp_tversky.py on a clean substructure pair (phenol contained in naphthol) rather
-    # than on this arbitrary ibu/caf pair; here the point is batched == per-pair parity.)
+    # (the fits-inside asymmetry is charge-dependent under ESP weighting; test_vol_esp_tversky.py
+    # asserts it on a clean substructure pair)
 
     # self-copy == ~1.0 (Tversky(A,A)=1 for any weights) under numba
     selfp = [MoleculePair(Molecule(ibu), Molecule(ibu), do_center=True, device=cpu),

@@ -474,13 +474,11 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
         skipped and only the cross-overlap VAB is computed each call. Used to
         avoid redundant self-overlap recomputation in optimization loops.
     directionless : bool, optional
-        When ``False`` (default), HBA/HBD/aromatic/halogen are scored with the
-        orientation-vector cosine weighting (fss behavior). When ``True``, *all* types
-        are scored as isotropic point Gaussians (ROCS/ROSHAMBO "color"); this forces
-        ``extended_points`` off and is incompatible with ``precomputed_self_overlaps``.
-        (This is the scoring-side counterpart of the extraction-side ``directionless``
-        in :func:`~shepherd_score.pharm_utils.pharmacophore.get_pharmacophores`; both use
-        the same polarity — ``True`` means orientation-blind.)
+        When ``True``, every type is scored as an isotropic point Gaussian (ROCS-style
+        "color"); ``extended_points`` is forced off and ``precomputed_self_overlaps`` is
+        rejected. Default ``False`` keeps the orientation-vector weighting for
+        HBA/HBD/aromatic/halogen. Same polarity as ``directionless`` in
+        :func:`~shepherd_score.pharm_utils.pharmacophore.get_pharmacophores`.
 
     Returns
     -------
@@ -512,17 +510,14 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
     else:
         raise ValueError('Argument `similarity` must be one of (tanimoto, tversky, tversky_ref, tversky_fit).')
 
-    # Directionless (ROCS/ROSHAMBO-style "color") scoring routes EVERY type through the
-    # point-only Gaussian overlap. Note: zeroing the vectors is NOT equivalent -- a zero
-    # vector gives cosine weight (0+2)/3 = 2/3 on cross terms but 1 on self terms, which
-    # does not cancel in the Tanimoto, so the cosine path must be skipped entirely.
+    # Directionless scoring routes every type through the point-only Gaussian overlap.
+    # Zeroing the vectors is not equivalent: a zero vector gets cosine weight 2/3 on cross
+    # terms but 1 on self terms, which does not cancel in the Tanimoto.
     if directionless:
-        # `extended_points` encodes directional geometry (anchor + vector-extended point),
-        # so it is mutually exclusive with directionless scoring.
+        # extended_points encodes directional geometry, so it cannot combine with this.
         extended_points = False
         only_extended = False
-        # Self-overlaps must be recomputed directionless; a directional precompute (e.g.
-        # from compute_self_overlaps_pharm) would corrupt the Tanimoto denominator.
+        # A directional self-overlap precompute would corrupt the Tanimoto denominator.
         if precomputed_self_overlaps is not None:
             raise ValueError(
                 "Directionless pharmacophore scoring (`directionless=True`) is incompatible "

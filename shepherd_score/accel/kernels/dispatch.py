@@ -1,21 +1,12 @@
 """Device-driven kernel dispatch for the batched coarse-to-fine aligners.
 
-Each value+gradient kernel the ``fast_*_se3`` drivers call has two interchangeable
-implementations with identical signatures:
-
-  * a **Triton** kernel (:mod:`.shape_triton`, :mod:`.esp_triton`, :mod:`.pharm_triton`)
-    that runs on **CUDA** tensors, and
-  * a **numba** kernel (:mod:`.cpu`) that runs on **CPU** tensors.
-
-Each name exported here is a thin wrapper that routes a *call* to the implementation
-matching the **device of its tensor arguments**. This choice must stay per-call, never
-frozen at import time: a Triton kernel requires CUDA tensors and the numba kernel
-requires CPU tensors, so a single process must be able to run **both** paths (that is
-what lets ``backend="numba"`` run CPU tensors on a machine where Triton imports fine).
-
-The Triton source modules are imported **lazily** -- only the first time a CUDA tensor is
-dispatched -- so importing this module on a CPU-only box (where Triton is not installed)
-never touches them.
+Each value+gradient kernel has two implementations with identical signatures: a Triton
+kernel (:mod:`.shape_triton`, :mod:`.esp_triton`, :mod:`.pharm_triton`,
+:mod:`.avoid_triton`) for CUDA tensors and a numba kernel (:mod:`.cpu`) for CPU tensors.
+Each name exported here routes a call by the device of its tensor arguments. The choice
+is per call, never frozen at import, so one process can run both paths (``backend="numba"``
+on a machine where Triton imports). The Triton modules are imported lazily, on the first
+CUDA dispatch, so a CPU-only box never touches them.
 """
 from __future__ import annotations
 
@@ -103,7 +94,7 @@ _batch_self_overlap = _make("_batch_self_overlap", "shape")
 # --- ESP kernels (esp_triton <-> cpu) -----------------------------------------
 overlap_score_grad_esp_se3_batch = _make("overlap_score_grad_esp_se3_batch", "esp")
 _batch_self_overlap_esp = _make("_batch_self_overlap_esp", "esp")
-# ShaEP ESP surface-comparison (esp_combo), value-only fused reduction.
+# ShaEP ESP surface comparison (vol_and_surf_esp), value-only fused reduction.
 esp_comparison_batch = _make("esp_comparison_batch", "esp")
 
 # --- pharmacophore kernel (pharm_triton <-> cpu) ------------------------------
@@ -111,7 +102,7 @@ pharm_score_grad_se3_batch = _make("pharm_score_grad_se3_batch", "pharm")
 
 # --- avoid (linear hard-sphere excluded-volume) kernel (avoid_triton <-> cpu) -
 overlap_score_grad_avoid_se3_batch = _make("overlap_score_grad_avoid_se3_batch", "avoid")
-# Directional pharm value+QUATERNION-grad kernel (pharm mode, in-register dQ).
+# Directional pharm value + quaternion-gradient kernel (pharm mode, in-register dQ).
 pharm_grad_dq_se3_batch = _make("pharm_grad_dq_se3_batch", "pharm")
 # Directionless "color" value+quaternion-grad kernel (vol_color).
 pharm_color_score_grad_se3_batch = _make("pharm_color_score_grad_se3_batch", "pharm")

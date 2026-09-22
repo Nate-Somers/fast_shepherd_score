@@ -1400,10 +1400,8 @@ def optimize_vol_color_overlay(ref_centers: torch.Tensor,
     ``(1 - color_weight) * shape_Tanimoto + color_weight * color_Tanimoto``.
 
     Multi-start (identity + 4 principal-component + Fibonacci rotations, all COM-aligned)
-    with Adam; the best-scoring pose by the combined similarity is returned. The shape SE(3)
-    seed comes from ``ref_centers``/``fit_centers`` (the atom clouds), matching the ``vol``
-    optimizer. Self-overlaps are recomputed every step, so directionless scoring is
-    internally consistent (no precomputed-self-overlap collision).
+    with Adam; the best-scoring pose by the combined similarity is returned. The SE(3) seeds
+    come from ``ref_centers``/``fit_centers``, as in the ``vol`` optimizer.
 
     Parameters
     ----------
@@ -1423,7 +1421,7 @@ def optimize_vol_color_overlay(ref_centers: torch.Tensor,
         Similarity for the color channel ('tanimoto', 'tversky', 'tversky_ref', 'tversky_fit').
     directionless : bool (default=True)
         ``True`` scores color as isotropic point Gaussians (ROCS/ROSHAMBO); ``False`` keeps
-        the fss orientation-vector cosine weighting.
+        the orientation-vector cosine weighting.
     extended_points, only_extended : bool
         Forwarded to the color scorer (ignored when ``directionless=True``).
     num_repeats : int (default=50)
@@ -1558,15 +1556,11 @@ def _vol_lipo_overlap(ref_centers: torch.Tensor,
                       alpha: float,
                       lam: float,
                       lipo_weight: float) -> torch.Tensor:
-    """Combined shape + lipophilicity similarity (helper shared by the objective/optimizer).
+    """Combined shape + lipophilicity similarity shared by the objective and optimizer.
 
-    ``shape`` is the atom-centred Gaussian volume Tanimoto over the shape centres (the vol-mode
-    RemoveHs coordinates); ``lipo`` is the ESP-style shape-weighted overlap of the per-atom Crippen
-    logP placed at the TRUE-heavy centres, matched by value (``get_overlap_esp`` with the logP as
-    the "charge"). Each channel self-normalises to a Tanimoto, so a self-copy scores 1.000. If
-    either lipophilicity point set is empty the lipo channel is 0 (shape-only). ``fit_*`` are
-    assumed already SE(3)-transformed. Returns the combined similarity with shape matching
-    ``get_overlap(ref_centers, fit_centers)``.
+    ``shape`` is the Gaussian volume Tanimoto over the shape centres; ``lipo`` is
+    ``get_overlap_esp`` with the per-atom Crippen logP as the charge. If either lipophilicity
+    point set is empty the lipo channel is 0. ``fit_*`` are assumed already transformed.
     """
     shape_sim = get_overlap(ref_centers, fit_centers, alpha)
     n_ref = ref_lipo_pos.shape[-2]
@@ -1596,12 +1590,11 @@ def objective_vol_lipo_overlay(se3_params: torch.Tensor,
                                ) -> torch.Tensor:
     """
     Objective for the ``vol_lipo`` overlay: a weighted combination of atom-centred Gaussian
-    *shape* (volume) Tanimoto and *lipophilicity* Tanimoto (Crippen atomic logP overlaid like an
-    ESP/partial-charge field, matched by value so hydrophobic overlaps hydrophobic).
+    *shape* (volume) Tanimoto and *lipophilicity* Tanimoto (Crippen atomic logP overlaid like a
+    partial-charge field, so hydrophobic overlaps hydrophobic).
 
-    The combined similarity is ``(1 - lipo_weight) * shape + lipo_weight * lipo``. Only the fit
-    inputs are transformed; both the fit shape centres AND the fit lipophilicity centres move
-    rigidly under the same SE(3) pose. Supports batched and non-batched inputs; for a batch the
+    The combined similarity is ``(1 - lipo_weight) * shape + lipo_weight * lipo``. Both fit point
+    sets move under the same SE(3) pose. Supports batched and non-batched inputs; for a batch the
     loss is the average.
 
     Parameters
@@ -1611,15 +1604,14 @@ def objective_vol_lipo_overlay(se3_params: torch.Tensor,
     ref_centers, fit_centers : torch.Tensor (N,3)/(M,3) or batched (B,N,3)/(B,M,3)
         Shape-channel centres (RemoveHs coordinates, identical to the ``vol`` mode).
     ref_lipo_pos, fit_lipo_pos : torch.Tensor (P,3)/(Q,3) or batched
-        TRUE-heavy centres that carry the per-atom Crippen logP (may be empty, P=0 or Q=0).
+        Heavy-atom centres that carry the per-atom Crippen logP (may be empty).
     ref_lipo, fit_lipo : torch.Tensor (P,)/(Q,) or batched
         Per-atom Crippen logP contributions, used as the ESP "charge".
     alpha : float
         Gaussian width for both the shape overlap and the lipophilicity positional overlap
         (0.81 = volumetric, heavy atoms).
     lam : float
-        Value ("charge") weighting for the lipophilicity ESP overlap (0.1 = atom-centred
-        convention, NOT the surface-tuned default).
+        Width of the value-matching kernel in the lipophilicity overlap, used raw (0.1).
     lipo_weight : float
         Weight of the lipophilicity channel in [0, 1]; shape gets ``1 - lipo_weight``.
 
@@ -1674,24 +1666,22 @@ def optimize_vol_lipo_overlay(ref_centers: torch.Tensor,
     ``(1 - lipo_weight) * shape_Tanimoto + lipo_weight * lipo_Tanimoto``.
 
     Multi-start (identity + 4 principal-component + Fibonacci rotations, all COM-aligned) with
-    Adam; the best-scoring pose by the combined similarity is returned. The SE(3) seed comes from
-    the shape point clouds (``ref_centers``/``fit_centers``), matching the ``vol``/``vol_color``
-    optimizers. Both the fit shape centres and the fit lipophilicity centres are transformed by the
-    pose. Self-overlaps are recomputed every step (both channels self-normalise), so a self-copy
-    scores 1.000.
+    Adam; the best-scoring pose by the combined similarity is returned. The SE(3) seeds come from
+    the shape point clouds, as in the ``vol`` optimizer. Both fit point sets are transformed by
+    the pose.
 
     Parameters
     ----------
     ref_centers, fit_centers : torch.Tensor (N,3) / (M,3)
         Shape-channel centres (RemoveHs coordinates, identical to the ``vol`` mode).
     ref_lipo_pos, fit_lipo_pos : torch.Tensor (P,3) / (Q,3)
-        TRUE-heavy centres carrying the per-atom Crippen logP (may be empty, P=0 or Q=0).
+        Heavy-atom centres carrying the per-atom Crippen logP (may be empty).
     ref_lipo, fit_lipo : torch.Tensor (P,) / (Q,)
         Per-atom Crippen logP contributions, used as the ESP "charge".
     alpha : float (default=0.81)
         Gaussian width for the shape and lipophilicity overlaps.
     lam : float (default=0.1)
-        Value weighting for the lipophilicity ESP overlap (atom-centred convention).
+        Width of the value-matching kernel in the lipophilicity overlap, used raw.
     lipo_weight : float (default=0.5)
         Weight of the lipophilicity channel in [0, 1].
     num_repeats : int (default=50)
@@ -1833,10 +1823,8 @@ def objective_vol_tversky_overlay(se3_params: torch.Tensor,
     (scaffold-hop / larger-elaborated-active detection). Supports batched and non-batched inputs;
     for a batch the loss is the average.
 
-    Note ``AA`` and ``BB`` are both invariant to the SE(3) pose (rigid transforms preserve a
-    self-overlap), so they may be precomputed and passed in for speed; the gradient flows only
-    through ``AB`` (via the transformed fit). Tversky(A, A) = AA / (AA + 0 + 0) = 1 for any
-    ``tversky_alpha``/``tversky_beta``, so the self-overlap gate holds regardless of the weights.
+    ``AA`` and ``BB`` are invariant to the pose, so they may be precomputed and passed in; the
+    gradient flows only through ``AB``.
 
     Parameters
     ----------
@@ -2034,27 +2022,18 @@ def objective_vol_esp_tversky_overlay(se3_params: torch.Tensor,
     """
     Objective for the asymmetric "fits-inside" ``vol_esp_tversky`` overlay.
 
-    Identical electrostatic-weighted atom-centred Gaussian overlap channel as
-    ``objective_ROCS_esp_overlay`` (the ``vol_esp`` reference -- only the fit is transformed and
-    the overlap ``VAB_2nd_order_esp`` weights each Gaussian pair-term by ``exp(-|q_i-q_j|^2/lam)``),
-    but the similarity *reduction* is Tversky rather than Tanimoto::
+    The electrostatic-weighted atom-centred Gaussian overlap of ``objective_ROCS_esp_overlay``
+    (``VAB_2nd_order_esp``, which weights each Gaussian pair term by ``exp(-|q_i-q_j|^2/lam)``;
+    only the fit is transformed), but with a Tversky rather than Tanimoto reduction::
 
         T = AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))
 
-    where ``AB`` is the cross ESP overlap of the reference with the SE(3)-transformed fit, ``AA``
-    is the reference ESP self-overlap, and ``BB`` is the fit ESP self-overlap (all raw
-    ``VAB_2nd_order_esp`` integrals). This is EXACTLY what ``objective_vol_tversky_overlay`` is to
-    ``objective_ROCS_overlay``, with the shape overlap ``VAB_2nd_order`` swapped for the ESP
-    overlap ``VAB_2nd_order_esp``. With the defaults (``tversky_alpha=0.95``,
-    ``tversky_beta=0.05``) missing reference volume is penalized heavily while extra fit volume is
-    barely penalized, so the score rewards the *reference* being contained in the fit. Supports
-    batched and non-batched inputs; for a batch the loss is the average.
-
-    ``AA`` and ``BB`` are both invariant to the SE(3) pose (a rigid transform preserves a
-    self-overlap and the charges are unchanged), so they may be precomputed and passed in for
-    speed; the gradient flows only through ``AB`` (via the transformed fit). Tversky(A, A) =
-    AA / (AA + 0 + 0) = 1 for any ``tversky_alpha``/``tversky_beta``, so the self-overlap gate
-    holds regardless of the weights.
+    where ``AB`` is the cross ESP overlap of the reference with the transformed fit and ``AA`` /
+    ``BB`` the ESP self-overlaps. With the defaults (``tversky_alpha=0.95``, ``tversky_beta=0.05``)
+    missing reference volume is penalized heavily and extra fit volume barely, so the score
+    rewards the *reference* being contained in the fit. Supports batched and non-batched inputs;
+    for a batch the loss is the average. ``AA`` and ``BB`` are invariant to the pose, so they may
+    be precomputed and passed in; the gradient flows only through ``AB``.
 
     Parameters
     ----------
@@ -2071,8 +2050,8 @@ def objective_vol_esp_tversky_overlay(se3_params: torch.Tensor,
     alpha : float (default=0.81)
         Gaussian width for the overlap (0.81 = volumetric, heavy atoms).
     lam : float (default=0.1)
-        RAW charge-scaling term for the ESP exponential kernel (atom-centred convention; NOT
-        surface-tuned -- do NOT pass ``LAM_SCALING``-scaled values here).
+        Width of the ESP exponential kernel, used raw (do not pass ``LAM_SCALING``-scaled
+        values).
     tversky_alpha : float (default=0.95)
         Weight on missing reference volume ``AA - AB``. Named to avoid colliding with the
         Gaussian width ``alpha``.
@@ -2139,13 +2118,10 @@ def optimize_vol_esp_tversky_overlay(ref_points: torch.Tensor,
     Optimize the asymmetric "fits-inside" ``vol_esp_tversky`` overlay over SE(3), maximizing the
     Tversky ESP similarity ``AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))``.
 
-    Same electrostatic-weighted Gaussian overlap machinery and multi-start scheme (identity + 4
-    principal-component + Fibonacci rotations, all COM-aligned) with Adam as the ``vol_esp``/ESP
-    optimizer, but scored with an asymmetric Tversky reduction instead of Tanimoto -- i.e. exactly
-    what ``optimize_vol_tversky_overlay`` is to ``optimize_ROCS_overlay``, with the shape overlap
-    swapped for the ESP overlap. With the defaults the objective rewards the *reference* being
-    contained in the fit. The pose-invariant ESP self-overlaps ``AA``/``BB`` are precomputed once
-    before the loop.
+    Same overlap and multi-start scheme (identity + 4 principal-component + Fibonacci rotations,
+    all COM-aligned) with Adam as ``optimize_ROCS_esp_overlay``, but scored with a Tversky
+    reduction instead of Tanimoto. With the defaults the objective rewards the *reference* being
+    contained in the fit. The pose-invariant self-overlaps ``AA``/``BB`` are precomputed once.
 
     Parameters
     ----------
@@ -2160,7 +2136,7 @@ def optimize_vol_esp_tversky_overlay(ref_points: torch.Tensor,
     alpha : float (default=0.81)
         Gaussian width for the overlap (0.81 = volumetric, heavy atoms).
     lam : float (default=0.1)
-        RAW charge-scaling term for the ESP exponential kernel (atom-centred convention).
+        Width of the ESP exponential kernel, used raw.
     tversky_alpha : float (default=0.95)
         Weight on missing reference volume ``AA - AB`` (named to avoid the Gaussian width ``alpha``).
     tversky_beta : float (default=0.05)
@@ -2275,15 +2251,9 @@ def optimize_vol_esp_tversky_overlay(ref_points: torch.Tensor,
     return best_alignment, best_transform, best_score
 
 
-# =============================================================================
-# vol_atomtype -- shape (volume) + atom-identity (element) categorical overlay
-# -----------------------------------------------------------------------------
-# The atom-identity counterpart of vol_color / vol_lipo: instead of a pharmacophore-colour or a
-# lipophilicity channel, the second channel is a Gaussian overlap partitioned by element identity
-# (only same-element atoms overlap; ``score/atomtype_scoring.get_overlap_atomtype``). Structurally
-# identical to vol_lipo (shape channel on the RemoveHs centres; the identity channel on the
-# TRUE-heavy centres carrying the atomic-number labels).
-# =============================================================================
+# vol_atomtype: shape (volume) + atom-identity overlay. The second channel is a Gaussian overlap
+# in which only same-element atoms contribute (``score/atomtype_scoring.get_overlap_atomtype``);
+# otherwise structured like vol_lipo.
 def _vol_atomtype_overlap(ref_centers: torch.Tensor,
                           fit_centers: torch.Tensor,
                           ref_type_pos: torch.Tensor,
@@ -2293,14 +2263,11 @@ def _vol_atomtype_overlap(ref_centers: torch.Tensor,
                           alpha: float,
                           atomtype_weight: float,
                           similarity: _SIM_TYPE = 'tanimoto') -> torch.Tensor:
-    """Combined shape + atom-identity similarity (helper shared by the objective/optimizer).
+    """Combined shape + atom-identity similarity shared by the objective and optimizer.
 
-    ``shape`` is the atom-centred Gaussian volume Tanimoto over the shape centres (the vol-mode
-    RemoveHs coordinates); ``atomtype`` is the categorical Gaussian overlap of the per-atom element
-    labels placed at the TRUE-heavy centres (``get_overlap_atomtype``, only same-element atoms
-    contribute). Each channel self-normalises (Tanimoto/Tversky), so a self-copy scores 1.000. If
-    either label set is empty the identity channel is 0 (shape-only). ``fit_*`` are assumed already
-    SE(3)-transformed."""
+    ``shape`` is the Gaussian volume Tanimoto over the shape centres; ``atomtype`` is
+    ``get_overlap_atomtype`` over the element labels at the heavy-atom centres. If either label
+    set is empty the identity channel is 0. ``fit_*`` are assumed already transformed."""
     shape_sim = get_overlap(ref_centers, fit_centers, alpha)
     n_ref = ref_type_pos.shape[-2]
     n_fit = fit_type_pos.shape[-2]
@@ -2324,12 +2291,10 @@ def objective_vol_atomtype_overlay(se3_params: torch.Tensor,
                                    atomtype_weight: float = 0.5,
                                    similarity: _SIM_TYPE = 'tanimoto',
                                    ) -> torch.Tensor:
-    """Objective for the ``vol_atomtype`` overlay: a weighted combination of atom-centred Gaussian
-    *shape* (volume) similarity and *atom-identity* (element-categorical) similarity, i.e. exactly
-    what ``objective_vol_lipo_overlay`` is with the lipophilicity ESP channel swapped for the
-    element-identity categorical channel. ``(1 - atomtype_weight) * shape + atomtype_weight * type``.
-    Only the fit inputs are transformed; both the fit shape centres AND the fit identity centres move
-    rigidly under the same SE(3) pose. Supports batched and non-batched inputs."""
+    """Objective for the ``vol_atomtype`` overlay, ``(1 - atomtype_weight) * shape +
+    atomtype_weight * type``: ``objective_vol_lipo_overlay`` with the element-identity channel in
+    place of lipophilicity. Both fit point sets move under the same SE(3) pose. Supports batched
+    and non-batched inputs."""
     if len(fit_centers.shape) - 1 != len(se3_params.shape):
         err_mssg = f'Instead these shapes were given: fit_centers {fit_centers.shape} and se3_params {se3_params.shape}'
         if len(fit_centers.shape) == 2:
@@ -2480,13 +2445,10 @@ def objective_vol_color_tversky_overlay(se3_params: torch.Tensor,
                                         extended_points: bool = False,
                                         only_extended: bool = False,
                                         ) -> torch.Tensor:
-    """Objective for ``vol_color_tversky``: the ``vol_color`` shape+colour combo scored with an
-    asymmetric **Tversky** reduction on BOTH channels instead of Tanimoto. Shape Tversky is
-    ``AB/(AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))`` (== ``AB/(tversky_alpha*AA +
-    tversky_beta*BB)`` for the default alpha+beta=1); the colour channel uses the OpenEye 0.95
-    Tversky via ``get_overlap_pharm(similarity='tversky')`` (consistent with the default
-    ``tversky_alpha=0.95``). ``(1 - color_weight) * shape_tversky + color_weight * color_tversky``.
-    Tversky(A,A)=1 for each channel, so the self-overlap gate holds. Only the fit is transformed."""
+    """Objective for ``vol_color_tversky``: the ``vol_color`` combo with a Tversky reduction on
+    both channels, ``(1 - color_weight) * shape_tversky + color_weight * color_tversky``. Shape
+    Tversky is ``AB/(AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))``; the colour channel uses
+    ``get_overlap_pharm(similarity='tversky')``. Only the fit is transformed."""
     if len(fit_centers.shape) - 1 != len(se3_params.shape):
         raise ValueError(f'fit_centers {fit_centers.shape} incompatible with se3_params {se3_params.shape}')
 
@@ -2635,11 +2597,10 @@ def objective_vol_lipo_tversky_overlay(se3_params: torch.Tensor,
                                        tversky_alpha: float = 0.95,
                                        tversky_beta: float = 0.05,
                                        ) -> torch.Tensor:
-    """Objective for ``vol_lipo_tversky``: the ``vol_lipo`` shape+lipophilicity combo scored with an
-    asymmetric **Tversky** reduction on BOTH channels. Shape Tversky uses ``VAB_2nd_order``; the
-    lipophilicity Tversky uses the ESP overlap ``VAB_2nd_order_esp`` (Crippen logP as the "charge"),
-    each reduced by ``AB/(AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))``. Both fit centre sets
-    move rigidly under the same SE(3) pose. Tversky(A,A)=1 per channel → self-overlap 1.000."""
+    """Objective for ``vol_lipo_tversky``: the ``vol_lipo`` combo with a Tversky reduction on both
+    channels. Shape uses ``VAB_2nd_order`` and lipophilicity ``VAB_2nd_order_esp`` (Crippen logP
+    as the charge), each reduced by ``AB/(AB + tversky_alpha*(AA-AB) + tversky_beta*(BB-AB))``.
+    Both fit point sets move under the same SE(3) pose."""
     if len(fit_centers.shape) - 1 != len(se3_params.shape):
         raise ValueError(f'fit_centers {fit_centers.shape} incompatible with se3_params {se3_params.shape}')
 
@@ -2779,16 +2740,9 @@ def optimize_vol_lipo_tversky_overlay(ref_centers: torch.Tensor,
     return best_alignment, best_transform, best_score
 
 
-# =============================================================================
-# vol_and_surf_esp_tversky -- ShaEP-style vol+surf-ESP with a Tversky SHAPE channel
-# -----------------------------------------------------------------------------
-# vol_and_surf_esp blends a shape Tanimoto (volume) with a surface-ESP AGREEMENT channel. The ESP
-# channel is a point-to-point potential-agreement average (range [0,1]), NOT an overlap ratio, so a
-# Tversky reduction is not defined for it -- Tversky applies only to the shape channel. This mode is
-# therefore ``esp_weight * esp_agreement + (1-esp_weight) * shape_TVERSKY``. The ESP channel is
-# reused verbatim from ``esp_combo_score`` (called with ``esp_weight=1.0``) so its well-tested
-# masking / potential math is not re-derived here.
-# =============================================================================
+# vol_and_surf_esp_tversky: ShaEP-style vol + surface-ESP with a Tversky shape channel. The ESP
+# channel is a point-to-point potential-agreement average, not an overlap ratio, so Tversky
+# applies only to the shape channel; the ESP term is ``esp_combo_score`` with ``esp_weight=1.0``.
 def objective_vol_and_surf_esp_tversky_overlay(se3_params: torch.Tensor,
                                                ref_centers_w_H: torch.Tensor,
                                                fit_centers_w_H: torch.Tensor,
@@ -2809,10 +2763,9 @@ def objective_vol_and_surf_esp_tversky_overlay(se3_params: torch.Tensor,
                                                tversky_alpha: float = 0.95,
                                                tversky_beta: float = 0.05,
                                                ) -> torch.Tensor:
-    """Objective for ``vol_and_surf_esp_tversky``: the ShaEP-style vol+surf-ESP score with the SHAPE
-    channel scored by Tversky instead of Tanimoto (the surface-ESP agreement channel is unchanged --
-    it is not an overlap ratio, so Tversky does not apply). ``esp_weight * esp_agreement +
-    (1-esp_weight) * shape_tversky``. Only the fit is transformed."""
+    """Objective for ``vol_and_surf_esp_tversky``, ``esp_weight * esp_agreement + (1 - esp_weight)
+    * shape_tversky``: the ShaEP-style score with the shape channel reduced by Tversky. Only the
+    fit is transformed."""
     if len(fit_points.shape) - 1 != len(se3_params.shape):
         raise ValueError(f'fit_points {fit_points.shape} incompatible with se3_params {se3_params.shape}')
 

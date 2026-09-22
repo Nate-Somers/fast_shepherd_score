@@ -1,12 +1,6 @@
-"""Reference-mode tests for the asymmetric "fits-inside" ``vol_tversky`` shape overlay.
-
-Correctness gate (per the design-scoring-mode skill):
-  * self-overlap == 1.000 (Tversky(A,A) = 1 for any weights),
-  * autograd gradient matches central finite differences at a NON-identity pose (float32),
-  * the multi-start optimizer recovers a planted rotation (score -> ~1.0),
-  * determinism given a fixed seed,
-  * Tversky asymmetry: a small query contained in a bigger molecule scores HIGHER when the
-    small molecule is the REFERENCE (query -> big fit) than in the reverse direction.
+"""Reference-mode gates for the asymmetric ``vol_tversky`` shape overlay: self-overlap = 1.0,
+autograd vs finite difference at a non-identity pose, planted-pose recovery, determinism, and
+Tversky asymmetry (a small query scores higher as the reference than as the fit).
 """
 import warnings
 
@@ -132,8 +126,7 @@ def test_deterministic_given_seed(ibuprofen):
 
 # --- Gate 5: Tversky asymmetry (fits-inside) --------------------------------------------------
 def test_tversky_asymmetry_fits_inside():
-    """A small query contained in a larger molecule should score HIGHER when it is the
-    REFERENCE (query -> big fit) than in the reverse direction, under the default weights."""
+    """A small query contained in a larger molecule scores higher as the reference than as the fit."""
     benzene = _embed("c1ccccc1")
     naphthalene = _embed("c1ccc2ccccc2c1")
 

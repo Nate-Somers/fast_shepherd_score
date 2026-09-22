@@ -1,13 +1,12 @@
-"""Fused CPU (numba) fine loop -- a first-class CPU path for EVERY mode, not a GPU fallback.
+"""Fused CPU (numba) fine loop: a first-class CPU path for every mode.
 
-No torch in the hot loop: the inputs are marshalled to numpy once, each step chains the
-per-term overlap+grad njit kernels with two njit ``prange`` tails (score / best / blended
-descent gradient, then the tangent-projected Adam), and the per-pair early-stop check is a numpy
+No torch in the hot loop: inputs are marshalled to numpy once, each step chains the per-term
+overlap+grad njit kernels with two njit ``prange`` tails (score / best / blended descent
+gradient, then the tangent-projected Adam), and the per-pair early-stop check is a numpy
 ``.max(axis=1)``. The tails reproduce the torch fp32 arithmetic of ``drivers/engine.py`` op for
-op -- same operand order, float32 constants, eps inside the sqrt, no bias correction -- so on the
-fp64 AoS kernels (no SVML) the fused loop and the eager loop see the same kernel outputs and
-differ only in float32 rounding of the tail; with SVML the SoA fp32 kernels add ~1e-4 gradient
-error (see ``cpu_soa.py``). Seeds, step count and early-stop schedule are the caller's.
+op (same operand order, float32 constants, eps inside the sqrt, no bias correction). With SVML
+the SoA fp32 kernels of ``cpu_soa.py`` run; otherwise the fp64 AoS kernels of ``cpu.py``.
+Seeds, step count and early-stop schedule are the caller's.
 """
 from __future__ import annotations
 
@@ -58,7 +57,7 @@ def _tail_blend(Vg, dQg, dTg, kind, kc, cst, guard, useg, gpos, sims, wt, q, t, 
                 gq, gt, score_now):
     """Per pose: reduce every gradient term (Tanimoto / Tversky / raw, guarded), blend the
     similarities in term order (value-only rows of ``sims`` prefilled by the host), track the
-    best PRE-Adam pose, and build the blended descent gradient into ``gq``/``gt``."""
+    best pre-Adam pose, and build the blended descent gradient into ``gq``/``gt``."""
     P = q.shape[0]
     Tg = Vg.shape[0]
     T = sims.shape[0]

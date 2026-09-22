@@ -1,16 +1,11 @@
-"""SoA + fp32 + SVML-vectorized CPU kernels — the vectorizable twins of cpu.py.
+"""SoA fp32 CPU kernels: the vectorizable twins of the AoS fp64 kernels in cpu.py.
 
-cpu.py's kernels store coordinates AoS (``A[k, n, :]``) and accumulate fp64; the interleaved
-xyz stride + fp64 reduction stop LLVM's auto-vectorizer, so ``math.exp`` stays scalar and the
-inner O(N·M) loop runs one lane at a time. These kernels instead take coordinates **SoA**
-(``A[k, :, n]`` — contiguous in n) and accumulate **fp32**, so with an SVML-enabled numba
-(``numba<=0.59`` + ``icc_rt``; ``config.USING_SVML==True``) LLVM vectorizes the inner loop and
-SVML supplies the vector ``exp``. Accuracy cost of fp32: value rel-err ~1e-6, gradient
-rel-err ~1e-4.
-
-Used ONLY by the fused CPU driver when ``USING_SVML`` is true (see cpu_fused.py); otherwise the
-fp64 AoS kernels in cpu.py run. The fp64 rotation/dQ-tail are kept (cheap, per-pose / per-m); only
-the heavy inner n-loop is fp32 (the part that vectorizes). Math mirrors cpu.py op-for-op.
+The AoS layout (``A[k, n, :]``) and fp64 accumulation in cpu.py keep LLVM from vectorizing
+the inner O(N*M) loop. These kernels take coordinates SoA (``A[k, :, n]``, contiguous in n)
+and accumulate fp32, so with an SVML-enabled numba (``numba<=0.59`` + ``icc_rt``,
+``config.USING_SVML``) the inner loop vectorizes and SVML supplies the vector ``exp``. Used
+only by the fused CPU driver (cpu_fused.py) when SVML is present. The rotation and dQ tail
+stay fp64 per pose; only the inner n-loop is fp32. Math mirrors cpu.py op for op.
 """
 from __future__ import annotations
 

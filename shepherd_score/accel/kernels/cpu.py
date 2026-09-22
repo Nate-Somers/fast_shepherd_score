@@ -1,28 +1,12 @@
 """numba CPU mirrors of the Triton overlap+grad and Adam kernels.
 
-:mod:`~shepherd_score.accel.kernels.dispatch` routes each call to the Triton kernel for
-CUDA tensors and to these numba kernels for CPU tensors, per-call and device-driven, so
-the batched coarse-to-fine drivers (``accel.drivers.shape.coarse_fine_align_many`` and the
-``accel.batch`` aligners) run with no Triton/CUDA at all.
-
-Design / correctness
---------------------
-``overlap_score_grad_se3_batch`` replicates ``_gauss_overlap_se3_tiled`` (shape_triton.py)
-**operation-for-operation**: identical quaternion convention ``q=(w,x,y,z)``, the standard
-unit-quaternion rotation matrix, ``B`` (fit) rotated against ``A`` (ref),
-``Vab = K·Σ exp(-α/2·r²)`` with ``K = π^1.5/(2α)^1.5``, and the exact analytical
-``dVab/dq`` (4) and ``dVab/dt`` (3). It is therefore numerically **exact** (it computes
-the true overlap+gradient), though not bit-identical to the GPU (``math.exp`` ≠ Triton's
-``exp2``). The heavy O(K·N·M) work is a fused single-pass ``@njit(parallel=True)`` kernel
-(one row per pose, prange over poses); the cheap O(K) quaternion/Adam bookkeeping stays in
-torch.
-
-``fused_adam_qt_with_tangent_proj`` must mirror the Triton ``_adam_qt_with_tangent_proj``
-exactly (tangent projection ``dQ-q(dQ·q)``, Adam β1=0.9 β2=0.999 eps=1e-8 *inside* the
-sqrt, **no** bias correction, quaternion renormalisation), in-place, pure torch.
-
-Thread count is set by ``NUMBA_NUM_THREADS`` (=1 pins one core; the shard-parallel screen
-driver sets it to 1 to avoid oversubscription); the default uses all cores.
+:mod:`~shepherd_score.accel.kernels.dispatch` routes CPU tensors here, so the batched
+coarse-to-fine drivers run with no Triton/CUDA. Each kernel replicates its Triton twin op for
+op (quaternion ``q=(w,x,y,z)``, fit ``B`` rotated against ref ``A``, ``Vab = K*sum
+exp(-alpha/2 r^2)`` with ``K = pi^1.5/(2 alpha)^1.5``, analytic ``dVab/dq`` and ``dVab/dt``);
+results match the GPU to rounding (``math.exp`` vs ``exp2``). The O(K*N*M)
+work is a fused ``@njit(parallel=True)`` kernel, one pose per prange iteration; the O(K) Adam
+bookkeeping stays in torch. ``NUMBA_NUM_THREADS`` sets the thread count.
 """
 from __future__ import annotations
 import math
@@ -38,11 +22,9 @@ _K_PI = math.pi ** 1.5
 def _np_cached(x, dtype):
     """``x`` as a numpy array of ``dtype``, converted once per tensor object.
 
-    The eager fine loop hands the typed kernels the same invariant type, table and count
-    tensors every step, and ``astype`` on the ``(K, N_pad)`` type arrays alone was 13% of a
-    threaded pharm screen. The converted copy is stashed on the tensor and keyed by storage
-    pointer, shape and in-place version counter, so a rebuilt or mutated tensor converts
-    again. Always a copy, never a view, so the stash holds no reference back to the tensor.
+    The eager fine loop hands the typed kernels the same type, table and count tensors every
+    step. The copy is stashed on the tensor, keyed by storage pointer, shape and in-place
+    version counter, so a rebuilt or mutated tensor converts again. Always a copy, never a view.
     """
     key = (x.data_ptr(), tuple(x.shape), x._version, dtype)
     hit = getattr(x, "_fss_np", None)
@@ -62,7 +44,7 @@ def _overlap_grad_kernel(A, B, q, t, Nr, Mr, alpha, need_grad):
 
     A (K,N,3) ref, B (K,M,3) fit, q (K,4)=(w,x,y,z), t (K,3). Nr/Mr (K,) int real counts.
     Returns V (K,), dQ (K,4)=dVab/dq, dT (K,3)=dVab/dt. fp64 accumulation.
-    Mirrors _gauss_overlap_se3_tiled in gaussian_overlap_triton.py.
+    Mirrors ``shape_triton._gauss_overlap_se3_tiled``.
     """
     K = A.shape[0]
     Kc = _K_PI / (2.0 * alpha) ** 1.5
@@ -132,22 +114,13 @@ def overlap_score_grad_se3_batch(A, B, q, t, *, alpha: float = 0.81,
 
 @njit(parallel=True, fastmath=True, cache=True)
 def _avoid_grad_kernel(A, B, q, t, Nr, Mr, min_dist, need_grad):
-    """Fused linear-hard-sphere AVOID penalty value + SE(3) gradient, one pose per prange iter.
+    """Linear hard-sphere avoid penalty value + SE(3) gradient, one pose per prange iteration.
 
-    A structural clone of ``_overlap_grad_kernel`` (same quaternion->R, same dR/dq tail): A is the
-    FIXED avoid-point cloud in the ref frame (NOT transformed), B is the fit-avoid cloud transformed
-    by (q,t). Only the inner per-pair scalar changes -- a piecewise-linear hinge instead of a
-    Gaussian, and NO ``exp``:
-
-      penalty  A_pen = sum_a sum_b relu( (d0 - ||A_a - B'_b||) / d0 ),   B'_b = R*B_b + t
-      value    (d0 - d)/d0     for d < d0    (relu; 1 at coincidence, 0 at/after d0)
-      grad     force f_b = dA_pen/dB'_b = sum_a mask * (1/(d0*d)) * (A_a - B'_b)
-               active for 0 < d < d0; the d~0 point is skipped (torch.cdist's gradient is 0 at
-               coincidence, so autograd contributes nothing there -- match it, and avoid 1/0).
-
-    Returns V (K,) = A_pen, dQ (K,4) = dA_pen/dq, dT (K,3) = dA_pen/dt. fp64 accumulation.
-    Mirrors the shape kernel exactly so the driver blends dA_pen/dq with dVAB/dq in one quaternion
-    space: g = -scale_s*dQ_shape + avoid_weight*dQ_avoid.
+    A is the fixed avoid cloud in the ref frame (not transformed), B the fit cloud transformed
+    by (q, t); same quaternion->R build and dR/dq tail as ``_overlap_grad_kernel``.
+    ``A_pen = sum_a sum_b relu((d0 - ||A_a - B'_b||) / d0)``; the force on B'_b is
+    ``sum_a (1/(d0 d)) (A_a - B'_b)`` for ``0 < d < d0`` (the d~0 point is skipped, matching
+    torch.cdist's zero gradient at coincidence). Returns V (K,), dQ (K,4), dT (K,3), fp64.
     """
     K = A.shape[0]
     inv_d0 = 1.0 / min_dist
@@ -195,10 +168,9 @@ def _avoid_grad_kernel(A, B, q, t, Nr, Mr, min_dist, need_grad):
 def overlap_score_grad_avoid_se3_batch(A, B, q, t, *, min_dist: float = 2.0,
                                        N_real=None, M_real=None, NEED_GRAD: bool = True,
                                        BLOCK=None, num_warps=None, num_stages=None):
-    """CPU drop-in for the Triton ``overlap_score_grad_avoid_se3_batch``. Linear-hard-sphere avoid
-    penalty value + SE(3) gradient. A = fixed avoid points (ref frame), B = fit-avoid points
-    (transformed). Returns (V, dQ, dT) as torch tensors on A.device with A.dtype. Extra kwargs
-    (GPU-only knobs) ignored. Identical call shape to ``overlap_score_grad_se3_batch``."""
+    """CPU drop-in for the Triton ``overlap_score_grad_avoid_se3_batch``. A = fixed avoid points
+    (ref frame), B = fit points (transformed). Returns (V, dQ, dT) as torch tensors on A.device
+    with A.dtype. Extra kwargs (GPU-only knobs) ignored."""
     K, N_pad, _ = A.shape
     _, M_pad, _ = B.shape
     dev, dt = A.device, A.dtype
@@ -256,11 +228,10 @@ def _batch_self_overlap(P_pad: torch.Tensor, N_real: torch.Tensor, alpha: float 
 
 
 # ===========================================================================
-#  ESP-weighted overlap (esp / vol_esp): shape kernel x charge weight.
-#  Replicates gaussian_overlap_esp_triton._gauss_overlap_esp_se3_tiled:
-#  V = K * sum exp(-a/2 r^2) * exp(-(Ci-Cj)^2/lam), gradient = shape grad scaled
-#  by the (SE(3)-invariant) charge weight (folded into g). The two exps are fused
-#  into one exp(-a/2 r^2 - c2/lam) (algebraically identical).
+#  ESP-weighted overlap (vol_esp / surf_esp): CPU twin of
+#  esp_triton._gauss_overlap_esp_se3_tiled. V = K * sum exp(-a/2 r^2) *
+#  exp(-(Ci-Cj)^2/lam); the charge weight is SE(3)-invariant, so the gradient is
+#  the shape gradient with the weight folded into g. The two exps are fused.
 # ===========================================================================
 @njit(parallel=True, fastmath=True, cache=True)
 def _overlap_grad_esp_kernel(A, B, CA, CB, q, t, Nr, Mr, alpha, inv_lam, need_grad):
@@ -333,12 +304,11 @@ def overlap_score_grad_esp_se3_batch(A, B, charges_A, charges_B, q, t, *,
 
 
 # ===========================================================================
-#  ShaEP ESP surface comparison (esp_combo), VALUE-ONLY. CPU twin of the Triton
-#  esp_triton._esp_comparison_tiled, op-for-op: for each real field point i,
-#  Coulomb ESP from the other molecule's atoms, vdW+probe volume mask, Gaussian
-#  of the ESP difference, summed over points. fp64 accumulation; math.exp vs the
-#  Triton exp2 is the only intended divergence. No gradient (esp_combo steers the
-#  pose with the shape gradient).
+#  ShaEP ESP surface comparison (vol_and_surf_esp), value only: CPU twin of
+#  esp_triton._esp_comparison_tiled. For each real field point, the Coulomb ESP
+#  from the other molecule's atoms, the vdW+probe volume mask and a Gaussian of
+#  the ESP difference, summed over points. fp64 accumulation; no gradient (the
+#  pose is steered by the shape gradient).
 # ===========================================================================
 @njit(parallel=True, fastmath=True, cache=True)
 def _esp_comparison_kernel(P, A, Q, R, PE, Nr, Mr, inv_lam, coulomb, probe):
@@ -393,11 +363,11 @@ def esp_comparison_batch(points, atoms, charges, point_esp, radii, *,
 
 
 # ===========================================================================
-#  Pharmacophore overlap value+grad (pharm). Replicates pharmacophore_grad_triton
-#  ._pharm_score_grad_kernel op-for-op: typed Gaussians (per-type alpha/K/cat),
-#  directional weighting w (cat 1 = (clamp(D,0,1)+2)/3, cat 2 = (|D|+2)/3, else 1),
-#  type-match + non-dummy(cat!=3) masking; returns O, grad_R (3x3), grad_t. FIT=i
-#  (rotated by R,t), REF=j (fixed); type/alpha/K/cat from FIT.
+#  Pharmacophore overlap value + grad (pharm): CPU twin of
+#  pharm_triton._pharm_score_grad_kernel. Typed Gaussians (per-type alpha/K/cat),
+#  directional weight w (cat 1 = (clamp(D,0,1)+2)/3, cat 2 = (|D|+2)/3, else 1),
+#  type-match and non-dummy (cat != 3) masking; returns O, grad_R (3x3), grad_t.
+#  FIT = i (rotated by R, t), REF = j (fixed); type/alpha/K/cat from FIT.
 # ===========================================================================
 @njit(parallel=True, fastmath=True, cache=True)
 def _pharm_grad_kernel(RaA, FaB, RvA, FvB, RtA, FtB, R, t, alphas, Ks, cats, Nr, Mr, need_grad):
@@ -503,16 +473,13 @@ def pharm_score_grad_se3_batch(R, t, ref_types, fit_types, ref_anchors, fit_anch
 
 
 # ===========================================================================
-#  DIRECTIONLESS pharmacophore "color" overlap value + QUATERNION gradient
-#  (vol_color mode). Same same-type-only typed Gaussian as the pharm kernel, but
-#  (a) DIRECTIONLESS (every real type is an isotropic point Gaussian: w=1, no
-#  vector machinery, no weight gradient), and (b) emits dV/dq DIRECTLY in-register
-#  -- exactly like the shape kernel _overlap_grad_kernel -- so the driver needs no
-#  rotation-matrix -> quaternion projection / normalization-Jacobian tail.
-#  q is assumed unit (the adam renormalizes it each step), matching the shape kernel.
-#  A = ref anchors, B = fit anchors (rotated by R(q),t); At/Bt = ref/fit type idx.
-#  dx = A - rot(B): identical sign convention to _overlap_grad_kernel, so the dV/dq
-#  tail below is byte-identical to the shape-kernel tail.
+#  Directionless pharmacophore "color" overlap value + quaternion gradient
+#  (vol_color): the same same-type-only typed Gaussian as the pharm kernel, but
+#  isotropic (w = 1, no vectors, no weight gradient) and emitting dV/dq
+#  in-register like _overlap_grad_kernel, so the driver needs no rotation ->
+#  quaternion projection. q is assumed unit (Adam renormalises each step).
+#  A = ref anchors, B = fit anchors (rotated); At/Bt = ref/fit type indices;
+#  dx = A - rot(B), the shape-kernel sign convention.
 # ===========================================================================
 @njit(parallel=True, fastmath=True, cache=True)
 def _pharm_color_grad_kernel(A, B, q, t, At, Bt, alphas, Ks, cats, Nr, Mr, need_grad):
@@ -566,7 +533,7 @@ def _pharm_color_grad_kernel(A, B, q, t, At, Bt, alphas, Ks, cats, Nr, Mr, need_
 def pharm_color_score_grad_se3_batch(A, B, q, t, ref_types, fit_types, alphas, Ks, cats, *,
                                      N_real=None, M_real=None, NEED_GRAD: bool = True,
                                      BLOCK=None, num_warps=None, num_stages=None):
-    """CPU drop-in for the Triton directionless-color value+quaternion-grad kernel.
+    """CPU drop-in for the Triton directionless-color value + quaternion-gradient kernel.
     A = ref anchors (P,N,3), B = fit anchors (P,M,3), q=(P,4), t=(P,3); ref/fit_types
     (P,N)/(P,M). Returns (O, dQ, dT) with dQ = dO/dq (quaternion), like the shape kernel."""
     P, N_pad, _ = A.shape
@@ -590,15 +557,12 @@ def pharm_color_score_grad_se3_batch(A, B, q, t, ref_types, fit_types, alphas, K
 
 
 # ===========================================================================
-#  DIRECTIONAL pharmacophore overlap value + QUATERNION gradient (pharm mode).
-#  Same typed/directional Gaussian + weight (cat 1/2) as _pharm_grad_kernel, but
-#  takes the quaternion q (assumes |q|=1, as the adam renormalizes it) and emits
-#  dV/dq DIRECTLY in-register, so the pharm driver drops the
-#  rotation->quaternion projection + normalization-Jacobian tail. dV/dq is the
-#  projection of grad_R = grad_R_positional + grad_R_weight onto q, computed by
-#  reusing the shape-kernel dR/dq tail TWICE: once with the positional
-#  "force" (sum_j aKwE*(rotfit-ref)) and the body-frame fit ANCHOR, and once with
-#  the weight "force" (sum_j coeff*ref_vn) and the body-frame fit VECTOR.
+#  Directional pharmacophore overlap value + quaternion gradient (pharm): the
+#  typed/directional Gaussian and weight of _pharm_grad_kernel, but taking q
+#  (assumed unit) and emitting dV/dq directly, by applying the shape-kernel dR/dq
+#  tail twice: to the positional force (sum_j aKwE*(rotfit-ref)) with the
+#  body-frame fit anchor, and to the weight force (sum_j coeff*ref_vn) with the
+#  body-frame fit vector.
 # ===========================================================================
 @njit(parallel=True, fastmath=True, cache=True)
 def _pharm_grad_dq_kernel(A, B, q, t, At, Bt, RvA, FvB, alphas, Ks, cats, Nr, Mr, need_grad):
@@ -669,12 +633,12 @@ def _pharm_grad_dq_kernel(A, B, q, t, At, Bt, RvA, FvB, alphas, Ks, cats, Nr, Mr
                     wfx += coeff * rvxn; wfy += coeff * rvyn; wfz += coeff * rvzn
             if need_grad:
                 dTx += fxj; dTy += fyj; dTz += fzj
-                # positional dV/dq: shape tail with force (fxj,..) and body fit ANCHOR (fa*0)
+                # positional dV/dq: shape tail with force (fxj,..) and body-frame fit anchor
                 dQw += fxj * (-2.0 * qk_ * fay0 + 2.0 * qj * faz0) + fyj * (2.0 * qk_ * fax0 - 2.0 * qi * faz0) + fzj * (-2.0 * qj * fax0 + 2.0 * qi * fay0)
                 dQx += fxj * (2.0 * qj * fay0 + 2.0 * qk_ * faz0) + fyj * (2.0 * qj * fax0 - 4.0 * qi * fay0 - 2.0 * qr * faz0) + fzj * (2.0 * qk_ * fax0 + 2.0 * qr * fay0 - 4.0 * qi * faz0)
                 dQy += fxj * (-4.0 * qj * fax0 + 2.0 * qi * fay0 + 2.0 * qr * faz0) + fyj * (2.0 * qi * fax0 + 2.0 * qk_ * faz0) + fzj * (-2.0 * qr * fax0 + 2.0 * qk_ * fay0 - 4.0 * qj * faz0)
                 dQz += fxj * (-4.0 * qk_ * fax0 - 2.0 * qr * fay0 + 2.0 * qi * faz0) + fyj * (2.0 * qr * fax0 - 4.0 * qk_ * fay0 + 2.0 * qj * faz0) + fzj * (2.0 * qi * fax0 + 2.0 * qj * fay0)
-                # weight dV/dq: shape tail with force (wf*) and body fit VECTOR (fv*n)
+                # weight dV/dq: shape tail with force (wf*) and body-frame fit vector
                 dQw += wfx * (-2.0 * qk_ * fvyn + 2.0 * qj * fvzn) + wfy * (2.0 * qk_ * fvxn - 2.0 * qi * fvzn) + wfz * (-2.0 * qj * fvxn + 2.0 * qi * fvyn)
                 dQx += wfx * (2.0 * qj * fvyn + 2.0 * qk_ * fvzn) + wfy * (2.0 * qj * fvxn - 4.0 * qi * fvyn - 2.0 * qr * fvzn) + wfz * (2.0 * qk_ * fvxn + 2.0 * qr * fvyn - 4.0 * qi * fvzn)
                 dQy += wfx * (-4.0 * qj * fvxn + 2.0 * qi * fvyn + 2.0 * qr * fvzn) + wfy * (2.0 * qi * fvxn + 2.0 * qk_ * fvzn) + wfz * (-2.0 * qr * fvxn + 2.0 * qk_ * fvyn - 4.0 * qj * fvzn)
@@ -689,8 +653,8 @@ def pharm_grad_dq_se3_batch(q, t, ref_types, fit_types, ref_anchors, fit_anchors
                             ref_vectors, fit_vectors, alphas, Ks, cats, *,
                             N_real=None, M_real=None, NEED_GRAD: bool = True,
                             BLOCK=None, num_warps=None, num_stages=None):
-    """CPU drop-in for the Triton directional pharm value+QUATERNION-grad kernel. Takes q
-    (not R) and returns (O, dQ, dT) with dQ = dO/dq -- no R->q projection needed downstream."""
+    """CPU drop-in for the Triton directional pharm value + quaternion-gradient kernel. Takes q
+    (not R) and returns (O, dQ, dT) with dQ = dO/dq, so no R->q projection is needed downstream."""
     P, N_pad, _ = ref_anchors.shape
     _, M_pad, _ = fit_anchors.shape
     dev, dt = ref_anchors.device, ref_anchors.dtype

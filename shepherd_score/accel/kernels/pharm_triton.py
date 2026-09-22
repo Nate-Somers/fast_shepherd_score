@@ -1,20 +1,17 @@
-# shepherd_score/accel/kernels/pharm_triton.py
-# Triton value + SE(3) gradient for the typed/directional pharmacophore overlap.
-# Mirrors score.analytical_gradients._torch.compute_overlap_and_grad_pharm
-# (extended_points=False) so its outputs (O_AB, grad_R, grad_t) are a drop-in
-# replacement for the analytical torch path in the pharm fine loop.
-#
-# One CTA per pose (grid=(P,)); a single BLOCK x BLOCK tile covers the (small)
-# feature counts. Indexing follows the analytical code: FIT (B, rotated by R,t)
-# is index i; REF (A, fixed) is index j; the type/alpha/K/cat come from FIT.
+"""Triton value + SE(3) gradient kernels for the typed/directional pharmacophore overlap.
+
+``_pharm_score_grad_kernel`` mirrors ``score.analytical_gradients._torch
+.compute_overlap_and_grad_pharm`` (extended_points=False) and returns (O_AB, grad_R, grad_t).
+One CTA per pose (grid=(P,)); a single BLOCK x BLOCK tile covers the feature counts. FIT (B,
+rotated by R, t) is index i, REF (A, fixed) is index j; type/alpha/K/cat come from FIT.
+"""
 import torch
 import triton
 import triton.language as tl
 
 
-# Self-tunes num_warps per (N_pad, M_pad) on the actual device. BLOCK is derived
-# from the feature count (next_pow2), not a GPU-specific constant; only the warp
-# count is hardware-dependent, so autotune picks it -- nothing hardcoded per GPU.
+# BLOCK is derived from the feature count (next power of two); autotune picks only the
+# warp and stage counts.
 @triton.autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
                           for _w in (1, 2, 4, 8) for _s in (1, 2, 3, 4)],
                  key=['N_pad', 'M_pad'], cache_results=True)
@@ -141,14 +138,12 @@ def _pharm_score_grad_kernel(
 
 
 # ===========================================================================
-#  DIRECTIONLESS "color" kernel for vol_color: same same-type-only typed Gaussian
-#  but isotropic (w=1, no vectors, no weight-gradient), takes the QUATERNION q
-#  (not R) and emits dV/dq DIRECTLY in-register -- byte-identical dV/dq tail to the
-#  shape kernel (_gauss_overlap_se3_tiled), so the driver drops the
-#  rotation->quaternion projection / normalization-Jacobian tail entirely.
-#  q is assumed unit (the adam renormalizes each step), as in the shape kernel.
-#  A = ref anchors (axis 0), B = fit anchors (axis 1, rotated). dx = A - rot(B):
-#  the same sign convention as the shape kernel, so its dV/dq tail is reused verbatim.
+#  Directionless "color" kernel for vol_color: the same same-type-only typed
+#  Gaussian, but isotropic (w=1, no vectors, no weight gradient). Takes the
+#  quaternion q (assumed unit; Adam renormalises each step) and emits dV/dq
+#  in-register with the shape kernel's tail, so the driver needs no
+#  rotation->quaternion projection. A = ref anchors (axis 0), B = fit anchors
+#  (axis 1, rotated); dx = A - rot(B), the shape-kernel sign convention.
 # ===========================================================================
 @triton.autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
                           for _w in (1, 2, 4, 8) for _s in (1, 2, 3, 4)],
@@ -225,7 +220,7 @@ def _pharm_color_grad_kernel(
         fy = tl.sum(coeff * dy, 0)
         fz = tl.sum(coeff * dz, 0)
         dTx = tl.sum(fx); dTy = tl.sum(fy); dTz = tl.sum(fz)
-        # dV/dq via the body-frame fit coords (bx0,by0,bz0) -- verbatim shape-kernel tail
+        # dV/dq via the body-frame fit coords (bx0,by0,bz0); the shape-kernel tail
         wq = qr; xq = qi; yq = qj; zq = qk
         dw = (fx * (-two * zq * by0 + two * yq * bz0) +
               fy * (two * zq * bx0 - two * xq * bz0) +
@@ -255,10 +250,10 @@ def pharm_color_score_grad_se3_batch(
     A, B, q, t, ref_types, fit_types, alphas, Ks, cats, *,
     N_real=None, M_real=None, NEED_GRAD=True, BLOCK=None, num_warps=None, num_stages=None,
 ):
-    """Triton directionless-color value+QUATERNION-grad kernel for vol_color.
+    """Directionless-color value + quaternion-gradient kernel for vol_color.
     A = ref anchors (P,N,3), B = fit anchors (P,M,3), q=(P,4), t=(P,3);
-    ref/fit_types (P,N)/(P,M) int. Returns (O, dQ, dT) with dQ = dO/dq (like the shape
-    kernel) -- no rotation->quaternion projection needed downstream."""
+    ref/fit_types (P,N)/(P,M) int. Returns (O, dQ, dT) with dQ = dO/dq, like the shape
+    kernel, so no rotation->quaternion projection is needed downstream."""
     P, N_pad, _ = A.shape
     _, M_pad, _ = B.shape
     dev = A.device
@@ -269,11 +264,8 @@ def pharm_color_score_grad_se3_batch(
     if M_real is None:
         M_real = torch.full((P,), M_pad, device=dev, dtype=torch.int32)
 
-    # Every kernel below STORES its score for each pose unconditionally, and its gradients
-    # whenever NEED_GRAD, so pre-zeroing is a memset per fine step over buffers about to be
-    # overwritten -- 0.0159 us/mol of device time on a vol screen at N=100,000 (job
-    # 22593930), and this kernel has more outputs than that one. Without NEED_GRAD the
-    # gradient buffers ARE left unwritten, so those keep their zeros.
+    # The kernel stores every score and, when NEED_GRAD, every gradient, so no pre-zeroing;
+    # without NEED_GRAD the gradient buffers are left unwritten and keep their zeros.
     O = torch.empty(P, device=dev, dtype=A.dtype)
     _g = torch.empty if NEED_GRAD else torch.zeros
     dQ = _g(P, 4, device=dev, dtype=A.dtype)
@@ -293,11 +285,11 @@ def pharm_color_score_grad_se3_batch(
 
 
 # ===========================================================================
-#  DIRECTIONAL pharm value + QUATERNION gradient (pharm mode in-register dQ).
-#  Same typed/directional Gaussian + weight as _pharm_score_grad_kernel, but takes
-#  q (builds R; assumes |q|=1) and emits dV/dq directly via the shape dR/dq tail
-#  applied to (positional force, fit anchor) + (weight force, fit vector).
-#  Layout: REF=axis 0 (n), FIT=axis 1 (m); dx = ref - rot(fit) (shape convention).
+#  Directional pharm value + quaternion gradient (pharm mode, in-register dQ).
+#  Same typed/directional Gaussian and weight as _pharm_score_grad_kernel, but
+#  takes q (assumes |q|=1) and emits dV/dq directly: the shape dR/dq tail applied
+#  to (positional force, fit anchor) plus (weight force, fit vector).
+#  Layout: REF = axis 0 (n), FIT = axis 1 (m); dx = ref - rot(fit).
 # ===========================================================================
 @triton.autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
                           for _w in (1, 2, 4, 8) for _s in (1, 2, 3, 4)],
@@ -410,8 +402,8 @@ def pharm_grad_dq_se3_batch(
     q, t, ref_types, fit_types, ref_anchors, fit_anchors, ref_vectors, fit_vectors,
     alphas, Ks, cats, *, N_real=None, M_real=None, NEED_GRAD=True, BLOCK=None, num_warps=None, num_stages=None,
 ):
-    """Triton directional pharm value+QUATERNION-grad kernel (in-register dQ). Takes q (not R);
-    returns (O, dQ, dT) with dQ = dO/dq -- no R->q projection needed downstream."""
+    """Directional pharm value + quaternion-gradient kernel (in-register dQ). Takes q (not R);
+    returns (O, dQ, dT) with dQ = dO/dq, so no R->q projection is needed downstream."""
     P, N_pad, _ = ref_anchors.shape
     _, M_pad, _ = fit_anchors.shape
     dev = ref_anchors.device
@@ -421,11 +413,8 @@ def pharm_grad_dq_se3_batch(
         N_real = torch.full((P,), N_pad, device=dev, dtype=torch.int32)
     if M_real is None:
         M_real = torch.full((P,), M_pad, device=dev, dtype=torch.int32)
-    # Every kernel below STORES its score for each pose unconditionally, and its gradients
-    # whenever NEED_GRAD, so pre-zeroing is a memset per fine step over buffers about to be
-    # overwritten -- 0.0159 us/mol of device time on a vol screen at N=100,000 (job
-    # 22593930), and this kernel has more outputs than that one. Without NEED_GRAD the
-    # gradient buffers ARE left unwritten, so those keep their zeros.
+    # The kernel stores every score and, when NEED_GRAD, every gradient, so no pre-zeroing;
+    # without NEED_GRAD the gradient buffers are left unwritten and keep their zeros.
     O = torch.empty(P, device=dev, dtype=ref_anchors.dtype)
     _g = torch.empty if NEED_GRAD else torch.zeros
     dQ = _g(P, 4, device=dev, dtype=ref_anchors.dtype)
@@ -447,7 +436,7 @@ def pharm_score_grad_se3_batch(
     alphas, Ks, cats, *, N_real=None, M_real=None, NEED_GRAD=True,
     BLOCK=None, num_warps=1,
 ):
-    """Triton value+grad for the pharm overlap; outputs match
+    """Pharm overlap value + gradient; outputs match
     compute_overlap_and_grad_pharm(extended_points=False): (O_AB, grad_R, grad_t).
     R: (P,3,3), t: (P,3); *_anchors/*_vectors: (P,N/M,3); *_types: (P,N/M) int.
     """
@@ -461,11 +450,8 @@ def pharm_score_grad_se3_batch(
     if M_real is None:
         M_real = torch.full((P,), M_pad, device=dev, dtype=torch.int32)
 
-    # Every kernel below STORES its score for each pose unconditionally, and its gradients
-    # whenever NEED_GRAD, so pre-zeroing is a memset per fine step over buffers about to be
-    # overwritten -- 0.0159 us/mol of device time on a vol screen at N=100,000 (job
-    # 22593930), and this kernel has more outputs than that one. Without NEED_GRAD the
-    # gradient buffers ARE left unwritten, so those keep their zeros.
+    # The kernel stores every score and, when NEED_GRAD, every gradient, so no pre-zeroing;
+    # without NEED_GRAD the gradient buffers are left unwritten and keep their zeros.
     O = torch.empty(P, device=dev, dtype=ref_anchors.dtype)
     _g = torch.empty if NEED_GRAD else torch.zeros
     gR = _g(P, 3, 3, device=dev, dtype=ref_anchors.dtype)

@@ -1,9 +1,6 @@
-"""Batched (numba) accel regression tests for the vol_tversky and vol_lipo modes.
-
-Covers the fast-path gates that survive without a GPU: self-copy overlap == 1.0 under the
-numba backend, and batched-numba vs the per-pair torch reference on a distinct pair (matched
-seed/step budget, loose tolerance to absorb the different multi-start seed set). Triton parity
-and GPU throughput are validated separately on a CUDA box.
+"""Batched-numba gates for the CPU-testable experimental modes: self-copy scores 1.0, and the
+batched path matches the per-pair torch reference on a distinct pair (loose tolerance, since
+the two use different multi-start seed sets). Triton parity is CUDA-only.
 """
 import warnings
 import numpy as np
@@ -27,8 +24,7 @@ def _mol(smiles):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         rd = embed_conformer_from_smiles(smiles, MMFF_optimize=True, random_seed=0)
-    # pharm_multi_vector=False builds pharmacophores (needed by the pharm/colour SI modes;
-    # harmless for the shape/ESP/lipophilicity modes, which ignore them).
+    # pharm_multi_vector=False builds the pharmacophores the pharm/colour modes need
     return Molecule(rd, pharm_multi_vector=False)
 
 
@@ -42,9 +38,7 @@ MODES = [
     ("vol_tversky", "sim_aligned_vol_tversky"),
     ("vol_lipo", "sim_aligned_vol_lipo"),
     ("vol_esp_tversky", "sim_aligned_vol_esp_tversky"),
-    # SI experimental modes that need NO molecular surface (validatable on a CPU-only box).
-    # The surface modes (surf_tversky, surf_esp_tversky, vol_and_surf_esp_tversky) require Open3D
-    # and are validated on the GPU cluster.
+    # surface-free SI modes only; the surface modes need Open3D
     ("vol_mr", "sim_aligned_vol_mr"),
     ("vol_lipo_tversky", "sim_aligned_vol_lipo_tversky"),
     ("vol_color_tversky", "sim_aligned_vol_color_tversky"),
@@ -67,9 +61,7 @@ def test_numba_self_copy_is_one(mode, attr, mols):
 
 @pytest.mark.parametrize("mode,attr", MODES)
 def test_numba_batched_matches_per_pair(mode, attr, mols):
-    """Batched-numba matches the per-pair torch reference on a distinct pair at the shipped
-    (MODE_SEEDS, MODE_STEPS) budget. Loose tolerance: the batched and per-pair paths use
-    different multi-start seed sets, so they land in the same basin, not bit-identical."""
+    """Batched-numba lands in the per-pair reference's basin at the shipped seed/step budget."""
     from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     ibu, caf = mols
@@ -91,10 +83,7 @@ def test_numba_batched_matches_per_pair(mode, attr, mols):
 @pytest.mark.skipif(not (TORCH and torch.cuda.is_available()), reason="CUDA required")
 @pytest.mark.parametrize("mode,attr", MODES)
 def test_triton_matches_numba(mode, attr, mols):
-    """Gate 2 (Triton == numba): the GPU (Triton) batched driver agrees with the CPU (numba)
-    one on the same pair. These modes REUSE the shape + ESP kernels, whose Triton twins are
-    already parity-validated; this end-to-end check confirms the driver's blend dispatches
-    device-consistently. CPU-only boxes skip it (the rest of the gates still run)."""
+    """The Triton batched driver agrees with the numba one on the same pair."""
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     bn = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,
                                          device=torch.device("cpu"))])

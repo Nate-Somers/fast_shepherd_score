@@ -1,15 +1,7 @@
-"""Reference-layer correctness gates for the SI experimental alignment modes.
-
-Covers the nine modes added for the supplementary information:
-  vol_pharm, vol_atomtype, vol_mr,
-  surf_tversky, surf_esp_tversky, vol_and_surf_esp_tversky,
-  vol_color_tversky, vol_lipo_tversky, pharm_tversky.
-
-Design-scoring-mode gates enforced here: self-overlap = 1.000 (gate 1), autograd == finite
-difference at a non-identity pose (gate 2, for the modes with new objective math), determinism
-(gate 4), and the retained-H basis (gate 5, for the per-atom-field modes). The surface modes need
-Open3D; those tests ``importorskip`` it, but ``vol_and_surf_esp_tversky``'s NEW blend math is also
-exercised with synthetic surface data so it is validated even without Open3D.
+"""Reference-layer gates for the nine SI experimental modes: self-overlap = 1.0, autograd vs
+finite difference at a non-identity pose, determinism, and the retained-H basis for the
+per-atom-field modes. Surface modes need Open3D; ``vol_and_surf_esp_tversky``'s blend is also
+exercised on synthetic surface data.
 """
 import numpy as np
 import pytest
@@ -153,11 +145,7 @@ def test_retained_h_molecule(mode):
 
 # --- vol_and_surf_esp_tversky: NEW blend math, exercised with SYNTHETIC surface data ----------
 def _synthetic_esp_inputs(seed=0):
-    """A real molecule's atom set + a fake surface point cloud/ESP so the vol_and_surf_esp_tversky
-    optimizer runs without Open3D. The points sit on a shell OUTSIDE the vdW+probe envelope (so
-    ``_esp_comparison`` never masks them, exactly like a real molecular surface) -- required for the
-    self-overlap = 1.000 gate: a masked point contributes 0 to the numerator but 1 to the point
-    count, so in-volume points would depress the ESP-agreement channel even for a self-pair."""
+    """A real molecule's atoms plus a synthetic shell surface outside the vdW+probe envelope, so no point is masked."""
     rng = np.random.default_rng(seed)
     m = _mol("CC(=O)Oc1ccccc1C(=O)O")
     w_h = m.mol.GetConformer().GetPositions().astype(np.float32)
@@ -169,9 +157,8 @@ def _synthetic_esp_inputs(seed=0):
     dirs = rng.normal(size=(120, 3)).astype(np.float32)
     dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
     surf = (com + shell_r * dirs).astype(np.float32)
-    # ESP at each surface point = Coulomb potential of the molecule's charges (the SAME formula
-    # _esp_comparison recomputes internally). It must be the real potential, not random, or a
-    # self-pair's stored-vs-recomputed ESP would differ and the agreement channel would be < 1.
+    # the ESP must be the real Coulomb potential of the charges (what _esp_comparison recomputes),
+    # or a self-pair's stored and recomputed ESP would differ
     from shepherd_score.score.constants import COULOMB_SCALING
     d = np.linalg.norm(surf[:, None, :] - w_h[None, :, :], axis=2)   # (120, n_wh)
     surf_esp = ((charges[None, :] / d).sum(axis=1) * COULOMB_SCALING).astype(np.float32)
@@ -208,9 +195,7 @@ def test_vol_and_surf_esp_tversky_deterministic_synthetic():
 def test_surf_modes_self_overlap(mode):
     pytest.importorskip("open3d")
     m = _mol("CC(=O)Oc1ccccc1C(=O)O", surface=True)
-    # num_surf_points is a MoleculePair attribute, and align_with_surf_* guards on IT, not on
-    # whether the molecules carry surfaces -- so building the pair without it made every surface
-    # mode raise "initialized with no surface points" on molecules that had them.
+    # align_with_surf_* guards on the pair's num_surf_points, not on the molecules' surfaces
     pair = MoleculePair(m, m, do_center=True, num_surf_points=100,
                         device=torch.device("cpu"))
     getattr(pair, f"align_with_{mode}")(**_KW)

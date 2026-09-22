@@ -1,11 +1,7 @@
 # shepherd_score/accel/drivers/pharm_overlap.py
-# Fast GPU-accelerated pharmacophore overlap scoring.
-#
-# This module intentionally stays in PyTorch (rather than Triton) because pharmacophore
-# overlap depends on type-specific alpha values and optional vector/extended-point logic.
-#
-# It is used by the fast coarse→fine alignment routines. Coarse stages should call these
-# functions under `torch.no_grad()`; fine stages may enable autograd on (q,t).
+# Batched pharmacophore overlap scoring in PyTorch rather than Triton: the overlap depends on
+# type-specific alpha values and optional vector / extended-point logic. Coarse stages call
+# these under `torch.no_grad()`; fine stages may enable autograd on (q, t).
 
 import math
 import torch
@@ -184,7 +180,7 @@ def _batch_pharm_overlap_typed(
 
         if use_extended:
             # Extended-point semantics (legacy): anchor overlap + (anchor+vector) overlap,
-            # with NO cosine weighting. `only_extended` drops the anchor term.
+            # with no cosine weighting. `only_extended` drops the anchor term.
             if not only_extended:
                 diff_12 = anchors_1.unsqueeze(2) - anchors_2.unsqueeze(1)  # (B, N, M, 3)
                 r2_12 = (diff_12 ** 2).sum(dim=-1)  # (B, N, M)

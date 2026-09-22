@@ -470,15 +470,13 @@ def _average_vectors(vectors: List):
 _cached_factory: rdkit.Chem.rdMolChemicalFeatures.MolChemicalFeatureFactory | None = (
     None
 )
-# Separate lazily-cached factory for RDKit's stock BaseFeatures.fdef (used for the
-# ROCS/ROSHAMBO-style ``feature_set='rdkit_base'`` color definitions).
+# Lazily-built factory for RDKit's stock BaseFeatures.fdef (``feature_set='rdkit_base'``).
 _cached_factory_base: rdkit.Chem.rdMolChemicalFeatures.MolChemicalFeatureFactory | None = (
     None
 )
 
-# Stock BaseFeatures.fdef families used for the 6-type ROCS/ROSHAMBO color set and how
-# they map onto fss ``P_TYPES`` names. ``LumpedHydrophobe`` (clustered) is used for the
-# hydrophobe rather than the per-atom ``Hydrophobe`` to avoid an explosion of points.
+# BaseFeatures.fdef families kept for the 6-type ROCS-style color set, and their ``P_TYPES``
+# names. ``LumpedHydrophobe`` (clustered) stands in for the per-atom ``Hydrophobe``.
 _RDKIT_BASE_FAMILIES = ('Aromatic', 'Donor', 'Acceptor', 'PosIonizable', 'NegIonizable',
                         'LumpedHydrophobe')
 _RDKIT_BASE_RENAME = {'PosIonizable': 'Cation', 'NegIonizable': 'Anion',
@@ -513,16 +511,14 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
         Length of the vector in Angstroms. Default is 1.0.
     feature_set : str, optional
         Which feature definition to use. ``'shepherd'`` (default) uses the local
-        ``smarts_features.fdef`` (8 fss types incl. Halogen/ZnBinder). ``'rdkit_base'``
+        ``smarts_features.fdef`` (8 types incl. Halogen/ZnBinder). ``'rdkit_base'``
         uses RDKit's stock ``BaseFeatures.fdef`` reduced to the 6 ROCS/ROSHAMBO color
         types (Donor, Acceptor, Aromatic, Hydrophobe, Cation, Anion), mapping
         ``PosIonizable->Cation``, ``NegIonizable->Anion``, ``LumpedHydrophobe->Hydrophobe``.
     directionless : bool, optional
-        When ``True``, emit one zero-vector anchor per feature for *all* families (including
-        donor/acceptor/aromatic/halogen) so the features are isotropic ROCS/ROSHAMBO-style
-        "color" atoms. This **overrides** ``multi_vector`` (no per-H / per-lone-pair / +-normal
-        expansion happens) and reduces the pharmacophore count. Default is ``False`` (compute
-        orientation vectors as usual).
+        When ``True``, emit one zero-vector anchor per feature for every family (isotropic
+        ROCS-style "color" features). This overrides ``multi_vector``: no per-H, per-lone-pair
+        or ring-normal expansion happens. Default is ``False``.
     return_atom_ids : bool, optional
         When ``True``, each family sub-dict also contains an ``'A'`` key holding a list of
         atom-id sets (one set per emitted pharmacophore, aligned with ``'P'``). For
@@ -554,7 +550,6 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
     else:
         raise ValueError(f"`feature_set` must be 'shepherd' or 'rdkit_base', got {feature_set!r}.")
 
-    # Use the feature_set-selected factory (not _cached_factory) so 'rdkit_base' works.
     mol_feats = factory.GetFeaturesForMol(mol)
     conf = mol.GetConformer()
 
@@ -565,8 +560,8 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
     for feat in mol_feats:
         family = feat.GetFamily() # type of pharmacophore
         if feature_set == 'rdkit_base':
-            # Keep only the 6 ROCS/ROSHAMBO color families (checked on the stock name so
-            # the per-atom 'Hydrophobe' family is excluded), then rename into P_TYPES.
+            # Keep only the 6 color families (this drops the per-atom 'Hydrophobe'), then
+            # rename into P_TYPES.
             if family not in _RDKIT_BASE_FAMILIES:
                 continue
             family = _RDKIT_BASE_RENAME.get(family, family)
@@ -685,9 +680,7 @@ def get_pharmacophores_dict(mol: rdkit.Chem.rdchem.Mol,
                 if return_atom_ids:
                     pharmacophores[family]['A'].append(feat_atom_ids)
 
-    # Hydrophobe processing. The 'shepherd' feature set computes hydrophobes via SMARTS
-    # clustering here; 'rdkit_base' already sourced Hydrophobe (from LumpedHydrophobe) in
-    # the loop above, so skip to avoid double-counting.
+    # Hydrophobe processing ('rdkit_base' already took its hydrophobes from LumpedHydrophobe above).
     if feature_set != 'rdkit_base':
         hydrophobes_raw = find_hydrophobes(mol=mol, cluster_hydrophobic=True,
                                            return_atom_ids=return_atom_ids)

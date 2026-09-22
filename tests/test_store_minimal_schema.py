@@ -1,17 +1,7 @@
-"""Every screenable mode must work from a store built for THAT MODE ALONE.
+"""Every screenable mode must work from a store built for that mode alone.
 
-The existing screen tests build one store for the whole mode list, which hides a class of bug:
-a mode whose declared schema flags do not cover everything ``ProfileStore._flush`` needs, but
-whose missing arrays another mode in the list happens to write.
-
-That is not hypothetical. ``vol_and_surf_esp`` reads the store's with-H arrays (``cwh``,
-``radii``, ``all_off``, ``nonH``), which ``_flush`` writes in one block under
-``schema["charges"]``. Its ``partial`` channel declared ``flag="with_H"`` rather than
-``flag="charges"``, so a combo-only store set ``charges=False``, ``_flush`` wrote none of the
-block, ``supports()`` still said yes, and screening died with ``KeyError: 'cwh'``. Every shared
-store in the suite also contained ``vol_esp``, which sets ``charges``, so every test passed.
-
-One store per mode is the gate that cannot be fooled that way.
+A shared store can hide a mode whose schema flags do not cover everything ``_flush`` writes,
+because another mode in the list supplies the missing arrays. One store per mode cannot.
 """
 import os
 import shutil
@@ -74,8 +64,7 @@ def _screenable():
 
 @pytest.mark.parametrize("mode", _screenable())
 def test_mode_screens_from_a_store_built_for_itself_alone(mode):
-    """A store created with ``modes=[mode]`` must actually serve that mode. If a mode's flags do
-    not cover what ``_flush`` writes, this fails where a shared store would not."""
+    """A store created with ``modes=[mode]`` must actually serve that mode."""
     from shepherd_score.screen import ProfileStore, screen
 
     mols = [_mol(s, i) for i, s in enumerate(SMILES)]
@@ -108,8 +97,7 @@ def test_mode_screens_from_a_store_built_for_itself_alone(mode):
 
 
 def test_every_flag_a_mode_declares_is_one_the_writer_knows():
-    """A flag a channel declares but ``_flush``/``MoleculeProfile`` never writes would make
-    ``supports()`` true for a store missing the data. Keeps the two tables in step."""
+    """Every schema flag a channel declares must be one the store writer defines."""
     from shepherd_score import screen as S
     from shepherd_score.accel._modes import CANONICAL_MODES
 
@@ -120,9 +108,7 @@ def test_every_flag_a_mode_declares_is_one_the_writer_knows():
 
 
 def test_combo_store_carries_the_with_H_block():
-    """The specific arrays whose absence produced ``KeyError: 'cwh'``. Pinned by name: they are
-    written as one block under ``schema["charges"]``, so a mode reading any of them must pull that
-    flag in."""
+    """A combo-only store carries the with-H block ``_flush`` writes under ``schema["charges"]``."""
     from shepherd_score.screen import ProfileStore
 
     mols = [_mol(s, i) for i, s in enumerate(SMILES)]

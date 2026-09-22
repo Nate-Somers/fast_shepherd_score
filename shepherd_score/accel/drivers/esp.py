@@ -84,15 +84,11 @@ def fast_optimize_ROCS_esp_overlay(ref_points, fit_points, ref_charges, fit_char
                                    lam: float, num_repeats: int = 50, trans_centers=None,
                                    num_repeats_per_trans: int = 10, topk: int = 30,
                                    steps_fine: int = 100, lr: float = 0.075, **kwargs):
-    """Single-pair GPU ESP alignment: ``(aligned_points, SE3 (4,4), score)`` on CPU. Falls back
+    """Single-pair GPU ESP alignment: ``(aligned_points, SE3 (4,4), score)`` on CPU; falls back
     to the eager reference optimizer when CUDA is unavailable.
 
-    ``num_repeats`` is ACCEPTED AND IGNORED on the accelerated path, as it always has been: this
-    function has never forwarded it, so the seed count is the batched default (50) and a caller
-    passing 1 still searches 50 orientations. It IS honoured by the CPU fallback below, which is
-    the reference optimizer. Left as is deliberately -- wiring it through is a behaviour change
-    (``tests/test_fast_batch_alignment.py`` compares this against the batched entry point at
-    ``num_repeats=1`` and expects them to agree to 1e-4, which only holds while both run 50)."""
+    ``num_repeats`` is not forwarded on the accelerated path, which uses the batched default
+    seed count; the CPU fallback honours it."""
     if not check_gpu_available():
         from ...alignment._torch import optimize_ROCS_esp_overlay
         return optimize_ROCS_esp_overlay(ref_points, fit_points, ref_charges, fit_charges,

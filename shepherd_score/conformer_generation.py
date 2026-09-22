@@ -522,8 +522,8 @@ def charges_from_single_point_conformer_with_xtb(conformer: Chem.Mol,
         killed and ``subprocess.TimeoutExpired`` is raised. Default is ``None`` (no timeout).
     uhf : int, optional
         Number of unpaired electrons (xTB ``--uhf``), for open-shell species such as the
-        mono-ions used in a finite-difference Fukui calculation. Default is 0 (closed shell);
-        the flag is emitted only when nonzero, so the default path is byte-identical to before.
+        mono-ions of a finite-difference Fukui calculation. Default is 0 (closed shell); the
+        flag is only passed when nonzero.
 
     Returns
     -------
@@ -586,21 +586,18 @@ def fukui_from_single_point_conformer_with_xtb(conformer: Chem.Mol,
                                                timeout: Optional[float] = None
                                                ):
     """
-    Condensed (finite-difference) Fukui functions per atom from three GFN2-xTB single points.
+    Compute per-atom condensed Fukui functions from three GFN2-xTB single points.
 
-    The Fukui function f(r) = d(rho)/dN condenses to per-atom reactivity indices under the
-    finite-difference / frozen-geometry approximation on the atomic partial charges ``q_k``:
+    Uses the finite-difference, frozen-geometry approximation on the atomic partial charges ``q_k``:
 
         f+_k = q_k(N)   - q_k(N+1)   (nucleophilic-attack susceptibility)
         f-_k = q_k(N-1) - q_k(N)     (electrophilic-attack susceptibility)
         f0_k = 0.5 * (f+_k + f-_k)   (radical)
 
-    where ``q_k(N)`` is the neutral partial charge, ``q_k(N+1)`` the anion (one added electron,
-    ``--chrg charge-1``) and ``q_k(N-1)`` the cation (one removed electron, ``--chrg charge+1``).
-    All three single points use the SAME geometry; each mono-ion carries one unpaired electron
-    (``--uhf 1``) to fix the parity flip for a closed-shell neutral. The signed dual descriptor
-    ``f+_k - f-_k`` (positive at nucleophilic, negative at electrophilic sites) is what the
-    ``vol_fukui`` alignment mode uses as its per-atom field.
+    where ``q_k(N)`` is the neutral charge, ``q_k(N+1)`` the anion (``--chrg charge-1``) and
+    ``q_k(N-1)`` the cation (``--chrg charge+1``), all at the same geometry. Each mono-ion is
+    run with ``--uhf 1``. The ``vol_fukui`` alignment mode uses the dual descriptor
+    ``f+_k - f-_k`` (positive at nucleophilic, negative at electrophilic sites).
 
     Parameters mirror :func:`charges_from_single_point_conformer_with_xtb`.
 
@@ -608,11 +605,7 @@ def fukui_from_single_point_conformer_with_xtb(conformer: Chem.Mol,
     -------
     numpy.ndarray
         ``(N, 3)`` float32 array of ``[f+, f-, f0]`` per atom, in the input (with-H) atom order.
-
-    Raises
-    ------
-    Any exception the underlying xTB single points raise (e.g. a non-converging ion) propagates;
-    callers that want graceful degradation should wrap this (see ``Molecule._generate_fukui``).
+        Any exception from the xTB single points (e.g. a non-converging ion) propagates.
     """
     import numpy as np
     q_neutral = np.asarray(charges_from_single_point_conformer_with_xtb(

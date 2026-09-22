@@ -64,10 +64,9 @@ def rotation_axis_jax(v1: Array, v2: Array) -> Array:
         v3 = jnp.cross(v1, v2)
         norm = jnp.linalg.norm(v3)
         if norm < 1e-12:
-            # v1, v2 (anti)parallel -> undefined axis; any perpendicular to v1 works. Without this
-            # the 0/0 yields NaN, which cascades into an eigh "Eigenvalues did not converge" crash
-            # for linear / single-atom / symmetric-top molecules (mirrors the pca_np fix; this
-            # single-instance branch is the one the jax PCA seeder uses).
+            # v1 and v2 are (anti)parallel, so the axis is undefined; any unit vector
+            # perpendicular to v1 works. Dividing by the zero norm would give a NaN axis that
+            # later crashes eigh (same guard as rotation_axis_np).
             ref = jnp.array([1., 0., 0.]) if abs(float(v1[0])) < 0.9 else jnp.array([0., 1., 0.])
             v3 = jnp.cross(v1, ref)
             norm = jnp.linalg.norm(v3)

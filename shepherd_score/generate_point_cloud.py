@@ -19,11 +19,9 @@ from scipy.special import logsumexp
 from shepherd_score.score.constants import COULOMB_SCALING
 
 
-# Open3D is imported LAZILY (on first real use), not at module load: it is a ~30s
-# cold import and -- importantly -- it is fork-hostile (importing it poisons a later
-# fork+CUDA), so importing it just to pull in shepherd_score would both slow every
-# import and break the fork-based multi-GPU pool (shepherd_score.accel.multi_gpu).
-# Only surface generation actually touches Open3D; alignment-only paths never pay it.
+# Open3D is imported lazily, on first use: its import is slow and it is fork-hostile
+# (importing it before a fork breaks CUDA in the child, which the fork-based multi-GPU
+# pool in shepherd_score.accel.multi_gpu relies on). Only surface generation needs it.
 class _LazyOpen3D:
     def __getattr__(self, attr):
         import open3d as _o3d
@@ -35,20 +33,14 @@ o3d = _LazyOpen3D()
 
 PT = Chem.GetPeriodicTable()
 
-# ---------------------------------------------------------------------------
-# Defaults for the opt-in mesh-free smooth surfacer (get_molecular_surface_smooth_sdf).
-# These are ONLY used when method='smooth_sdf' is explicitly requested; the default
-# Molecule surface (method='mesh') is unchanged. `s` is the smooth-min sharpness:
-# smaller rounds the concave atom-border "crimps" more (less atom-position leak) and
-# pushes points farther off the exact spheres; larger -> sharper union (more leak).
-SMOOTH_SDF_S = 10.0       # smooth-min sharpness; smaller rounds the concave atom-border crimps more
-                          # (points sit farther off the exact spheres, less atom-position leak),
-                          # larger approaches the sharp sphere union
-SMOOTH_SDF_NSPA = 15      # candidate samples/atom for the smooth path (the mesh path uses 25
-                          # because it needs a denser cloud to mesh)
+# Defaults for the opt-in mesh-free surfacer (get_molecular_surface_smooth_sdf); only used
+# when method='smooth_sdf' is requested.
+SMOOTH_SDF_S = 10.0       # smooth-min sharpness: smaller rounds the concave atom-border seams
+                          # more, larger approaches the sharp sphere union
+SMOOTH_SDF_NSPA = 15      # candidate samples per atom (the mesh path needs 25 to mesh)
 SMOOTH_SDF_ITERS = 6      # Newton projection steps
 SMOOTH_SDF_KNN = 8        # nearest atoms per point in the smooth-min (cost ~ O(M*knn))
-SMOOTH_SDF_JITTER = 0.0   # optional extra off-sphere jitter (A) to mimic mesh facet noise
+SMOOTH_SDF_JITTER = 0.0   # extra off-sphere jitter (Angstrom) to mimic mesh facet noise
 SMOOTH_SDF_EVEN = 'fps'   # 'fps' (even, blue-noise-like) or 'random' resample-to-count
 
 
@@ -436,7 +428,8 @@ def get_molecular_surface(centers:np.ndarray,
         was left after cleaning up the atom-sampled surface point cloud.
 
     num_samples_per_atom : int, optional
-        Number of points to sample from the surface of each atom. Default is 25.
+        Number of points to sample from the surface of each atom. Default is None, which
+        lets the chosen method apply its own default (25 for ``method='mesh'``).
         Note that this value is scaled by a given atom's relative vdW radius to a carbon
         and SQUARED. Typically choose a value between 15 and 35. For example, if set to
         20, a carbon atom would have 400 sampled points.
@@ -449,16 +442,15 @@ def get_molecular_surface(centers:np.ndarray,
         The radius of the ball(s) used in Open3D's ball pivoting algorithm to generate
         a triangle mesh. Default is [1.2]. Only used by ``method='mesh'``.
 
-    method : str (default = 'mesh')
-        Surface generation method.
-          'mesh'       -- original Open3D ball-pivoting + Poisson-disk resample (UNCHANGED default).
-          'smooth_sdf' -- mesh-free, Open3D-free smooth + stochastic surfacer (see
-                          ``get_molecular_surface_smooth_sdf``). Opt-in; rounds the concave atom-border
-                          crimps so atom centers are not trivially recoverable from the surface.
+    method : str, optional
+        ``'mesh'`` (default) uses Open3D ball pivoting plus Poisson-disk resampling.
+        ``'smooth_sdf'`` uses the mesh-free, Open3D-free surfacer
+        ``get_molecular_surface_smooth_sdf``, which rounds the concave atom-border seams so
+        atom centers are not trivially recoverable from the surface.
 
     sdf_s, sdf_iters, sdf_knn, sdf_jitter, even, seed
-        Tunables forwarded to ``get_molecular_surface_smooth_sdf`` when ``method='smooth_sdf'``
-        (ignored for ``method='mesh'``).
+        Forwarded to ``get_molecular_surface_smooth_sdf`` when ``method='smooth_sdf'``;
+        ignored otherwise.
 
     Returns
     -------
@@ -467,7 +459,7 @@ def get_molecular_surface(centers:np.ndarray,
     """
     method = (method or 'mesh').lower()
     if method == 'mesh':
-        # None -> 25, the original mesh density (preserves default behavior bit-for-bit)
+        # None -> 25, the mesh path's default density
         nspa = 25 if num_samples_per_atom is None else num_samples_per_atom
         pcd = get_molecular_surface_point_cloud(centers=centers, radii=radii,
                                                 num_points=num_points,
@@ -476,7 +468,7 @@ def get_molecular_surface(centers:np.ndarray,
                                                 ball_radii=ball_radii)
         return np.asarray(pcd.points)
     if method in ('smooth_sdf', 'sdf', 'smooth', 'fast'):
-        # None -> the smooth-path default (SMOOTH_SDF_NSPA, sparser than the mesh's 25)
+        # None -> SMOOTH_SDF_NSPA (resolved inside)
         return get_molecular_surface_smooth_sdf(centers=centers, radii=radii,
                                                 num_points=num_points,
                                                 num_samples_per_atom=num_samples_per_atom,
@@ -486,23 +478,15 @@ def get_molecular_surface(centers:np.ndarray,
     raise ValueError(f"Unknown surface method {method!r}; expected 'mesh' or 'smooth_sdf'.")
 
 
-# =============================================================================
-# Mesh-free smooth + stochastic surfacer (opt-in; Open3D-free)
-# -----------------------------------------------------------------------------
-# Replaces the Open3D ball-pivoting mesh used purely to evenly resample surface
-# points. For the GENERATIVE pipeline the surface must (a) be smooth so a
-# network cannot read atom centers off it ("leak") and (b) be stochastic. This
-# path keeps both: it samples the union-of-(vdW+probe)-spheres envelope, projects
-# the points onto a smooth-min implicit iso-surface (which rounds the concave
-# atom-border "crimps"), and evenly resamples to an exact count. It imports no
-# Open3D, so a smooth-only pipeline runs without that dependency.
-# =============================================================================
+# Mesh-free smooth + stochastic surfacer (opt-in; Open3D-free). Samples the envelope of the
+# union of (vdW + probe) spheres, projects the points onto a smooth-min implicit surface
+# (rounding the concave atom-border seams so atom centers cannot be read off the surface),
+# and evenly resamples to an exact count.
 def _farthest_point_sample(points: np.ndarray, num_points: Union[int, None], start: int = 0) -> np.ndarray:
     """Even (blue-noise-like) subsample via greedy farthest-point sampling.
 
     Returns exactly ``min(num_points, len(points))`` points (all of them if num_points is None).
-    Deterministic given ``start``; with stochastic input points the overall surface is still
-    stochastic. O(num_points * len(points)).
+    Deterministic given ``start``. O(num_points * len(points)).
     """
     P = len(points)
     n = P if num_points is None else min(int(num_points), P)
@@ -526,12 +510,11 @@ def _get_masked_surface_candidates(centers: np.ndarray,
                                    probe_radius: float = 1.2,
                                    stochastic: bool = True,
                                    seed: Union[int, None] = None) -> np.ndarray:
-    """Outer boundary of the union of (vdW+probe) spheres.
+    """Sample the outer boundary of the union of (vdW + probe) spheres.
 
-    Samples each atom's (vdW+probe) sphere, then keeps only points outside every other atom's
-    sphere (the exposed solvent-accessible envelope). This is the SAME masking the mesh path uses
-    (``_get_molecular_surface_mesh``). ``stochastic=True`` uses the random sampler so the envelope
-    varies run-to-run (matching the unseeded mesh+Poisson); ``seed`` makes it reproducible.
+    Samples each atom's sphere and keeps the points outside every other atom's sphere, the
+    same masking ``_get_molecular_surface_mesh`` uses. ``stochastic=True`` uses the random
+    sampler; ``seed`` makes it reproducible.
     """
     radii = np.asarray(radii)
     if stochastic:
@@ -560,12 +543,10 @@ def _smoothmin_sdf_project(points: np.ndarray,
 
         g(x) = -(1/s) * logsumexp_i( -s * (||x - c_i|| - a_i) )
 
-    via Newton steps ``x <- x - g * grad g / ||grad g||^2`` along the analytic gradient
-    ``grad g = sum_i w_i (x-c_i)/||x-c_i||`` with softmin weights ``w_i``. Smaller ``s`` rounds the
-    concave atom-border seams more (and pushes points off the exact spheres -> less leak); larger
-    ``s`` approaches the sharp sphere union. Only each point's ``knn`` nearest atoms contribute
-    (the LSE decays), fixed once at the start (Newton moves points < ~0.5 A), so cost is O(M*knn)
-    and roughly independent of molecule size.
+    via Newton steps ``x <- x - g * grad g / ||grad g||^2`` with the analytic gradient
+    ``grad g = sum_i w_i (x-c_i)/||x-c_i||`` (softmin weights ``w_i``). Smaller ``s`` rounds
+    the concave atom-border seams more; larger ``s`` approaches the sharp sphere union. Only
+    each point's ``knn`` nearest atoms contribute, chosen once up front, so cost is O(M*knn).
     """
     points = np.asarray(points, dtype=np.float64)
     centers = np.asarray(centers, dtype=np.float64)
@@ -602,18 +583,13 @@ def get_molecular_surface_smooth_sdf(centers: np.ndarray,
                                      jitter: float = SMOOTH_SDF_JITTER,
                                      even: str = SMOOTH_SDF_EVEN,
                                      seed: Union[int, None] = None) -> np.ndarray:
-    """Mesh-free, Open3D-free smooth + stochastic molecular surface (opt-in).
+    """Mesh-free, Open3D-free smooth and stochastic molecular surface.
 
-    Pipeline: sample the union-of-(vdW+probe)-spheres envelope (stochastic) -> project onto the
-    smooth-min implicit iso-surface (rounds the concave atom-border "crimps" so atom centers are
-    not trivially recoverable) -> optional small off-sphere jitter -> even (FPS) resample to
-    exactly ``num_points``. Stochastic per call unless ``seed`` is given (then fully reproducible).
-
-    Smoothness / anti-leak is tuned by ``s`` (smaller = smoother / more off-sphere / less leak).
-
-    IMPORTANT: this is opt-in. The default ``Molecule`` surface (``method='mesh'``) is unchanged.
-    Using this instead of the mesh surface is a distribution shift relative to a model trained on
-    the mesh surface.
+    Samples the envelope of the union of (vdW + probe) spheres, projects the points onto the
+    smooth-min implicit iso-surface (rounding the concave atom-border seams so atom centers
+    are not trivially recoverable), optionally jitters them off the surface, and resamples
+    evenly to exactly ``num_points``. Stochastic per call unless ``seed`` is given. A model
+    trained on the mesh surface sees this surface as a distribution shift.
 
     Parameters
     ----------
@@ -622,11 +598,11 @@ def get_molecular_surface_smooth_sdf(centers: np.ndarray,
     s, iters, knn
         Smooth-min sharpness, Newton steps, and nearest-atom count (see ``_smoothmin_sdf_project``).
     jitter : float
-        Optional std (A) of extra outward jitter to mimic the mesh's facet noise. Default 0.
+        Std (Angstrom) of extra outward jitter to mimic the mesh's facet noise. Default 0.
     even : str
         'fps' (even, blue-noise-like; default) or 'random' resample to ``num_points``.
     seed : int or None
-        If given, the surface is reproducible; otherwise it varies run-to-run (stochastic).
+        If given, the surface is reproducible; otherwise it varies run to run.
 
     Returns
     -------

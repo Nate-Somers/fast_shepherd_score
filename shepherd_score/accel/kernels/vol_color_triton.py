@@ -1,16 +1,11 @@
-"""Fused vol_color value+gradient kernel: shape (volume) overlap AND directionless color
-overlap in ONE CUDA kernel per pose.
+"""Fused vol_color kernel: shape (volume) overlap and directionless color overlap in one launch.
 
-The two channels (`overlap_score_grad_se3_batch` for shape, `pharm_color_score_grad_se3_batch`
-for color) are structurally identical -- same R(q) build, same isotropic-Gaussian overlap,
-the SAME dV/dq tail (the color tail is "verbatim shape-kernel tail"). They differ only in:
-  * shape uses a FIXED alpha (half_alpha, k_const) and no type gate;
-  * color uses a PER-FIT-TYPE alpha/K from the lookup tables and gates pairs on
-    (same-type AND not-dummy).
-So this kernel builds R(q) ONCE and runs both overlaps, emitting (Vs, dQs, dTs, Oc, dQc, dTc)
-in a single launch -- collapsing vol_color's 2 kernels/step to 1 (the ROSHAMBO2 fused
-shape+color). Single-tile (one BLOCK covers each cloud); the vol_color driver falls back to
-the two separate kernels when a cloud exceeds the tile (large molecules).
+The two channels (``overlap_score_grad_se3_batch`` for shape, ``pharm_color_score_grad_se3_batch``
+for color) share the R(q) build, the isotropic-Gaussian overlap and the dV/dq tail; shape uses
+a fixed alpha and no type gate, color a per-fit-type alpha/K from the lookup tables gated on
+same-type and not-dummy. This kernel builds R(q) once and emits (Vs, dQs, dTs, Oc, dQc, dTc)
+per pose. Single-tile (one BLOCK covers each cloud); the driver falls back to the two separate
+kernels above ``VOL_COLOR_FUSED_MAX_PAD``.
 """
 from __future__ import annotations
 
@@ -40,7 +35,7 @@ def _vol_color_fused_kernel(
 ):
     pid = tl.program_id(0)
 
-    # ---- quaternion / translation + R(q) (SHARED by both channels) ----
+    # ---- quaternion / translation + R(q) (shared by both channels) ----
     Qb = Q_ptr + pid * 4
     Tb = T_ptr + pid * 3
     qr = tl.load(Qb + 0); qi = tl.load(Qb + 1); qj = tl.load(Qb + 2); qk = tl.load(Qb + 3)
@@ -153,12 +148,8 @@ def _vol_color_fused_kernel(
         tl.store(dTcb + 0, dTcx); tl.store(dTcb + 1, dTcy); tl.store(dTcb + 2, dTcz)
 
 
-# Max cloud edge for which the fused kernel is used. The single-tile fused kernel carries BOTH
-# channels' BLOCKxBLOCK accumulators in registers, so tiles above 32 blow occupancy and the two
-# separate kernels are faster. The driver must only take the fused path when every pad is <= this
-# value, and fall back to the separate shape + color kernels otherwise.
-# NO JOB ID: the 32 records no measurement, so the occupancy claim above cannot be re-checked.
-# Same gap as drivers/shape.py:_MODE_POSES -- cite the job id when you change it.
+# Largest padded cloud edge for which the fused kernel is used: it holds both channels'
+# BLOCKxBLOCK accumulators in registers, so larger tiles lose occupancy to the separate kernels.
 VOL_COLOR_FUSED_MAX_PAD = 32
 
 
@@ -167,12 +158,12 @@ def vol_color_score_grad_se3_batch(
     alphas, Ks, cats, *, alpha=0.81,
     N_real_cent=None, M_real_cent=None, N_real_anc=None, M_real_anc=None, NEED_GRAD=True,
 ):
-    """One fused launch computing BOTH channels for vol_color. Returns
-    (VAB_shape, dQ_shape, dT_shape, O_color, dQ_color, dT_color) -- the same six tensors the
+    """One fused launch computing both channels for vol_color. Returns
+    (VAB_shape, dQ_shape, dT_shape, O_color, dQ_color, dT_color), the same six tensors the
     two separate kernels produce, in the same conventions (dQ = dO/dq).
 
     Shapes: centers_1/2 (P,Ns/Ms,3) shape atoms; anchors_1/2 (P,Na/Ma,3) color anchors;
-    ref/fit_types (P,Na)/(P,Ma); q (P,4); t (P,3). Caller must ensure max pad <=
+    ref/fit_types (P,Na)/(P,Ma); q (P,4); t (P,3). The caller must ensure max pad <=
     VOL_COLOR_FUSED_MAX_PAD (else use the separate kernels)."""
     P, Ns_pad, _ = centers_1.shape
     _, Ms_pad, _ = centers_2.shape
@@ -190,11 +181,8 @@ def vol_color_score_grad_se3_batch(
     half_alpha = 0.5 * alpha
     k_const = math.pi ** 1.5 / ((2.0 * alpha) ** 1.5)
 
-    # Every kernel below STORES its score for each pose unconditionally, and its gradients
-    # whenever NEED_GRAD, so pre-zeroing is a memset per fine step over buffers about to be
-    # overwritten -- 0.0159 us/mol of device time on a vol screen at N=100,000 (job
-    # 22593930), and this kernel has more outputs than that one. Without NEED_GRAD the
-    # gradient buffers ARE left unwritten, so those keep their zeros.
+    # The kernel stores every score and, when NEED_GRAD, every gradient, so no pre-zeroing;
+    # without NEED_GRAD the gradient buffers are left unwritten and keep their zeros.
     Vs = torch.empty(P, device=dev, dtype=dtype)
     Oc = torch.empty(P, device=dev, dtype=dtype)
     _g = torch.empty if NEED_GRAD else torch.zeros

@@ -1,14 +1,6 @@
-"""
-Tests for the ROCS/ROSHAMBO-style directionless "color" scoring and the ``vol_color``
-combined shape + color alignment mode.
-
-Covers:
-  * directionless=True (isotropic point-Gaussian) scoring parity: torch vs NumPy oracle,
-  * directionless self-overlap == 1.0,
-  * the precomputed-self-overlap guard,
-  * combo scorer color_weight + directional,
-  * RDKit BaseFeatures.fdef featurization (feature_set='rdkit_base', directionless),
-  * the optimize_vol_color_overlay / MoleculePair.align_with_vol_color path (self-copy -> 1.0).
+"""Tests for the directionless "color" pharmacophore scoring and the ``vol_color`` combined
+shape + color alignment mode: torch vs NumPy parity, self-overlap, the precomputed-self-overlap
+guard, the combo scorer, RDKit BaseFeatures featurization, and the alignment path.
 """
 import warnings
 
@@ -100,8 +92,7 @@ class TestDirectionlessScoring:
         assert np.allclose(res_torch.numpy(), 1.0, rtol=1e-10, atol=1e-10)
 
     def test_directionless_precompute_guard(self):
-        """directionless=True with precomputed_self_overlaps must raise (avoids the
-        directional-self vs directionless-cross Tanimoto collision)."""
+        """directionless=True with precomputed_self_overlaps must raise."""
         ptype_1, ptype_2, anchors_1, anchors_2, vectors_1, vectors_2 = \
             TestDataGenerator.generate_pharmacophore_data(6, 4, seed=3)
         with pytest.raises(ValueError):
@@ -251,8 +242,7 @@ class TestVolColorBatch:
     """The batched vol_color driver (shape kernel + directionless color)."""
 
     def test_batched_numba_self_copy(self, embedded_mol):
-        """MoleculePairBatch.align_with_vol_color(backend='numba') recovers self-copy ~1.0
-        and matches the per-pair path (the batched GPU driver runs the same code on CUDA)."""
+        """The batched numba vol_color driver recovers self-copies at ~1.0."""
         try:
             import numba  # noqa: F401
         except ImportError:

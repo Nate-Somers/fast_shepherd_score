@@ -1,16 +1,7 @@
-"""Reference-mode gates for the ``vol_fukui`` mode (shape + condensed-Fukui reactivity field).
-
-``vol_fukui`` overlays the signed condensed-Fukui dual descriptor ``f+ - f-`` as an ESP-style
-per-atom field on top of the Gaussian shape, structurally identical to ``vol_lipo`` (it reuses
-``objective_vol_lipo_overlay`` / ``optimize_vol_lipo_overlay``) but with the Fukui field instead of
-Crippen logP. Gates 1-4 are the correctness gate for every reference mode; gate 5 (retained-H) is
-required because it reads a per-atom field.
-
-The real Fukui field comes from three gfn2-xTB single points (``Molecule.fukui``), which needs the
-xtb binary. These gates instead **inject a deterministic synthetic signed field** via the
-``Molecule(fukui=...)`` constructor argument, so they exercise the exact same signed-field overlap
-path without requiring xTB -- the correctness of the *overlap math* is independent of how the field
-was produced. Field robustness / xTB integration is a benchmark concern, not a mode-correctness one.
+"""Reference-mode gates for ``vol_fukui`` (shape + condensed-Fukui field), which rides the
+``vol_lipo`` objective with the Fukui field in place of Crippen logP. The real field needs xTB,
+so a deterministic synthetic signed field is injected via ``Molecule(fukui=...)``; the overlap
+math does not depend on how the field was produced.
 """
 import numpy as np
 import pytest
@@ -40,10 +31,7 @@ def _embed(smi, seed=0):
 
 
 def _synthetic_fukui(m):
-    """A deterministic SIGNED per-atom field (full ``(N,)`` with-H order) standing in for the real
-    xTB Fukui dual descriptor in these tests. Signed and varied (so the signed-field path is
-    genuinely exercised) and a pure function of atom order (so ref and a copy get the same field,
-    keeping self-overlap == 1)."""
+    """Deterministic signed per-atom field in with-H order; a function of atom order so copies match."""
     z = np.array([a.GetAtomicNum() for a in m.GetAtoms()], dtype=np.float32)
     return (0.2 * ((z % 4) - 1.5)).astype(np.float32)   # values in {-0.3, -0.1, 0.1, 0.3}
 
@@ -53,8 +41,7 @@ def deepcopy_mol(m):
 
 
 def _make_pair(smi="c1ccccc1CCO"):
-    """Build a (ref, fit) MoleculePair where fit is a copy of ref (self-overlap), each carrying the
-    injected synthetic Fukui field (no xTB)."""
+    """A (ref, fit) pair where fit is a copy of ref, each carrying the synthetic Fukui field."""
     m = _embed(smi)
     ref = Molecule(deepcopy_mol(m), fukui=_synthetic_fukui(m))
     fit = Molecule(deepcopy_mol(m), fukui=_synthetic_fukui(m))
@@ -82,8 +69,7 @@ def test_self_overlap_is_one():
 
 # --- Gate 2: autograd gradient matches finite differences -------------------------------------
 def test_autograd_matches_finite_difference():
-    """vol_fukui reuses ``objective_vol_lipo_overlay``; validate the analytic gradient with the
-    Fukui field fed in (float32, eps=1e-3, atol=2e-3, at a NON-identity pose per pitfalls.md)."""
+    """Analytic gradient with the Fukui field matches finite differences at a non-identity pose."""
     pair = _make_pair()
     ref_centers, ref_fukui_pos, ref_fukui = _fukui_inputs(pair.ref_molec)
     fit_centers, fit_fukui_pos, fit_fukui = _fukui_inputs(pair.fit_molec)
@@ -151,11 +137,7 @@ def test_deterministic_given_seed():
 
 # --- Gate 5: retained-H molecule --------------------------------------------------------------
 def test_retained_h_molecule():
-    """A molecule whose Chem.RemoveHs RETAINS an H (deuterium) has ``atom_pos`` longer than the
-    true-heavy set ``_nonH_atoms_idx`` selects. vol_fukui pairs the heavy Fukui field with the
-    true-heavy conformer positions (never ``atom_pos``); pairing it with ``atom_pos`` would
-    broadcast (N) against (N-1) and crash. This gate proves it does not. Uses an injected synthetic
-    field so the with-H array has the full atom count and its heavy slice is well-defined."""
+    """A retained-H molecule must not desync the heavy Fukui field from its centres."""
     m = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))     # deuterium survives RemoveHs
     params = AllChem.ETKDGv3(); params.randomSeed = 0
     assert AllChem.EmbedMolecule(m, params) == 0
@@ -168,9 +150,8 @@ def test_retained_h_molecule():
     assert len(fukui) == len(mol._nonH_atoms_idx)
     assert len(fukui) != mol.atom_pos.shape[0]
 
-    # desync guard: exercise the full per-atom overlap path at a NON-identity pose. shape centres
-    # (atom_pos, N rows) and fukui centres (true-heavy, N-1 rows) differ in length; a wrong pairing
-    # with atom_pos would raise a broadcast error here.
+    # the shape centres (N rows) and Fukui centres (N-1 rows) differ in length; a wrong pairing
+    # would raise a broadcast error here
     centers, fukui_pos, fukui_t = _fukui_inputs(mol)
     assert centers.shape[0] != fukui_pos.shape[0]                 # shape N vs fukui N-1
     se3 = torch.tensor([0.966, 0.259, 0.0, 0.0, 0.3, -0.2, 0.1], dtype=torch.float32)
@@ -180,7 +161,7 @@ def test_retained_h_molecule():
     )
     assert 0.0 <= float(1 - loss) <= 1.0
 
-    # End-to-end on the same deuterated molecule: MoleculePair self-aligns to 1.000.
+    # end-to-end on the same deuterated molecule
     m2 = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))
     params2 = AllChem.ETKDGv3(); params2.randomSeed = 2
     assert AllChem.EmbedMolecule(m2, params2) == 0

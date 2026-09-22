@@ -1,37 +1,12 @@
 """Persistent single-threaded process pool for the CPU (``numba``) batched aligner.
 
-Why this exists
----------------
-The ``backend="numba"`` path parallelises *one* batch across **threads** -- the
-``@njit(parallel=True)`` ``prange`` overlap kernel. On many-core CPUs this scales
-sub-linearly: ``prange`` static-schedules the poses behind a per-step barrier, so one
-slow core straggles every step, and the numba and torch thread pools oversubscribe each
-other.
-
-This module is the alternative that scales closer to *N*: shard the **pairs** across
-*N* persistent worker **processes**, each running the unchanged batched aligner
-**single-threaded**. Alignment pairs are independent (each score is its own max over
-SE(3) seeds), so sharding does not change the optimization problem for any pair -- it
-only removes the per-step cross-core barrier, so heterogeneous cores no longer drag each
-other and the aggregate approaches one-core-throughput x N. Agreement with one big call
-is to convergence tolerance, not bitwise: the fine loop's early-stop runs until EVERY
-pair in the batch has stopped improving, so a pair's step count depends on which pairs
-share its batch and a shard may plateau a step or two apart.
-
-Design
-------
-* **Persistent** workers (one pool per process, reused across calls): the numba
-  JIT-cache load and heavy imports are paid once, not per call.
-* Reuses :data:`shepherd_score.accel.batch._MODE_SPEC` and
-  :class:`~shepherd_score.accel.batch._ProcStandIn` -- the same per-mode
-  ``extract`` / ``tensors`` / ``out`` declarations the GPU process path uses -- so only
-  small numpy arrays cross the boundary (no RDKit / ``Molecule`` objects, no tensors).
-* Opt-in via ``MoleculePairBatch.align_with_*(backend="numba", num_workers=N)`` with
-  ``N > 1`` (mirrors the JAX path's ``num_workers``). ``N == 1`` keeps the original
-  single-process thread path untouched.
-
-Caveat: uses the ``spawn`` start method, so the importing program must be
-``if __name__ == "__main__"``-guarded (the standard multiprocessing requirement).
+The in-process numba path parallelises one batch across threads behind a per-step barrier and
+scales sub-linearly on many-core hosts. This pool shards the pairs across persistent worker
+processes instead (``align_with_*(backend="numba", num_workers=N)``), each running the unchanged
+batched aligner single-threaded. Pairs are independent, so sharding changes no pair's problem;
+agreement with one big call is to convergence tolerance, not bitwise, because the fine loop's
+early stop depends on which pairs share a batch. Only small numpy arrays cross the process
+boundary. Uses ``spawn``, so the importing program must be ``if __name__ == "__main__"``-guarded.
 """
 from __future__ import annotations
 
@@ -40,10 +15,8 @@ import os
 
 import numpy as np
 
-# Modes with a `_MODE_SPEC` entry (the GPU process / CPU-pool path); the others fall back to the
-# single-process path. Sourced from the mode registry (asserted == tuple(_MODE_SPEC) by the
-# registry test). Legacy aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp) likewise come
-# from the registry and are normalized in align_pairs.
+# Modes with a ``_MODE_SPEC`` entry; the others use the single-process path. Legacy aliases
+# (esp -> surf_esp, esp_combo -> vol_and_surf_esp) are normalised in align_pairs.
 from ._modes import PROCESS_MODES as POOL_MODES, LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES
 
 
@@ -51,11 +24,8 @@ from ._modes import PROCESS_MODES as POOL_MODES, LEGACY_MODE_ALIASES as _LEGACY_
 # Worker side (runs in each persistent child process)
 # ---------------------------------------------------------------------------
 def _run_shard(bm, torch, mode, rows, kwargs):
-    """Run the unchanged batched aligner on one shard of stand-ins.
-
-    ``rows`` is a list of tuples-of-numpy, one per pair, ordered to match
-    ``_MODE_SPEC[mode]['tensors']``. Returns numpy ``(scores (k,), transforms (k,4,4))``.
-    """
+    """Run the batched aligner on one shard. ``rows`` holds one tuple of numpy arrays per pair,
+    ordered as ``_MODE_SPEC[mode]['tensors']``; returns ``(scores (k,), transforms (k,4,4))``."""
     mode = _LEGACY_MODE_ALIASES.get(mode, mode)
     spec = bm._MODE_SPEC[mode]
     tnames = spec["tensors"]
@@ -79,14 +49,13 @@ def _run_shard(bm, torch, mode, rows, kwargs):
 
 
 def _worker_loop(task_q, res_q):
-    """Persistent worker: pin to one core, then serve shard tasks until a ``None``
-    sentinel. Task = ``(mode, rows, kwargs)``; reply = ``(scores, transforms)`` or
-    ``("__ERR__", traceback)``."""
+    """Persistent single-threaded worker serving ``(mode, rows, kwargs)`` tasks until a ``None``
+    sentinel; replies are ``(scores, transforms)`` or ``("__ERR__", traceback)``."""
     os.environ["CUDA_VISIBLE_DEVICES"] = ""          # pure CPU; set before torch import
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     import torch
-    torch.set_num_threads(1)                          # this worker IS one core of the budget
+    torch.set_num_threads(1)                          # one thread per worker
     try:
         import numba
         numba.set_num_threads(1)
@@ -112,8 +81,8 @@ def _worker_loop(task_q, res_q):
 class CpuAlignPool:
     """A fixed-size pool of persistent single-threaded worker processes.
 
-    One task queue + one result queue per worker, so shard ``w`` always maps to worker
-    ``w`` (round-robin over pairs) -- simple and order-preserving.
+    One task queue and one result queue per worker, so shard ``w`` always maps to worker ``w``
+    (round-robin over pairs) and results reassemble in order.
     """
 
     def __init__(self, num_workers: int):
@@ -131,9 +100,8 @@ class CpuAlignPool:
         self._closed = False
 
     def align(self, mode, per_pair, kwargs):
-        """Shard ``per_pair`` (list of tuples-of-numpy, original order) round-robin
-        across workers and return ``(scores, transforms)`` reassembled in original
-        order. Workers with an empty shard simply return nothing."""
+        """Shard ``per_pair`` (list of tuples of numpy arrays) round-robin across workers and
+        return ``(scores, transforms)`` reassembled in the original order."""
         K = len(per_pair)
         shards = [list(range(w, K, self.num_workers)) for w in range(self.num_workers)]
         for w, idxs in enumerate(shards):
@@ -173,8 +141,7 @@ _POOL: CpuAlignPool | None = None
 
 
 def get_pool(num_workers: int) -> CpuAlignPool:
-    """Return the module-level persistent pool, rebuilt only if the worker count
-    changes (so back-to-back calls at the same width reuse warm workers)."""
+    """Return the module-level persistent pool, rebuilt only if the worker count changes."""
     global _POOL
     if _POOL is None or _POOL._closed or _POOL.num_workers != num_workers:
         if _POOL is not None:
@@ -196,12 +163,8 @@ def _shutdown_pool():
 # ---------------------------------------------------------------------------
 def align_pairs(mode, pairs, num_workers, align_kwargs):
     """Align ``pairs`` (``MoleculePair``) across the persistent CPU pool, writing
-    ``sim_aligned_*`` / ``transform_*`` back in-place -- equivalent to the
-    single-process numba path (pairs are independent; agreement is to convergence
-    tolerance, not bitwise -- see the module docstring). Also caches the per-pair
-    input tensors (``_*_t``) on each pair, so the caller's ``return_aligned`` path
-    finds them just as the single-process path would. Results are in-place; returns
-    nothing.
+    ``sim_aligned_*`` / ``transform_*`` back in place. Also caches the per-pair input tensors
+    (``_*_t``) on each pair, as the single-process path does for ``return_aligned``. Returns nothing.
     """
     import torch
     from shepherd_score.accel import batch as bm

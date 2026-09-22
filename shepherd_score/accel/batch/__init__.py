@@ -1,10 +1,10 @@
 # shepherd_score/accel/batch/__init__.py
-"""Batched multi-GPU GPU/Triton aligners for MoleculePair, split into ``_pad`` (bucketing /
-sub-batching / scatter), ``_dispatch`` (multi-GPU sharding + the process-pool tensor spec),
-``aligners`` (the generic ``_align_batch_<mode>`` functions, one generated per registry mode)
-and ``_arrays`` (the array-native screen aligner). The ``accel.batch`` attribute surface --
-``_align_batch_<mode>`` for every canonical mode and both legacy aliases, ``_MODE_SPEC``,
-``_batch_upload``, ... -- is re-exported here."""
+"""Batched GPU/Triton aligners for MoleculePair: ``_pad`` (bucketing, sub-batching, scatter),
+``_dispatch`` (multi-GPU sharding and the process-pool tensor spec), ``aligners`` (the generic
+``_align_batch_<mode>`` functions, one per registry mode) and ``_arrays`` (the array-native
+screen aligner). The ``accel.batch`` attribute surface (``_align_batch_<mode>`` for every
+canonical mode and both legacy aliases, ``_MODE_SPEC``, ``_batch_upload``, ...) is re-exported
+here."""
 from ._pad import (
     _band_key, _subbatched_align, _scatter_fill, _PAIR_FOOTPRINT_BYTES, _BAND,
 )

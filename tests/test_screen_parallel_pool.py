@@ -1,9 +1,7 @@
 """The shard-parallel CPU driver keeps its forked pool across calls against the same library.
 
-Runs the driver in a SUBPROCESS on purpose: ``screen_parallel`` forks, and forking a process
-that has already run a numba prange -- as this pytest process has by the time this file is
-collected -- can abort the child under libgomp. A fresh interpreter is numba-clean, which is the
-contract the driver's docstring states (featurise, then screen).
+Runs in a subprocess: forking a process that has already run a numba prange, as this pytest
+process has by collection time, can abort the child under libgomp.
 """
 import json
 import os
@@ -65,10 +63,8 @@ def test_pool_is_reused_for_the_same_library_and_refreshed_for_another():
     assert out["resized"], "a different worker count was served by the old pool"
     assert out["closed"]
     assert len(out["a"]) == 6 and all(isinstance(s, float) for s in out["a"])
-    # a, b and c align identical shard batches, so they must agree bit for bit; d splits the
-    # library into three shards instead of two, and a batch's padded composition feeds the
-    # principal-axis frame the seeds are built from, so d is only close (measured: 6e-5 on
-    # one score when this read `a == d`).
+    # a, b and c align identical shard batches and must agree bit for bit; d splits into three
+    # shards, and the padded batch composition feeds the seed frame, so d is only close
     assert out["a"] == out["b"], "the reused pool returned different scores"
     assert out["a"] == out["c"], "a fresh pool for the same library returned different scores"
     assert max(abs(x - y) for x, y in zip(out["a"], out["d"])) < 1e-3, \
@@ -76,8 +72,7 @@ def test_pool_is_reused_for_the_same_library_and_refreshed_for_another():
 
 
 def test_shards_are_strided_and_cover_the_library():
-    """Worker w gets w, w+k, w+2k, ...: a library stored as compound ensembles is then spread
-    across the workers instead of handing one of them the largest compounds."""
+    """Worker w gets w, w+k, w+2k, ... so compound ensembles are spread across workers."""
     from shepherd_score.accel.screen_parallel import _chunks
     ch = _chunks(10, 4)
     assert [list(r) for r in ch] == [[0, 4, 8], [1, 5, 9], [2, 6], [3, 7]]

@@ -14,8 +14,8 @@ import torch.nn.functional as F
 
 
 def quaternions_to_SE3_batch(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """Batched (q,t)->(K,4,4) SE(3) builder, applied row-wise.
-    q : (K, 4) normalised (r,i,j,k); t : (K, 3) -> (K, 4, 4)."""
+    """Build a (K, 4, 4) batch of SE(3) matrices from normalised quaternions q (K, 4) in
+    (r, i, j, k) order and translations t (K, 3)."""
     r, i, j, k = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     two = 2.0
     R = torch.stack((
@@ -167,8 +167,7 @@ def apply_SE3_transform(points: torch.Tensor,
     -------
     transformed_points : torch.Tensor (batch, N, 3) or (N, 3)
         Set of coordinates transformed by the corresponding SE(3) transformation.
-        Note: a singleton batch (batch==1) is collapsed to (N, 3) so single-vs-batch
-        handling agrees at num_repeats==1.
+        A singleton batch (batch == 1) is returned as (N, 3).
     """
     if points.shape[-1] != 3:
         raise ValueError(f'"points" should have shape (N_points, 3) or (batch, N_points, 3). Instead the shape given was: {points.shape}')
@@ -177,10 +176,8 @@ def apply_SE3_transform(points: torch.Tensor,
     if len(SE3_transform.shape) != len(points.shape):
         raise ValueError(f'Shapes of points and SE3_transform should be the same length. Instead {len(SE3_transform.shape)} and {len(points.shape)} were given.')
 
-    # Normalize to a (R, ., .) batch, transform with one fused baddbmm, then collapse a
-    # singleton batch back to a single (N, 3) cloud. The R==1 batched case MUST return
-    # (N, 3) so single-vs-batch handling downstream stays consistent at num_repeats==1
-    # (the analytical and autograd optimizers rely on this).
+    # Promote to a batch, apply one baddbmm, then collapse a singleton batch back to (N, 3);
+    # the optimizers rely on the batch == 1 case returning a single cloud.
     se3 = SE3_transform if SE3_transform.dim() == 3 else SE3_transform.unsqueeze(0)
     pts = points if points.dim() == 3 else points.unsqueeze(0)
     rot = se3[:, :3, :3]

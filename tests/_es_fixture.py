@@ -1,70 +1,8 @@
-"""Deterministic CPU fixture that guards the PER-PAIR early stop (WHATS_NEW B9).
+"""Early-stop fixture: a converged self-pair must not halt the other pairs in its bucket.
 
-This is a HELPER, not a collected test: the leading underscore keeps it out of pytest's
-``python_files = test_*.py`` discovery. Run it directly::
-
-    python tests/_es_fixture.py
-
-WHAT IT GUARDS
---------------
-Every fine loop in ``shepherd_score/accel`` USED to decide when to stop from a GLOBAL maximum::
-
-    if step % 5 == 0:
-        current_max = best_score.max().item()     # max over ALL pairs AND ALL seeds
-        ...                                       # patience=2 -> break
-
-``best_score`` has shape ``(PK,)`` with ``PK = K*P`` (K = pairs in the bucket, P = seeds),
-laid out k-major, so ``.max()`` collapsed every pose of every pair to one scalar and a pair
-that converged early halted optimization for every other pair sharing the bucket. With
-``patience=2`` and a check every 5 steps the floor was 11 executed steps no matter how large
-the configured budget was. The criterion is now taken PER PAIR, so that leak is closed.
-
-The fixture holds it closed by putting a SELF-PAIR (a molecule against a copy of itself,
-which scores 1.0 from the identity seed and can never improve) in the same bucket as four
-genuinely different cross-pairs. Under the old rule the self-pair pinned the global max at
-1.0 immediately, the whole bucket broke at step 10, and the cross-pairs got 11 steps instead
-of their configured 30 / 40 / 50. A PASS today is every BASELINE row running its full budget
-with its deficit at the fp32 noise floor (|deficit| < 1e-6); a row that reads 11 steps again,
-or a deficit that grows past noise, is the defect back.
-
-Four variants are printed per mode, plus a control:
-
-  * REFERENCE -- the existing ``early_stop_patience`` keyword raised so the break can never
-    fire and the configured budget runs in full. These are the scores the fix has to reach.
-    ``MODE_SEEDS`` / ``MODE_STEPS`` are NOT touched; search effort is identical.
-  * BASELINE  -- the shipped behaviour. Each cross-pair prints its ``deficit`` against the
-    reference; with the per-pair criterion in place that deficit is fp32 noise.
-  * CONTROL   -- the same four cross-pairs with the self-pair dropped from the bucket and
-    nothing else changed. They run their full budget and land back on the reference scores,
-    which attributes the whole deficit to the other pair sharing the bucket.
-
-THE TWO CPU CODE PATHS
-----------------------
-One generic fine loop now serves every mode (``accel/drivers/engine.py``), with two CPU
-implementations of it, and both are covered here:
-
-  * the FUSED numba loop (``kernels/cpu_fused.py::run_fused``) -- no torch in the hot loop;
-  * the EAGER torch loop (``engine._eager``) -- the fall-back, and the only path for the
-    pharmacophore family, whose spec sets ``cpu_fused=False``.
-
-So each mode is run twice: once on its default CPU route, and once with ``run_fused`` forced to
-fail so the eager loop runs instead.
-
-INSTRUMENTATION
----------------
-No driver, kernel or container file is edited. Everything is a monkeypatch of a module
-attribute, restored on exit:
-
-  * ``drivers.engine.align`` -- wrapped only to OPEN a record, one per fine-loop invocation.
-    A bucket split or a sub-batch split shows up as several records instead of hiding inside
-    one total.
-  * ``drivers.engine._eager`` / ``kernels.cpu_fused.run_fused`` -- which loop ran.
-  * ``drivers.terms.evaluate`` -- the value+grad call each EAGER iteration makes once per
-    gradient term, so the per-iteration count divides by the mode's term count.
-
-Counting convention: the reported number is FINE-LOOP ITERATIONS entered. Both loops now apply
-their Adam update AFTER the early-stop check, so an 11-iteration run applies 10 updates on
-either path -- the asymmetry the old fused loop had is gone.
+A helper, not a collected test; run it directly with ``python tests/_es_fixture.py``. Per mode
+it prints the full-budget reference, the default behaviour and a control with the self-pair
+dropped, on both the fused numba and the eager torch CPU fine loops.
 """
 from __future__ import annotations
 
@@ -98,10 +36,8 @@ def _stats_steps():
 
 MODES = ("vol", "vol_color", "vol_lipo")
 
-# Fixed library. Heavy-atom counts are close enough (9-14) that the adaptive bucketer keeps
-# all five pairs in ONE bucket, which is the point: the leak this guards against was a
-# cross-pair one, inside a bucket. Entry 0 is the reference itself, so pair 0 is a
-# self-overlap that scores 1.0.
+# Heavy-atom counts (9-14) are close enough that all five pairs share one bucket; entry 0 is
+# the reference itself, so pair 0 is a self-overlap that scores 1.0.
 SMILES = (
     "c1ccccc1CCO",                    # 2-phenylethanol   (ref, and the self-pair fit)
     "CC(=O)Oc1ccccc1C(=O)O",          # aspirin
@@ -130,12 +66,7 @@ def _embed(smiles: str) -> Chem.Mol:
 
 
 def _molecule(smiles: str) -> Molecule:
-    """A Molecule carrying everything the three modes read.
-
-    ``pharm_multi_vector=False`` + ``feature_set='rdkit_base'`` gives the directionless
-    pharmacophores ``vol_color`` needs. No ``num_surf_points``: none of these modes touch the
-    surface, and building one would require open3d.
-    """
+    """A Molecule with directionless pharmacophores (for vol_color) and no surface (no open3d)."""
     return Molecule(_embed(smiles), pharm_multi_vector=False, feature_set="rdkit_base")
 
 
@@ -146,22 +77,13 @@ def build_pairs() -> list[MoleculePair]:
             for s in SMILES]
 
 
-# Patience large enough that the early-stop branch can never fire, so the configured step
-# budget runs in full. Used only for the reference variant.
+# Patience large enough that the early-stop branch can never fire (reference variant only).
 _NO_EARLY_STOP = 1 << 30
 
 
 @contextlib.contextmanager
 def _instrumented(force_eager: bool, disable_early_stop: bool = False):
-    """Count value+grad evaluations per fine-loop invocation; optionally force the eager path.
-
-    Yields a list of ``[path, n_evals]`` records, one per fine loop that ran. ``force_eager``
-    makes the two ``cpu_fused`` entry points raise, which the drivers catch (``except
-    Exception: best_score = None``) and answer by running their eager loop.
-    ``disable_early_stop`` raises ``early_stop_patience`` on the existing driver keyword so the
-    whole configured budget runs -- the reference the fix has to reach. It changes NO search
-    effort: ``MODE_SEEDS`` / ``MODE_STEPS`` are untouched, only the premature break is removed.
-    """
+    """Yield per-fine-loop ``[path, n_evals, n_terms]`` records; optionally force eager or disable early stop."""
     from shepherd_score.accel.drivers import engine, terms
     from shepherd_score.accel.kernels import cpu_fused
 
@@ -229,14 +151,7 @@ def _instrumented(force_eager: bool, disable_early_stop: bool = False):
 
 def run_mode(mode: str, force_eager: bool, disable_early_stop: bool = False,
              drop_self_pair: bool = False):
-    """Align one bucket of pairs in ``mode``; return (scores, per-loop step records).
-
-    ``drop_self_pair`` removes pair 0 from the bucket and changes NOTHING else -- same
-    molecules, same seeds, same step budget, same untouched early-stop settings. It is the
-    attribution control: if the four cross-pairs then run their full budget and land on the
-    full-budget reference scores, the deficit they show in the five-pair bucket was caused by
-    the OTHER pair sharing the bucket, not by anything about themselves.
-    """
+    """Align one bucket in ``mode`` (``drop_self_pair``: the control without pair 0); return (scores, records)."""
     pairs = build_pairs()
     if drop_self_pair:
         pairs = pairs[1:]
@@ -282,7 +197,7 @@ def main() -> None:
             for i, (path, n) in enumerate(records):
                 print(f"    fine-loop[{i}] path={path:<5s} steps_executed={n:3d} of {steps}")
             if no_es and not force_eager:
-                reference[mode] = scores            # the target the fix must reach
+                reference[mode] = scores            # the full-budget reference
             for i, score in enumerate(scores):
                 tag = "self " if i == 0 else "cross"
                 line = (f"    pair[{i}] {tag} {SMILES[0]:<24s} vs {SMILES[i]:<30s} "
@@ -292,9 +207,7 @@ def main() -> None:
                 print(line)
             print()
 
-        # --- attribution control: same four cross-pairs, self-pair dropped, nothing else
-        # changed. Full budget runs and the scores land back on the reference -> the deficit
-        # above was leaked in from the other pair in the bucket.
+        # --- attribution control: same cross-pairs, self-pair dropped, nothing else changed
         scores, records = run_mode(mode, force_eager=False, drop_self_pair=True)
         print(f"--- mode={mode}  seeds={seeds}  steps_configured={steps}  "
               f"[CONTROL self-pair dropped, early stop untouched]")

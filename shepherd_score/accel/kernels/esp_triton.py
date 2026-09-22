@@ -14,8 +14,8 @@ from .shape_triton import _OVERLAP_CONFIGS, _quat_to_rotmat, _quat_grad_tail
 from ...score.constants import COULOMB_SCALING, LAM_SCALING
 
 
-# Self-tunes per (N_pad, M_pad) on the actual device -- no GPU-specific hardcoding.
-# cache_results=True persists the choice to disk so the sweep is once-per-machine.
+# Autotuned per (N_pad, M_pad); cache_results persists the choice so the sweep runs once
+# per machine.
 @triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _gauss_overlap_esp_se3_tiled(
@@ -31,27 +31,20 @@ def _gauss_overlap_esp_se3_tiled(
     NEED_GRAD: tl.constexpr,
     SEEDS: tl.constexpr = 1       # poses per molecule; 1 == one molecule per CTA (legacy)
 ):
+    """ESP-weighted Gaussian overlap with SE(3) gradients, one CTA per pose.
+
+    V = sum_ij k_const * exp(-alpha/2 * R_ij^2) * exp(-(C_i - C_j)^2 / lam), with R_ij the
+    spatial distance and C_i / C_j the ESP values at points i / j. The charge weight does not
+    depend on the pose, so the gradient is the shape gradient scaled by it.
     """
-    ESP-weighted Gaussian overlap kernel with SE(3) gradients.
-
-    The overlap formula is:
-    V = sum_ij( k_const * exp(-alpha/2 * R_ij^2) * exp(-(C_i - C_j)^2 / lam) )
-
-    Where R_ij is spatial distance, C_i/C_j are ESP values at points i/j.
-
-    The charge weighting exp(-(C_i-C_j)^2/lam) is independent of SE(3) params,
-    so gradients have the same structure as the base kernel, just scaled by
-    the charge weight factor.
-    """
-    # -------- which alignment (one CTA per pair) --------
     pid = tl.program_id(0)
-    # Coordinates and charges belong to a MOLECULE; pose state is per CTA. SEEDS == 1 gives
-    # mol == pid, i.e. the original one-molecule-per-CTA layout, byte for byte.
+    # Coordinates and charges belong to a molecule; pose state is per CTA. SEEDS == 1 gives
+    # mol == pid, the one-molecule-per-CTA layout.
     mol = pid // SEEDS
     realN = tl.load(Nreal_ptr + mol)
     realM = tl.load(Mreal_ptr + mol)
 
-    # -------- base pointers: coords/charges by molecule, pose state by CTA ---------
+    # base pointers: coords/charges by molecule, pose state by CTA
     A_ptr  = A_ptr  + mol * N_pad * 3
     B_ptr  = B_ptr  + mol * M_pad * 3
     CA_ptr = CA_ptr + mol * N_pad
@@ -62,33 +55,28 @@ def _gauss_overlap_esp_se3_tiled(
     dT_ptr = dT_ptr + pid * 3
     S_ptr  = S_ptr  + pid
 
-    # -------- quaternion / translation ------------------
     qr = tl.load(Q_ptr + 0); qi = tl.load(Q_ptr + 1)
     qj = tl.load(Q_ptr + 2); qk = tl.load(Q_ptr + 3)
     tx = tl.load(T_ptr + 0); ty = tl.load(T_ptr + 1); tz = tl.load(T_ptr + 2)
 
-    # rotation matrix (registers) -- shared device fn (inlined, bit-identical)
     r00, r01, r02, r10, r11, r12, r20, r21, r22 = _quat_to_rotmat(qr, qi, qj, qk)
 
-    # -------- accumulators (register) -------------------
     Vab_acc = 0.0
     dTx = 0.0; dTy = 0.0; dTz = 0.0
     dQw = 0.0; dQx = 0.0; dQy = 0.0; dQz = 0.0
 
     inv_ln2 = 1.4426950408889634
 
-    # NOTE: outer loop over A tiles, inner loop over B tiles
+    # outer loop over A tiles, inner loop over B tiles
     for n0 in range(0, N_pad, BLOCK):
         offs_n = n0 + tl.arange(0, BLOCK)
         mask_n = offs_n < realN
 
-        # load A tile coordinates (x,y,z) into registers
         a_idx = tl.where(mask_n, offs_n, 0)
         ax = tl.load(A_ptr + a_idx * 3 + 0, mask=mask_n, other=0.0)
         ay = tl.load(A_ptr + a_idx * 3 + 1, mask=mask_n, other=0.0)
         az = tl.load(A_ptr + a_idx * 3 + 2, mask=mask_n, other=0.0)
 
-        # load A tile charges
         ca = tl.load(CA_ptr + a_idx, mask=mask_n, other=0.0)
 
         for m0 in range(0, M_pad, BLOCK):
@@ -100,7 +88,6 @@ def _gauss_overlap_esp_se3_tiled(
             by0 = tl.load(B_ptr + b_idx * 3 + 1, mask=mask_m, other=0.0)
             bz0 = tl.load(B_ptr + b_idx * 3 + 2, mask=mask_m, other=0.0)
 
-            # load B tile charges
             cb = tl.load(CB_ptr + b_idx, mask=mask_m, other=0.0)
 
             # rotate + translate B tile
@@ -114,45 +101,38 @@ def _gauss_overlap_esp_se3_tiled(
             dz = az[:, None] - bz[None, :]
             r2 = dx*dx + dy*dy + dz*dz
 
-            # charge difference squared (BLOCK x BLOCK)
             dc = ca[:, None] - cb[None, :]
             c2 = dc * dc
 
-            # Gaussian spatial term
             g_spatial = tl.exp2((-half_alpha * r2) * inv_ln2) * k_const
 
-            # ESP charge weighting term: exp(-c2 / lam) = exp2(-c2 * inv_lam / ln2)
+            # exp(-c2 / lam) = exp2(-c2 * inv_lam / ln2)
             g_charge = tl.exp2((-c2 * inv_lam) * inv_ln2)
 
-            # Combined overlap
             g = g_spatial * g_charge
 
             pair_mask = mask_n[:, None] & mask_m[None, :]
             g = tl.where(pair_mask, g, 0.0)
 
-            # overlap accumulation
             Vab_acc += tl.sum(g)
 
             if NEED_GRAD:
-                # Gradient coefficient includes both spatial and charge terms
-                # d/dR(g) = d/dR(g_spatial * g_charge) = g_charge * d/dR(g_spatial)
-                # Since g_charge doesn't depend on R
+                # g_charge does not depend on the pose, so d(g)/dR = g_charge * d(g_spatial)/dR
                 coeff = (2.0 * half_alpha) * g
 
-                # forces sum over i for each j (axis 0)
+                # forces: sum over i for each j (axis 0)
                 fx = tl.sum(coeff * dx, 0)
                 fy = tl.sum(coeff * dy, 0)
                 fz = tl.sum(coeff * dz, 0)
 
-                # translation grads (sum over valid j)
                 dTx += tl.sum(fx)
                 dTy += tl.sum(fy)
                 dTz += tl.sum(fz)
 
-                # quaternion grads (shared device fn; reuses body-frame coords bx0,by0,bz0)
+                # quaternion grads from the body-frame coords (bx0, by0, bz0)
                 dw, dxq, dyq, dzq = _quat_grad_tail(fx, fy, fz, bx0, by0, bz0, qr, qi, qj, qk)
 
-                # mask again
+                # mask padding lanes
                 dw  = tl.where(mask_m, dw,  0.0)
                 dxq = tl.where(mask_m, dxq, 0.0)
                 dyq = tl.where(mask_m, dyq, 0.0)
@@ -163,7 +143,7 @@ def _gauss_overlap_esp_se3_tiled(
                 dQy += tl.sum(dyq)
                 dQz += tl.sum(dzq)
 
-    # -------- single final write (no atomics needed) -------
+    # single final write per CTA; no atomics needed
     tl.store(S_ptr, Vab_acc)
 
     if NEED_GRAD:
@@ -193,17 +173,11 @@ def _gauss_overlap_esp_se3_multipose(
     POSES: tl.constexpr,
     POSES_PAD: tl.constexpr,
 ):
-    """POSES poses of ONE molecule per CTA, ESP variant. See the shape kernel for the rationale.
+    """POSES poses of one molecule per CTA, ESP variant of the shape multi-pose kernel.
 
-    ESP gains an amortisation the shape kernel does not have: the charge weighting
-    ``exp(-(Ci-Cj)^2/lam)`` is POSE-INDEPENDENT -- charges do not rotate -- so ``dc``, ``c2`` and
-    its ``exp2`` are computed ONCE per tile and reused by every pose, instead of once per pose.
-    That halves the transcendental work per pair-eval at POSES=2 and better beyond.
-
-    Only worth enabling for LARGE clouds. Measured on the shape kernel: surf (~200 surface points)
-    gained 1.32x while vol (~32 atoms) LOST, monotonically, out to POSES=10 -- small tiles have too
-    little to amortise and bigger per-CTA blocks just cost resident CTAs. surf_esp shares surf's
-    cloud size; vol_esp shares vol's, so vol_esp is expected to behave like vol.
+    The charge weighting ``exp(-(Ci-Cj)^2/lam)`` does not depend on the pose, so ``dc``, ``c2``
+    and their ``exp2`` are computed once per tile and reused by every pose. POSES is a
+    ``tl.arange`` extent padded to POSES_PAD (a power of two) and must divide SEEDS.
     """
     pid = tl.program_id(0)
     base = pid * POSES
@@ -259,7 +233,7 @@ def _gauss_overlap_esp_se3_multipose(
             cb = tl.load(CB_ptr + b_idx, mask=mask_m, other=0.0)
             pair_mask = mask_n[None, :, None] & mask_m[None, None, :]
 
-            # POSE-INDEPENDENT: charges do not rotate, so this exp2 is paid once per tile
+            # charges do not rotate, so this exp2 is paid once per tile
             dc = ca[:, None] - cb[None, :]
             g_charge = tl.exp2((-(dc * dc) * inv_lam) * inv_ln2)
 
@@ -321,10 +295,7 @@ def overlap_score_grad_esp_se3_batch(
     seeds_per_mol: int = 1,
     poses_per_cta: int = 1,
 ):
-    """
-    ESP-weighted overlap with SE(3) gradients.
-
-    One CTA per alignment (pair). Internal tile loops over A, B.
+    """ESP-weighted overlap with SE(3) gradients; one CTA per pose, tile loops over A and B.
 
     Shapes:
       A : (K, N_pad, 3) - coordinates of molecule A (reference)
@@ -333,6 +304,7 @@ def overlap_score_grad_esp_se3_batch(
       charges_B : (K, M_pad) - ESP values at B points
       q : (K, 4) - quaternions
       t : (K, 3) - translations
+    With ``seeds_per_mol > 1`` the coordinate blocks are unreplicated (see the shape kernel).
 
     Returns:
       VAB : (K,) - ESP-weighted overlap scores
@@ -365,11 +337,8 @@ def overlap_score_grad_esp_se3_batch(
     k_const    = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
     inv_lam    = 1.0 / lam
 
-    # Every kernel below STORES its score for each pose unconditionally, and its gradients
-    # whenever NEED_GRAD, so pre-zeroing is a memset per fine step over buffers about to be
-    # overwritten -- 0.0159 us/mol of device time on a vol screen at N=100,000 (job
-    # 22593930), and this kernel has more outputs than that one. Without NEED_GRAD the
-    # gradient buffers ARE left unwritten, so those keep their zeros.
+    # The kernel stores every score and, when NEED_GRAD, every gradient, so no pre-zeroing;
+    # without NEED_GRAD the gradient buffers are left unwritten and keep their zeros.
     out_S  = torch.empty(K, device=device, dtype=dtype)
     out_dQ = torch.empty_like(q) if NEED_GRAD else torch.zeros_like(q)
     out_dT = torch.empty_like(t) if NEED_GRAD else torch.zeros_like(t)
@@ -394,7 +363,6 @@ def overlap_score_grad_esp_se3_batch(
 
     grid = (K,)    # 1-D launch: one CTA per alignment
 
-    # BLOCK + num_warps chosen by triton.autotune per (N_pad, M_pad) on the actual device.
     _gauss_overlap_esp_se3_tiled[grid](
         A.contiguous().view(-1),
         B.contiguous().view(-1),
@@ -413,20 +381,12 @@ def overlap_score_grad_esp_se3_batch(
 
 
 # ============================================================================
-#  ShaEP ESP surface-comparison kernel (esp_combo mode), VALUE-ONLY.
-#
-#  For each real field point i of the "observer" molecule, compute the Coulomb
-#  ESP induced there by the OTHER molecule's atoms, mask the point out if it
-#  falls inside that molecule's vdW+probe volume, and accumulate a Gaussian of
-#  the ESP difference:
+#  ShaEP ESP surface-comparison kernel (vol_and_surf_esp), value only. For each
+#  real field point i of the observer molecule: the Coulomb ESP induced there by
+#  the other molecule's atoms, dropped if inside that molecule's vdW+probe volume,
 #      esp = sum_i  keep_i * exp( -(point_esp_i - sum_m q_m/d_im)^2 / lam )
-#
-#  VALUE-ONLY: esp_combo steers the pose with the SHAPE gradient (the ESP term
-#  is scored / used for seed selection), so this kernel emits no dO/dq tail.
-#
-#  PRECONDITION: the caller passes points + atoms already in the world frame (the
-#  driver applies the SE(3) transform to whichever cloud is moving), so the kernel
-#  takes no quaternion -- it is a pure pairwise reduction.
+#  Points and atoms arrive in the world frame, so the kernel takes no pose and
+#  emits no gradient (the pose is steered by the shape gradient).
 # ============================================================================
 @triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit

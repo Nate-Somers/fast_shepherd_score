@@ -1,16 +1,7 @@
-"""Accel parity gates for ``vol_avoid`` (shape Tanimoto MINUS a linear hard-sphere excluded-volume
-penalty against a FIXED avoid-point cloud).
-
-Unlike the other modes, vol_avoid takes a THIRD input (``avoid_points``) that is neither molecule, so
-it is pairwise-only (no screen wiring). Gates here:
-  * self-copy with the avoid cloud far away  -> pure shape self-overlap == 1.000 (gate 4);
-  * batched-numba == per-pair ACCEL (same seeds) -> the true "batched == per-pair" gate (bit-level);
-  * batched-numba ~= the per-pair AUTOGRAD reference for a realistic MILD avoid (basin tol 1e-2)
-    -- the reference and accel use DIFFERENT multi-start seed sets, and the penalty landscape is
-    piecewise-linear, so a strong/degenerate avoid cloud (e.g. one covering the whole molecule) can
-    land the two seed sets in different near-degenerate optima; that is seed coverage, not a kernel
-    error (the kernel itself is validated bit-for-bit by the value+FD-grad gate).
-  * Triton == numba (CUDA-only; the new hard-sphere kernel's GPU twin).
+"""Accel parity gates for ``vol_avoid`` (shape Tanimoto minus a hard-sphere excluded-volume penalty
+against a fixed avoid cloud). It takes a third input, so it is pairwise-only. Batched-numba must
+equal the per-pair accel entry point (same seeds) and land in the autograd reference's basin for a
+mild cloud; a strong cloud can put different seed sets in different near-degenerate optima.
 """
 import warnings
 import numpy as np
@@ -43,14 +34,12 @@ def _far_cloud(m):
 
 
 def _mild_cloud():
-    """A small fixed 'wall' ~5 A to one side: a realistic, mild excluded region that nudges the pose
-    without dominating, so the reference and accel agree tightly."""
+    """A small fixed wall ~5 A to one side: nudges the pose without dominating."""
     return np.array([[5.0, 0.0, 0.0], [5.0, 2.0, 0.0], [5.0, -2.0, 0.0]], dtype=np.float32)
 
 
 def test_self_copy_far_avoid_is_one():
-    """Gate 4: a molecule aligned to a copy of itself with the avoid cloud far away scores 1.0
-    (the penalty term is 0, so only the shape self-overlap remains)."""
+    """Self-copy with the avoid cloud far away scores 1.0 (the penalty is 0)."""
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     m = _mol(IBU)
     b = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(IBU), do_center=True,
@@ -62,9 +51,7 @@ def test_self_copy_far_avoid_is_one():
 
 @pytest.mark.parametrize("cloud_name", ["far", "mild", "strong"])
 def test_numba_batched_matches_per_pair_accel(cloud_name):
-    """Gate 3 (batched == per-pair): the batched-numba path equals the per-pair accel entry point
-    (fast_optimize_vol_avoid_overlay) to convergence -- both use the SAME structured seed set, so
-    this is bit-level even on a strong/degenerate avoid cloud."""
+    """Batched-numba equals the per-pair accel entry point, which uses the same seed set."""
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     from shepherd_score.accel.drivers.avoid import fast_optimize_vol_avoid_overlay
     from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS
@@ -93,8 +80,7 @@ def test_numba_batched_matches_per_pair_accel(cloud_name):
 
 
 def test_numba_batched_matches_reference_mild():
-    """The batched-numba accel finds the per-pair AUTOGRAD reference's optimum for a realistic MILD
-    avoid cloud (basin tolerance 1e-2; different seed sets, same optimum)."""
+    """Batched-numba finds the per-pair autograd reference's optimum for a mild avoid cloud."""
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS
     nr, ns = MODE_SEEDS["vol_avoid"], MODE_STEPS["vol_avoid"]
@@ -113,8 +99,7 @@ def test_numba_batched_matches_reference_mild():
 
 
 def test_avoid_penalty_lowers_score():
-    """Sanity: a strong avoid cloud (covering the reference shape) drives the best score well below
-    the no-penalty (far avoid) score -- the penalty actually steers the pose."""
+    """A strong avoid cloud drives the score well below the no-penalty score."""
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     ref_m = _mol(IBU)
     far = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,
@@ -131,8 +116,7 @@ def test_avoid_penalty_lowers_score():
 @pytest.mark.cuda
 @pytest.mark.skipif(not (TORCH and torch.cuda.is_available()), reason="CUDA required")
 def test_triton_matches_numba():
-    """Gate 2 (Triton == numba): the new hard-sphere avoid kernel's GPU twin agrees with the numba
-    kernel end-to-end. CPU-only boxes skip it."""
+    """The hard-sphere avoid kernel's GPU twin agrees with the numba kernel end-to-end."""
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     avoid = _mild_cloud()
     bn = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,

@@ -50,15 +50,10 @@ def rotation_axis_np(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
     v3 = np.cross(v1, v2)
     norm = np.linalg.norm(v3)
     if norm < 1e-12:
-        # v1 and v2 are (anti)parallel -> their cross product is the zero vector and the axis is
-        # undefined (any vector perpendicular to v1 rotates v1 onto +-v1). Without this guard the
-        # 0/0 below produces a NaN axis, which propagates into NaN coordinates and finally crashes
-        # np.linalg.eigh downstream with "Eigenvalues did not converge". The antiparallel case is
-        # reached routinely: quaternions_for_principal_component_alignment_np flips a principal axis
-        # (pmi_ref[0] = -pmi_ref[0]), so a linear / single-heavy-atom / symmetric-top molecule --
-        # whose principal axes are degenerate -- hits v2 == -v1 exactly. Return any unit vector
-        # perpendicular to v1 (for a 180deg flip the choice is immaterial; for the ~0deg parallel
-        # case the rotation angle is ~0 so the axis is irrelevant).
+        # v1 and v2 are (anti)parallel, so the cross product is zero and the axis is undefined;
+        # dividing by it would give a NaN axis that later crashes np.linalg.eigh. Any unit vector
+        # perpendicular to v1 works (the choice is immaterial for a 180 degree flip, and the angle
+        # is ~0 in the parallel case). Reached whenever the principal axes are degenerate.
         ref = np.array([1.0, 0.0, 0.0]) if abs(v1[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
         v3 = np.cross(v1, ref)
         norm = np.linalg.norm(v3)

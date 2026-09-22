@@ -189,9 +189,8 @@ def build_lookup_tables_cached(device_str: str, dtype_str: str,
         if p_lower == 'dummy':
             categories.append(3)
         elif directionless:
-            # ROCS/ROSHAMBO "color": every real type is an isotropic point Gaussian
-            # (category 0 -> kernel uses w=1.0, no vector weighting). Per-type alpha is
-            # unchanged, so this matches the directionless pure-torch get_overlap_pharm.
+            # Directionless "color": every real type is an isotropic point Gaussian
+            # (category 0, no vector weighting); per-type alpha is unchanged.
             categories.append(0)
         elif p_lower in _NONDIRECTIONAL:
             categories.append(0)

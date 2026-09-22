@@ -57,8 +57,7 @@ def test_unknown_method_raises():
 
 @pytest.mark.skipif(HAS_OPEN3D, reason="needs an Open3D-free env to prove mesh path is untouched")
 def test_default_mesh_still_uses_open3d():
-    """The default ('mesh') path is the original Open3D surface (requires Open3D); proving it was
-    not rerouted to the mesh-free path."""
+    """The default 'mesh' path still requires Open3D, so it was not rerouted to the mesh-free path."""
     c, r = _geom(_embed("c1ccccc1"))
     with pytest.raises(ModuleNotFoundError):
         get_molecular_surface(c, r, num_points=100)  # method defaults to 'mesh'
@@ -76,9 +75,7 @@ def test_fast_alias_matches_smooth_sdf():
 def test_smooth_sdf_no_open3d_and_exact_count():
     import sys
     c, r = _geom(_embed("CC(=O)Oc1ccccc1C(=O)O"))  # aspirin
-    # Whether open3d is ALREADY imported depends on which tests ran before this one (several
-    # importorskip it), so the claim to check is that THIS CALL does not import it -- not that
-    # the module is absent from the whole process.
+    # open3d may already be imported by earlier tests; the claim is that this call does not import it
     had_open3d = "open3d" in sys.modules
     surf = get_molecular_surface(c, r, num_points=200, method="smooth_sdf", seed=1)
     assert surf.shape == (200, 3)
@@ -110,8 +107,7 @@ def test_knn_cutoff_is_exact():
     a = r + PROBE
     full = _smoothmin_sdf_project(cand, c, a, s=10, iters=6, knn=len(c))
     knn = _smoothmin_sdf_project(cand, c, a, s=10, iters=6, knn=8)
-    # The k=8 cutoff agrees with the full LSE far below the 0.01 A surface noise floor
-    # (and below float32 coord precision), so it is exact for all practical purposes.
+    # the k=8 cutoff agrees with the full LSE far below the surface noise floor
     assert np.max(np.linalg.norm(full - knn, axis=1)) < 1e-3
 
 
@@ -144,8 +140,7 @@ def test_smooth_defeats_leak_relative_to_on_sphere():
 
 
 def test_crimp_detection_localizes_at_seam():
-    """Two equal spheres centered on the x-axis: their intersection ring is the x=mid plane.
-    Detected crimp points must cluster there; non-crimp points must not."""
+    """Two equal spheres on the x-axis: detected crimp points must cluster at the x=mid seam plane."""
     d = 1.6
     centers = np.array([[0.0, 0.0, 0.0], [d, 0.0, 0.0]])
     radii = np.array([1.7, 1.7])

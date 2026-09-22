@@ -42,9 +42,8 @@ from shepherd_score.container.profiles import Surface
 
 
 def _default_seeds(mode: str) -> int:
-    """Per-mode default SE(3) seed count (``MODE_SEEDS``) from ``shepherd_score/accel/_modes.py``,
-    the single source of truth shared with the batched path. Resolves ``num_repeats=None`` in
-    ``align_with_*`` so the per-pair API uses the same per-mode defaults as the batched API."""
+    """Per-mode default SE(3) seed count (``MODE_SEEDS`` in ``accel/_modes.py``), shared with the
+    batched path; resolves ``num_repeats=None`` in ``align_with_*``."""
     from shepherd_score.accel.batch.aligners import _seeds_for
     return _seeds_for(mode)
 
@@ -55,23 +54,22 @@ def _default_steps(mode: str) -> int:
     return _steps_for(mode)
 
 
-# Alignment modes tracked by MoleculePair (one AlignmentResult each), in fss canonical names.
-# The upstream ``esp``/``esp_combo`` modes are ``surf_esp``/``vol_and_surf_esp`` here, plus the
-# new ``vol_color`` mode. The bare ``vol``/``vol_esp`` keys hold the WITH-hydrogen results;
-# the ``*_noH`` keys hold the heavy-atom results. Legacy ``esp``/``esp_combo`` attribute names
-# are kept as delegating properties on MoleculePair (see the class body).
+# Alignment modes tracked by MoleculePair (one AlignmentResult each). ``esp``/``esp_combo`` are
+# now ``surf_esp``/``vol_and_surf_esp``; the legacy names remain as delegating properties on
+# MoleculePair. The bare ``vol``/``vol_esp`` keys hold the with-hydrogen results, ``*_noH`` the
+# heavy-atom results.
 _ALIGN_KEYS = (
     'vol', 'vol_noH', 'vol_esp', 'vol_esp_noH',
     'surf', 'surf_esp', 'vol_and_surf_esp', 'pharm', 'vol_color', 'vol_tversky',
     'vol_lipo', 'vol_esp_tversky',
-    # SI experimental modes (reference layer): directional-pharmacophore / atom-identity /
-    # molar-refractivity blends, and the Tversky variants of the remaining canonical modes.
+    # Experimental modes: directional-pharmacophore, atom-identity and molar-refractivity
+    # blends, and the Tversky variants of the remaining modes.
     'vol_pharm', 'vol_atomtype', 'vol_mr',
     'surf_tversky', 'surf_esp_tversky', 'vol_and_surf_esp_tversky',
     'vol_color_tversky', 'vol_lipo_tversky', 'pharm_tversky',
     # shape + condensed-Fukui reactivity field (reuses the vol_lipo overlap; f+ - f- dual descriptor)
     'vol_fukui',
-    # shape MINUS a linear hard-sphere excluded-volume penalty against a fixed avoid-point cloud
+    # shape minus a linear hard-sphere excluded-volume penalty against a fixed avoid-point cloud
     'vol_avoid',
 )
 
@@ -201,11 +199,9 @@ class Molecule:
             If ``None``, charges are generated lazily from ``charge_model`` the first time they are
             needed (an ESP mode, or the surface ESP built when a surface is generated).
         charge_model : str
-            Charge model used when ``partial_charges`` is ``None``. ``'xtb'`` (default) uses gfn2-xTB
-            partial charges (an external per-molecule subprocess), falling back to MMFF94 with a
-            warning if ``xtb`` is unavailable; ``'mmff'`` uses MMFF94 directly (free by-product of the
-            MMFF optimisation, no subprocess). Charges are computed lazily either way, so pure-shape
-            modes that never read them incur no cost.
+            Charge model used when ``partial_charges`` is ``None``: ``'xtb'`` (default) runs a
+            gfn2-xTB single point, falling back to MMFF94 with a warning if ``xtb`` is unavailable;
+            ``'mmff'`` uses MMFF94 directly. Charges are computed lazily either way.
         electrostatics : Optional[np.ndarray]
             Electrostatic potential if they were previously generated. Shape: (M,).
         pharm_multi_vector : Optional[bool]
@@ -218,28 +214,23 @@ class Molecule:
         pharm_vecs : Optional[np.ndarray]
             Unit vectors relative to anchor positions of pharmacophore. Shape: (P,3).
         feature_set : str
-            Which pharmacophore feature definition to use when generating pharmacophores.
-            ``'shepherd'`` (default) uses the local ``smarts_features.fdef`` (8 fss types);
-            ``'rdkit_base'`` uses RDKit's stock ``BaseFeatures.fdef`` reduced to the 6
-            ROCS/ROSHAMBO color types. Only used when pharmacophores are generated (i.e.
-            ``pharm_multi_vector`` is not ``None`` and explicit arrays are not provided).
+            Pharmacophore feature definition used when pharmacophores are generated:
+            ``'shepherd'`` (default) is the local ``smarts_features.fdef`` (8 types);
+            ``'rdkit_base'`` is RDKit's ``BaseFeatures.fdef`` reduced to the 6 ROCS color types.
         directionless : bool
             When ``True``, generate isotropic (zero-vector) "color" pharmacophores for all
-            families (ROCS/ROSHAMBO style); this overrides ``pharm_multi_vector`` for the
-            orientation-capable families. Default ``False`` computes orientation vectors.
-            Only used when pharmacophores are generated.
+            families, overriding ``pharm_multi_vector``. Default ``False``. Only used when
+            pharmacophores are generated.
         surface_method : str
-            How to generate the surface point cloud when it is generated internally.
-            ``'mesh'`` (default, UNCHANGED) uses the original Open3D ball-pivoting + Poisson-disk
-            surface. ``'smooth_sdf'`` uses the opt-in, Open3D-free, mesh-free smooth + stochastic
-            surfacer (``generate_point_cloud.get_molecular_surface_smooth_sdf``) intended for the
-            generative pipeline; it requires ``num_surf_points`` (not ``density``). Opt-in only;
-            using it is a distribution shift vs a model trained on the mesh surface (validate first).
+            How to generate the surface point cloud. ``'mesh'`` (default) uses Open3D ball
+            pivoting plus Poisson-disk resampling; ``'smooth_sdf'`` uses the Open3D-free
+            ``generate_point_cloud.get_molecular_surface_smooth_sdf`` and requires
+            ``num_surf_points`` rather than ``density``. A model trained on the mesh surface sees
+            the smooth surface as a distribution shift.
         fukui : Optional[np.ndarray]
-            Per-atom condensed Fukui field for the ``vol_fukui`` reactivity mode -- a full ``(N,)``
-            signed dual descriptor (f+ - f-) in with-H order, same basis as ``partial_charges``. If
-            ``None`` (default) it is generated lazily on first access via three gfn2-xTB single
-            points (neutral/cation/anion), so non-reactivity modes never pay for it.
+            Per-atom condensed Fukui dual descriptor (f+ - f-) for the ``vol_fukui`` mode, in the
+            same with-H order as ``partial_charges``. Shape: (N,). If ``None`` it is generated
+            lazily on first access from three gfn2-xTB single points.
         """
         self.mol = mol
         self.atom_pos = Chem.RemoveHs(mol).GetConformer().GetPositions()
@@ -253,32 +244,20 @@ class Molecule:
         if isinstance(partial_charges, list):
             partial_charges = np.array(partial_charges)
 
-        # Charges are generated LAZILY (see the ``partial_charges`` property): a molecule that is
-        # never asked for its charges -- e.g. pure volumetric-shape / colour / pharmacophore screening
-        # -- never pays to compute them. When they ARE needed (an ESP mode, or a surface whose ESP is
-        # built below), they come from ``charge_model`` (default ``'xtb'`` = gfn2-xTB, with an MMFF94
-        # fallback). Explicit ``partial_charges`` short-circuit generation entirely.
+        # Charges are generated lazily by the ``partial_charges`` property, so shape-only
+        # molecules never pay for them.
         self._charge_model = str(charge_model).lower()
         if isinstance(partial_charges, np.ndarray):
             self._partial_charges = partial_charges
         else:
             self._partial_charges = None                       # deferred
-        # Per-atom condensed Fukui field (the ``vol_fukui`` reactivity channel), generated LAZILY
-        # like ``partial_charges``: a full ``(N,)`` signed dual descriptor (f+ - f-) in with-H order
-        # -- the same order/basis as ``partial_charges`` -- computed by three gfn2-xTB single points
-        # only when first read, so non-reactivity modes never pay the xTB cost. Explicit ``fukui=``
-        # short-circuits generation (also how tests inject a synthetic field without xTB).
+        # Fukui field, generated lazily by the ``fukui`` property like ``partial_charges``.
         if isinstance(fukui, list):
             fukui = np.array(fukui)
         self._fukui = fukui if isinstance(fukui, np.ndarray) else None   # deferred
-        # Per-atom Crippen atomic logP contributions (the ``vol_lipo`` lipophilicity channel).
-        # A full ``(N,)`` array over ALL atoms in RDKit-mol (with-H) order -- the same order and
-        # basis as ``partial_charges`` -- so its heavy slice reuses the SAME ``_nonH_atoms_idx``.
+        # Per-atom Crippen logP and molar-refractivity contributions, (N,) in with-H order like
+        # ``partial_charges`` (the ``vol_lipo`` and ``vol_mr`` channels).
         self.lipophilicity = self.get_lipophilicity_contribs()
-        # Per-atom Crippen atomic molar-refractivity (polarizability) contributions -- the ``vol_mr``
-        # channel. Same ``(N,)`` with-H order/basis as ``lipophilicity``: ``_CalcCrippenContribs``
-        # returns one ``(logP, MR)`` tuple per atom, and this takes the ``MR`` element (index 1)
-        # exactly where ``lipophilicity`` takes ``logP`` (index 0).
         self.molar_refractivity = self.get_molar_refractivity_contribs()
         self.radii = get_atomic_vdw_radii(mol)
 
@@ -325,19 +304,13 @@ class Molecule:
 
     def __setstate__(self, state):
         """
-        Restore a pickled Molecule, upgrading the pre-refactor flat layout.
+        Restore a pickled Molecule, upgrading the older flat layout.
 
-        Molecules pickled before the Surface/Pharmacophore refactor carry
-        ``surf_pos`` / ``surf_esp`` / ``probe_radius`` / ``pharm_types`` /
-        ``pharm_ancs`` / ``pharm_vecs`` directly in ``__dict__``. Those names are
-        now data descriptors, so they take precedence over the instance dict and
-        forward to ``self._surface`` / ``self._pharmacophore``. Without this hook
-        every one of those reads raises AttributeError on an old pickle, which
-        silently strands any on-disk store written by a prior release.
-
-        (``MoleculePair`` has the same hazard for ``transform_esp`` /
-        ``sim_aligned_esp``; see WHATS_NEW B3. ORCHARD only pickles ``Molecule``,
-        so only this class is shimmed here.)
+        Older pickles carry ``surf_pos`` / ``surf_esp`` / ``probe_radius`` / ``pharm_types`` /
+        ``pharm_ancs`` / ``pharm_vecs`` directly in ``__dict__``. Those names are now data
+        descriptors forwarding to ``self._surface`` / ``self._pharmacophore``, and a descriptor
+        takes precedence over the instance dict, so without this hook every such read on an old
+        pickle raises AttributeError.
         """
         state = dict(state)
 
@@ -363,13 +336,9 @@ class Molecule:
             for _k in ("pharm_types", "pharm_ancs", "pharm_vecs"):
                 state.pop(_k, None)
 
-        # Added after the flat layout; get_pc() reads it.
+        # Attributes added after the flat layout, defaulted to the constructor's values so an
+        # old pickle does not raise on first read.
         state.setdefault("surface_method", "mesh")
-
-        # Same hazard, fork side: state this fork added after the flat layout, each read
-        # unguarded by a lazy accessor. _charge_model is read by partial_charges whenever
-        # the pickle carried no charges, and _fukui by the fukui property. Default them to
-        # the constructor's values rather than letting an old pickle AttributeError.
         state.setdefault("_charge_model", "xtb")
         state.setdefault("_fukui", None)
 
@@ -445,11 +414,9 @@ class Molecule:
     def partial_charges(self) -> np.ndarray:
         """Per-atom partial charges (all atoms, with-H order), computed lazily on first access.
 
-        The default charge model is **gfn2-xTB** (``charge_model='xtb'``). It is generated the first
-        time the charges are read -- so pure-shape modes that never touch charges never pay for the
-        xTB subprocess -- and cached thereafter. If the ``xtb`` binary is unavailable or fails on a
-        molecule, it falls back to MMFF94 with a warning. Pass ``charge_model='mmff'`` (or explicit
-        ``partial_charges=...``) to skip xTB entirely.
+        Generated by ``charge_model`` (gfn2-xTB by default, falling back to MMFF94 with a warning
+        if ``xtb`` is unavailable or fails) and cached. Pass ``charge_model='mmff'`` or explicit
+        ``partial_charges`` to skip xTB.
         """
         if self._partial_charges is None:
             self._partial_charges = self._generate_partial_charges()
@@ -482,10 +449,8 @@ class Molecule:
         mol_copy = deepcopy(self.mol)
         molec_props = Chem.AllChem.MMFFGetMoleculeProperties(mol_copy)
         if molec_props is None:
-            # MMFF94 cannot parameterize this molecule (e.g. H2, a lone noble-gas atom, or elements
-            # outside MMFF's coverage), so GetMMFFPartialCharge would raise a cryptic
-            # ``'NoneType' object has no attribute 'GetMMFFPartialCharge'``. Fail with an actionable
-            # message instead; such inputs should supply ``partial_charges`` explicitly.
+            # MMFF94 cannot parameterize this molecule (e.g. H2 or a lone noble-gas atom); fail
+            # with an actionable message instead of an AttributeError on None.
             raise ValueError(
                 "MMFF94 could not parameterize this molecule, so partial charges cannot be "
                 "computed (this happens for inputs MMFF does not cover, e.g. H2 or a single "
@@ -497,13 +462,10 @@ class Molecule:
 
     @property
     def fukui(self) -> np.ndarray:
-        """Per-atom condensed Fukui field (all atoms, with-H order), computed lazily on first access.
-
-        Returns the signed **dual descriptor** ``f+ - f-`` per atom (positive at nucleophilic,
-        negative at electrophilic sites) -- the ``vol_fukui`` mode's reactivity field. Generated the
-        first time it is read (so shape/ESP/pharm modes never pay for it) via three gfn2-xTB single
-        points (neutral, cation, anion) and cached thereafter. Pass ``fukui=...`` to the constructor
-        to supply it explicitly and skip xTB.
+        """Per-atom condensed Fukui dual descriptor ``f+ - f-`` (all atoms, with-H order), computed
+        lazily on first access from three gfn2-xTB single points and cached. Positive at
+        nucleophilic and negative at electrophilic sites. Pass ``fukui=...`` to the constructor to
+        skip xTB.
         """
         if self._fukui is None:
             self._fukui = self._generate_fukui()
@@ -514,13 +476,9 @@ class Molecule:
         self._fukui = value
 
     def _generate_fukui(self) -> np.ndarray:
-        """Condensed Fukui dual descriptor (f+ - f-) per atom via three gfn2-xTB single points.
-
-        Runs the neutral, cation (N-1 e-) and anion (N+1 e-) single points at the SAME geometry and
-        returns ``f+ - f-`` as a full ``(N,)`` with-H array. Any xTB failure (e.g. a non-converging
-        ion) propagates -- callers that want to drop such molecules should catch it (the benchmark
-        does), matching how the ESP charge path degrades. There is no cheap non-QM fallback that is a
-        faithful Fukui function, so unlike charges this does NOT fall back to MMFF.
+        """Condensed Fukui dual descriptor (f+ - f-) per atom from three gfn2-xTB single points
+        (neutral, cation, anion) at the same geometry. Unlike charges there is no non-QM fallback,
+        so any xTB failure (e.g. a non-converging ion) propagates.
         """
         from shepherd_score.conformer_generation import fukui_from_single_point_conformer_with_xtb
         fpm = fukui_from_single_point_conformer_with_xtb(
@@ -575,11 +533,9 @@ class Molecule:
         """
         Get the per-atom Crippen atomic logP contribution for each atom.
 
-        Uses RDKit's ``rdMolDescriptors._CalcCrippenContribs``, which returns one
-        ``(logP, MR)`` tuple per atom in RDKit-mol (with-H) order; the per-atom scalar taken
-        here is the ``logP`` element. The result is a full ``(N,)`` array over ALL atoms in the
-        same order/basis as :attr:`partial_charges` (heavy atoms are sliced out later via
-        :meth:`get_lipophilicity`, reusing the same ``_nonH_atoms_idx`` the charges use).
+        Uses ``rdMolDescriptors._CalcCrippenContribs`` (one ``(logP, MR)`` tuple per atom in
+        with-H order) and keeps the ``logP`` element, in the same order as
+        :attr:`partial_charges`.
 
         Returns
         -------
@@ -594,8 +550,7 @@ class Molecule:
         """
         Get per-atom Crippen logP contributions with or without hydrogens.
 
-        This slices the already-computed ``lipophilicity``; it does not recompute it
-        (see :meth:`get_lipophilicity_contribs`). Mirrors :meth:`get_charges`.
+        Slices the cached ``lipophilicity``; mirrors :meth:`get_charges`.
 
         Parameters
         ----------
@@ -614,21 +569,17 @@ class Molecule:
 
 
     def get_lipo_positions(self) -> np.ndarray:
-        """Get the TRUE-heavy atom coordinates that carry the per-atom Crippen logP -- the
-        lipophilicity channel's centres for the ``vol_lipo`` mode.
+        """Get the heavy-atom coordinates that carry the per-atom Crippen logP (the ``vol_lipo``
+        channel's centres).
 
-        Reads the with-H conformer and selects the strict-heavy atoms via ``_nonH_atoms_idx``,
-        so the positions stay 1:1 with :meth:`get_lipophilicity`. This is NOT ``atom_pos``:
-        ``atom_pos`` is the ``Chem.RemoveHs`` coordinate set, which RETAINS isotope-labelled H
-        (e.g. deuterium), so it can be longer than and misaligned with the heavy logP -- the
-        retained-H trap. Mirrors the strict-heavy centres the ``vol_esp`` mode uses, and lets a
-        ``Molecule`` and the RDKit-free ``MoleculeProfile`` feed the ``vol_lipo`` aligner
-        identically (both expose ``get_lipo_positions()``).
+        Indexes the with-H conformer by ``_nonH_atoms_idx`` so the positions stay 1:1 with
+        :meth:`get_lipophilicity`. ``atom_pos`` is not used because ``Chem.RemoveHs`` retains
+        isotope-labelled hydrogens, which would misalign it with the heavy-atom logP.
 
         Returns
         -------
         np.ndarray
-            TRUE-heavy atom coordinates. Shape: (N_heavy, 3).
+            Heavy-atom coordinates. Shape: (N_heavy, 3).
         """
         return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
 
@@ -637,13 +588,8 @@ class Molecule:
         """
         Get the per-atom Crippen atomic molar-refractivity (MR) contribution for each atom.
 
-        Uses RDKit's ``rdMolDescriptors._CalcCrippenContribs``, which returns one ``(logP, MR)``
-        tuple per atom in RDKit-mol (with-H) order; the per-atom scalar taken here is the ``MR``
-        element (index 1), exactly where :meth:`get_lipophilicity_contribs` takes ``logP`` (index
-        0). Atomic MR is a size/polarizability descriptor (larger for heavy, polarizable atoms such
-        as S/Cl/Br/I and aromatic carbons). The result is a full ``(N,)`` array over ALL atoms in
-        the same order/basis as :attr:`partial_charges` (heavy atoms are sliced out later via
-        :meth:`get_molar_refractivity`, reusing the same ``_nonH_atoms_idx`` the charges use).
+        Uses ``rdMolDescriptors._CalcCrippenContribs`` and keeps the ``MR`` element, in the same
+        with-H order as :attr:`partial_charges`. Atomic MR is a size/polarizability descriptor.
 
         Returns
         -------
@@ -658,8 +604,7 @@ class Molecule:
         """
         Get per-atom Crippen molar-refractivity contributions with or without hydrogens.
 
-        This slices the already-computed ``molar_refractivity``; it does not recompute it
-        (see :meth:`get_molar_refractivity_contribs`). Mirrors :meth:`get_lipophilicity`.
+        Slices the cached ``molar_refractivity``; mirrors :meth:`get_lipophilicity`.
 
         Parameters
         ----------
@@ -678,20 +623,15 @@ class Molecule:
 
 
     def get_mr_positions(self) -> np.ndarray:
-        """Get the TRUE-heavy atom coordinates that carry the per-atom Crippen molar refractivity --
-        the ``vol_mr`` channel's centres. Identical basis to :meth:`get_lipo_positions` (strict-heavy
-        via ``_nonH_atoms_idx``, from the with-H conformer, NOT ``atom_pos`` -- the retained-H trap);
-        a separate accessor so a ``Molecule`` and the RDKit-free ``MoleculeProfile`` feed the
-        ``vol_mr`` aligner identically."""
+        """Get the heavy-atom coordinates that carry the per-atom Crippen molar refractivity (the
+        ``vol_mr`` channel's centres); same basis as :meth:`get_lipo_positions`."""
         return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
 
 
     def get_fukui(self, no_H: bool = True) -> np.ndarray:
         """Get the per-atom Fukui dual-descriptor field with or without hydrogens.
 
-        Slices the lazily-computed ``fukui`` (the signed ``f+ - f-`` array); does not recompute it
-        (see :attr:`fukui` / :meth:`_generate_fukui`). Mirrors :meth:`get_charges` -- heavy atoms via
-        the same ``_nonH_atoms_idx`` the charges use, so it stays 1:1 with :meth:`get_fukui_positions`.
+        Slices the cached :attr:`fukui`; mirrors :meth:`get_charges`.
 
         Parameters
         ----------
@@ -709,33 +649,26 @@ class Molecule:
 
 
     def get_fukui_positions(self) -> np.ndarray:
-        """Get the TRUE-heavy atom coordinates that carry the per-atom Fukui field -- the
-        ``vol_fukui`` channel's centres. Identical basis to :meth:`get_lipo_positions` (strict-heavy
-        via ``_nonH_atoms_idx``, from the with-H conformer, NOT ``atom_pos`` -- the retained-H trap);
-        a separate accessor so a ``Molecule`` and the RDKit-free ``MoleculeProfile`` feed the
-        ``vol_fukui`` aligner identically."""
+        """Get the heavy-atom coordinates that carry the per-atom Fukui field (the ``vol_fukui``
+        channel's centres); same basis as :meth:`get_lipo_positions`."""
         return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
 
 
     def get_atomtype_positions(self) -> np.ndarray:
-        """Get the TRUE-heavy atom coordinates that carry the per-atom element labels -- the
-        ``vol_atomtype`` categorical channel's centres. Strict-heavy via ``_nonH_atoms_idx`` (1:1 with
-        :meth:`get_atomic_numbers`), from the with-H conformer, NOT ``atom_pos`` (the retained-H
-        trap)."""
+        """Get the heavy-atom coordinates that carry the per-atom element labels (the
+        ``vol_atomtype`` channel's centres); 1:1 with :meth:`get_atomic_numbers` and the same basis
+        as :meth:`get_lipo_positions`."""
         return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
 
 
     def get_atomic_numbers(self, no_H: bool = True) -> np.ndarray:
         """
-        Get per-atom atomic numbers (element identity) as a float32 array -- the categorical label
-        the ``vol_atomtype`` (atom-identity) channel matches on.
+        Get per-atom atomic numbers as a float32 array, the categorical label the ``vol_atomtype``
+        channel matches on.
 
-        A full ``(N,)`` array over ALL atoms in RDKit-mol (with-H) order, sliced to the strict-heavy
-        set with the SAME ``_nonH_atoms_idx`` the charges/lipophilicity use, so the labels stay 1:1
-        with the true-heavy centres ``mol.GetConformer().GetPositions()[_nonH_atoms_idx]`` (NOT
-        ``atom_pos`` -- the retained-H trap). Returned as float32 to sit alongside the other per-atom
-        channels in a batch tensor; equality of the (integer-valued) labels is what the categorical
-        overlap tests.
+        Sliced with the same ``_nonH_atoms_idx`` as the charges, so the labels stay 1:1 with
+        :meth:`get_atomtype_positions`. Returned as float32 to sit alongside the other per-atom
+        channels in a batch tensor.
 
         Parameters
         ----------
@@ -794,8 +727,7 @@ class Molecule:
                                                             probe_radius=self.probe_radius,
                                                             num_samples_per_atom=25)
         else:
-            # num_samples_per_atom left to each method's default: 25 for 'mesh' (unchanged),
-            # the sparser SMOOTH_SDF_NSPA for 'smooth_sdf'.
+            # num_samples_per_atom is left to each method's default.
             positions = get_molecular_surface(centers,
                                               radii,
                                               num_points=self.num_surf_points,
@@ -879,8 +811,8 @@ class Molecule:
         scale : float, optional
             Length of a pharmacophore vector in Angstroms. Default 1.
         feature_set : str, optional
-            ``'shepherd'`` (default, 8 fss types) or ``'rdkit_base'`` (6 ROCS/ROSHAMBO
-            color types). See :func:`get_pharmacophores`.
+            ``'shepherd'`` (default, 8 types) or ``'rdkit_base'`` (6 ROCS color types).
+            See :func:`get_pharmacophores`.
         directionless : bool, optional
             When ``True``, emit isotropic zero-vector "color" pharmacophores, overriding
             ``multi_vector``. Default ``False``.
@@ -1006,11 +938,8 @@ class Molecule:
             pharm_types=None if new_pharm is None else new_pharm.types,
             pharm_ancs=None if new_pharm is None else new_pharm.positions,
             pharm_vecs=None if new_pharm is None else new_pharm.vectors,
-            # fork-only instance state; without these the subset silently reverts to the
-            # defaults (xtb charges, mesh surface) and any regeneration on the returned
-            # Molecule would no longer match the one it came from. feature_set/directionless
-            # are deliberately absent: the fork keeps those call-time on get_pharmacophore(),
-            # not as instance state, so there is nothing here to carry over.
+            # Carry the remaining instance state so regeneration on the subset matches the
+            # source; feature_set/directionless are call-time arguments, not instance state.
             charge_model=self._charge_model,
             surface_method=self.surface_method,
             fukui=self._fukui,
@@ -1018,11 +947,9 @@ class Molecule:
 
 
 def _bind_batch_aligners(cls):
-    """Bind ``accel.batch._align_batch_<mode>`` onto ``cls`` as static methods -- one per
-    canonical registry mode, plus the legacy-name aliases (esp->surf_esp,
-    esp_combo->vol_and_surf_esp) -- so ``MoleculePair._align_batch_vol(pairs, ...)`` etc. still
-    resolve here and adding a mode needs no per-mode edit. Exactly mirrors the old explicit
-    staticmethod block; driven off accel/_modes so the registry is the single source."""
+    """Bind ``accel.batch._align_batch_<mode>`` onto ``cls`` as static methods, one per registry
+    mode plus the legacy aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp), so
+    ``MoleculePair._align_batch_vol(pairs, ...)`` resolves and adding a mode needs no edit here."""
     for _m in _CANONICAL_MODES:
         setattr(cls, "_align_batch_" + _m, staticmethod(getattr(_ba, "_align_batch_" + _m)))
     for _legacy, _canon in _LEGACY_MODE_ALIASES.items():
@@ -1101,7 +1028,7 @@ class MoleculePair:
             self.ref_molec.center_to(self.ref_molec.atom_pos.mean(0))
             self.fit_molec.center_to(self.fit_molec.atom_pos.mean(0))
 
-        # ----  pre-convert atomic coordinates to torch on the target device  ----
+        # Atomic coordinates as float32 tensors on the target device.
         self._ref_xyz_t = torch.as_tensor(self.ref_molec.atom_pos,
                                           dtype=torch.float32,
                                           device=device)          # (N,3)
@@ -1116,20 +1043,13 @@ class MoleculePair:
 
     def __setstate__(self, state):
         """
-        Restore a pickled MoleculePair, upgrading the pre-refactor flat layout.
+        Restore a pickled MoleculePair, upgrading the older flat layout.
 
-        Same hazard as :meth:`Molecule.__setstate__` and the one WHATS_NEW B3 documents:
-        ``transform_<mode>`` / ``sim_aligned_<mode>`` were plain attributes and are now data
-        descriptors delegating to ``self._alignments``. Data descriptors take precedence over
-        the instance dict, so an old pickle restores its flat keys and then raises
-        ``AttributeError: 'MoleculePair' object has no attribute '_alignments'`` on the first
-        read of any of them.
-
-        Remap the flat keys into AlignmentResult entries, honouring the renamed-mode aliases
-        (``esp`` -> ``surf_esp``, ``esp_combo`` -> ``vol_and_surf_esp``) that a pickle written
-        before the rename would carry. New-format pickles are untouched: the remap only fires
-        when ``_alignments`` is absent, and stale flat duplicates are stripped either way so a
-        shadowed copy cannot drift from the canonical entry.
+        Same hazard as :meth:`Molecule.__setstate__`: ``transform_<mode>`` / ``sim_aligned_<mode>``
+        are now data descriptors delegating to ``self._alignments``, so an old pickle would raise
+        AttributeError on first read. Flat keys (including the legacy ``esp`` / ``esp_combo``
+        names) are remapped into AlignmentResult entries when ``_alignments`` is absent, and
+        stripped either way so a stale duplicate cannot shadow the canonical entry.
         """
         state = dict(state)
         aliases = {'esp': 'surf_esp', 'esp_combo': 'vol_and_surf_esp'}
@@ -1164,17 +1084,14 @@ class MoleculePair:
         locals()[f'sim_aligned_{_key}'] = _alignment_property(_key, 'score')
     del _key
 
-    # Legacy result-attribute aliases (renamed modes; old names kept working):
-    # esp -> surf_esp, esp_combo -> vol_and_surf_esp. Delegate to the canonical entries.
+    # Legacy result-attribute aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp).
     transform_esp = _alignment_property('surf_esp', 'transform')
     sim_aligned_esp = _alignment_property('surf_esp', 'score')
     transform_esp_combo = _alignment_property('vol_and_surf_esp', 'transform')
     sim_aligned_esp_combo = _alignment_property('vol_and_surf_esp', 'score')
 
-    # --- batched GPU/Triton aligners -------------------------------------
-    # Implemented as free functions in ``accel.batch``; bound as static methods (one per
-    # registry mode + legacy aliases) by the ``@_bind_batch_aligners`` class decorator above, so
-    # the public seam ``MoleculePair._align_batch_vol(pairs, ...)`` etc. still resolves here.
+    # Batched aligners (``_align_batch_<mode>``) live in ``accel.batch`` and are bound as static
+    # methods by ``@_bind_batch_aligners``.
 
     def align_with_vol(self,
                        no_H: bool = True,
@@ -1280,17 +1197,15 @@ class MoleculePair:
                              lr: float = 0.1,
                              max_num_steps: int = None,
                              verbose: bool = False) -> np.ndarray:
-        """Align fit_molec to ref_molec by volumetric (shape) similarity MINUS a linear hard-sphere
-        excluded-volume penalty that keeps the fit out of a FIXED cloud of ``avoid_points``.
+        """Align fit_molec to ref_molec by volumetric similarity minus a linear hard-sphere
+        excluded-volume penalty that keeps the fit out of a fixed cloud of ``avoid_points``:
 
             score = shape_Tanimoto - avoid_weight * sum relu((avoid_min_dist - d)/avoid_min_dist)
 
-        ``avoid_points`` (K,3) is an arbitrary point cloud in the reference frame (a pocket wall, a
-        region to grow away from, etc.) -- NOT one of the two molecules. Score/transform stored in
-        ``self.sim_aligned_vol_avoid`` / ``self.transform_vol_avoid``. This is the eager AUTOGRAD
-        reference (the oracle for the accelerated ``MoleculePairBatch.align_with_vol_avoid``); it
-        wraps ``optimize_ROCS_overlay(..., avoid_points=...)``. The fit-avoid cloud defaults to the
-        fit shape atoms.
+        ``avoid_points`` is an arbitrary cloud in the reference frame (a pocket wall, a region to
+        grow away from), not one of the two molecules. The penalty is evaluated on the fit shape
+        atoms. Optimally aligned score found in ``self.sim_aligned_vol_avoid`` and the SE(3)
+        transformation in ``self.transform_vol_avoid``.
 
         Parameters
         ----------
@@ -1349,19 +1264,10 @@ class MoleculePair:
         Align fit_molec to ref_molec using volume similarity weighted by partial charge
         Toggle ``no_H`` parameter for scoring with or without hydrogens.
 
-        ``lam`` DEFAULTS to 0.1 -- the value this library has always documented for
-        partial-charge volumetric ESP.
-
-        !! ``lam`` IS A WIDTH, NOT A WEIGHT, AND ITS UNITS DIFFER BY MODE.
-        The ESP term is ``exp(-esp_diff_sq / lam)``, so a SMALLER lam means charge
-        differences are penalised MORE sharply (a more discriminative ESP), not less.
-        Crucially, ``align_with_vol_esp`` takes lam RAW, while ``align_with_surf_esp``
-        multiplies its lam by ``LAM_SCALING`` (= COULOMB_SCALING**2, ~207) internally.
-        The two lams are therefore ~207x apart in absolute terms and are NOT
-        interchangeable. Handing this method surf_esp's 0.3 makes the ESP ~3x too
-        permissive; that mistake previously cost ~0.02 ROC-AUC on a 41-target DUDE-Z
-        screen, and it is exactly why lam is a DEFAULT here now rather than a required
-        argument the caller has to guess.
+        Typically ``lam=0.1`` is used (the default). ``lam`` is a width, not a weight: the ESP
+        term is ``exp(-esp_diff_sq / lam)``, so a smaller lam penalises charge differences more
+        sharply. It is used raw here, whereas ``align_with_surf_esp`` scales its lam by
+        ``LAM_SCALING`` internally, so the two are not interchangeable.
         Optimally aligned score found in ``self.sim_aligned_vol_esp`` and the optimal SE(3)
         transformation is at ``self.transform_vol_esp``. If ``no_H`` is ``True``, append '_noH' to them.
 
@@ -1553,8 +1459,8 @@ class MoleculePair:
                        use_analytical: bool = True,
                        verbose: bool = False) -> np.ndarray:
         """
-        Align fit_molec to ref_molec using surface-ESP similarity. ``surf_esp`` is the
-        canonical name for the mode formerly called ``esp`` (legacy alias kept below).
+        Align fit_molec to ref_molec using surface-ESP similarity (formerly ``align_with_esp``,
+        which is kept as an alias).
         ``lam`` is scaled by ``(1e4/(4*55.263*np.pi))**2`` for correct units.
 
         Typically, ``lam=0.3`` is used and is scaled internally.
@@ -1652,8 +1558,8 @@ class MoleculePair:
                              use_jax: bool = False,
                              verbose: bool = False):
         """
-        Align using ShaEP similarity score. ``vol_and_surf_esp`` is the canonical name
-        for the mode formerly called ``esp_combo`` (legacy alias kept below).
+        Align using ShaEP similarity score (formerly ``align_with_esp_combo``, which is kept as
+        an alias).
         If alpha is 0.81, then it automatically uses volumetric shape similarity.
         Otherwise, it uses surface shape similarity.
 
@@ -1785,15 +1691,14 @@ class MoleculePair:
                              max_num_steps: int = None,
                              verbose: bool = False) -> np.ndarray:
         """
-        Align using a ROCS/ROSHAMBO-style combined atom-centred Gaussian *shape* (volume) +
+        Align using a ROCS-style combined atom-centred Gaussian *shape* (volume) and
         directionless *color* (pharmacophore) overlay (a TanimotoCombo analogue).
 
         The optimized objective is
-        ``(1 - color_weight) * shape_Tanimoto + color_weight * color_Tanimoto``. By default
-        the color channel is *directionless* (isotropic point Gaussians, ROCS/ROSHAMBO
-        "color"); pass ``directionless=False`` to keep fss's orientation-vector weighting. For
-        ROCS/ROSHAMBO feature parity, build the ``Molecule`` objects with
-        ``feature_set='rdkit_base'``.
+        ``(1 - color_weight) * shape_Tanimoto + color_weight * color_Tanimoto``. By default the
+        color channel is directionless (isotropic point Gaussians); pass ``directionless=False``
+        to keep the orientation-vector weighting. For ROCS feature parity, build the
+        ``Molecule`` objects with ``feature_set='rdkit_base'``.
 
         Optimally aligned score is stored in ``self.sim_aligned_vol_color`` and the optimal
         SE(3) transformation in ``self.transform_vol_color``.
@@ -1802,7 +1707,7 @@ class MoleculePair:
         ----------
         color_weight : float, optional
             Weight of the color channel in [0, 1]; shape gets ``1 - color_weight``.
-            Default is 0.5 (the ROCS/ROSHAMBO 50/50 combo).
+            Default is 0.5.
         alpha : float, optional
             Gaussian width for the shape overlap. Default is 0.81 (volumetric, heavy atoms).
         similarity : str, optional
@@ -1814,13 +1719,13 @@ class MoleculePair:
         extended_points, only_extended : bool, optional
             Forwarded to the color scorer (ignored when ``directionless=True``).
         num_repeats : int, optional
-            Number of SE(3) initializations. Default (``None``) is ``MODE_SEEDS['vol_color']`` (16).
+            Number of SE(3) initializations. Default (``None``) is ``MODE_SEEDS['vol_color']``.
         trans_init : bool, optional
             Translation-seeded initialization from the reference atoms. Default is ``False``.
         lr : float, optional
             Learning rate. Default is 0.1.
         max_num_steps : int, optional
-            Maximum optimization steps. Default (``None``) is ``MODE_STEPS['vol_color']`` (40).
+            Maximum optimization steps. Default (``None``) is ``MODE_STEPS['vol_color']``.
         verbose : bool, optional
             Print progress. Default is ``False``.
 
@@ -1882,14 +1787,10 @@ class MoleculePair:
 
         The optimized objective is
         ``(1 - lipo_weight) * shape_Tanimoto + lipo_weight * lipo_Tanimoto``. The shape channel is
-        the heavy-atom Gaussian volume overlap (identical to the ``vol`` mode, ``alpha=0.81``). The
-        lipophilicity channel overlays the per-atom Crippen atomic logP contributions -- placed at
-        the TRUE-heavy atom centres -- like an ESP/partial-charge field (``get_overlap_esp`` with
-        the logP as the "charge", matched by value so hydrophobic overlaps hydrophobic and
-        hydrophilic overlaps hydrophilic), with the atom-centred ``lam=0.1``. Each channel is its
-        own self-normalised Tanimoto, so a molecule aligned to a copy of itself scores 1.000. Only
-        the fit molecule is transformed; its shape centres and lipophilicity centres move rigidly
-        under the same SE(3) pose.
+        the heavy-atom Gaussian volume overlap of the ``vol`` mode; the lipophilicity channel
+        overlays the per-atom Crippen logP contributions at the heavy-atom centres like a
+        partial-charge field (``get_overlap_esp`` with logP as the charge), so hydrophobic
+        overlaps hydrophobic. Both fit point sets move under the same SE(3) pose.
 
         Optimally aligned score is stored in ``self.sim_aligned_vol_lipo`` and the optimal SE(3)
         transformation in ``self.transform_vol_lipo``.
@@ -1903,8 +1804,8 @@ class MoleculePair:
             Gaussian width for the shape and lipophilicity overlaps. Default is 0.81 (volumetric,
             heavy atoms).
         lam : float, optional
-            Value ("charge") weighting for the lipophilicity ESP overlap. Default is 0.1 (the
-            atom-centred convention, NOT the surface-tuned default).
+            Width of the value-matching kernel in the lipophilicity overlap, used raw as in
+            ``align_with_vol_esp``. Default is 0.1.
         num_repeats : int, optional
             Number of SE(3) initializations. Default (``None``) is ``MODE_SEEDS['vol_lipo']``.
         trans_init : bool, optional
@@ -1925,11 +1826,8 @@ class MoleculePair:
             num_repeats = _default_seeds("vol_lipo")
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_lipo")
-        # TRUE-heavy centres that MATCH the heavy Crippen logP. NOT ``atom_pos``: atom_pos is the
-        # RemoveHs coordinate set, which RETAINS isotope-labelled H (e.g. deuterium), whereas
-        # ``_nonH_atoms_idx`` selects atomic-number != 1 and so drops it -- they desync (N vs N-1)
-        # whenever an H is retained. Index the with-H conformer by the SAME ``_nonH_atoms_idx`` the
-        # lipophilicity slice uses so positions and logP stay 1:1 (the retained-H trap).
+        # Heavy-atom centres indexed by the same ``_nonH_atoms_idx`` as the logP slice, so they
+        # stay 1:1 (``atom_pos`` can retain isotope-labelled H and would not).
         ref_lipo_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
         fit_lipo_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
         ref_lipo = self.ref_molec.get_lipophilicity(no_H=True)
@@ -2044,7 +1942,7 @@ class MoleculePair:
         """
         Align fit_molec to ref_molec using the asymmetric "fits-inside" ``vol_esp_tversky``
         overlay: the ``vol_esp`` electrostatic-weighted volumetric overlap scored with **Tversky**
-        rather than Tanimoto. It is to ``vol_esp`` EXACTLY what ``vol_tversky`` is to ``vol``.
+        rather than Tanimoto, as ``vol_tversky`` is to ``vol``.
 
         The optimized objective is the Tversky ESP similarity
         ``AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))`` where ``AB`` is the
@@ -2055,12 +1953,8 @@ class MoleculePair:
         score rewards the *reference* (query) being contained in the fit. The objective is
         asymmetric: swapping ref and fit changes the score. Only the fit is transformed.
 
-        ``lam`` DEFAULTS to 0.1 -- the value this library documents for partial-charge volumetric
-        ESP -- and, like ``align_with_vol_esp``, is taken RAW (NOT ``LAM_SCALING``-scaled; that
-        scaling is only for the surface ESP modes). Reads the strict-heavy atom centres from the
-        with-H conformer indexed by ``_nonH_atoms_idx`` (1:1 with the heavy partial charges), NOT
-        ``atom_pos`` -- the same retained-H-safe heavy-charge handling the ``vol_esp`` accel path
-        uses.
+        ``lam`` defaults to 0.1 and, as in ``align_with_vol_esp``, is used raw (not scaled by
+        ``LAM_SCALING``).
 
         Optimally aligned score is stored in ``self.sim_aligned_vol_esp_tversky`` and the optimal
         SE(3) transformation in ``self.transform_vol_esp_tversky``.
@@ -2075,7 +1969,7 @@ class MoleculePair:
         alpha : float, optional
             Gaussian width for the overlap. Default is 0.81 (volumetric, heavy atoms).
         lam : float, optional
-            RAW partial-charge weighting parameter for the ESP kernel. Default is 0.1.
+            Width of the ESP kernel, used raw. Default is 0.1.
         no_H : bool, optional
             Whether to exclude hydrogens (heavy-atom overlay). Default is ``True``.
         num_repeats : int, optional
@@ -2100,9 +1994,8 @@ class MoleculePair:
             num_repeats = _default_seeds("vol_esp_tversky")
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_esp_tversky")
-        # Heavy centres come from the with-H conformer indexed by ``_nonH_atoms_idx`` (strict-heavy,
-        # 1:1 with ``get_charges(no_H=True)``) -- NOT ``atom_pos``, which is the ``Chem.RemoveHs``
-        # set and RETAINS isotope-labelled H (deuterium), desyncing from the heavy charges.
+        # Heavy-atom centres indexed by the same ``_nonH_atoms_idx`` as ``get_charges(no_H=True)``
+        # (``atom_pos`` can retain isotope-labelled H and would not stay 1:1).
         if no_H:
             ref_atom_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
             fit_atom_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
@@ -2253,19 +2146,10 @@ class MoleculePair:
         return aligned_fit_anchors.numpy(), aligned_fit_vectors.numpy()
 
 
-    # =====================================================================================
-    # SI experimental modes (reference layer). Each reuses an existing eager optimizer or one
-    # of the new SI optimizers in ``alignment/_torch.py``; seed/step defaults are LITERAL (50/200),
-    # matching every eager optimizer in ``alignment/_torch.py``.
-    #
-    # These modes ARE in ``MODE_SEEDS``/``MODE_STEPS`` -- all 21 canonical modes are -- so the
-    # literals here are not a consequence of the registry lacking them. They are what a
-    # reference-only mode starts with (``_default_seeds``/``_default_steps`` read tables the mode
-    # is not in yet), and the accelerate-scoring-mode pass that promoted these modes did not come
-    # back to switch them over. The effect is that the per-pair and batched defaults DIVERGE here:
-    # eager ``vol_tversky`` runs 50x200 where ``MoleculePairBatch`` runs 10x40. Callers comparing
-    # the two paths must pass ``num_repeats``/``max_num_steps`` explicitly.
-    # =====================================================================================
+    # Experimental modes. Each reuses an eager optimizer from ``alignment/_torch.py`` and keeps
+    # that optimizer's literal 50-seed / 200-step defaults, whereas ``MoleculePairBatch`` resolves
+    # ``None`` to ``MODE_SEEDS`` / ``MODE_STEPS``; pass ``num_repeats`` / ``max_num_steps``
+    # explicitly when comparing the two paths.
     def align_with_vol_pharm(self,
                              color_weight: float = 0.5,
                              alpha: float = 0.81,
@@ -2277,11 +2161,9 @@ class MoleculePair:
                              lr: float = 0.1,
                              max_num_steps: int = 200,
                              verbose: bool = False) -> np.ndarray:
-        """Align using a combined atom-centred Gaussian *shape* (volume) + *directional
-        pharmacophore* overlay. This is the ``vol_color`` combo with the orientation-vector cosine
-        weighting KEPT (``directionless=False``) -- a full ROCS ColorTanimoto analogue where the
-        HBA/HBD/aromatic/halogen features must also point the same way, rather than the
-        directionless ``vol_color`` "color". Score/transform stored in
+        """Align using a combined atom-centred Gaussian *shape* (volume) and *directional
+        pharmacophore* overlay: the ``vol_color`` combo with the orientation-vector weighting kept
+        (``directionless=False``). Score and transform are stored in
         ``self.sim_aligned_vol_pharm`` / ``self.transform_vol_pharm``."""
         if self.ref_molec.pharm_types is None or self.fit_molec.pharm_types is None:
             raise ValueError(
@@ -2318,13 +2200,11 @@ class MoleculePair:
                                 lr: float = 0.1,
                                 max_num_steps: int = 200,
                                 verbose: bool = False) -> np.ndarray:
-        """Align using a combined atom-centred Gaussian *shape* (volume) + *atom-identity* overlay.
-        The identity channel is a categorical Gaussian overlap keyed by element (atomic number) --
-        only same-element atoms contribute, so the pose is rewarded for placing carbon-on-carbon,
-        oxygen-on-oxygen, etc. (a cheap, feature-detection-free "colour" that prioritises atom
-        identity). ``(1 - atomtype_weight) * shape + atomtype_weight * identity``. Identity labels /
-        centres are the strict-heavy set (``_nonH_atoms_idx``), retained-H-safe (NOT ``atom_pos``).
-        Score/transform stored in ``self.sim_aligned_vol_atomtype`` / ``self.transform_vol_atomtype``."""
+        """Align using a combined atom-centred Gaussian *shape* (volume) and *atom-identity*
+        overlay, ``(1 - atomtype_weight) * shape + atomtype_weight * identity``. The identity
+        channel is a Gaussian overlap in which only same-element atoms contribute. Score and
+        transform are stored in ``self.sim_aligned_vol_atomtype`` /
+        ``self.transform_vol_atomtype``."""
         ref_type_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
         fit_type_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
         aligned_fit_centers, se3_transform, score = optimize_vol_atomtype_overlay(
@@ -2352,14 +2232,10 @@ class MoleculePair:
                           lr: float = 0.1,
                           max_num_steps: int = 200,
                           verbose: bool = False) -> np.ndarray:
-        """Align using a combined atom-centred Gaussian *shape* (volume) + *molar-refractivity*
-        (polarizability) overlay. Structurally identical to ``vol_lipo`` -- the per-atom Crippen
-        atomic MR is overlaid like an ESP/partial-charge field (matched by value, so polarizable
-        overlaps polarizable) at the TRUE-heavy centres -- but the scalar is the Crippen MR
-        contribution instead of logP. Molar refractivity tracks atomic size/polarizability
-        (large for S/Cl/Br/I and aromatic systems), a physicochemical channel distinct from shape,
-        electrostatics and lipophilicity. ``(1 - mr_weight) * shape + mr_weight * mr``.
-        Score/transform stored in ``self.sim_aligned_vol_mr`` / ``self.transform_vol_mr``."""
+        """Align using a combined atom-centred Gaussian *shape* (volume) and *molar-refractivity*
+        overlay, ``(1 - mr_weight) * shape + mr_weight * mr``: ``vol_lipo`` with the per-atom
+        Crippen MR contribution in place of logP. Score and transform are stored in
+        ``self.sim_aligned_vol_mr`` / ``self.transform_vol_mr``."""
         ref_mr_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
         fit_mr_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
         aligned_fit_centers, se3_transform, score = optimize_vol_lipo_overlay(
@@ -2387,15 +2263,11 @@ class MoleculePair:
                              lr: float = 0.1,
                              max_num_steps: int = 200,
                              verbose: bool = False) -> np.ndarray:
-        """Align using a combined atom-centred Gaussian *shape* (volume) + *Fukui-reactivity* overlay.
-        Structurally identical to ``vol_lipo`` / ``vol_mr`` -- the per-atom condensed Fukui dual
-        descriptor ``f+ - f-`` is overlaid like an ESP/partial-charge field (matched by value, so a
-        nucleophilic site overlaps nucleophilic and electrophilic overlaps electrophilic, and the
-        signed field penalizes reactive-character mismatches) at the TRUE-heavy centres -- but the
-        scalar is the Fukui dual descriptor instead of logP/MR. The Fukui field is a conceptual-DFT
-        reactivity descriptor from three gfn2-xTB single points (generated lazily on
-        ``Molecule.fukui``). ``(1 - fukui_weight) * shape + fukui_weight * fukui``. Score/transform
-        stored in ``self.sim_aligned_vol_fukui`` / ``self.transform_vol_fukui``."""
+        """Align using a combined atom-centred Gaussian *shape* (volume) and *Fukui-reactivity*
+        overlay, ``(1 - fukui_weight) * shape + fukui_weight * fukui``: ``vol_lipo`` with the
+        per-atom Fukui dual descriptor ``f+ - f-`` (``Molecule.fukui``) in place of logP, so
+        nucleophilic sites overlap nucleophilic and electrophilic overlap electrophilic. Score and
+        transform are stored in ``self.sim_aligned_vol_fukui`` / ``self.transform_vol_fukui``."""
         ref_fukui_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
         fit_fukui_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
         aligned_fit_centers, se3_transform, score = optimize_vol_lipo_overlay(
@@ -2423,11 +2295,9 @@ class MoleculePair:
                                 lr: float = 0.1,
                                 max_num_steps: int = 200,
                                 verbose: bool = False) -> np.ndarray:
-        """Align using the *surface* shape overlay scored with **Tversky** rather than Tanimoto -- it
-        is to ``surf`` exactly what ``vol_tversky`` is to ``vol`` (the same asymmetric "fits-inside"
-        Tversky reduction, over the surface point cloud instead of atom centres). Reuses the
-        ``vol_tversky`` optimizer with the molecules' surface points. Requires surfaces.
-        Score/transform stored in ``self.sim_aligned_surf_tversky`` / ``self.transform_surf_tversky``."""
+        """Align using the *surface* shape overlay scored with Tversky rather than Tanimoto, as
+        ``vol_tversky`` is to ``vol``. Requires surfaces. Score and transform are stored in
+        ``self.sim_aligned_surf_tversky`` / ``self.transform_surf_tversky``."""
         if self.num_surf_points is None:
             raise ValueError('The Molecule objects were initialized with no surface points so '
                              'align_with_surf_tversky cannot be used.')
@@ -2454,11 +2324,10 @@ class MoleculePair:
                                     lr: float = 0.1,
                                     max_num_steps: int = 200,
                                     verbose: bool = False) -> np.ndarray:
-        """Align using the *surface ESP* overlay scored with **Tversky** rather than Tanimoto -- it
-        is to ``surf_esp`` exactly what ``vol_esp_tversky`` is to ``vol_esp``. Reuses the
-        ``vol_esp_tversky`` optimizer with the molecules' surface points + surface ESP, and (like
-        ``surf_esp``) scales ``lam`` by ``LAM_SCALING`` for the surface convention. Requires surfaces.
-        Score/transform stored in ``self.sim_aligned_surf_esp_tversky`` / ``self.transform_surf_esp_tversky``."""
+        """Align using the *surface ESP* overlay scored with Tversky rather than Tanimoto, as
+        ``vol_esp_tversky`` is to ``vol_esp``. ``lam`` is scaled by ``LAM_SCALING`` as in
+        ``align_with_surf_esp``. Requires surfaces. Score and transform are stored in
+        ``self.sim_aligned_surf_esp_tversky`` / ``self.transform_surf_esp_tversky``."""
         if self.num_surf_points is None:
             raise ValueError('The Molecule objects were initialized with no surface points so '
                              'align_with_surf_esp_tversky cannot be used.')
@@ -2493,7 +2362,7 @@ class MoleculePair:
                                      verbose: bool = False) -> np.ndarray:
         """Align using the ``vol_color`` shape+colour combo scored with an asymmetric **Tversky**
         reduction on both channels (shape via ``tversky_alpha``/``tversky_beta``; colour via the
-        OpenEye 0.95 Tversky). Requires pharmacophores. Score/transform stored in
+        OpenEye 0.95 Tversky). Requires pharmacophores. Score and transform are stored in
         ``self.sim_aligned_vol_color_tversky`` / ``self.transform_vol_color_tversky``."""
         if self.ref_molec.pharm_types is None or self.fit_molec.pharm_types is None:
             raise ValueError(
@@ -2532,8 +2401,9 @@ class MoleculePair:
                                     max_num_steps: int = 200,
                                     verbose: bool = False) -> np.ndarray:
         """Align using the ``vol_lipo`` shape+lipophilicity combo scored with an asymmetric
-        **Tversky** reduction per channel (shape and the Crippen-logP ESP channel). Score/transform
-        stored in ``self.sim_aligned_vol_lipo_tversky`` / ``self.transform_vol_lipo_tversky``."""
+        **Tversky** reduction per channel (shape and the Crippen-logP ESP channel). Score and
+        transform are stored in ``self.sim_aligned_vol_lipo_tversky`` /
+        ``self.transform_vol_lipo_tversky``."""
         ref_lipo_pos = self.ref_molec.mol.GetConformer().GetPositions()[self.ref_molec._nonH_atoms_idx]
         fit_lipo_pos = self.fit_molec.mol.GetConformer().GetPositions()[self.fit_molec._nonH_atoms_idx]
         aligned_fit_centers, se3_transform, score = optimize_vol_lipo_tversky_overlay(
@@ -2568,7 +2438,7 @@ class MoleculePair:
         """Align using the ShaEP-style ``vol_and_surf_esp`` score with the SHAPE channel scored by
         **Tversky** rather than Tanimoto (the surface-ESP agreement channel is a point-to-point
         potential average, not an overlap ratio, so Tversky is not applied to it). Requires surfaces.
-        Score/transform stored in ``self.sim_aligned_vol_and_surf_esp_tversky`` /
+        Score and transform are stored in ``self.sim_aligned_vol_and_surf_esp_tversky`` /
         ``self.transform_vol_and_surf_esp_tversky``."""
         if self.num_surf_points is None:
             raise ValueError('The Molecule objects were initialized with no surface points so '
@@ -2611,11 +2481,11 @@ class MoleculePair:
                                  max_num_steps: int = 200,
                                  use_analytical: bool = True,
                                  verbose: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-        """Align using pharmacophore similarity scored with **Tversky** (OpenEye 0.95 formulation)
-        rather than Tanimoto -- i.e. ``align_with_pharm`` with ``similarity='tversky'`` registered as
-        its own mode. Requires pharmacophores. Score/transform stored in
-        ``self.sim_aligned_pharm_tversky`` / ``self.transform_pharm_tversky``; returns the aligned
-        pharmacophore anchors and vectors like ``align_with_pharm``."""
+        """Align using pharmacophore similarity scored with Tversky rather than Tanimoto, i.e.
+        ``align_with_pharm`` with ``similarity='tversky'`` as its own mode. Requires pharmacophores.
+        Score and transform are stored in ``self.sim_aligned_pharm_tversky`` /
+        ``self.transform_pharm_tversky``; returns the aligned anchors and vectors like
+        ``align_with_pharm``."""
         if self.ref_molec.pharm_types is None or self.fit_molec.pharm_types is None:
             raise ValueError('Both Molecule objects must have pharmacophores to use align_with_pharm_tversky.')
         _pharm_fn = optimize_pharm_overlay_analytical if use_analytical else optimize_pharm_overlay

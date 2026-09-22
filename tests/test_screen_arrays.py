@@ -1,41 +1,8 @@
-"""Gate 5 for the array-native screen path (``FSS_SCREEN_ARRAYS=1``).
+"""Parity gate for the array-native screen path (``FSS_SCREEN_ARRAYS=1``).
 
-``ea46a2e`` added ``accel/batch/_arrays.py`` plus the ``screen.py`` dispatch and asserted
-"bit-identical" in its commit message, but shipped no test; ``_arrays.py`` still says "Default OFF
-until the gates pass". This is that gate: the array path must produce byte-for-byte the same
-scores as the object path it replaces, or it is not the re-expression it claims to be.
-
-EVERY ARRAY MODE, DERIVED. ``_ARRAY_MODES`` grew from five to eleven (``vol_tversky``,
-``vol_esp_tversky``, ``surf``, ``surf_esp``, ``vol_lipo``, ``vol_fukui`` joined), and this file
-covered the old five BY NAME -- three hardcoded lists plus a store fixture built for five modes,
-so the six new ones had no repo coverage at all and the negative control below asserted that two
-of them were *not* array modes. Everything mode-shaped here is now read off
-``screen.py::_ARRAY_MODES`` at import, and the store is built for that same tuple, so a mode
-added there is covered by this file on the next run instead of being forgotten. The six were
-measured bit-identical at N=99,984 on an L40S (jobs 22640575 / 22641030 / 22641516: 0 of 99,984
-scores moved, max|delta| 0.000e+00); this file is the standing check that they stay that way.
-
-WHY THE SPIES. A parity test here can pass while proving nothing. ``_use_arrays`` gates on
-``mode in _ARRAY_MODES`` AND ``_arrays.ENABLED``, so a mistake in either silently compares the
-object path against itself and reports success. These tests therefore assert WHICH BUILDER RAN,
-not merely that two vectors matched -- and each mode has its own builder, so the spy set is read
-off ``_ARRAY_BUILDERS`` (every entry wrapped) rather than named one by one.
-
-WHY THE PARITY GATE ALSO RUNS WITHOUT A GPU. ``fast`` (screen.py::screen_many) needs a
-pre-centered store and a ``_FAST_MODES`` mode; it does NOT need CUDA, and ``_use_arrays`` never
-looks at the device -- so ``backend="numba"`` takes the same ``_array_dispatch`` branch on the
-CPU. Measured here on this fixture: all eleven modes, both legs, 0 of 12 scores moved with
-max|delta| 0.000e+00 and identical top-k order, the spies confirming the ON leg entered the array
-builder and the OFF leg the object builder. The CPU twin is what gives the six new modes a gate
-on a machine with no GPU; the ``cuda``-marked twin stays because the GPU is where the kernels
-differ.
-
-WHY THE SIZES ARE WHAT THEY ARE. The array path re-derives bucket membership as spans over an
-index array rather than Python lists of pair objects, and ``_pad._band_key`` bands molecules by
-``((n + 15) // 16) * 16``. A library of drug-like molecules is NOT enough: 3-15 heavy atoms all
-land in band 16, giving one cell and leaving the span/pad arithmetic untested (measured -- an
-earlier version of this file asserted >=2 buckets and failed on exactly that). The alkanes below
-exist to push the library across band boundaries: heavy counts 3..36 span bands 16/32/48.
+For every mode in ``screen.py::_ARRAY_MODES`` the array path must produce byte-identical scores
+to the object path. Spies assert which builder ran, so a gate that silently routed both legs
+the same way could not pass. The library spans several pad bands (see ``_SMILES``).
 """
 import os
 
@@ -55,19 +22,12 @@ from shepherd_score.screen import ProfileStore, screen          # noqa: E402
 
 _BAND = 16          # mirrors accel.batch._pad._BAND; asserted against the real one below
 
-#: THE list every mode-shaped thing in this file is driven off: both parametrize lists, the store
-#: fixture's ``modes=``, and the negative control's complement. Snapshotted at import because
-#: ``pytest.mark.parametrize`` needs a concrete sequence; the store guard below re-reads
-#: ``screenmod._ARRAY_MODES`` so a mode added after import still fails loudly rather than
-#: silently going untested.
+#: Every mode-shaped thing in this file derives from this tuple; snapshotted at import because
+#: ``pytest.mark.parametrize`` needs a concrete sequence.
 _MODES = tuple(screenmod._ARRAY_MODES)
 
-#: The kwargs each mode REQUIRES of ``screen()``, derived from the registry rather than listed:
-#: a spec parameter whose default is ``None`` has to be supplied (``lam`` for vol_esp, which
-#: takes it RAW where surf_esp scales it x207; ``alpha`` for the combo modes, where it selects
-#: volumetric shape at 0.81 and surface shape otherwise), and ``vol_avoid`` additionally needs
-#: the query-side avoid cloud its objective scores against. Everything else carries a default.
-#: Listing these by hand is how six modes once shipped with no coverage.
+#: The kwargs each mode requires of ``screen()``: spec parameters defaulting to ``None`` must be
+#: supplied, and ``vol_avoid`` additionally needs its avoid cloud.
 _REQUIRED_VALUES = {"lam": 0.1, "alpha": 0.81}
 _MODE_KW = {}
 for _m, _sp in screenmod._SPECS.items():
@@ -77,24 +37,9 @@ for _m, _sp in screenmod._SPECS.items():
     if _kw:
         _MODE_KW[_m] = _kw
 
-#: Modes whose self-copy does NOT reach ~1.0 on THIS fixture, DERIVED from the objective rather
-#: than listed. Two structures cannot reach 1.0 here and both are readable off the mode's terms:
-#:
-#: * a value-only AGREEMENT term (the ShaEP surface-ESP channel). ``_build_molecule`` gives every
-#:   molecule a SYNTHETIC random surface so the suite needs no Open3D, which is fine for the
-#:   shape and pharmacophore channels but is not the surface implied by that molecule's own
-#:   atoms -- and this channel scores a surface against fields derived from those atoms, so a
-#:   self-copy need not reach 1.0. ``test_screen.py::test_self_screen_recovers_one`` excludes
-#:   ``vol_and_surf_esp`` from the same assertion for the same reason. Measured self-scores:
-#:   0.5865 (numba) / 0.5886 (triton) on an L40S (job 22642878) and 0.5864 on a Windows CPU box
-#:   -- route dependent, which is why the structure is excused rather than a number asserted.
-#: * a SUBTRACTED penalty term (``vol_avoid``'s excluded volume): the score is a shape Tanimoto
-#:   MINUS a penalty, so a molecule aligned onto itself scores 1.0 only when the avoid cloud
-#:   happens to be far from the pose the optimiser finds.
-#:
-#: Written as an EXCLUSION derived from the spec, not as the positive list this file used to
-#: carry: a mode is asserted at 1.0 by default and has to be excused by its own structure, which
-#: is how the old positive list came to silently drop six modes.
+#: Modes whose self-copy cannot reach ~1.0 on this fixture, derived from the spec: a value-only
+#: agreement term (the synthetic surface is not the one implied by the atoms) or a subtracted
+#: penalty term (``vol_avoid``).
 _SELF_SCORE_NOT_ONE = {m for m, sp in screenmod._SPECS.items()
                        if any(t.reduction == "agreement" for t in sp.terms)
                        or any(isinstance(t.weight, str) and t.weight.startswith("-")
@@ -102,21 +47,7 @@ _SELF_SCORE_NOT_ONE = {m for m, sp in screenmod._SPECS.items()
 
 
 def _scored_asymmetrically(mode: str) -> bool:
-    """Whether ``mode`` scores through an ASYMMETRIC Tversky reduction -- read off screen.py.
-
-    Such a mode cannot promise that the self-copy RANKS first: Tversky alpha=0.95 / beta=0.05
-    rewards a fit molecule that CONTAINS the query, so a bigger library molecule legitimately
-    outscores it and the scores are not capped at 1. Measured on this fixture (query = library
-    id 1, job 22642878, L40S): ``vol_tversky`` puts id=4 first at 1.2065 and ``vol_esp_tversky``
-    puts id=5 first at 1.0709, on BOTH the numba and the triton route, while the self-copy still
-    scores exactly 1.000000 in each case (so the score half of the anchor stands for them).
-
-    Derived rather than listed, and this is why: ``vol_esp_tversky`` ranked the self-copy first
-    on one CPU box (a different optimizer landing, same asymmetric score), so a list written from
-    that box's numbers would have excused the wrong mode and asserted a coincidence on the other.
-    ``_fast_batch_kwargs`` is the authority on which modes carry an unequal Tversky alpha/beta,
-    so a future Tversky-reduced mode is excused the day it lands and a symmetric one never is.
-    """
+    """Whether ``mode`` uses an asymmetric Tversky reduction, so the self-copy need not rank first."""
     kw = screenmod._fast_batch_kwargs(mode, dict(_MODE_KW.get(mode, {})))
     return kw.get("tversky_alpha") != kw.get("tversky_beta")
 
@@ -131,13 +62,12 @@ def _require_fast_cuda():
 
 
 def _require_numba():
-    """The fast CPU path runs the batched kernels through numba, and ``screen()`` raises
-    ImportError without it (screen.py::screen_many) -- a missing dependency, not a failure."""
+    """``screen()`` raises ImportError without numba on the fast CPU path."""
     pytest.importorskip("numba")
 
 
-# Drug-like molecules (band 16) + n-alkanes chosen so the library also occupies bands 32 and 48.
-# "C" * n has exactly n heavy atoms, so the band coverage is exact rather than eyeballed.
+# Drug-like molecules (band 16) plus n-alkanes so the library also occupies bands 32 and 48;
+# "C" * n has exactly n heavy atoms.
 _SMILES = [
     "CCO",                                  # 3
     "C1CCCCC1",                             # 6
@@ -155,18 +85,7 @@ _SMILES = [
 
 
 def _build_molecule(smi, seed, S=64):
-    """Real RDKit conformer + a *synthetic* surface (so the test needs no Open3D).
-
-    ``fukui=`` is injected for the same reason the surface is synthetic. ``Molecule.fukui`` is
-    generated lazily from THREE gfn2-xTB single points (neutral/cation/anion), which needs an
-    ``xtb`` binary this suite cannot assume -- and unlike ``partial_charges`` it has no MMFF
-    fallback, so building a ``vol_fukui`` store would die in the fixture. The constructor
-    documents ``fukui=`` as exactly this seam. It must be a full ``(N,)`` array in with-H order
-    (the same basis as ``partial_charges``): ``get_fukui(no_H=True)`` slices it with
-    ``_nonH_atoms_idx``, so a heavy-length array would silently misalign with its centres.
-    ``lipophilicity`` needs no such help -- the constructor computes it from RDKit's Crippen
-    contributions, offline and for free.
-    """
+    """Real RDKit conformer with a synthetic surface (no Open3D) and a synthetic with-H Fukui field (no xtb)."""
     m = Chem.AddHs(Chem.MolFromSmiles(smi))
     params = AllChem.ETKDGv3()
     params.randomSeed = seed
@@ -186,21 +105,8 @@ def molecules():
 
 @pytest.fixture(scope="module")
 def store_path(tmp_path_factory, molecules):
-    """One store that serves EVERY array mode.
-
-    ``modes=_MODES`` rather than a five-name list, because the store is the binding constraint on
-    what this file can test at all: a store built without the ``lipophilicity`` / ``fukui``
-    schema flags makes ``store.supports("vol_lipo")`` False and ``screen()`` raises in
-    ``_resolve_screen`` before any path is chosen, whatever the parametrize list says. Handing
-    ``_schema_from_modes`` the array-mode tuple means a future mode's channels are stored the
-    moment it joins ``_ARRAY_MODES``.
-    """
+    """One non-canonical store serving every array mode, so both parity legs run the same seeds."""
     p = os.path.join(tmp_path_factory.mktemp("arrays"), "lib.fss")
-    # NON-canonical, explicitly. Every parity test in this file asks whether the array path and the
-    # object path agree bit for bit, which is only defined when both run the same seeds; on a
-    # canonical store (the library default for any store that serves vol) the array path runs a
-    # constant seed set that the object path does not, and the two legitimately differ at ~1e-2.
-    # The canonical store has its own section below.
     with ProfileStore.create(p, num_surf_points=64, modes=_MODES,
                              dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
@@ -210,19 +116,12 @@ def store_path(tmp_path_factory, molecules):
 
 def _screen_recording(monkeypatch, store_path, query, *, enabled, mode="vol", steps=30,
                       backend="triton"):
-    """Run one screen with the array path forced on/off, recording which builder ran.
-
-    ``_use_arrays`` re-imports ``_arrays`` and reads ``.ENABLED`` on every call
-    (screen.py::_use_arrays), so patching the ATTRIBUTE steers the dispatch. Patching the env var
-    would not: ``ENABLED`` is resolved from the environment once, at import.
-    """
+    """Run one screen with the array path forced on/off, recording which builder ran."""
     from shepherd_score.accel.batch import _arrays
 
     monkeypatch.setattr(_arrays, "ENABLED", enabled, raising=True)
-    # The seam has to BITE FOR THIS MODE, and that is checked before the screen runs rather than
-    # inferred from the spy counts afterwards. A mode outside ``_ARRAY_MODES`` -- or a gate that
-    # stopped reading ENABLED live -- would send both legs down the same path, and the parity
-    # assertion behind them would then compare the object path against itself and pass.
+    # the seam must bite for this mode, or both legs would take the same path and the parity
+    # assertion would compare the object path with itself
     assert screenmod._use_arrays(mode) is enabled, (
         f"_arrays.ENABLED={enabled} but _use_arrays({mode!r}) is "
         f"{screenmod._use_arrays(mode)}; the two legs would take the same path")
@@ -249,23 +148,13 @@ def _screen_recording(monkeypatch, store_path, query, *, enabled, mode="vol", st
         return order, buckets
 
     def spy_spans_multi(*a, **k):
-        # vol_and_surf_esp keys SIX dims, so it plans through plan_spans_multi and never
-        # touches plan_spans. Counting only the latter made the bucket tripwire fire on a
-        # perfectly good path -- and, worse, short-circuited the parity check behind it.
+        # vol_and_surf_esp keys six dims and plans through plan_spans_multi, not plan_spans
         buckets = real_spans_multi(*a, **k)
         seen["buckets"] = max(seen["buckets"], len(buckets))
         return buckets
 
-    # Both call sites resolve these as module globals (screen.py:1315/1322, _arrays.py:167),
-    # so attribute patches genuinely intercept them.
-    # EVERY array builder is wrapped, and the _ARRAY_BUILDERS table is re-pointed at the
-    # wrapped versions -- the dispatch reads the table, so patching only the module globals
-    # would leave the table holding unwrapped functions and the spy would count zero.
-    # The builder names come from the TABLE (deduped, order preserved), not from a literal list:
-    # that list named five builders while the table held eleven, so a new mode's builder went
-    # unwrapped. Both are still patched because ``_build_fit_arrays_vol_tversky`` reaches
-    # ``_build_fit_arrays_vol`` through the module global -- which double-counts that one mode,
-    # harmless against assertions that read >0 rather than an exact count.
+    # Every array builder is wrapped and the _ARRAY_BUILDERS table re-pointed at the wrappers:
+    # the dispatch reads the table, so patching only the module globals would count zero.
     for _fn in dict.fromkeys(screenmod._ARRAY_BUILDERS.values()):
         monkeypatch.setattr(screenmod, _fn.__name__, _count_arr(_fn), raising=True)
     monkeypatch.setattr(screenmod, "_ARRAY_BUILDERS",
@@ -283,7 +172,7 @@ def _screen_recording(monkeypatch, store_path, query, *, enabled, mode="vol", st
 
 
 def _assert_paths_diverged(seen_on, seen_off):
-    """The two legs really ran DIFFERENT builders. Everything else here is worthless without it."""
+    """The two legs really ran different builders."""
     assert seen_on["arrays"] > 0, "ENABLED=True did not reach the array builder"
     assert seen_on["objects"] == 0, "ENABLED=True still built _FastPair objects"
     assert seen_off["objects"] > 0, "ENABLED=False did not reach the object builder"
@@ -305,13 +194,7 @@ def _assert_bit_identical(s_on, h_on, s_off, h_off):
 
 
 def _assert_self_copy(mode, scores, hits):
-    """Independent anchor: the array path must be a CORRECT screen, not merely a consistent one.
-
-    Two paths agreeing on nonsense would satisfy parity by itself. The query is the library's own
-    id=1, so RANKING is the anchor that holds for every symmetric mode, and the self-copy's own
-    score is asserted at ~1.0 unless the mode is excused above. Both checks are ON by default for
-    a mode that joins ``_ARRAY_MODES``.
-    """
+    """The query is library id=1: it ranks first (symmetric modes) and scores ~1.0 unless excused."""
     if not _scored_asymmetrically(mode):
         assert hits[0].id == 1, "query is in the library at id=1 and must rank first"
     if mode not in _SELF_SCORE_NOT_ONE:
@@ -319,11 +202,7 @@ def _assert_self_copy(mode, scores, hits):
 
 
 def test_library_spans_multiple_pad_bands(molecules):
-    """The parity test is only meaningful on a library that crosses ``_band_key`` boundaries.
-
-    Guards the fixture itself: if someone trims the alkanes, the parity test silently stops
-    exercising the multi-cell span arithmetic instead of failing here.
-    """
+    """The fixture must cross ``_band_key`` boundaries or the span arithmetic goes untested."""
     from shepherd_score.accel.batch._pad import _BAND as REAL_BAND, _band_key
 
     assert REAL_BAND == _BAND, "band width changed upstream; revisit the library sizes"
@@ -334,20 +213,7 @@ def test_library_spans_multiple_pad_bands(molecules):
 
 
 def test_store_fixture_serves_every_array_mode(store_path):
-    """Guards the OTHER fixture, and it is the one that binds.
-
-    A store is built from a schema (``_schema_from_modes``), so a mode whose channels are absent
-    is refused by ``_resolve_screen`` before any path is chosen: the parametrized tests would
-    then fail with "does not support" rather than on parity, and a store built for five modes
-    cannot test eleven however the parametrize list is written. Re-reads
-    ``screenmod._ARRAY_MODES`` rather than the import-time snapshot so a mode added to screen.py
-    is caught here first.
-
-    ``_FAST_MODES`` is checked in the same breath because this file's OFF leg depends on it:
-    ``fast`` is what routes to ``_build_fit_fast_pairs``, and a mode in ``_ARRAY_MODES`` but not
-    in ``_FAST_MODES`` would send the ENABLED=False leg down the MoleculePair profile path
-    instead, where the object spy sees nothing.
-    """
+    """The store must serve every array mode, and every array mode must also be a fast mode."""
     store = ProfileStore.open(store_path)
     assert set(screenmod._ARRAY_MODES) == set(_MODES), \
         "_ARRAY_MODES changed after import; the store was built for the import-time tuple"
@@ -361,14 +227,7 @@ def test_store_fixture_serves_every_array_mode(store_path):
 
 
 def test_the_self_copy_rank_anchor_is_not_excused_away():
-    """``_scored_asymmetrically`` decides which modes skip the rank half of the anchor, so a
-    change that made it answer True everywhere would delete that half for every mode silently.
-
-    Deliberately one-sided: it pins that the anchor still applies to SOMEONE (and to ``vol``, a
-    plain symmetric Tanimoto, by name) without pinning how many modes are excused -- a count
-    would go red the day a Tversky mode is added to or dropped from ``_ARRAY_MODES``, which is
-    the rot this file is being fixed for.
-    """
+    """``_scored_asymmetrically`` must not excuse every mode, and never ``vol``."""
     excused = [m for m in _MODES if _scored_asymmetrically(m)]
     assert not _scored_asymmetrically("vol"), "vol is a symmetric Tanimoto; nothing excuses it"
     assert len(excused) < len(_MODES), \
@@ -393,18 +252,7 @@ def test_array_path_is_bit_identical_to_object_path(monkeypatch, store_path, mol
 
 @pytest.mark.parametrize("mode", _MODES)
 def test_array_path_is_bit_identical_to_object_path_cpu(monkeypatch, store_path, molecules, mode):
-    """The same gate on the CPU route, where it runs on every box instead of only a GPU one.
-
-    ``fast`` needs a pre-centered store and a ``_FAST_MODES`` mode, not a device, and
-    ``_use_arrays`` never looks at one -- so ``backend="numba"`` reaches the identical
-    ``_array_dispatch`` branch with ``device=cpu``. That is what gives the six modes that joined
-    ``_ARRAY_MODES`` a parity gate on a machine with no GPU; the cuda twin above stays for the
-    triton kernels, which this leg never enters.
-
-    The self-copy anchor rides along here instead of in a CPU test of its own: it asserts on the
-    ON-leg vector this test already has, and a second CPU screen per mode would cost the file
-    eleven more screens to check the same numbers.
-    """
+    """The same gate on the CPU route; the self-copy anchor rides along on the ON leg."""
     _require_numba()
     query = molecules[1]
 
@@ -433,20 +281,10 @@ def test_array_path_recovers_the_self_copy(monkeypatch, store_path, molecules, m
 
 
 def test_use_arrays_gates_on_mode_and_reads_enabled_live(monkeypatch):
-    """``_use_arrays`` must gate on BOTH the mode and the live flag -- the two ways this file
-    could silently stop testing anything.
-
-    THE NEGATIVE CONTROL IS COMPUTED. It used to name ``surf`` and ``surf_esp`` as modes with no
-    array-native aligner; both have one now, so it asserted something false and took the suite
-    red. Naming two other modes would rot the same way on the next port, so the non-array modes
-    are derived as ``CANONICAL_MODES`` minus ``_ARRAY_MODES`` (10 of the 21 today: ``vol_mr``,
-    the surf/pharm/color Tversky family, ``vol_atomtype``, ``vol_pharm``, ``vol_avoid``, ...).
-    An unknown name is checked alongside them so the discrimination is still proven on the day
-    that difference empties out. Legacy aliases are deliberately no part of this: ``_use_arrays``
-    does not canonicalize, and callers reach it past ``_canon_mode``.
-    """
+    """``_use_arrays`` gates on both the mode and the live ``ENABLED`` flag."""
     from shepherd_score.accel.batch import _arrays
 
+    # the non-array modes are derived, not named, so the negative control cannot rot
     non_array = tuple(m for m in CANONICAL_MODES if m not in screenmod._ARRAY_MODES)
 
     monkeypatch.setattr(_arrays, "ENABLED", True, raising=True)
@@ -463,17 +301,10 @@ def test_use_arrays_gates_on_mode_and_reads_enabled_live(monkeypatch):
 
 
 # ------------------------------------------------------------------------------------------------
-# Canonical-frame stores: the transform must come back in the MOLECULE's frame, not the store's.
+# Canonical-frame stores: the transform must come back in the molecule's frame, not the store's.
+# Scores and ranking are correct either way, so the check re-scores each returned pose on the
+# molecule's own centred coordinates; a pose in the wrong frame does not reproduce its score.
 # ------------------------------------------------------------------------------------------------
-# A canonical store rotates every library molecule into its own principal frame at build time, so
-# the pose the optimizer finds is expressed against those rotated coordinates. Scores and RANKING
-# are correct either way -- which is exactly why this needs its own test: every score-based check
-# in this file passes on a canonical store whose transforms are silently in the wrong frame.
-#
-# The check does not compare against the legacy store's transform. It cannot: the two stores seed
-# the optimizer differently, so they reach different optima and their poses legitimately differ.
-# Instead it re-scores: apply the returned transform to the molecule's OWN centred coordinates and
-# recompute the Tanimoto directly. A pose in the wrong frame does not reproduce its own score.
 
 
 def _canonical_store(tmp_path, molecules):
@@ -486,9 +317,7 @@ def _canonical_store(tmp_path, molecules):
 
 
 def _plain_store(tmp_path, molecules):
-    """Same library, same modes, canonical OFF -- the control leg. Said explicitly: a pre-centred
-    vol store is canonical by default, so relying on the default here would make the control leg
-    canonical too and this section would compare a store with itself."""
+    """The control leg: same library, canonical explicitly off (the default would be on)."""
     p = os.path.join(tmp_path, "plain.fss")
     with ProfileStore.create(p, num_surf_points=64, modes=("vol",), dtype="float32",
                              pre_centered=True, canonical=False) as store:
@@ -498,11 +327,7 @@ def _plain_store(tmp_path, molecules):
 
 
 def test_canonical_store_records_its_rotation(tmp_path, molecules):
-    """The store must carry ``rot``, and it must be a PROPER rotation.
-
-    Without this the composition below is a no-op that the re-scoring test would still pass on a
-    store that quietly fell back to non-canonical -- the same vacuity the spies guard elsewhere.
-    """
+    """The store must carry ``rot`` and it must be a proper rotation."""
     store = ProfileStore.open(_canonical_store(str(tmp_path), molecules))
     assert store.canonical is True
     _, arrs = store.read_shard(0)
@@ -515,12 +340,7 @@ def test_canonical_store_records_its_rotation(tmp_path, molecules):
 
 
 def _rescore_hits(hits, molecules, query):
-    """``(reported, re-scored)`` for each hit: apply its own transform, recompute the Tanimoto.
-
-    The store is pre-centred and ``screen`` centres the query (``_centered_copy``), so both sides
-    are centred here to match. ``points @ R.T + t`` is the repo's convention
-    (``alignment/utils/se3.py::apply_SE3_transform``).
-    """
+    """``(id, reported, re-scored)`` per hit: apply its own transform and recompute the Tanimoto."""
     from shepherd_score.score.gaussian_overlap import shape_tanimoto
     q = np.asarray(query.atom_pos, dtype=np.float64)
     qt = torch.as_tensor(q - q.mean(0), dtype=torch.float64)
@@ -536,20 +356,7 @@ def _rescore_hits(hits, molecules, query):
 
 @pytest.mark.parametrize("canonical", [False, True])
 def test_transform_is_in_the_molecule_frame_cpu(tmp_path, molecules, canonical):
-    """A returned pose must reproduce its own score -- on BOTH store kinds, on the CPU route.
-
-    This is the test that fails if ``_compose_rot`` is removed: the canonical store's pose would
-    be expressed against the rotated coordinates, so re-scoring it in the molecule's own frame
-    gives a different Tanimoto than the one reported. Measured with the composition disabled:
-    the canonical leg drifts up to 0.22 while the legacy leg stays at 1.7e-07 -- so this also
-    pins the composition as a genuine no-op on non-canonical stores rather than a global fudge.
-
-    Running BOTH legs matters. Score-based checks cannot see this defect at all: with the
-    composition disabled the self-copy still REPORTS 1.000000 while its pose re-scores to 0.9068.
-
-    CPU (``backend="torch"``, the non-fast object route) so it runs everywhere; the GPU routes
-    are covered by the ``cuda``-marked twin below.
-    """
+    """A returned pose must reproduce its own score on both store kinds (CPU route)."""
     path = _canonical_store(str(tmp_path), molecules) if canonical         else _plain_store(str(tmp_path), molecules)
     hits = screen(molecules[0], ProfileStore.open(path), mode="vol", backend="torch", top_k=4)
     assert hits, "screen returned nothing"
@@ -560,14 +367,7 @@ def test_transform_is_in_the_molecule_frame_cpu(tmp_path, molecules, canonical):
 
 
 def test_canonical_store_screens_without_the_array_path(monkeypatch, tmp_path, molecules):
-    """A canonical store must not REQUIRE ``FSS_SCREEN_ARRAYS``.
-
-    ``const_seeds`` is a parameter of ``align_batch_vol_arrays`` alone; the object path's
-    ``_align_batch_vol`` has no such keyword. Before the gate, a canonical store raised
-    ``TypeError: _align_batch_vol() got an unexpected keyword argument 'const_seeds'`` on every
-    route but the array one -- caught only because this suite exercises the CPU route, since the
-    benchmarks always run with the array path enabled.
-    """
+    """A canonical store must not require the array path (``const_seeds`` is array-only)."""
     from shepherd_score.accel.batch import _arrays
     monkeypatch.setattr(_arrays, "ENABLED", False, raising=True)
     hits = screen(molecules[0], ProfileStore.open(_canonical_store(str(tmp_path), molecules)),
@@ -577,12 +377,7 @@ def test_canonical_store_screens_without_the_array_path(monkeypatch, tmp_path, m
 
 @pytest.mark.cuda
 def test_canonical_transform_is_in_the_molecule_frame(tmp_path, molecules):
-    """Applying the returned transform to the molecule's own coords must reproduce its score.
-
-    GPU twin of ``test_transform_is_in_the_molecule_frame_cpu``. Same invariant, but over the
-    triton route, where the pose comes from the array path's batched SE(3) epilogue rather than
-    from a pair object -- a different composition site (``offer_row`` vs ``offer_pair``).
-    """
+    """GPU twin of the frame check: the pose comes from the array path's SE(3) epilogue."""
     _require_fast_cuda()
     path = _canonical_store(str(tmp_path), molecules)
     hits = screen(molecules[0], ProfileStore.open(path), mode="vol", backend="triton", top_k=5)
@@ -594,18 +389,9 @@ def test_canonical_transform_is_in_the_molecule_frame(tmp_path, molecules):
 
 
 # ---------------------------------------------------------------------------------------------
-# vol_esp on a canonical store, with a molecule whose Chem.RemoveHs RETAINS an H.
-#
-# ``xyz_noH`` (the strict-heavy centre set) is materialised ONLY for such a molecule; every other
-# molecule's row is filled from its ``atom_pos``, which on a canonical store is already rotated.
-# So if ``_profile_from_schema`` centres ``atom_pos_noH`` but forgets to ROTATE it, one row of
-# that array sits in the raw centred frame while its neighbours are canonical -- and vol_esp then
-# solves that row's pose unrotated while ``_compose_rot`` composes a rotation it never received.
-#
-# No score comparison can see it: the affected molecule's score still matches the pairwise path
-# EXACTLY (both are unrotated), which is why tests/test_screen.py's retained-H test stays green.
-# Only re-scoring the returned pose catches it. Measured before the rotation was added: the
-# retained-H molecule re-scored 0.619 below its reported score, every other molecule at ~1e-7.
+# vol_esp on a canonical store with a molecule whose Chem.RemoveHs retains an H: ``xyz_noH`` is
+# materialised only for that molecule and must be rotated like ``atom_pos``. A score comparison
+# cannot see a missing rotation; only re-scoring the returned pose can.
 # ---------------------------------------------------------------------------------------------
 
 _RETAINED_H_SMI = "[2H]OC(=O)c1ccccc1"          # the deuterium survives RemoveHs
@@ -621,12 +407,7 @@ def _esp_molecules():
 
 
 def _rescore_hits_vol_esp(hits, molecules, query, lam=0.1):
-    """``(id, reported, re-scored)`` per hit for vol_esp, on the strict-heavy basis.
-
-    ``get_overlap_esp`` ALREADY returns the Tanimoto -- it must NOT be wrapped in a second
-    ``n / (saa + sbb - n)``, which would read correct on a self-pair (1/(1+1-1) == 1) and wrong
-    on every distinct pair.
-    """
+    """``(id, reported, re-scored)`` per vol_esp hit; ``get_overlap_esp`` already returns a Tanimoto."""
     from shepherd_score.score.electrostatic_scoring import get_overlap_esp
 
     def heavy(m):
@@ -650,11 +431,7 @@ def _rescore_hits_vol_esp(hits, molecules, query, lam=0.1):
 
 @pytest.mark.parametrize("canonical", [False, True])
 def test_vol_esp_retained_h_transform_is_in_the_molecule_frame(tmp_path, canonical):
-    """A vol_esp pose must reproduce its own score even when the molecule retained an H.
-
-    Both legs run: the non-canonical leg is the control that proves the harness reproduces the
-    library's scoring at all, so a failure on the canonical leg is the library and not the check.
-    """
+    """A vol_esp pose reproduces its own score on both store kinds, retained-H molecule included."""
     mols, retained = _esp_molecules()
     p = os.path.join(str(tmp_path), f"esp_{int(canonical)}.fss")
     with ProfileStore.create(p, num_surf_points=64, modes=("vol", "vol_esp"),

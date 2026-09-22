@@ -1,18 +1,12 @@
-"""Batched (multi-GPU-aware) aligners for :class:`MoleculePair` -- ONE body for every mode.
+"""Batched (multi-GPU-aware) aligners for :class:`MoleculePair`: one body for every mode.
 
 ``_align_batch_<mode>(pairs, **kw)`` is generated for each registry mode from its
-:class:`~shepherd_score.accel._modes.ModeSpec`: upload the spec's channels once per molecule
-(:func:`_batch_upload`), bucket the pairs on the spec's cost dims (:func:`plan_buckets`), pad and
-scatter-fill every channel, and hand each bucket to the generic engine in GPU-memory-safe
-sub-batches, then write ``transform_<mode>`` / ``sim_aligned_<mode>`` back onto the pairs.
-
-Every function here is a *free function* over duck-typed ``MoleculePair`` objects -- it only
-reads/writes their attributes -- and ``MoleculePair`` binds them as static methods. This module
-keeps NO runtime dependency on ``_core`` (a TYPE_CHECKING import only), so it imports cheaply and
-the worker processes stay picklable.
-
-The epilogue's ``quaternions_to_SE3_batch(...).detach().numpy()`` is load-bearing (numpy rows
-into the screen's heap, not K one-element tensors); see the git history of this file.
+:class:`~shepherd_score.accel._modes.ModeSpec`: upload the spec's channels once per molecule,
+bucket the pairs on the spec's cost dims, pad and scatter-fill every channel, run each bucket
+through the generic engine in memory-safe sub-batches, then write ``transform_<mode>`` /
+``sim_aligned_<mode>`` back onto the pairs. Every function is a free function over duck-typed
+``MoleculePair`` objects, which bind them as static methods; there is no runtime dependency on
+``_core``, so the module imports cheaply and the worker processes stay picklable.
 """
 from __future__ import annotations
 from typing import TYPE_CHECKING
@@ -60,24 +54,15 @@ def _fit_molec_of(p):
 
 
 def _batch_upload(pairs, attr, src_fn, dtype, device, *, key_fn=None):
-    """Set ``p.<attr>`` for every ``p`` with ONE host concat + ONE ``.to(device)``
-    view-split, instead of one ``torch.as_tensor(..., device=device)`` per pair.
+    """Set ``p.<attr>`` for every ``p`` with one host concat and one ``.to(device)`` view-split
+    instead of one ``torch.as_tensor`` per pair.
 
-    Rules this build MUST obey to stay bit-identical to a per-pair
-    ``torch.as_tensor(src, dtype=..., device=...)``:
-
-    (1) The dtype cast goes THROUGH TORCH (``from_numpy(flat).to(device=..., dtype=...)``),
-        NEVER through numpy ``.astype`` (numpy's float64->float32 rounding can differ by a ULP).
-    (2) ``np.concatenate`` keeps the source dtype, so the concat itself never casts.
-    (3) Each per-molecule view is ``.clone()``d, so a cached ``_*_t`` tensor is its OWN
-        contiguous allocation.
-    (4) Each call's ``src_fn`` must yield a single uniform-dtype attribute.
-
-    Only pairs whose ``<attr>`` is None (cold cache) get the batched upload; pairs already
-    holding a same-device tensor are left untouched (so the screen path, which pre-warms
-    these, stays a no-op), and a wrong-device cached tensor is moved per pair. The upload is
-    keyed PER MOLECULE, not per pair: an all-vs-all workload draws K pairs from far fewer
-    molecules, and pair-keying uploaded each one hundreds of times (61.3% of a vol_color batch).
+    To match a per-pair ``torch.as_tensor(src, dtype=..., device=...)`` exactly: the dtype cast
+    goes through torch, never numpy ``.astype``; ``np.concatenate`` keeps the source dtype; each
+    per-molecule view is ``.clone()``d into its own allocation; and each ``src_fn`` yields one
+    uniform-dtype attribute. Only pairs whose ``<attr>`` is None get the batched upload, and a
+    wrong-device cached tensor is moved per pair. The upload is keyed per molecule, since an
+    all-vs-all workload draws K pairs from far fewer molecules.
     """
     cold = [p for p in pairs if getattr(p, attr, None) is None]
     if cold:
@@ -103,7 +88,7 @@ def _batch_upload(pairs, attr, src_fn, dtype, device, *, key_fn=None):
         else:
             _ten = {}
             for p, t in zip(reps, dev.split(sizes)):
-                _ten[id(key_fn(p))] = t.clone()                # one allocation PER MOLECULE
+                _ten[id(key_fn(p))] = t.clone()                # one allocation per molecule
             for p in cold:
                 setattr(p, attr, _ten[id(key_fn(p))])
     for p in pairs:                                            # warm wrong-device path
@@ -115,9 +100,8 @@ def _batch_upload(pairs, attr, src_fn, dtype, device, *, key_fn=None):
 # =============================================================================================
 # the generic aligner
 # =============================================================================================
-#: Keywords every mode accepts that are NOT objective parameters: the optimiser schedule, the
-#: legacy translation-seeded grid, and the two the screen front end attaches (a canonical
-#: store's constant seed set, and the uploaded query-side avoid cloud).
+#: Keywords every mode accepts that are not objective parameters: the optimiser schedule, the
+#: legacy translation-seeded grid, and the screen front end's constant seeds and avoid cloud.
 _LOOP_KW = ("steps_fine", "num_repeats", "trans_init", "num_repeats_per_trans", "topk",
             "early_stop_patience", "early_stop_tol", "const_seeds", "avoid_points",
             "avoid_points_t")
@@ -136,9 +120,9 @@ def resolve_params(spec, kw: dict, fn_name: str) -> dict:
         if v is None:
             raise TypeError(f"{fn_name}() missing required keyword-only argument: {k!r}")
     if spec.lam_scaling:
-        # SURFACE convention: the caller's ``lam`` is raw and is scaled by LAM_SCALING (~207)
-        # here, once, for both the cross-overlap and the self-overlaps. The atom-centred ESP
-        # modes take their ``lam`` raw and are not scaled (see score/constants.py).
+        # Surface convention: the caller's ``lam`` is raw and is scaled once by LAM_SCALING here,
+        # for both the cross-overlap and the self-overlaps; the atom-centred ESP modes take it
+        # raw (see score/constants.py).
         from ...score.constants import LAM_SCALING
         params["lam"] = LAM_SCALING * float(params["lam"])
     return params
@@ -299,7 +283,7 @@ def _align_batch(spec, pairs, _fn, **kw) -> None:
     es_tol = float(kw.get("early_stop_tol", 1e-5))
 
     # The pharmacophore family's ``extended_points`` objective has no kernel; it runs the
-    # legacy autograd driver as it always did.
+    # eager autograd driver.
     if spec.pharm_style and params.get("extended_points"):
         from .aligners_legacy import _align_batch_pharm_extended
         return _align_batch_pharm_extended(spec, pairs, params, n_seeds=n_seeds,
@@ -327,8 +311,8 @@ def _align_batch(spec, pairs, _fn, **kw) -> None:
         K = _bk.K
         chans = build_bucket(spec, bucket, _bk, bch, names, device)
         # A shared reference (one query object on every pair, as the screen sets it) lets the
-        # engine solve the reference self-overlaps and seed frame once. OBJECT identity, never
-        # value: a pure copy of one source object is provably bitwise-identical per row.
+        # engine solve the reference self-overlaps and seed frame once. Object identity, not
+        # value: a pure copy of one source object gives identical rows.
         ref_shared = K > 1 and all(getattr(p, a) is getattr(bucket[0], a)
                                    for p in bucket for a in ref_attrs)
         tcb = tcr = None

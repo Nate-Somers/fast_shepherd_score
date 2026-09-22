@@ -1,34 +1,8 @@
-"""Gate 3b on CPU: the fused numba fine loop and the eager torch fine loop must agree.
+"""The fused numba CPU fine loop and the eager torch fine loop must agree for every mode.
 
-`drivers/engine.align` picks the fused loop when the mode's ModeSpec allows it and the padded
-widths fit, and falls back to the eager loop on ANY exception::
-
-    try:
-        best, bq, bt = run_fused(...)
-    except Exception:
-        best = None          # fused failed -> eager
-
-That fallback is silent, so a mode whose two loops disagree would return different scores
-depending on whether an unrelated failure fired -- and nothing measured the gap. The engine
-rewrite put 19 of the 21 modes on the fused loop (4 before), so the question went from narrow
-to library-wide.
-
-The gap is ENVIRONMENT-DEPENDENT, which the first version of this file got wrong. With SVML the
-fused loop swaps in the fp32 SoA kernels (`kernels/cpu_soa.py`, ~1e-6 value / ~1e-4 gradient
-relative error by construction); without it the fp64 AoS kernels run. A bound fitted to one
-environment fails in the other, so these are fitted to BOTH.
-
-MEASURED over 6 molecules, every mode, in both:
-
-| | worst, no SVML (Windows) | worst, SVML (node3509) |
-|---|---|---|
-| every mode except `surf_esp` | 1.699e-06 / 0.0004% | 2.086e-06 / 0.0005% |
-| `surf_esp` | 1.699e-06 / 0.0004% | **1.782e-04 / 0.0375%** |
-
-`surf_esp` is the outlier by 75x, and it is the mode already singled out as the most
-shape-degenerate in the library -- the reason its spec carries `cpu_fused_max_pad=100`. It gets
-its own bound rather than loosening every mode to fit it. The pharmacophore family sets
-`cpu_fused=False` and is identical either way, because both runs take the eager loop.
+``drivers/engine.align`` silently falls back from the fused loop to the eager one, so the two
+must score alike. Bounds cover both the SVML (fp32 SoA) and non-SVML (fp64 AoS) kernels;
+``surf_esp``, the most shape-degenerate mode, gets its own.
 """
 import warnings
 
@@ -43,9 +17,8 @@ except ImportError:
 
 pytestmark = pytest.mark.skipif(not TORCH, reason="PyTorch required")
 
-# (max |delta|, max relative %) per mode, defaulting to the tight pair. Roughly an order of
-# magnitude above the worse of the two measured environments, so a failure means two loops
-# have genuinely diverged rather than that fp32 drifted.
+# (max |delta|, max relative %) per mode: roughly an order of magnitude above the fp32 drift
+# seen in either kernel environment, so a failure means the loops genuinely diverged.
 TOL_DEFAULT = (1.0e-5, 0.01)
 TOL = {"surf_esp": (1.0e-3, 0.2)}
 
@@ -137,8 +110,7 @@ def test_fused_and_eager_cpu_loops_agree(mode, mols):
 
 
 def test_disabling_the_fused_loop_actually_changes_the_path(mols, monkeypatch):
-    """Guard the guard: if forcing the fused loop off stopped reaching the eager loop, every
-    test above would compare a path against itself and pass vacuously."""
+    """Forcing the fused loop off must reach the eager loop, or the parity test is vacuous."""
     from shepherd_score.accel.drivers import engine
 
     seen = []
@@ -155,15 +127,12 @@ def test_disabling_the_fused_loop_actually_changes_the_path(mols, monkeypatch):
     assert seen, "forcing the fused loop off did not reach the eager loop"
 
 
-# --- the regime the lifted surf_esp cap opened ------------------------------------------------
-# surf_esp used to carry cpu_fused_max_pad=100, which refused the fused loop above ~96 surface
-# points and so never fired at the 200-point default. The tests above run at N_SURF, which is
-# below that, so they would not have noticed either the exclusion or its removal.
+# --- surf_esp at realistic surface sizes -----------------------------------------------------
+# The tests above run at N_SURF; these check surf_esp at 128-300 surface points.
 
 @pytest.mark.parametrize("n_surf", [128, 200, 300])
 def test_surf_esp_stays_fused_above_the_old_cap(n_surf, monkeypatch):
-    """Above 100 surface points surf_esp must take the FUSED loop. If someone reinstates a cap,
-    this fails rather than quietly costing 13x on CPU."""
+    """surf_esp must take the fused CPU loop at realistic surface-point counts."""
     from shepherd_score.accel.drivers import engine
     from shepherd_score.accel.kernels import cpu_fused
     from shepherd_score.container import MoleculePair, MoleculePairBatch
@@ -184,10 +153,7 @@ def test_surf_esp_stays_fused_above_the_old_cap(n_surf, monkeypatch):
 
 @pytest.mark.parametrize("n_surf", [128, 200])
 def test_surf_esp_pose_agrees_above_the_old_cap(n_surf):
-    """The cap's stated reason was pose-exactness, not score agreement: the most shape-degenerate
-    mode might settle in a different basin under the fused loop. Measured on real open3d surfaces
-    it does not (0.045 deg at 200 points), and this holds the claim on the synthetic fixture too.
-    Compares the returned 4x4 transforms, since scores can agree while poses diverge."""
+    """Fused and eager surf_esp must land in the same pose basin, not merely the same score."""
     from shepherd_score.accel.kernels import cpu_fused
     from shepherd_score.container import MoleculePair, MoleculePairBatch
 

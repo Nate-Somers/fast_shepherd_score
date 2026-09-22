@@ -1,23 +1,12 @@
-"""Top-level data-parallel multi-GPU driver for batch alignment.
+"""Data-parallel multi-GPU driver for batch alignment: one OS process per GPU.
 
-Alignment is *host-bound*, not kernel-bound, so the in-library auto-shard cannot reach
-~Nx on N GPUs: driving every GPU from one process serializes the host work behind the
-GIL, and a per-call process-scatter re-pays the bulk data handoff on every call. The
-pattern that does scale is plain data parallelism: ONE OS process per GPU, each OWNING
-its shard (build + align end-to-end, data resident on its GPU), with CPU threads capped
-to cores/ndev. The cap is mandatory: an uncapped worker sizes an all-cores MKL/OMP pool,
-so N workers oversubscribe the machine and scaling collapses below 1x.
-
-Only lightweight `Molecule` objects cross the process boundary (once, at spawn);
-no CUDA tensors are pickled. Each worker rebuilds `MoleculePair` on its own GPU
-(passing a `Molecule` does NOT regenerate its surface, so this is cheap) and runs
-the ordinary single-GPU `MoleculePairBatch.align_with_*` path.
-
-:func:`align_multi_gpu` is a ONE-SHOT launcher: it spawns the workers, processes the
-whole batch in one shot, and returns. Its fixed spawn+context-init cost is paid once,
-so it is amortized by a large screen but dominates a tiny batch -- use it for big
-workloads. For repeated query-vs-library screening, use :class:`MultiGPUAligner`, which
-keeps the workers and their shards warm.
+Alignment is host-bound, so driving every GPU from one process serialises the host work behind
+the GIL. Each worker here owns its shard end to end (build and align, data resident on its GPU)
+with CPU threads capped to cores/ndev; the cap is mandatory, since uncapped workers each size an
+all-core MKL/OMP pool and oversubscribe the machine. Only ``Molecule`` objects cross the process
+boundary, never CUDA tensors; each worker rebuilds its ``MoleculePair`` objects on its own GPU.
+:func:`align_multi_gpu` is a one-shot launcher whose spawn cost suits large batches;
+:class:`MultiGPUAligner` keeps the workers and their shards resident for repeated screening.
 """
 from __future__ import annotations
 
@@ -26,10 +15,8 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-# Public per-mode result attributes written in-place by align_with_*. The multi-GPU process path
-# supports exactly the registry's PROCESS_MODES (those with a _MODE_SPEC entry); derive both maps
-# (and the validation set ``list(_SCORE_ATTR)``) from the registry so they can't drift from the
-# canonical attribute names. Legacy aliases (esp/esp_combo) likewise come from the registry.
+# Per-mode result attributes written in place by align_with_*, taken from the mode registry so
+# they cannot drift; the process path supports exactly PROCESS_MODES.
 from ._modes import (MODE_ATTRS as _MODE_ATTRS, PROCESS_MODES as _PROCESS_MODES,
                      LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES)
 _TRANSFORM_ATTR = {m: _MODE_ATTRS[m][0] for m in _PROCESS_MODES}
@@ -37,10 +24,9 @@ _SCORE_ATTR = {m: _MODE_ATTRS[m][1] for m in _PROCESS_MODES}
 
 
 def _cap_threads(threads):
-    """Cap a worker's CPU intra-op threads to ``threads`` at RUNTIME. With the
-    ``fork`` start method the worker inherits the parent's already-sized MKL/OMP
-    pools (env vars set after import don't resize them), so we cap via the runtime
-    APIs: torch for ATen, threadpoolctl (if present) for MKL/OpenBLAS/OMP."""
+    """Cap this worker's CPU intra-op threads at runtime. A forked worker inherits the parent's
+    already-sized MKL/OMP pools (env vars set after import do not resize them), so the cap goes
+    through torch for ATen and threadpoolctl, if present, for MKL/OpenBLAS/OMP."""
     if not threads:
         return
     import torch
@@ -53,10 +39,9 @@ def _cap_threads(threads):
 
 
 def _worker(rank, mode, backend, do_center, threads, align_kwargs, shard_mols, out_q):
-    """One GPU's worker. Pins to ``cuda:rank`` and sets the dispatch-local
-    ``active`` flag so the in-library auto-shard sees it's already inside a
-    per-device shard and never re-distributes. Rebuilds MoleculePair on that GPU,
-    aligns its shard, returns numpy results."""
+    """One GPU's worker: pin to ``cuda:rank``, set the dispatch-local ``active`` flag so the
+    in-library auto-shard never re-distributes, rebuild the pairs on that GPU, align the shard
+    and return numpy results."""
     try:
         import time
         import torch
@@ -65,7 +50,7 @@ def _worker(rank, mode, backend, do_center, threads, align_kwargs, shard_mols, o
 
         _cap_threads(threads)
         torch.cuda.set_device(rank)
-        _DISPATCH_LOCAL.active = True            # own ONE GPU; never re-distribute
+        _DISPATCH_LOCAL.active = True            # owns one GPU; never re-distribute
         dev = torch.device("cuda", rank)
         t0 = time.perf_counter()
         pairs = [MoleculePair(ref, fit, do_center=do_center, device=dev)
@@ -107,27 +92,30 @@ def align_multi_gpu(pairs: Sequence,
         Pairs to align. Only their ``ref_molec`` / ``fit_molec`` (lightweight,
         picklable ``Molecule`` objects) cross the process boundary; each worker
         rebuilds the ``MoleculePair`` on its own GPU.
-    mode : {"vol", "surf", "surf_esp", "pharm"}  (legacy "esp" accepted)
+    mode : str
+        One of ``accel._modes.PROCESS_MODES`` (legacy ``esp`` / ``esp_combo`` accepted).
     ndev : int, optional
         Number of GPUs/processes (default: all visible CUDA devices).
     threads : int, optional
-        CPU intra-op threads PER worker (default: cpu_cores // ndev). This cap is
-        the lever that prevents the workers from oversubscribing the cores.
+        CPU intra-op threads per worker (default: cpu_cores // ndev). This cap is what
+        keeps the workers from oversubscribing the cores.
     backend : str
         Alignment backend forwarded to ``align_with_*`` (default "triton").
     do_center : bool
-        Forwarded to ``MoleculePair`` construction (keep this matching how the
-        single-GPU pairs were built, else results differ).
+        Forwarded to ``MoleculePair`` construction; keep it matching how the single-GPU
+        pairs were built, else results differ.
     write_back : bool
-        If True, write ``sim_aligned_*`` / ``transform_*`` back onto the input
-        ``pairs`` in order (matching the single-GPU API's in-place convention).
+        If True, write ``sim_aligned_*`` / ``transform_*`` back onto the input ``pairs``
+        in order, matching the single-GPU API's in-place convention.
+    return_timing : bool
+        If True, also return a dict of per-rank build/align timings.
     **align_kwargs
         Forwarded verbatim to ``MoleculePairBatch.align_with_<mode>``.
 
     Returns
     -------
     (scores, transforms) : (np.ndarray (K,), np.ndarray (K, 4, 4))
-        In input order. If ``return_timing`` also returns a dict of timings.
+        In input order. If ``return_timing``, a timing dict follows them.
     """
     import torch
     import torch.multiprocessing as mp
@@ -150,14 +138,14 @@ def align_multi_gpu(pairs: Sequence,
             cores = os.cpu_count() or ndev
         threads = max(1, cores // ndev)
 
-    # Lightweight, picklable specs -- NO CUDA tensors cross the boundary.
+    # Only picklable Molecule objects cross the process boundary, never CUDA tensors.
     specs = [(p.ref_molec, p.fit_molec) for p in pairs]
-    # Contiguous balanced shards + their original indices (for in-order gather).
+    # Contiguous balanced shards plus their original indices, for the in-order gather.
     bounds = np.linspace(0, K, ndev + 1).astype(int)
     shard_idx = [list(range(bounds[r], bounds[r + 1])) for r in range(ndev)]
 
-    # Cap MKL/OMP for the CHILDREN: env is read at their (fresh) numpy/torch import,
-    # so it must be set in the parent BEFORE spawning. Restore afterward.
+    # Spawned children read the MKL/OMP env at their own numpy/torch import, so it must be set
+    # in the parent before spawning; restored afterwards.
     _saved = {k: os.environ.get(k) for k in
               ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")}
     for k in _saved:
@@ -220,10 +208,9 @@ def align_multi_gpu(pairs: Sequence,
 # Persistent pool: build+retain shards once, align resident data many times.
 # ---------------------------------------------------------------------------
 def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
-    """Persistent worker: build+RETAIN this GPU's shard once, then align it
-    in-place on every job. Only (mode, kwargs) come in and (scores, transforms)
-    go out per call -- the bulk molecule data never recrosses the boundary, which
-    is what preserves ~Nx scaling (vs re-shipping/rebuilding every call)."""
+    """Persistent worker: build and retain this GPU's shard once, then align it in place on every
+    job. Only ``(mode, backend, kwargs)`` come in and ``(scores, transforms)`` go out per call;
+    the bulk molecule data never recrosses the process boundary."""
     try:
         import time
         import numpy as _np
@@ -232,7 +219,7 @@ def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
         from shepherd_score.accel.batch import _DISPATCH_LOCAL
 
         _cap_threads(threads)
-        torch.cuda.set_device(rank)          # creates THIS worker's CUDA context
+        torch.cuda.set_device(rank)          # creates this worker's CUDA context
         _DISPATCH_LOCAL.active = True
         dev = torch.device("cuda", rank)
         pairs = [MoleculePair(ref, fit, do_center=do_center, device=dev)
@@ -262,19 +249,15 @@ def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
 
 
 class MultiGPUAligner:
-    """Persistent one-process-per-GPU pool that BUILDS and RETAINS its shard, so
-    repeated :meth:`align` calls run on resident data at ~Nx (no per-call re-ship
-    or rebuild). It is the right tool for repeated screening (several modes/params
-    over the same pairs, or a resident library screened against many queries). For
-    a single align of a huge batch, use the one-shot :func:`align_multi_gpu`.
+    """Persistent one-process-per-GPU pool that builds and retains its shard, so repeated
+    :meth:`align` calls run on resident data with no per-call re-ship or rebuild. Use it for
+    repeated screening (several modes over the same pairs, or a resident library against many
+    queries); for a single align of a huge batch use the one-shot :func:`align_multi_gpu`.
 
-    **Fast startup via ``fork``.** By default the pool forks its workers, so they
-    inherit the parent's already-imported modules AND the molecule data via
-    copy-on-write -- no per-worker re-import or pickling, making an N-GPU pool warm
-    up in about the time of a single GPU (vs ~Nx with ``spawn``). ``fork`` is only
-    CUDA-safe if the parent has NOT initialized CUDA yet, so for fast startup:
-    **build ``pairs`` on CPU and create the pool BEFORE any GPU work.** If CUDA is
-    already initialized the pool transparently falls back to ``spawn`` (slower).
+    By default the pool forks its workers, so they inherit the parent's imported modules and the
+    molecule data copy-on-write. ``fork`` is only CUDA-safe if the parent has not yet initialised
+    CUDA (nor imported Open3D), so build ``pairs`` on CPU and create the pool before any GPU
+    work; otherwise the pool falls back to the slower ``spawn`` start method.
 
     Usage::
 
@@ -291,12 +274,9 @@ class MultiGPUAligner:
         import torch
         import torch.multiprocessing as mp
 
-        # Decide the start method up front. fork lets workers inherit the parent's
-        # already-imported stack + data via COW -> an N-GPU pool warms up in about
-        # the time of a single GPU (vs ~Nx with spawn, which re-imports per worker).
-        # fork is only safe if the parent hasn't (a) initialized CUDA or (b) imported
-        # Open3D -- both poison a subsequent fork+CUDA (Open3D's import does, even
-        # though it never creates a CUDA context). Detect either and fall back to spawn.
+        # fork lets workers inherit the imported stack and data copy-on-write, but is only safe
+        # if the parent has neither initialised CUDA nor imported Open3D (its import alone
+        # poisons a later fork+CUDA). Detect either and fall back to spawn.
         cuda_live = torch.cuda.is_initialized()
         o3d_live = "open3d" in sys.modules
         avail = mp.get_all_start_methods()
@@ -334,9 +314,8 @@ class MultiGPUAligner:
         bounds = np.linspace(0, self._K, ndev + 1).astype(int)
         self._shard_idx = [list(range(bounds[r], bounds[r + 1])) for r in range(ndev)]
 
-        # For spawn/forkserver, children re-import and read OMP/MKL env at import, so
-        # cap it in the parent first. fork inherits live pools -> _cap_threads (runtime)
-        # handles it in the worker instead, so the env dance is skipped.
+        # spawn/forkserver children read the OMP/MKL env at their own import, so cap it in the
+        # parent first; fork inherits live pools, which _cap_threads resizes in the worker.
         _saved = {}
         if start_method != "fork":
             _saved = {k: os.environ.get(k) for k in
@@ -369,8 +348,8 @@ class MultiGPUAligner:
         self._closed = False
 
     def align(self, mode, *, backend="triton", return_timing=False, **align_kwargs):
-        """Align the resident pairs with ``mode``; returns (scores, transforms) in
-        the original input order. Cheap per call -- only params in, results out."""
+        """Align the resident pairs with ``mode``; returns ``(scores, transforms)`` in the
+        original input order. Only parameters go in and results come out."""
         if self._closed:
             raise RuntimeError("MultiGPUAligner is closed")
         mode = _LEGACY_MODE_ALIASES.get(mode, mode)    # accept legacy esp / esp_combo

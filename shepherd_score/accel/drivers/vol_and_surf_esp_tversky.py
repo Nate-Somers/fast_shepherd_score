@@ -14,7 +14,7 @@ def _batch_esp_combo_tversky_score(
         centers_w_H_1, centers_w_H_2, points_1, points_2, partial_charges_1, partial_charges_2,
         point_charges_1, point_charges_2, radii_1, radii_2, lam, probe_radius, esp_weight, C, k,
         N_real_atoms_w_H_1, M_real_atoms_w_H_2, N_real_surf_1, M_real_surf_2, VAB_shape):
-    """ESP-combo score with a TVERSKY shape channel at a pose whose fit clouds are transformed."""
+    """ESP-combo score with a Tversky shape channel at a pose whose fit clouds are transformed."""
     N_surf = N_real_surf_1.to(dtype=points_1.dtype)
     M_surf = M_real_surf_2.to(dtype=points_1.dtype)
     volumetric_sim = VAB_shape / (k * VAB_shape + C)

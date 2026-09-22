@@ -1,24 +1,8 @@
-"""``_batch_upload`` keys its cache on the MOLECULE, not the pair.
+"""``_batch_upload`` keys its cache on the molecule, not the pair.
 
-WHY THIS EXISTS. An all-vs-all workload draws K pairs from a much smaller set of distinct
-molecules: ``workloads.pairwise_pairs`` picks the smallest ``m`` with ``m*(m-1) >= K``, so
-K=100,000 pairs come from m=317 compounds and every molecule appears in ~632 pairs. Keyed on the
-pair, ``_batch_upload`` concatenated, uploaded and cloned each molecule once per appearance.
-Measured share of a pairwise batch spent in that one call: 61.3% for ``vol_color`` (six arrays per
-pair) and 11.8% for ``vol`` (two).
-
-WHAT MUST HOLD, and what each test pins:
-
-  1. BIT-IDENTICAL. Only the concat order and length change; the dtype cast is elementwise and
-     goes through torch, so every molecule's bytes convert exactly as before. A change here moves
-     P3's published scores, so "close enough" is not the bar -- the test asserts EQUALITY.
-  2. THE DEDUP ACTUALLY HAPPENS. A parity test alone would pass just as happily if the keying
-     silently did nothing, so the tests count what reached ``np.concatenate`` and assert pairs
-     sharing a molecule share one tensor OBJECT.
-  3. NO CROSS-MOLECULE ALIASING. Distinct molecules must still get distinct storage -- that is
-     the half of the old "no shared-buffer aliasing" rule that still matters.
-  4. THE SCREEN PATH IS UNTOUCHED. ``build_fit`` pre-warms these attributes, so ``cold`` is empty
-     and the new branch never runs; a warm pair must not be re-uploaded.
+An all-vs-all workload repeats each molecule in many pairs. The upload must be bit-identical
+to the per-pair path, must actually dedup (pairs sharing a molecule share one tensor), must
+not alias distinct molecules, and must leave already-warm pairs untouched.
 """
 import numpy as np
 import pytest
@@ -61,7 +45,7 @@ def _all_vs_all(mols, k=None):
 
 
 def _count_concat_inputs(monkeypatch):
-    """Record how many arrays each ``np.concatenate`` received -- the anti-vacuity probe."""
+    """Record how many arrays each ``np.concatenate`` received."""
     seen = []
     real = np.concatenate
 
@@ -107,12 +91,7 @@ def test_pairs_sharing_a_molecule_share_one_tensor(monkeypatch):
     ("_ref_pharm_types_t", lambda p: p.ref_molec.pharm_types, torch.int64),
 ])
 def test_bit_identical_to_the_per_pair_upload(attr, src, dtype):
-    """Every pair must end up with EXACTLY the tensor the old per-pair path produced.
-
-    The reference here is ``torch.as_tensor(src, dtype=..., device=...)``, which is what the
-    docstring's rules were written to reproduce -- not the previous implementation, so this stays
-    a check against the contract rather than against whatever the code happens to do.
-    """
+    """Every pair ends up with exactly ``torch.as_tensor(src, dtype, device)`` of its own array."""
     dev = torch.device("cpu")
     mols = _library(6)
     pairs = _all_vs_all(mols)
@@ -139,11 +118,7 @@ def test_warm_pairs_are_not_reuploaded(monkeypatch):
 
 
 def test_dedup_survives_a_partially_warm_batch():
-    """A mixed batch (some pairs warm, some cold) must still land every pair on the right data.
-
-    This is the case a naive rewrite gets wrong: ``cold`` is a SUBSET, so keying must be computed
-    over that subset while the warm pairs are left exactly as they were.
-    """
+    """A mixed warm/cold batch lands every cold pair on the right data and leaves warm pairs alone."""
     dev = torch.device("cpu")
     mols = _library(5)
     pairs = _all_vs_all(mols)

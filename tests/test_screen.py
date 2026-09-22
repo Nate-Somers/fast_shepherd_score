@@ -1,9 +1,7 @@
 """Tests for the out-of-core streaming screen (``shepherd_score.screen``).
 
-Two layers:
-  * Store round-trip (pure numpy) -- always runs: arrays survive write+read exactly.
-  * End-to-end alignment (rdkit + torch + numba) -- self-copy -> 1.0 and
-    bit-equivalence to the in-memory MoleculePairBatch path on the CPU numba backend.
+Store round-trip (pure numpy) always runs; end-to-end alignment (rdkit + torch + numba) checks
+self-copy -> 1.0 and equivalence to the in-memory MoleculePairBatch path.
 """
 import os
 
@@ -93,11 +91,7 @@ def test_store_heavy_charges_identity_index(tmp_path):
 
 
 def test_store_pre_centered(tmp_path):
-    """pre_centered=True shifts to the heavy-atom COM but preserves geometry.
-
-    ``canonical=False`` explicitly: a pre-centred vol store is canonical BY DEFAULT now, which
-    also rotates the coordinates into the principal frame; this test is about the centring alone.
-    """
+    """pre_centered=True centres on the heavy-atom COM without changing geometry (canonical=False isolates that)."""
     store_path = os.path.join(tmp_path, "lib.fss")
     p = _synthetic_profile(0, with_full_charges=False)
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol",),
@@ -110,13 +104,7 @@ def test_store_pre_centered(tmp_path):
 
 
 def test_store_is_canonical_by_default_only_when_it_serves_vol(tmp_path):
-    """``canonical=None`` resolves to True for a pre-centred store whose modes include ``vol`` --
-    or any other mode that seeds from the atom cloud (``accel._modes.CONST_SEED_MODES``; the
-    per-mode sweep is in test_screen_const_seeds.py) -- and to False for a ``surf``-only store,
-    which seeds from the surface and gains nothing from the rotation. A canonical store's
-    ``atom_pos`` is the molecule in its own principal frame: still centred, and the geometry is
-    preserved up to that rotation (every pairwise distance). Canonical without pre-centring is
-    refused, since the axes are centroid-relative."""
+    """``canonical=None`` resolves True only for a pre-centred store serving a constant-seed mode."""
     p = _synthetic_profile(0, with_full_charges=False)
 
     vol = os.path.join(tmp_path, "vol.fss")
@@ -173,8 +161,7 @@ def test_screen_guards(tmp_path):
 
     class _Q:
         num_surf_points = 64
-    # legacy mode name "esp_combo" must still resolve (to canonical vol_and_surf_esp) and
-    # hit the alpha guard; the message reports the canonical name, so match name-agnostically.
+    # the legacy name resolves to vol_and_surf_esp; the message reports the canonical name
     with pytest.raises(ValueError, match="requires an explicit alpha"):
         screen(_Q(), store, mode="esp_combo", backend="numba")
     with pytest.raises(ValueError, match="heavy atoms only"):
@@ -249,8 +236,7 @@ def test_from_molecule_smoke(molecules):
 
 
 def test_screen_does_not_mutate_query(tmp_path, molecules):
-    """Centering must operate on a copy -- the caller's query is never mutated,
-    even on a non-pre-centered store (default do_center=True)."""
+    """Centering operates on a copy; the caller's query is never mutated."""
     query = molecules[0]
     before = query.atom_pos.copy()
     store_path = os.path.join(tmp_path, "lib.fss")
@@ -264,8 +250,7 @@ def test_screen_does_not_mutate_query(tmp_path, molecules):
 
 
 def test_stream_matches_in_memory_vol(tmp_path, molecules):
-    """Streaming scores are bit-equivalent to the in-memory MoleculePairBatch path
-    (numba backend, deterministic num_repeats=5 = identity + 4 PCA, no RNG)."""
+    """Streaming scores equal the in-memory MoleculePairBatch path (numba, deterministic seeds)."""
     query = molecules[0]
     lib = molecules[1:]
 
@@ -290,8 +275,7 @@ def test_stream_matches_in_memory_vol(tmp_path, molecules):
 
 
 def test_fast_path_matches_object_path(tmp_path, molecules):
-    """The direct array->kernel fast path (pre-centered store) gives the same scores
-    as building MoleculePairs from the identical centered profiles (object path)."""
+    """The fast path on a pre-centered store matches MoleculePairs built from the same profiles."""
     import copy
     store_path = os.path.join(tmp_path, "lib.fss")
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol", "esp"),
@@ -315,14 +299,11 @@ def test_fast_path_matches_object_path(tmp_path, molecules):
 
 
 def test_vol_color_store_and_fast_matches_object(tmp_path, molecules):
-    """vol_color (atoms + directionless pharmacophore color) screens from a pharm
-    store, and its fast path matches the per-pair object path on identical inputs."""
+    """vol_color screens from a pharm store and its fast path matches the per-pair object path."""
     import copy
     store_path = os.path.join(tmp_path, "lib.fss")
-    # ``canonical=False`` explicitly: a pre-centred store serving this mode is canonical BY
-    # DEFAULT now (accel._modes.CONST_SEED_MODES), and the fast path then runs one constant
-    # seed set the object path does not, so the two legitimately differ at ~1e-3. This test
-    # is about the array->kernel plumbing, which needs both legs on the same seeds.
+    # canonical=False: a canonical store would run constant seeds on the fast path only, so the
+    # two legs would legitimately differ; this test is about the array->kernel plumbing.
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_color",),
                              dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
@@ -348,15 +329,11 @@ def test_vol_color_store_and_fast_matches_object(tmp_path, molecules):
 
 
 def test_vol_tversky_stream_matches_object(tmp_path, molecules):
-    """vol_tversky screens from a plain (atoms-only) store -- it is a reduction over the
-    same shape overlap, needs no extra stored data -- and its streamed scores match the
-    per-pair object path on identical centered inputs."""
+    """vol_tversky screens from an atoms-only store and matches the per-pair object path."""
     import copy
     store_path = os.path.join(tmp_path, "lib.fss")
-    # ``canonical=False`` explicitly: a pre-centred store serving this mode is canonical BY
-    # DEFAULT now (accel._modes.CONST_SEED_MODES), and the fast path then runs one constant
-    # seed set the object path does not, so the two legitimately differ at ~1e-3. This test
-    # is about the array->kernel plumbing, which needs both legs on the same seeds.
+    # canonical=False: a canonical store would run constant seeds on the fast path only, so the
+    # two legs would legitimately differ; this test is about the array->kernel plumbing.
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_tversky",),
                              dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
@@ -380,16 +357,11 @@ def test_vol_tversky_stream_matches_object(tmp_path, molecules):
 
 
 def test_vol_esp_tversky_stream_matches_object(tmp_path, molecules):
-    """vol_esp_tversky screens from a vol_esp-style store (heavy centres + partial charges) -- it
-    reads the SAME per-molecule data as vol_esp, only the host-side reduction is Tversky -- and its
-    streamed scores (the resident-tensor FAST path, since it is in _FAST_MODES + the store is
-    pre_centered) match the per-pair object path on identical centered molecules."""
+    """vol_esp_tversky screens from a vol_esp-style store and matches the per-pair object path."""
     import copy, glob
     store_path = os.path.join(tmp_path, "lib.fss")
-    # ``canonical=False`` explicitly: a pre-centred store serving this mode is canonical BY
-    # DEFAULT now (accel._modes.CONST_SEED_MODES), and the fast path then runs one constant
-    # seed set the object path does not, so the two legitimately differ at ~1e-3. This test
-    # is about the array->kernel plumbing, which needs both legs on the same seeds.
+    # canonical=False: a canonical store would run constant seeds on the fast path only, so the
+    # two legs would legitimately differ; this test is about the array->kernel plumbing.
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_esp_tversky",),
                              dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
@@ -398,10 +370,7 @@ def test_vol_esp_tversky_stream_matches_object(tmp_path, molecules):
     # Reuses vol_esp's store schema (heavy centres + charges); no new per-molecule data.
     assert store.supports("vol_esp_tversky") and store.supports("vol_esp")
     assert store.schema["charges"]
-    # the heavy partial charges actually reached disk (a mode that stored nothing would still
-    # "pass" a score compare when every molecule's charges are empty -- this catches that).
-    # Read through the STORE, not by globbing a file name: a test that re-derives
-    # the on-disk layout is what let the .npy format break iter_shards.
+    # the heavy charges reached disk; read through the store rather than re-deriving the layout
     d = store.read_shard(0)[1]
     assert "charges" in d
 
@@ -417,25 +386,17 @@ def test_vol_esp_tversky_stream_matches_object(tmp_path, molecules):
     pairs = [MoleculePair(cq, _c(m), do_center=False) for m in molecules]
     ref, _ = MoleculePairBatch(pairs).align_with_vol_esp_tversky(
         backend="numba", lam=0.1, num_repeats=16, max_num_steps=50)
-    # reduction over a single ESP channel: fast and object paths feed identical inputs to one
-    # driver, so the streamed scores are effectively bit-identical to the per-pair path (measured
-    # max |fast-object| ~6e-8; abs=1e-4 like vol_esp's own store round-trip). NB the Tversky score
-    # is NOT clamped to [0, 1] -- a small dense query inside a bigger molecule legitimately >1.0.
+    # identical inputs to one driver, so abs=1e-4; the Tversky score is not clamped to [0, 1]
     for i, rs in enumerate(ref):
         assert by_id[i] == pytest.approx(float(rs), abs=1e-4)
 
 
 def test_vol_lipo_stream_matches_object(tmp_path, molecules):
-    """vol_lipo carries a NEW per-molecule data set (the TRUE-heavy lipo centres + per-atom
-    Crippen logP) through the store's variable-length serialization, then screens through the
-    resident-tensor FAST path. The streamed scores must match the per-pair object path, and the
-    store must actually persist the lipo arrays (offset table + centres + scalar)."""
+    """vol_lipo stores its variable-length lipo arrays and streams to the object path's scores."""
     import copy, glob
     store_path = os.path.join(tmp_path, "lib.fss")
-    # ``canonical=False`` explicitly: a pre-centred store serving this mode is canonical BY
-    # DEFAULT now (accel._modes.CONST_SEED_MODES), and the fast path then runs one constant
-    # seed set the object path does not, so the two legitimately differ at ~1e-3. This test
-    # is about the array->kernel plumbing, which needs both legs on the same seeds.
+    # canonical=False: a canonical store would run constant seeds on the fast path only, so the
+    # two legs would legitimately differ; this test is about the array->kernel plumbing.
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_lipo",),
                              dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(molecules):
@@ -443,9 +404,7 @@ def test_vol_lipo_stream_matches_object(tmp_path, molecules):
     store = ProfileStore.open(store_path)
     assert store.supports("vol_lipo") and store.supports("vol")
     assert store.schema["lipophilicity"]
-    # the variable-length lipo set made it to disk (offset table + centres + scalar arrays)
-    # Read through the STORE, not by globbing a file name: a test that re-derives
-    # the on-disk layout is what let the .npy format break iter_shards.
+    # the lipo set reached disk; read through the store rather than re-deriving the layout
     d = store.read_shard(0)[1]
     assert {"lipo_off", "lipo_pos", "lipophilicity"} <= set(d)
 
@@ -460,19 +419,14 @@ def test_vol_lipo_stream_matches_object(tmp_path, molecules):
     pairs = [MoleculePair(cq, p, do_center=False) for p in profiles]
     ref, _ = MoleculePairBatch(pairs).align_with_vol_lipo(
         backend="numba", num_repeats=16, max_num_steps=50)
-    # pre_centered store -> screen() takes the resident-tensor FAST path (mode in _FAST_MODES).
-    # The fit lipo data is bit-identical to the object path and the query differs only by fp noise
-    # (~2e-7 from re-centering it independently). The two-channel objective is basin-sensitive, so
-    # that tickle can flip a near-tie multi-start seed, moving a score by ~1e-3. Same abs=1e-2 the
-    # accel vol_lipo test uses -- loose enough for the flip, tight enough that wrong/empty lipo data
-    # (which would move scores >>1e-2 or change the heavy counts) is still caught.
+    # abs=1e-2: the query is re-centred independently (fp noise), which can flip a near-tie seed
+    # in the two-channel objective; wrong or empty lipo data would move scores far more
     for p, rs in zip(profiles, ref):
         assert by_id[p.id] == pytest.approx(float(rs), abs=1e-2)
 
 
 def test_screen_many_equals_per_query_and_streams_once(tmp_path_factory, molecules):
-    """A panel screen (one read per shard, all queries) equals per-query screens,
-    across multiple shards."""
+    """A panel screen (one read per shard) equals per-query screens across multiple shards."""
     store_path = os.path.join(tmp_path_factory.mktemp("panel"), "lib.fss")
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol", "esp"),
                              dtype="float32", pre_centered=True, shard_size=2) as store:
@@ -514,10 +468,7 @@ def test_panel_scores_out(tmp_path, molecules):
 
 
 def test_vol_esp_stream_retained_h(tmp_path):
-    """vol_esp must stream a molecule whose Chem.RemoveHs RETAINS an H (atom_pos longer
-    than the strict-heavy charge set -- some DUD-E decoys). The heavy-only store can't
-    split heavy charges by atom_off there, so it persists a heavy offset + strict-heavy
-    centers; the streamed scores must still match the in-memory MoleculePairBatch path."""
+    """vol_esp streams a molecule whose RemoveHs retains an H, matching the in-memory path."""
     import copy
 
     # [2H]OC(=O)c1ccccc1 keeps its deuterium after RemoveHs -> atom_pos (10) != heavy (9).
@@ -533,10 +484,8 @@ def test_vol_esp_stream_retained_h(tmp_path):
         for i, m in enumerate(mols):
             store.add(m, id=i)
 
-    # The store gained the heavy offset + strict-heavy centers (a clean store would not).
+    # the store gained the heavy offset + strict-heavy centers; read through the store
     import glob
-    # Read through the STORE, not by globbing a file name: a test that re-derives
-    # the on-disk layout is what let the .npy format break iter_shards.
     d = store.read_shard(0)[1]
     assert "heavy_off" in d and "xyz_noH" in d
 
@@ -557,11 +506,7 @@ def test_vol_esp_stream_retained_h(tmp_path):
 
 
 def test_vol_lipo_stream_retained_h(tmp_path):
-    """vol_lipo's two channels live on DIFFERENT bases: shape on ``atom_pos`` (RemoveHs) and
-    lipophilicity on the TRUE-heavy centres. When Chem.RemoveHs RETAINS an H (deuterium), the
-    RemoveHs set is longer than the heavy lipo set, so the two per-molecule offset tables
-    (``atom_off`` vs ``lipo_off``) legitimately diverge. The store must persist both bases
-    self-consistently and the streamed scores must match the in-memory MoleculePairBatch path."""
+    """vol_lipo stores the RemoveHs and true-heavy bases independently when an H is retained."""
     import copy, glob
 
     # [2H]OC(=O)c1ccccc1 keeps its deuterium after RemoveHs -> atom_pos (10) != heavy (9).
@@ -577,10 +522,7 @@ def test_vol_lipo_stream_retained_h(tmp_path):
         for i, m in enumerate(mols):
             store.add(m, id=i)
 
-    # The lipo set reached disk, and its offset table diverges from atom_off on the retained-H
-    # molecule (proving the two bases are stored independently, not desynced).
-    # Read through the STORE, not by globbing a file name: a test that re-derives
-    # the on-disk layout is what let the .npy format break iter_shards.
+    # the lipo offset table diverges from atom_off on the retained-H molecule
     d = store.read_shard(0)[1]
     assert {"lipo_off", "lipo_pos", "lipophilicity"} <= set(d)
     atom_lens = np.diff(d["atom_off"])
@@ -604,14 +546,11 @@ def test_vol_lipo_stream_retained_h(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# vol_fukui -- same store/fast-path plumbing as vol_lipo, but the per-atom field is the signed
-# condensed Fukui dual descriptor (f+ - f-). The real field needs three gfn2-xTB single points, so
-# these tests INJECT a deterministic synthetic field via Molecule(fukui=...) -- the *screen* wiring
-# (variable-length store + resident-tensor fast path) is independent of how the field was produced.
+# vol_fukui -- the same store/fast-path plumbing as vol_lipo, with a deterministic synthetic
+# Fukui field injected via Molecule(fukui=...) so no xTB is needed.
 # --------------------------------------------------------------------------- #
 def _synthetic_fukui(rd):
-    """Deterministic SIGNED per-atom field (full with-H order) standing in for the xTB Fukui dual
-    descriptor; a pure function of atom order so a molecule and its copy get the same field."""
+    """Deterministic signed per-atom field (with-H order) standing in for the xTB Fukui descriptor."""
     z = np.array([a.GetAtomicNum() for a in rd.GetAtoms()], dtype=np.float32)
     return (0.2 * ((z % 4) - 1.5)).astype(np.float32)
 
@@ -630,19 +569,14 @@ def _build_molecule_fukui(smi, seed, S=64):
 
 
 def test_vol_fukui_stream_matches_object(tmp_path):
-    """vol_fukui carries a NEW per-molecule data set (the TRUE-heavy Fukui centres + per-atom Fukui
-    field) through the store's variable-length serialization, then screens through the resident-tensor
-    FAST path (vol_fukui in _FAST_MODES). Streamed scores must match the per-pair object path, and the
-    store must actually persist the Fukui arrays (offset table + centres + scalar)."""
+    """vol_fukui stores its variable-length Fukui arrays and streams to the object path's scores."""
     import copy, glob
     smis = ["CCO", "CC(=O)Oc1ccccc1C(=O)O", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C", "c1ccccc1O"]
     mols = [_build_molecule_fukui(s, seed=i) for i, s in enumerate(smis)]
 
     store_path = os.path.join(tmp_path, "lib.fss")
-    # ``canonical=False`` explicitly: a pre-centred store serving this mode is canonical BY
-    # DEFAULT now (accel._modes.CONST_SEED_MODES), and the fast path then runs one constant
-    # seed set the object path does not, so the two legitimately differ at ~1e-3. This test
-    # is about the array->kernel plumbing, which needs both legs on the same seeds.
+    # canonical=False: a canonical store would run constant seeds on the fast path only, so the
+    # two legs would legitimately differ; this test is about the array->kernel plumbing.
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol_fukui",),
                              dtype="float32", pre_centered=True, canonical=False) as store:
         for i, m in enumerate(mols):
@@ -650,9 +584,7 @@ def test_vol_fukui_stream_matches_object(tmp_path):
     store = ProfileStore.open(store_path)
     assert store.supports("vol_fukui") and store.supports("vol")
     assert store.schema["fukui"]
-    # the variable-length Fukui set made it to disk (offset table + centres + scalar arrays)
-    # Read through the STORE, not by globbing a file name: a test that re-derives
-    # the on-disk layout is what let the .npy format break iter_shards.
+    # the Fukui set reached disk; read through the store rather than re-deriving the layout
     d = store.read_shard(0)[1]
     assert {"fukui_off", "fukui_pos", "fukui"} <= set(d)
 
@@ -667,19 +599,13 @@ def test_vol_fukui_stream_matches_object(tmp_path):
     pairs = [MoleculePair(cq, p, do_center=False) for p in profiles]
     ref, _ = MoleculePairBatch(pairs).align_with_vol_fukui(
         backend="numba", num_repeats=16, max_num_steps=50)
-    # pre_centered store -> screen() takes the resident-tensor FAST path (mode in _FAST_MODES).
-    # Same abs=1e-2 the accel/vol_lipo tests use: loose enough for a near-tie multi-start flip from
-    # the ~fp re-centering tickle, tight enough that wrong/empty Fukui data is still caught.
+    # abs=1e-2: independent re-centring can flip a near-tie seed; wrong Fukui data moves far more
     for p, rs in zip(profiles, ref):
         assert by_id[p.id] == pytest.approx(float(rs), abs=1e-2)
 
 
 def test_vol_fukui_stream_retained_h(tmp_path):
-    """vol_fukui's two channels live on DIFFERENT bases: shape on ``atom_pos`` (RemoveHs) and the
-    Fukui field on the TRUE-heavy centres. When Chem.RemoveHs RETAINS an H (deuterium), the RemoveHs
-    set is longer than the heavy Fukui set, so the two per-molecule offset tables (``atom_off`` vs
-    ``fukui_off``) legitimately diverge. The store must persist both bases self-consistently and the
-    streamed scores must match the in-memory MoleculePairBatch path."""
+    """vol_fukui stores the RemoveHs and true-heavy bases independently when an H is retained."""
     import copy, glob
 
     # [2H]OC(=O)c1ccccc1 keeps its deuterium after RemoveHs -> atom_pos (10) != heavy (9).
@@ -695,10 +621,7 @@ def test_vol_fukui_stream_retained_h(tmp_path):
         for i, m in enumerate(mols):
             store.add(m, id=i)
 
-    # The Fukui set reached disk, and its offset table diverges from atom_off on the retained-H
-    # molecule (proving the two bases are stored independently, not desynced).
-    # Read through the STORE, not by globbing a file name: a test that re-derives
-    # the on-disk layout is what let the .npy format break iter_shards.
+    # the Fukui offset table diverges from atom_off on the retained-H molecule
     d = store.read_shard(0)[1]
     assert {"fukui_off", "fukui_pos", "fukui"} <= set(d)
     atom_lens = np.diff(d["atom_off"])

@@ -272,6 +272,8 @@ def get_overlap_pharm_np(ptype_1: np.ndarray,
     only_extended : bool
         When `extended_points` is True, decide whether to only score the extended points (ignore
          anchor overlaps)
+    directionless : bool
+        Score every type as an isotropic point Gaussian (forces `extended_points` off).
 
     Returns
     -------
@@ -290,8 +292,8 @@ def get_overlap_pharm_np(ptype_1: np.ndarray,
     else:
         raise ValueError('Argument `similarity` must be one of (tanimoto, tversky, tversky_ref, tversky_fit).')
 
-    # Directionless (ROCS/ROSHAMBO "color") scoring: route all types through the point-only
-    # overlap. extended_points encodes directional geometry, so it is forced off.
+    # Directionless scoring routes every type through the point-only overlap;
+    # extended_points encodes directional geometry, so it is forced off.
     if directionless:
         extended_points = False
         only_extended = False

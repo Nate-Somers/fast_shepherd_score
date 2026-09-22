@@ -1,21 +1,8 @@
-"""A batch larger than one CUDA grid slice must score the same as one split across slices.
+"""Splitting a launch across CUDA grid slices must not change the answer.
 
-``drivers/terms._chunked`` slices a launch at the int32 pointer-offset ceiling
-``_launch_step`` derives from the pads (the old fixed 65,535 was the grid.z limit, which never
-applied to these 1-D grids; ``_CHUNK`` survives only as a cap these tests use to force slicing). The
-coordinate tensors are per-MOLECULE and the pose tensors per POSE, and the real-point counts
-``N_real`` / ``M_real`` are per-molecule too -- so they must be sliced with the molecules. They
-were not: they were passed whole in ``kw``, so from the second grid slice on, every pose was
-scored against a different molecule's atom count.
-
-It is invisible below the limit. One slice needs no slicing, so every batch under 65,535 poses
-is correct, which is every test in this suite, every CPU run (the numba kernels have no grid
-limit and take one call) and every small GPU batch. It surfaced only in a 100,000-pair
-benchmark cell: measured on an L40S, a 21,919-pair ``vol`` chunk (219,190 poses) returned 8,395
-of 30,000 Tanimotos above 1, up to 7.3e3, and ``vol_esp`` up to 1.1e5.
-
-These tests drive ``_chunked`` directly with a tiny stand-in limit, so they run on CPU and cost
-milliseconds. The property is the one that matters: chunking must not change the answer.
+``drivers/terms._chunked`` slices at a pointer-offset ceiling; the per-molecule arguments
+(coordinates, ``N_real`` / ``M_real``) must be sliced with the molecules. Driven with a tiny
+stand-in limit so it runs on CPU.
 """
 import numpy as np
 import pytest
@@ -30,8 +17,7 @@ pytestmark = pytest.mark.skipif(not TORCH, reason="PyTorch required")
 
 
 def _fake_kernel(A, B, q, t, *, alpha, N_real, M_real, NEED_GRAD=True, **extra):
-    """Stand-in with the real kernels' contract: row i of the per-molecule args goes with
-    ``N_real[i]``. Returns a value that DEPENDS on the count, so a misaligned slice shows up."""
+    """Kernel stand-in whose value depends on ``N_real``, so a misaligned slice shows up."""
     K = q.shape[0]
     S = K // A.shape[0]
     n = N_real.to(torch.float32).repeat_interleave(S)
@@ -43,8 +29,7 @@ def _fake_kernel(A, B, q, t, *, alpha, N_real, M_real, NEED_GRAD=True, **extra):
 @pytest.mark.parametrize("S", [1, 4])
 @pytest.mark.parametrize("n_mol", [10, 100, 257])
 def test_chunked_launch_matches_a_single_launch(S, n_mol, monkeypatch):
-    """Same inputs, one launch vs many: identical output. Fails if any per-molecule argument is
-    not sliced with the molecules."""
+    """One launch and many launches must give identical output."""
     from shepherd_score.accel.drivers import terms as T
 
     g = torch.Generator().manual_seed(0)
@@ -69,8 +54,7 @@ def test_chunked_launch_matches_a_single_launch(S, n_mol, monkeypatch):
 
 
 def test_chunked_keeps_each_seed_group_whole(monkeypatch):
-    """A chunk boundary inside a molecule's seed group would make the kernel's own ``pid // S``
-    address the wrong molecule, so the step is rounded down to a multiple of S."""
+    """Chunk sizes are rounded down to a multiple of S so a seed group is never split."""
     from shepherd_score.accel.drivers import terms as T
 
     seen = []

@@ -1,14 +1,11 @@
 """Objective-term evaluators: one kernel launch per :class:`~shepherd_score.accel._modes.Term`.
 
 Each evaluator takes the padded per-pose tensors of its channels plus the current pose and
-returns ``(value, dQ, dT)`` -- the overlap and its gradient in unit-quaternion space, exactly as
-the dispatched kernels emit them -- or ``(value, None, None)`` for a value-only term. The
-pose-invariant self-overlaps a reduction needs come from :func:`self_overlap`.
-
-Shape-family launches are sliced only at the int32 pointer-offset ceiling ``_launch_step``
-derives from the pads -- no longer at 65,535, which was the grid.z limit and never applied to
-these 1-D grids; the pharmacophore and colour kernels launch a 1-D grid and take the
-whole batch.
+returns ``(value, dQ, dT)``, the overlap and its gradient in unit-quaternion space as the
+dispatched kernels emit them, or ``(value, None, None)`` for a value-only term. The
+pose-invariant self-overlaps a reduction needs come from :func:`self_overlap`. Shape-family
+launches are sliced at the int32 pointer-offset ceiling ``_launch_step`` derives from the pads;
+the pharmacophore and colour kernels take the whole batch in one 1-D grid.
 """
 from __future__ import annotations
 
@@ -24,20 +21,16 @@ from ..kernels.dispatch import (
 )
 from ._common import apply_se3_transform
 
-# Poses per kernel launch. Every kernel here launches a ONE-DIMENSIONAL grid, so the bound that
-# applies is grid.x (2^31-1), and the old 65,535 -- the grid.z limit, which never entered into it
-# -- was pure overhead: at vol's 81,920-pose chunk it split each captured fine step into two
-# launches plus three output copies. The real ceiling is the int32 pointer offset the kernels form
-# as ``mol * N_pad * 3`` (``tl.program_id`` is int32), which ``_launch_step`` derives from the
-# ACTUAL pads at call time; pads round up to 16 with no fixed maximum, so it cannot be a constant.
-# ``_CHUNK`` remains as an upper bound so a test can force slicing with a small value.
+# Poses per kernel launch. The kernels launch a one-dimensional grid, so the bound that applies
+# is the int32 pointer offset formed as ``mol * N_pad * 3``, which ``_launch_step`` derives from
+# the pads at call time. ``_CHUNK`` is an upper bound that can be lowered to force slicing.
 _CHUNK = 2 ** 31 - 1
 _PID_MAX = 2 ** 31 - 1
 
 
 def _launch_step(S, args_mol):
     """Poses per launch: the int32 offset ceiling from the largest pad in ``args_mol``, capped by
-    ``_CHUNK``, and rounded DOWN to a whole seed group so a slice never splits one molecule's
+    ``_CHUNK``, and rounded down to a whole seed group so a slice never splits one molecule's
     seeds (the kernel's own ``pid // S`` would then address the wrong molecule)."""
     pad = max((int(a.shape[1]) for a in args_mol if a.dim() >= 2), default=1)
     ceil = max(1, min(_CHUNK, _PID_MAX // (3 * max(pad, 1))))
@@ -76,14 +69,8 @@ def tables_for(term, device, dtype, params):
 # ---------------------------------------------------------------------------------------------
 # chunked shape-family launches
 # ---------------------------------------------------------------------------------------------
-#: ``kw`` entries that are PER-MOLECULE, not per-pose, and so must be sliced with ``args_mol``
-#: in every grid-safe chunk. Passing them whole is not a tolerance issue: the kernel reads each
-#: molecule's real-point count at the row it is given, so from the SECOND chunk on every pose is
-#: scored against another molecule's atom count. Measured before the fix, on an L40S: a
-#: 21,919-pair vol chunk (219,190 poses, so 4 grid slices) returned 8,395 of 30,000 pairs with a
-#: Tanimoto above 1, up to 7.3e3, and vol_esp up to 1.1e5. Everything at or below one chunk --
-#: every batch under 65,535 poses, which is every test in the suite and every CPU run -- was
-#: correct, which is why this survived a full parity sweep.
+#: ``kw`` entries that are per molecule, not per pose, and so must be sliced with ``args_mol``
+#: in every chunk; passed whole, poses from the second chunk on read another molecule's counts.
 _MOL_KW = ("N_real", "M_real")
 
 
@@ -124,7 +111,7 @@ def _layout_kw(seeds_per_mol, poses_per_cta):
 class TermInputs:
     """The device tensors one term reads for a bucket of poses.
 
-    ``ref`` / ``fit``: per-channel padded tensors in the term's channel order (per MOLECULE row
+    ``ref`` / ``fit``: per-channel padded tensors in the term's channel order (per molecule row
     when ``seeds_per_mol > 1``, else per pose); ``n_real`` / ``m_real``: int32 real counts;
     ``tables``: the kernel's lookup triple or None; ``guard``: per-pose bool mask (``None`` when
     every pair has real points on both sides).
@@ -186,15 +173,13 @@ def evaluate(term, ti: TermInputs, q, t, *, need_grad=True, seeds_per_mol=1, pos
 
 
 def evaluate_fused_pair(t0, t1, ti0: TermInputs, ti1: TermInputs, q, t, params):
-    """Both channels of a shape+colour mode in ONE launch, or ``None`` if it does not apply.
+    """Both channels of a shape+colour mode in one launch, or ``None`` if it does not apply.
 
     ``vol_color_triton.vol_color_score_grad_se3_batch`` computes the Gaussian shape overlap and
     the directionless typed-anchor overlap in a single kernel, sharing the R(q) build and the
-    tile loads -- collapsing the mode's two launches per fine step to one. It is single-tile, so
-    it is used only when EVERY padded width fits ``VOL_COLOR_FUSED_MAX_PAD`` (32): the
-    two-channel register footprint destroys occupancy at a larger BLOCK. It has no numba twin,
-    which is why it is imported directly rather than through the kernel dispatcher, and CPU
-    tensors therefore take the two-kernel path.
+    tile loads. It is single-tile, so it is used only when every padded width fits
+    ``VOL_COLOR_FUSED_MAX_PAD``; it has no numba twin, so it is imported directly rather than
+    through the kernel dispatcher, and CPU tensors take the two-kernel path.
 
     Returns ``((V0, dQ0, dT0), (V1, dQ1, dT1))`` in the two terms' own order.
     """

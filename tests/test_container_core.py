@@ -278,16 +278,12 @@ def test_single_pair_align_vol_jax():
 # Legacy-pickle upgrade (Molecule.__setstate__)
 # ---------------------------------------------------------------------------
 
-# Every name a Molecule pickled before the Surface/Pharmacophore refactor carried flat in
-# __dict__ and that is now a data descriptor. Data descriptors win over the instance dict,
-# so without __setstate__ each of these raises AttributeError on an old pickle -- silently
-# stranding any on-disk store a prior release wrote.
+# Names a pre-refactor Molecule pickle carried flat in __dict__ that are now data descriptors;
+# without __setstate__ each raises AttributeError on an old pickle.
 _LEGACY_FLAT = ('surf_pos', 'surf_esp', 'probe_radius',
                 'pharm_types', 'pharm_ancs', 'pharm_vecs')
 
-# State added AFTER the flat layout, so absent from any such pickle. surface_method is read
-# by get_pc(); _charge_model by partial_charges when the pickle carried no charges; _fukui
-# by the fukui property. None of the three is guarded by its reader.
+# State added after the flat layout, absent from such a pickle and unguarded by its readers.
 _POST_FLAT = ('surface_method', '_charge_model', '_fukui')
 
 
@@ -314,8 +310,7 @@ def test_legacy_pickle_restores_flat_attributes():
     np.testing.assert_allclose(back.surf_pos, mol.surf_pos)
     np.testing.assert_allclose(back.surf_esp, mol.surf_esp)
     assert back.probe_radius == mol.probe_radius
-    # the flat duplicates must be gone, not shadowed -- a stale copy would diverge from
-    # the Surface on the first center_to()/write through the property
+    # the flat duplicates must be gone, not shadowed
     assert not set(_LEGACY_FLAT) & set(back.__dict__)
     assert isinstance(back._surface, Surface)
 
@@ -331,8 +326,7 @@ def test_legacy_pickle_defaults_post_refactor_state():
     assert back.surface_method == 'mesh'
     assert back.__dict__['_charge_model'] == 'xtb'
     assert back.__dict__['_fukui'] is None
-    # the point of the default: the lazy charge generator reads _charge_model, so without
-    # it this raises AttributeError instead of generating charges
+    # the lazy charge generator reads _charge_model
     back._charge_model = 'mmff'
     assert back.partial_charges.shape == (mol.mol.GetNumAtoms(),)
 
@@ -351,7 +345,7 @@ def test_new_format_pickle_round_trips_unchanged():
 
 
 def test_legacy_molecule_pair_pickle_restores_alignments():
-    """MoleculePair has the same descriptor hazard -- WHATS_NEW B3, now shimmed."""
+    """MoleculePair has the same descriptor hazard."""
     import pickle
     mp = _pair()
     mp.transform_vol = np.eye(4) * 2.0

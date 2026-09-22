@@ -12,36 +12,20 @@ import triton.language as tl
 import torch
 
 
-# ----------------- score and gradients wrt quaternion q and translation t -----------------
-# BLOCK/num_warps/num_stages are chosen by triton.autotune per (N_pad, M_pad) on the actual
-# device and cached, so the kernel self-tunes to any GPU / Triton version. Candidates are
-# deliberately small tiles (BLOCK <= 64, <= 4 warps): the kernel runs ONE CTA per pair, so a
-# batch already launches thousands of CTAs and occupancy comes from the pair count -- larger
-# tiles are never selected and only lengthen the cold-start autotune sweep.
+# Autotuned per (N_pad, M_pad) on the actual device. Candidates are small tiles (BLOCK <= 64,
+# <= 4 warps): the kernel runs one CTA per pair, so occupancy comes from the pair count.
 _OVERLAP_CONFIGS = [
     triton.Config({'BLOCK': _b}, num_warps=_w, num_stages=_s)
     for _b in (16, 32, 64) for _w in (1, 2, 4) for _s in (1, 2, 3, 4)
 ]
 
-# TESTED AND REVERTED: the 4-warp ceiling above is a single-pose observation, so a wider sweep
-# (num_warps up to 8) was tried for the multi-pose kernel, which does POSES times the work per
-# CTA. It changed NOTHING -- surf reproduced at 1.661/1.661/1.701 and vol was flat within run
-# variance -- while making the autotune sweep 33% larger (gate 5 went 6s -> 48.6s). The
-# autotuner selects the same config either way, so the ceiling was never the constraint.
 
-
-# --- shared SE(3) device functions (inlined at zero cost by @triton.jit) ------------------
-# The quaternion->rotation-matrix build and the overlap-force->quaternion-gradient tail were
-# copy-pasted byte-for-byte into every overlap kernel (shape + ESP here, and imported by
-# esp_triton). Factoring them into these @triton.jit helpers makes a correctness fix a SINGLE
-# edit instead of N identical ones and removes the silent-divergence risk. Triton inlines a
-# @triton.jit callee into its caller, so this is bit-identical to the inline blocks (validated:
-# kernel V/dQ/dT match a torch-autograd reference).
+# Shared SE(3) device functions. Triton inlines a @triton.jit callee, so factoring the
+# quaternion->rotation build and the force->quaternion-gradient tail here costs nothing.
 @triton.jit
 def _quat_to_rotmat(qr, qi, qj, qk):
-    """Rotation matrix (row-major r00..r22) from a quaternion (w,x,y,z). q need NOT be unit
-    -- the value kernels apply this to the raw optimiser state and the norm cancels in the
-    Tanimoto ratio (renormalisation happens in the Adam step)."""
+    """Rotation matrix (row-major r00..r22) from a unit quaternion (w,x,y,z). Seeds are
+    normalised and the Adam step renormalises q after every update, so q is unit here."""
     two = 2.0
     r00 = 1 - two*(qj*qj + qk*qk); r01 = two*(qi*qj - qk*qr); r02 = two*(qi*qk + qj*qr)
     r10 = two*(qi*qj + qk*qr);     r11 = 1 - two*(qi*qi + qk*qk); r12 = two*(qj*qk - qi*qr)
@@ -71,9 +55,8 @@ def _quat_grad_tail(fx, fy, fz, bx0, by0, bz0, qr, qi, qj, qk):
     return dw, dxq, dyq, dzq
 
 
-# cache_results=True persists the chosen (BLOCK, num_warps) to the Triton cache dir
-# keyed by (N_pad, M_pad), so the per-process autotune sweep (~4 s/shape) is paid
-# once per machine, not once per process -- big win for fresh-process workloads.
+# cache_results persists the chosen config per (N_pad, M_pad), so the autotune sweep runs
+# once per machine rather than once per process.
 @triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _gauss_overlap_se3_tiled(
@@ -87,16 +70,14 @@ def _gauss_overlap_se3_tiled(
     NEED_GRAD: tl.constexpr,
     SEEDS: tl.constexpr           # poses per molecule; 1 == one molecule per CTA (legacy)
 ):
-    # -------- which alignment (one CTA per pair) --------
     pid = tl.program_id(0)
-    # One CTA per POSE, but coordinates belong to a MOLECULE. With SEEDS > 1 the caller passes
-    # the molecule blocks UNREPLICATED and the SEEDS consecutive CTAs of a molecule all read its
-    # one copy; with SEEDS == 1 this is pid, i.e. the original one-molecule-per-CTA layout.
+    # One CTA per pose; coordinates belong to a molecule. With SEEDS > 1 the caller passes the
+    # molecule blocks unreplicated and the SEEDS consecutive CTAs of a molecule share one copy.
     mol = pid // SEEDS
     realN = tl.load(Nreal_ptr + mol)
     realM = tl.load(Mreal_ptr + mol)
 
-    # -------- base pointers: coords by molecule, pose state by CTA ---------
+    # base pointers: coords by molecule, pose state by CTA
     A_ptr  = A_ptr  + mol * N_pad * 3
     B_ptr  = B_ptr  + mol * M_pad * 3
     Q_ptr  = Q_ptr  + pid * 4
@@ -105,28 +86,23 @@ def _gauss_overlap_se3_tiled(
     dT_ptr = dT_ptr + pid * 3
     S_ptr  = S_ptr  + pid
 
-    # -------- quaternion / translation ------------------
     qr = tl.load(Q_ptr + 0); qi = tl.load(Q_ptr + 1)
     qj = tl.load(Q_ptr + 2); qk = tl.load(Q_ptr + 3)
     tx = tl.load(T_ptr + 0); ty = tl.load(T_ptr + 1); tz = tl.load(T_ptr + 2)
 
-    # rotation matrix (registers) -- shared device fn (inlined, bit-identical)
     r00, r01, r02, r10, r11, r12, r20, r21, r22 = _quat_to_rotmat(qr, qi, qj, qk)
 
-    # -------- accumulators (register) -------------------
     Vab_acc = 0.0
     dTx = 0.0; dTy = 0.0; dTz = 0.0
     dQw = 0.0; dQx = 0.0; dQy = 0.0; dQz = 0.0
 
     inv_ln2 = 1.4426950408889634
 
-    # NOTE: outer loop over A tiles, inner loop over B tiles
-    # Each tile load is once per loop -> reuse inside nested loops.
+    # outer loop over A tiles, inner loop over B tiles
     for n0 in range(0, N_pad, BLOCK):
         offs_n = n0 + tl.arange(0, BLOCK)
         mask_n = offs_n < realN
 
-        # load A tile (x,y,z) into registers
         a_idx = tl.where(mask_n, offs_n, 0)
         ax = tl.load(A_ptr + a_idx * 3 + 0, mask=mask_n, other=0.0)
         ay = tl.load(A_ptr + a_idx * 3 + 1, mask=mask_n, other=0.0)
@@ -156,26 +132,23 @@ def _gauss_overlap_se3_tiled(
             pair_mask = mask_n[:, None] & mask_m[None, :]
             g = tl.where(pair_mask, g, 0.0)
 
-            # overlap accumulation
             Vab_acc += tl.sum(g)
 
             if NEED_GRAD:
                 coeff = (2.0 * half_alpha) * g
-                # forces sum over i for each j (axis 0)
+                # forces: sum over i for each j (axis 0)
                 fx = tl.sum(coeff * dx, 0)
                 fy = tl.sum(coeff * dy, 0)
                 fz = tl.sum(coeff * dz, 0)
 
-                # translation grads (sum over valid j)
                 dTx += tl.sum(fx)
                 dTy += tl.sum(fy)
                 dTz += tl.sum(fz)
 
-                # quaternion grads (shared device fn; reuses body-frame coords bx0,by0,bz0).
-                # mask_m already applied via fx,fy,fz sums above (masked zeros).
+                # quaternion grads from the body-frame coords (bx0, by0, bz0)
                 dw, dxq, dyq, dzq = _quat_grad_tail(fx, fy, fz, bx0, by0, bz0, qr, qi, qj, qk)
 
-                # mask again (safer if any fx,fy,fz lanes picked noise)
+                # mask padding lanes
                 dw  = tl.where(mask_m, dw,  0.0)
                 dxq = tl.where(mask_m, dxq, 0.0)
                 dyq = tl.where(mask_m, dyq, 0.0)
@@ -186,7 +159,7 @@ def _gauss_overlap_se3_tiled(
                 dQy += tl.sum(dyq)
                 dQz += tl.sum(dzq)
 
-    # -------- single final write (no atomics needed) -------
+    # single final write per CTA; no atomics needed
     tl.store(S_ptr, Vab_acc)
 
     if NEED_GRAD:
@@ -199,20 +172,8 @@ def _gauss_overlap_se3_tiled(
         tl.store(dQ_ptr + 3, dQz)
 
 
-# ---------------------------------------------------------------------------------------
-# Multi-pose variant: POSES poses of ONE molecule per CTA.
-#
-# The single-pose kernel above is latency/occupancy-bound, not bandwidth- or compute-bound:
-# measured at ~5% of an L40S's fp32 peak and ~17% of its SFU throughput, doing only ~N_pad*M_pad
-# (~1024) pair-evals per CTA with <= 4 warps. Removing the coordinate replication was worth 1.01x,
-# which ruled out memory traffic; what is left is simply too little work per CTA to hide latency.
-#
-# This does the same arithmetic with POSES times more of it per CTA. The A and B tiles are loaded
-# ONCE per (n-tile, m-tile) and reused across POSES poses, so the quaternion->rotmat build, the
-# tile loads and the loop overhead amortise over POSES instead of being paid per pose.
-#
-
-
+# Multi-pose variant: POSES poses of one molecule per CTA, so the tile loads, the
+# quaternion->rotmat build and the loop overhead amortise over POSES poses.
 @triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'])
 @triton.jit
 def _gauss_overlap_se3_multipose(
@@ -228,23 +189,13 @@ def _gauss_overlap_se3_multipose(
     POSES: tl.constexpr,
     POSES_PAD: tl.constexpr,      # next power of two >= POSES (tl.arange extent)
 ):
-    """POSES poses of ONE molecule per CTA, vectorised over the pose axis.
+    """POSES poses of one molecule per CTA, vectorised over the pose axis.
 
-    The single-pose kernel is latency/occupancy-bound, not bandwidth- or compute-bound: measured
-    at ~5% of an L40S fp32 peak and ~17% of its SFU, doing only ~N_pad*M_pad (~1024) pair-evals
-    per CTA with <= 4 warps. Deduplicating its coordinate traffic was worth 1.008x, which ruled
-    memory out; what remains is too little work per CTA to hide latency.
-
-    Here the A and B tiles load ONCE and the pose axis broadcasts over them, so every tile load,
-    the quaternion->rotmat build and the loop overhead amortise over POSES poses, and each CTA
-    carries POSES times the arithmetic.
-
-    Poses are a TENSOR dimension rather than an unrolled Python loop -- Triton has no
-    ``__setitem__``, so list accumulators are not expressible. That makes POSES a ``tl.arange``
-    extent, hence power-of-two, and it must divide SEEDS so a CTA never straddles two molecules.
-
-    Identical arithmetic and identical per-pose accumulation order to the single-pose kernel,
-    so results are bit-identical; only which CTA performs them changes.
+    The A and B tiles load once and the pose axis broadcasts over them, so every tile load,
+    the quaternion->rotmat build and the loop overhead amortise over POSES poses. Poses are a
+    tensor dimension (Triton has no ``__setitem__``), so POSES is a ``tl.arange`` extent padded
+    to a power of two, and it must divide SEEDS so a CTA never straddles two molecules. The
+    per-pose accumulation order matches the single-pose kernel.
     """
     pid = tl.program_id(0)
     base = pid * POSES
@@ -255,10 +206,8 @@ def _gauss_overlap_se3_multipose(
     A_ptr = A_ptr + mol * N_pad * 3
     B_ptr = B_ptr + mol * M_pad * 3
 
-    # -------- pose state: (POSES,) vectors, built once --------
-    # tl.arange demands a power-of-two extent, so run POSES_PAD lanes and mask the tail. That
-    # is what lets POSES be 5 or 10 -- vol has 10 seeds, so without this the only testable value
-    # was 2, which is too little extra work per CTA to decide anything.
+    # pose state: (POSES,) vectors, built once. tl.arange needs a power-of-two extent, so run
+    # POSES_PAD lanes and mask the tail.
     p_off = tl.arange(0, POSES_PAD)
     mask_p = p_off < POSES
     qo = (base + p_off) * 4
@@ -295,7 +244,7 @@ def _gauss_overlap_se3_multipose(
             offs_m = m0 + tl.arange(0, BLOCK)
             mask_m = offs_m < realM
             b_idx = tl.where(mask_m, offs_m, 0)
-            # ONE load, reused by every pose via the broadcast below
+            # one load, reused by every pose via the broadcast below
             bx0 = tl.load(B_ptr + b_idx * 3 + 0, mask=mask_m, other=0.0)
             by0 = tl.load(B_ptr + b_idx * 3 + 1, mask=mask_m, other=0.0)
             bz0 = tl.load(B_ptr + b_idx * 3 + 2, mask=mask_m, other=0.0)
@@ -315,10 +264,9 @@ def _gauss_overlap_se3_multipose(
             pair_mask = mask_n[None, :, None] & mask_m[None, None, :]
             g = tl.where(pair_mask, g, 0.0)
 
-            # Reduce the (n, m) plane in ONE pass over a flattened row, matching the
-            # single-pose kernel's tl.sum(g) over a flat (BLOCK, BLOCK). The two-stage
-            # tl.sum(tl.sum(g,2),1) is a DIFFERENT summation tree, and float addition is not
-            # associative -- that, not the arithmetic, is why multi-pose was not bit-identical.
+            # Reduce the (n, m) plane in one pass over a flattened row so the summation tree
+            # matches the single-pose kernel's tl.sum over a flat (BLOCK, BLOCK); a two-stage
+            # tl.sum(tl.sum(g, 2), 1) would round differently.
             Vab_acc += tl.sum(tl.reshape(g, [POSES_PAD, BLOCK * BLOCK]), 1)
 
             if NEED_GRAD:
@@ -361,23 +309,12 @@ def overlap_score_grad_se3_batch(
     seeds_per_mol: int = 1,
     poses_per_cta: int = 1,
 ):
-    """
-    One CTA per POSE. Internal tile loops over A,B.
-    Shapes (``seeds_per_mol == 1``, the default and the legacy layout):
-      A : (K, N_pad, 3)
-      B : (K, M_pad, 3)
-      q : (K, 4)
-      t : (K, 3)
+    """Gaussian overlap value + SE(3) gradient; one CTA per pose, tile loops over A and B.
 
-    With ``seeds_per_mol = S > 1`` the coordinate blocks are UNREPLICATED and the pose tensors
-    carry every pose:
-      A : (K // S, N_pad, 3)      N_real, M_real : (K // S,)
-      q : (K, 4)                  t : (K, 3)
-    CTA ``i`` then reads molecule ``i // S``. Identical arithmetic on identical values -- only
-    the address changes -- so results are bit-identical to the replicated layout.
-
-    BLOCK and the warp count are chosen by ``triton.autotune`` per (N_pad, M_pad) on the
-    actual device.
+    Shapes with ``seeds_per_mol == 1``: A (K, N_pad, 3), B (K, M_pad, 3), q (K, 4), t (K, 3).
+    With ``seeds_per_mol = S > 1`` the coordinate blocks are unreplicated: A (K // S, N_pad, 3),
+    N_real / M_real (K // S,), q (K, 4), t (K, 3); CTA ``i`` reads molecule ``i // S``.
+    Returns (V (K,), dQ (K, 4), dT (K, 3)).
     """
     K = q.shape[0]                       # POSES == CTAs
     S = int(seeds_per_mol)
@@ -402,12 +339,9 @@ def overlap_score_grad_se3_batch(
     half_alpha = 0.5 * alpha
     k_const    = math.pi**1.5 / ((2.0 * alpha) ** 1.5)
 
-    # Both kernels below STORE every element of out_S, and every element of out_dQ/out_dT when
-    # NEED_GRAD (the multi-pose variant's mask only hides the tl.arange padding lanes, which
-    # address no real pose), so pre-zeroing is three memset kernels per fine step writing
-    # buffers that are about to be overwritten -- 0.0159 us/mol of device time on a vol screen
-    # at N=100,000 (job 22593930). Without NEED_GRAD the gradient buffers ARE left unwritten,
-    # so those keep their zeros rather than handing a caller uninitialised memory.
+    # Both kernels store every element of out_S and, when NEED_GRAD, of out_dQ / out_dT (the
+    # multi-pose mask only hides tl.arange padding lanes), so no pre-zeroing; without NEED_GRAD
+    # the gradient buffers are left unwritten and keep their zeros.
     out_S  = torch.empty(K, device=device, dtype=dtype)
     if NEED_GRAD:
         out_dQ = torch.empty_like(q)
@@ -418,8 +352,8 @@ def overlap_score_grad_se3_batch(
 
     POSES = int(poses_per_cta)
     if POSES > 1:
-        # POSES poses of ONE molecule per CTA. Every pose in a CTA must share a molecule, so
-        # SEEDS must divide evenly by POSES; K % POSES follows from that.
+        # POSES poses of one molecule per CTA: every pose in a CTA must share a molecule, so
+        # POSES must divide SEEDS.
         if S <= 1 or S % POSES != 0 or K % POSES != 0:
             raise ValueError(
                 f"poses_per_cta={POSES} needs the deduped layout and SEEDS % POSES == 0 "
@@ -437,8 +371,6 @@ def overlap_score_grad_se3_batch(
 
     grid = (K,)    # 1-D launch: one CTA per alignment
 
-    # BLOCK + num_warps are chosen by triton.autotune per (N_pad, M_pad) on the
-    # ACTUAL device (see _OVERLAP_CONFIGS) -- nothing GPU-specific.
     _gauss_overlap_se3_tiled[grid](
         A.contiguous().view(-1),
         B.contiguous().view(-1),
@@ -455,7 +387,7 @@ def overlap_score_grad_se3_batch(
     return out_S, out_dQ, out_dT
 
 
-#  Fused Adam update for (q,t)     – 1 thread-block = 1..256 orientations
+# Fused Adam update for (q, t); one CTA handles up to BLOCK poses.
 @triton.jit
 def _adam_qt(
     Q_ptr, T_ptr,
@@ -587,16 +519,11 @@ def fused_adam_qt(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr):
 
 
 def fused_adam_qt_with_tangent_proj(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr):
-    """
-    Fused Adam update with tangent-space projection for quaternion gradients.
-
-    Unlike fused_adam_qt, this function accepts the raw gradient dQ (before
-    tangent projection) and performs the projection internally in the kernel,
-    saving one memory read/write cycle.
+    """Fused Adam update with in-kernel tangent-space projection of the raw quaternion gradient.
 
     Args:
         q, t: quaternion (K,4) and translation (K,3) parameters (updated in-place)
-        dQ: raw quaternion gradients (K,4) - NOT tangent-projected
+        dQ: raw quaternion gradients (K,4), not yet tangent-projected
         dT: translation gradients (K,3)
         m_q, v_q, m_t, v_t: Adam moment tensors (updated in-place)
         lr: learning rate
@@ -612,12 +539,9 @@ def fused_adam_qt_with_tangent_proj(q, t, dQ, dT, m_q, v_q, m_t, v_t, lr):
     )
 
 
-#  One-time _adam_qt warm-up so the first real call doesn't pay the PTX build.
-#  Must stay lazy -- never call this at import. Importing this module must NOT
-#  initialize CUDA: it would allocate GPU memory just by importing, and (crucially)
-#  it would poison the fork-based multi-GPU pool (shepherd_score.accel.multi_gpu),
-#  which can only fork its workers while the parent has not initialized CUDA.
-#  Triton JIT-compiles on first launch regardless; this only front-loads it.
+# One-time _adam_qt warm-up so the first real call does not pay the PTX build. Must stay lazy:
+# importing this module must not initialise CUDA, because the fork-based multi-GPU pool
+# (shepherd_score.accel.multi_gpu) can only fork its workers before the parent touches CUDA.
 _ADAM_QT_WARMED = False
 
 
@@ -636,9 +560,7 @@ def _warmup_adam_qt():
     )
     torch.cuda.synchronize()
 
-# ---------------------------------------------------------------------
-# helper: batched self-overlap   VPP(P,P)  for a padded tensor
-# ---------------------------------------------------------------------
+# Batched self-overlap VPP(P,P) for a padded tensor via the identity pose.
 @torch.no_grad()
 def _batch_self_overlap(P_pad: torch.Tensor,
                               N_real: torch.Tensor,

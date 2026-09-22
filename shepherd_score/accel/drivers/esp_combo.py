@@ -1,6 +1,6 @@
 """``vol_and_surf_esp`` driver entry points (ShaEP-style shape + surface-ESP agreement).
 
-The pose is steered by the SHAPE gradient only; the ESP agreement enters the tracked score.
+The pose is steered by the shape gradient only; the ESP agreement enters the tracked score.
 The eager loop scores the ESP term every ``_ESP_STRIDE`` steps (plus the last); the CUDA-graph
 step scores it every step (see ``engine._GraphedFineTerms``).
 """
@@ -62,7 +62,7 @@ def _batch_esp_combo_score(centers_w_H_1, centers_w_H_2, centers_1, centers_2, p
                            radii_1, radii_2, alpha, lam, probe_radius, esp_weight, VAA, VBB,
                            N_real_centers, M_real_centers, N_real_atoms_w_H_1, M_real_atoms_w_H_2,
                            N_real_surf_1, M_real_surf_2, VAB_shape=None):
-    """The combined score at a pose whose fit clouds are ALREADY transformed (value only)."""
+    """The combined score at a pose whose fit clouds are already transformed (value only)."""
     B = centers_1.shape[0]
     if VAB_shape is None:
         VAB, _, _ = _overlap_in_chunks_volumetric(

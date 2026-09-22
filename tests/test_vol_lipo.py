@@ -1,8 +1,6 @@
-"""Reference-mode gates for the ``vol_lipo`` mode (shape + lipophilicity).
-
-Gates 1-4 are the correctness gate for every reference mode; gate 5 (retained-H) is required
-here because ``vol_lipo`` reads a per-atom scalar field (the Crippen atomic logP). All gates must
-pass before handing off to ``accelerate-scoring-mode``.
+"""Reference-mode gates for ``vol_lipo`` (shape + lipophilicity): self-overlap = 1.0, autograd vs
+finite difference, planted-pose recovery, determinism, and the retained-H basis, required because
+the mode reads a per-atom scalar field (Crippen atomic logP).
 """
 import numpy as np
 import pytest
@@ -133,12 +131,7 @@ def test_deterministic_given_seed():
 
 # --- Gate 5: retained-H molecule --------------------------------------------------------------
 def test_retained_h_molecule():
-    """A molecule whose Chem.RemoveHs RETAINS an H (deuterium) has ``atom_pos`` longer than the
-    true-heavy set ``_nonH_atoms_idx`` selects. vol_lipo pairs the heavy Crippen logP with the
-    true-heavy conformer positions (never ``atom_pos``), so the shape channel (atom_pos, N rows)
-    and the lipo channel (true-heavy, N-1 rows) have DIFFERENT lengths -- pairing the logP with
-    ``atom_pos`` would broadcast (N) against (N-1) and crash. This gate proves it does not.
-    """
+    """A retained-H molecule must not desync the heavy logP from its true-heavy centres."""
     m = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))     # deuterium survives RemoveHs
     params = AllChem.ETKDGv3(); params.randomSeed = 0
     assert AllChem.EmbedMolecule(m, params) == 0
@@ -151,9 +144,8 @@ def test_retained_h_molecule():
     assert len(lipo) == len(mol._nonH_atoms_idx)
     assert len(lipo) != mol.atom_pos.shape[0]
 
-    # The desync guard: exercise the full per-atom overlap path at a NON-identity pose. The shape
-    # centres (atom_pos, N rows) and lipo centres (true-heavy, N-1 rows) differ in length; if the
-    # heavy logP were wrongly paired with atom_pos this evaluation would raise a broadcast error.
+    # the shape centres (N rows) and lipo centres (N-1 rows) differ in length; a wrong pairing
+    # would raise a broadcast error here
     centers, lipo_pos, lipo_t = _lipo_inputs(mol)
     assert centers.shape[0] != lipo_pos.shape[0]                 # shape N vs lipo N-1
     se3 = torch.tensor([0.966, 0.259, 0.0, 0.0, 0.3, -0.2, 0.1], dtype=torch.float32)
@@ -163,10 +155,8 @@ def test_retained_h_molecule():
     )
     assert 0.0 <= float(1 - loss) <= 1.0
 
-    # End-to-end integration on the same deuterated molecule: MoleculePair(mol, mol) self-aligns to
-    # 1.000. (Uses a conformer embed seed that avoids an unrelated numpy eigh non-convergence in
-    # the shared PCA seeder -- it trips the vol optimizer on this molecule too, so it is not a
-    # vol_lipo issue.)
+    # end-to-end on the same deuterated molecule (embed seed 2 avoids an unrelated eigh
+    # non-convergence in the shared PCA seeder that also trips vol)
     m2 = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))
     params2 = AllChem.ETKDGv3(); params2.randomSeed = 2
     assert AllChem.EmbedMolecule(m2, params2) == 0

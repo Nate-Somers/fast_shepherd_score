@@ -1,16 +1,12 @@
-"""Fused forward+backward LINEAR HARD-SPHERE (excluded-volume "avoid") kernel in Triton.
+"""Linear hard-sphere excluded-volume ("avoid") penalty kernel in Triton.
 
-The GPU twin of ``cpu._avoid_grad_kernel``: value + SE(3) gradient of the piecewise-linear penalty
+Value + SE(3) gradient of the piecewise-linear penalty
 
     A_pen = sum_a sum_b relu((d0 - ||A_a - B'_b||)/d0),   B'_b = R(q) B_b + t
 
-A = fixed avoid points (ref frame, NOT transformed), B = fit-avoid points (transformed). This is a
-structural clone of ``shape_triton._gauss_overlap_se3_tiled`` -- same one-CTA-per-pair layout, same
-A/B tile loops, and the SAME shared ``_quat_to_rotmat`` / ``_quat_grad_tail`` device functions -- with
-only the inner per-pair scalar changed: a ``tl.sqrt`` + hinge instead of ``tl.exp2`` (cheaper, and
-``tl.where`` selects the active band with no warp divergence). The numba CPU twin is
-``cpu.overlap_score_grad_avoid_se3_batch``; both share an identical call signature so the dispatch
-wrapper is drop-in.
+with A the fixed avoid points (ref frame, not transformed) and B the fit points. Structurally
+the shape kernel (``shape_triton._gauss_overlap_se3_tiled``) with the Gaussian replaced by a
+``tl.sqrt`` + hinge; the numba twin is ``cpu.overlap_score_grad_avoid_se3_batch``.
 """
 from __future__ import annotations
 
@@ -124,9 +120,9 @@ def overlap_score_grad_avoid_se3_batch(
     num_warps: int | None = None,
     num_stages: int | None = None,
 ):
-    """Linear hard-sphere avoid penalty value + SE(3) gradient. One CTA per pair.
-    Shapes: A (K, N_pad, 3) fixed avoid points, B (K, M_pad, 3) fit-avoid points, q (K,4), t (K,3).
-    Drop-in twin of ``cpu.overlap_score_grad_avoid_se3_batch`` (identical signature)."""
+    """Linear hard-sphere avoid penalty value + SE(3) gradient; one CTA per pair.
+    Shapes: A (K, N_pad, 3) fixed avoid points, B (K, M_pad, 3) fit points, q (K,4), t (K,3).
+    Returns (S (K,), dQ (K,4), dT (K,3)); same signature as the numba twin."""
     K, N_pad, _ = A.shape
     _, M_pad, _ = B.shape
     device = A.device

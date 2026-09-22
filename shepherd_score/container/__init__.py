@@ -6,8 +6,7 @@ from shepherd_score.container._core import (
 )
 from shepherd_score.container._batch import MoleculePairBatch
 from shepherd_score.container.profiles import Surface, Pharmacophore
-# Explicit data-parallel multi-GPU driver (the large-screen data-parallel path).
-# Lives in the acceleration subpackage; surfaced here for discoverability.
+# Multi-GPU driver from the accel subpackage, re-exported here for discoverability.
 from shepherd_score.accel.multi_gpu import align_multi_gpu, MultiGPUAligner
 
 __all__ = [

@@ -1,9 +1,9 @@
 """``pharm`` / ``pharm_tversky`` driver entry points (directional pharmacophore overlap).
 
 The default objective (``extended_points=False``) runs the generic engine on the in-register
-``pharm_grad_dq_se3_batch`` kernel. ``extended_points=True`` -- an anchor+vector Gaussian term
-with no directional weighting -- has no kernel and keeps the eager autograd / analytical-gradient
-loop below, exactly as it always ran.
+``pharm_grad_dq_se3_batch`` kernel. ``extended_points=True``, an anchor+vector Gaussian term
+with no directional weighting, has no kernel and keeps the eager autograd / analytical-gradient
+loop below.
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def coarse_fine_pharm_align_many(
         N_real=None, M_real=None, early_stop_patience: int = 5, early_stop_tol: float = 1e-5,
         seeds=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched pharmacophore alignment: ``(score, q, t)`` per pair, the transform mapping the
-    ORIGINAL fit onto the ORIGINAL ref (both clouds are centred internally)."""
+    original fit onto the original ref (both clouds are centred internally)."""
     if not extended_points:
         a = batch(anchors_1, anchors_2, N_real, M_real)
         chans = {"pharm_ancs": a, "pharm_vecs": batch(vectors_1, vectors_2, a.n_real, a.m_real),
@@ -58,8 +58,8 @@ def _coarse_fine_pharm_extended(
         anchors_1, anchors_2, vectors_1, vectors_2, types_1, types_2, VAA, VBB, *, similarity,
         only_extended, num_seeds, trans_centers, trans_centers_real, num_repeats_per_trans, topk,
         steps_fine, lr, N_real, M_real, early_stop_patience, early_stop_tol):
-    """The legacy eager loop for ``extended_points=True``: the analytical ``grad_R`` path on
-    unpadded inputs, the autograd path on padded ones."""
+    """The eager loop for ``extended_points=True``: the analytical ``grad_R`` path on unpadded
+    inputs, the autograd path on padded ones."""
     device = anchors_1.device
     BATCH, N_pad, _ = anchors_1.shape
     _, M_pad, _ = anchors_2.shape
@@ -211,7 +211,7 @@ _VBB_MEMO: dict = {}
 
 
 def _self_overlap_cached(anchors, vectors, types, *, extended_points, only_extended, N_real):
-    """``batch_pharm_self_overlap`` memoised on the identity of its inputs (the entry HOLDS a
+    """``batch_pharm_self_overlap`` memoised on the identity of its inputs (the entry holds a
     reference to what it keyed on, so a data_ptr cannot be recycled under the key)."""
     key = (anchors.data_ptr(), tuple(anchors.shape), vectors.data_ptr(), types.data_ptr(),
            None if N_real is None else N_real.data_ptr(),
@@ -228,7 +228,7 @@ def _self_overlap_cached(anchors, vectors, types, *, extended_points, only_exten
 
 def _self_overlap_shared_ref(anchors, vectors, types, *, extended_points, only_extended,
                              N_real, shared):
-    """Self-overlap of a REF side that may be one molecule replicated across the batch."""
+    """Self-overlap of a ref side that may be one molecule replicated across the batch."""
     if not shared or anchors.shape[0] <= 1:
         return batch_pharm_self_overlap(anchors, vectors, types, extended_points=extended_points,
                                         only_extended=only_extended, N_real=N_real)

@@ -1,15 +1,7 @@
-"""Gates for the one alignment objective with no kernel: pharmacophore ``extended_points``.
-
-`extended_points=True` adds an anchor+vector Gaussian term with no directional weighting, which
-none of the dispatched kernels computes, so the batched path hands off to the eager autograd
-driver through `accel/batch/aligners_legacy.py`. `tests/test_alignment.py` covers the objective
-itself, but only through the per-pair torch and jax REFERENCE optimizers -- the batched
-accelerated hand-off had no coverage at all, which a coverage run over `accel/` made visible as a
-0% file. These tests cover the hand-off: that it happens, that the flags reach the driver, and
-that the three settings are genuinely three different objectives.
-
-Scores here were verified bit-identical to 591f695 across all four settings (plain, extended,
-only_extended, and extended with `trans_init`), 0 of 5 moved.
+"""The pharmacophore ``extended_points`` objective has no kernel, so the batched path hands off
+to the eager autograd driver (``accel/batch/aligners_legacy.py``). These tests check that the
+hand-off happens, that the flags reach the driver, and that the three settings are three
+different objectives.
 """
 import warnings
 
@@ -63,9 +55,7 @@ def mols():
 ])
 def test_extended_points_routes_to_the_kernel_free_driver(flags, expect_legacy, mols,
                                                           monkeypatch):
-    """`extended_points=True` must leave the kernel path; anything else must stay on it. The
-    condition lives in one place (`aligners._align_batch`), and getting it wrong would either
-    silently score a different objective or lose the extended term entirely."""
+    """``extended_points=True`` must leave the kernel path and anything else must stay on it."""
     from shepherd_score.accel.batch import aligners_legacy
 
     calls = []
@@ -87,8 +77,7 @@ def test_extended_points_routes_to_the_kernel_free_driver(flags, expect_legacy, 
 
 
 def test_the_three_settings_are_three_different_objectives(mols):
-    """Plain, extended and only-extended must give different scores on a distinct pair. If two
-    of them agreed, a flag would be silently ignored -- the failure mode this file exists for."""
+    """Plain, extended and only-extended must score differently on a distinct pair."""
     plain = _run(mols)
     ext = _run(mols, extended_points=True)
     only = _run(mols, extended_points=True, only_extended=True)
@@ -108,14 +97,12 @@ def test_the_three_settings_are_three_different_objectives(mols):
     {"extended_points": True, "only_extended": True},
 ])
 def test_self_copy_is_one_on_the_extended_objective(flags, mols):
-    """The kernel-free driver still has to satisfy the basic identity: a molecule against a copy
-    of itself scores 1.0."""
+    """A molecule against a copy of itself scores 1.0 on the extended objective."""
     assert np.isclose(_run(mols, **flags)[0], 1.0, atol=1e-4)
 
 
 def test_extended_points_composes_with_trans_init(mols):
-    """The two legacy paths are independent and must compose: the kernel-free driver takes the
-    translation-seeded coarse grid as well. Verified bit-identical to 591f695."""
+    """The kernel-free driver also takes the translation-seeded coarse grid."""
     ext = _run(mols, extended_points=True)
     ti = _run(mols, extended_points=True, trans_init=True)
     assert np.isclose(ti[0], 1.0, atol=1e-4), f"trans_init self-copy {ti[0]}"

@@ -1,19 +1,11 @@
-"""
-Surface diagnostics: detect atom-border "crimps" and quantify how much a surface point cloud
+"""Surface diagnostics: detect atom-border crimps and quantify how much a surface point cloud
 leaks atom positions.
 
 The molecular surface is the outer boundary of the union of (vdW + probe) spheres. For a point
-``x`` the *shell residual* to atom ``i`` is ``| ||x - c_i|| - a_i |`` with ``a_i = vdW_i + probe``
-(the distance from ``x`` to atom ``i``'s sphere, NOT to its center). Then:
-
-- ``leak``  : a point with shell residual ~0 to ONE sphere sits exactly on that atom's sphere, so
-              the atom center is directly recoverable -> a leak.
-- ``crimp`` : a point with shell residual ~0 to TWO spheres sits where two spheres intersect = an
-              atom border / concave seam (plus a local normal discontinuity).
-
-These functions need only numpy + scipy (no Open3D), so they run anywhere and are the validation
-gate for any new surfacer: a low-leak surface spreads its shell-residual mass off zero, and a
-smooth surfacer rounds the crimps (lower curvature there).
+``x`` the shell residual to atom ``i`` is ``| ||x - c_i|| - a_i |`` with ``a_i = vdW_i + probe``.
+A point with residual ~0 to one sphere sits on that atom's sphere, so the centre is recoverable
+(a leak); a point with residual ~0 to two spheres sits on an atom border (a crimp). Needs only
+numpy and scipy, so it can gate any surface generator.
 """
 from __future__ import annotations
 
@@ -28,11 +20,7 @@ def _sorted_shell_residuals(points: np.ndarray,
                             centers: np.ndarray,
                             radii: np.ndarray,
                             probe_radius: float = 1.2) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-point residual ``| ||x-c_i|| - (vdW_i+probe) |`` to every atom, sorted ascending.
-
-    Returns ``(residuals_sorted (M,N), owner_index_sorted (M,N))`` where column 0 is the nearest
-    sphere (the one the point sits on).
-    """
+    """Per-point residual to every atom sphere, sorted ascending, as ``(residuals (M,N), atom order (M,N))``."""
     a = np.asarray(radii) + probe_radius
     R = np.abs(distance.cdist(points, centers) - a)
     order = np.argsort(R, axis=1)
@@ -43,12 +31,10 @@ def leak_metrics(points: np.ndarray,
                  centers: np.ndarray,
                  radii: np.ndarray,
                  probe_radius: float = 1.2) -> Dict[str, float]:
-    """How close the points lie to the atom spheres (lower residual => more leak).
+    """How close the points lie to the atom spheres (lower residual means more leak).
 
     Returns median / mean shell residual (A) and the fraction of points within 0.05 / 0.10 A of a
-    sphere. For scale: the ``method='mesh'`` (Open3D ball-pivoting + Poisson-disk) surfacer gives
-    ~0.010 A median with 86-98% within 0.05 A; a surface whose points lie exactly on the
-    (vdW + probe) spheres gives 0.000 A / ~100%.
+    sphere; points lying exactly on the (vdW + probe) spheres give 0.000 A / 100%.
     """
     Rs, _ = _sorted_shell_residuals(points, centers, radii, probe_radius)
     nearest = Rs[:, 0]
@@ -68,8 +54,8 @@ def crimp_points(points: np.ndarray,
                  seam_tol: float = 0.35) -> Tuple[np.ndarray, np.ndarray]:
     """Boolean mask of atom-border (crimp) points + the owner atom index of every point.
 
-    A crimp point sits on its owner sphere (``residual[0] < on_shell_tol``) AND close to a second
-    atom's sphere (``residual[1] < seam_tol``) -- i.e. near where two spheres intersect.
+    A crimp point sits on its owner sphere (``residual[0] < on_shell_tol``) and close to a second
+    atom's sphere (``residual[1] < seam_tol``), i.e. near where two spheres intersect.
     """
     Rs, order = _sorted_shell_residuals(points, centers, radii, probe_radius)
     is_crimp = (Rs[:, 0] < on_shell_tol) & (Rs[:, 1] < seam_tol)
@@ -89,12 +75,8 @@ def center_recovery_attack(points: np.ndarray,
                            radii: np.ndarray,
                            probe_radius: float = 1.2,
                            min_pts: int = 8) -> Dict[str, float]:
-    """Strongest-case leak test: assume the attacker knows each point's owner atom, fit a sphere per
-    atom, and recover its center. Returns the recovery error (A) -- HIGHER is safer.
-
-    Exactly-on-sphere surfaces give ~0 (atoms fully recovered); a smooth off-sphere surface gives a
-    large error (atoms hidden).
-    """
+    """Strongest-case leak test: fit a sphere to each atom's owned points and recover its centre.
+    Returns the recovery error (A); higher is safer, and points exactly on the spheres give ~0."""
     _, order = _sorted_shell_residuals(points, centers, radii, probe_radius)
     owner = order[:, 0]
     errs = []
@@ -113,8 +95,7 @@ def center_recovery_attack(points: np.ndarray,
 
 def local_curvature(points: np.ndarray, k: int = 12) -> np.ndarray:
     """Per-point local non-flatness: smallest / total eigenvalue of the kNN covariance (0 = flat,
-    higher = more curved/faceted). Crimps are high-curvature; a smoother surface lowers it there.
-    """
+    higher = more curved or faceted). Crimps are high-curvature points."""
     tree = cKDTree(points)
     _, nbr = tree.query(points, k=min(k, len(points)))
     out = np.empty(len(points))
@@ -129,8 +110,8 @@ def summarize(points: np.ndarray,
               centers: np.ndarray,
               radii: np.ndarray,
               probe_radius: float = 1.2) -> Dict[str, float]:
-    """One-call report: leak metrics + crimp fraction + center-recovery error + curvature at vs off
-    the crimps. Use this to gate any surfacer (mesh, smooth_sdf, ...)."""
+    """One-call report: leak metrics, crimp fraction, centre-recovery error and curvature at vs off
+    the crimps, for gating a surface generator."""
     out: Dict[str, float] = {}
     out.update(leak_metrics(points, centers, radii, probe_radius))
     out.update(center_recovery_attack(points, centers, radii, probe_radius))

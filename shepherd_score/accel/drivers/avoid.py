@@ -1,5 +1,5 @@
-"""``vol_avoid`` driver entry points: shape Tanimoto MINUS a linear hard-sphere excluded-volume
-penalty against a FIXED avoid cloud in the reference frame (the one pair-level input)."""
+"""``vol_avoid`` driver entry points: shape Tanimoto minus a linear hard-sphere excluded-volume
+penalty against a fixed avoid cloud in the reference frame (the one pair-level input)."""
 from __future__ import annotations
 
 import torch

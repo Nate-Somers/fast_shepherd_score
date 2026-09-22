@@ -1,7 +1,6 @@
-"""The mode registry (``accel/_modes.py``) is the single source of truth for the alignment
-modes. These tests pin its internal invariants and assert every consumer that used to keep its
-own copy (aligners seeds/steps, cpu_pool POOL_MODES + aliases, multi_gpu attr maps + aliases,
-screen attr maps + aliases) now agrees with it -- so a future mode can be added in one place.
+"""The mode registry (``accel/_modes.py``) is the single source of truth for alignment modes:
+its internal invariants hold and every consumer (aligners, cpu_pool, multi_gpu, screen)
+agrees with it.
 """
 import pytest
 
@@ -29,8 +28,7 @@ def test_legacy_aliases_resolve_to_canonical():
 
 
 def test_process_modes_match_mode_spec():
-    """PROCESS_MODES must equal the torch-typed _MODE_SPEC keys (the authority for the GPU
-    process / CPU-pool path), and the spec's (transform, score) 'out' must match MODE_ATTRS."""
+    """PROCESS_MODES equals the ``_MODE_SPEC`` keys and each spec's ``out`` matches MODE_ATTRS."""
     pytest.importorskip("torch")
     from shepherd_score.accel.batch import _MODE_SPEC
     assert tuple(_MODE_SPEC) == M.PROCESS_MODES
@@ -73,8 +71,7 @@ def test_screen_attr_maps_cover_all_modes():
 
 
 def test_moleculepair_batch_aligner_binds_are_registry_driven():
-    """The @_bind_batch_aligners decorator must bind accel.batch._align_batch_<mode> for every
-    canonical mode AND every legacy alias, identically to the old explicit staticmethod block."""
+    """``_align_batch_<mode>`` is bound on MoleculePair for every canonical mode and legacy alias."""
     pytest.importorskip("torch")
     pytest.importorskip("rdkit")
     from shepherd_score.container._core import MoleculePair
@@ -86,9 +83,7 @@ def test_moleculepair_batch_aligner_binds_are_registry_driven():
 
 
 def test_moleculepair_init_result_slots_cover_registry():
-    """The registry-driven __init__ block must pre-init every MODE_ATTRS slot (transform=eye,
-    score=None) plus the two legacy no_H-variant extras, and legacy-name reads must still resolve
-    through the property aliases. Guards against the loop dropping a slot."""
+    """``MoleculePair.__init__`` pre-initialises every MODE_ATTRS slot and the legacy no_H extras."""
     import numpy as np
     pytest.importorskip("torch")
     Chem = pytest.importorskip("rdkit.Chem")

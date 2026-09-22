@@ -1,9 +1,6 @@
-"""Batched accel parity gates for the ``vol_fukui`` mode (shape + condensed-Fukui reactivity field).
-
-Mirrors ``test_new_modes_accel.py`` (gate 1: numba self-copy == 1.0; gate 3: batched-numba vs the
-per-pair torch reference; gate 2: Triton == numba, CUDA-only) but INJECTS a deterministic synthetic
-Fukui field via ``Molecule(fukui=...)`` -- the real ``f+ - f-`` field needs the xtb binary (three
-gfn2-xTB single points), and the *accel* correctness is independent of how the field was produced.
+"""Batched accel parity gates for ``vol_fukui``: numba self-copy = 1.0, batched-numba vs the
+per-pair torch reference, and Triton = numba (CUDA-only). A deterministic synthetic Fukui field
+is injected via ``Molecule(fukui=...)`` so no xtb binary is needed.
 """
 import warnings
 import numpy as np
@@ -22,8 +19,7 @@ CAF = "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"
 
 
 def _synthetic_fukui(rd):
-    """Deterministic SIGNED per-atom field (full with-H order) standing in for the xTB Fukui dual
-    descriptor; a pure function of atom order so a molecule and its copy get the same field."""
+    """Deterministic signed per-atom field in with-H order; a function of atom order so copies match."""
     z = np.array([a.GetAtomicNum() for a in rd.GetAtoms()], dtype=np.float32)
     return (0.2 * ((z % 4) - 1.5)).astype(np.float32)
 
@@ -41,7 +37,7 @@ MODE, ATTR = "vol_fukui", "sim_aligned_vol_fukui"
 
 
 def test_numba_self_copy_is_one():
-    """Gate 1/4: a molecule aligned to a copy of itself scores 1.0 under the numba backend."""
+    """A molecule aligned to a copy of itself scores 1.0 under the numba backend."""
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     b = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(IBU), do_center=True,
                                         device=torch.device("cpu"))])
@@ -51,8 +47,7 @@ def test_numba_self_copy_is_one():
 
 
 def test_numba_batched_matches_per_pair():
-    """Gate 3: batched-numba matches the per-pair torch reference on a distinct pair at the shipped
-    (MODE_SEEDS, MODE_STEPS) budget (loose tol: different multi-start seed sets, same basin)."""
+    """Batched-numba lands in the per-pair reference's basin at the shipped seed/step budget."""
     from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     nr, ns = MODE_SEEDS[MODE], MODE_STEPS[MODE]
@@ -72,9 +67,7 @@ def test_numba_batched_matches_per_pair():
 @pytest.mark.cuda
 @pytest.mark.skipif(not (TORCH and torch.cuda.is_available()), reason="CUDA required")
 def test_triton_matches_numba():
-    """Gate 2 (Triton == numba): reuses the already-parity-validated shape + ESP kernels, so this
-    end-to-end check confirms the vol_lipo-driver blend dispatches device-consistently for the
-    Fukui field. CPU-only boxes skip it."""
+    """The Triton batched driver agrees with the numba one on the same pair."""
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     bn = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,
                                          device=torch.device("cpu"))])

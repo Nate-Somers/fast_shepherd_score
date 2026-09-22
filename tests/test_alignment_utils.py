@@ -121,9 +121,7 @@ class TestSE3:
         assert torch.allclose(out_transformed, sol_repeated)
 
     def test_apply_se3_transform_torch_R1_collapses_to_single(self):
-        """Fork contract: a singleton batch (R==1) of (1,N,3)+(1,4,4) returns (N,3), not
-        (1,N,3), and equals the single-instance result. The accel/autograd optimizers rely
-        on this so num_repeats==1 batched calls agree with the unbatched path. Pin it."""
+        """A singleton batch (R==1) returns (N,3), equal to the single-instance result."""
         pts_single = torch.Tensor(self.ex_set_of_points)
         tf_single = torch.Tensor(self.sol_se3_transform)
         out_single = apply_SE3_transform(pts_single, tf_single)
@@ -159,10 +157,7 @@ class TestPCA:
     """
 
     def test_rotation_axis_np_antiparallel_is_finite_perpendicular(self):
-        """rotation_axis_np on ANTIPARALLEL vectors must return a finite unit axis perpendicular
-        to v1 -- not a 0/0 NaN. The PCA seeder flips a principal axis (pmi_ref[0] = -pmi_ref[0]),
-        so a degenerate molecule hits v2 == -v1 exactly; the old code divided by the zero-norm
-        cross product and produced a NaN that later crashed np.linalg.eigh."""
+        """Antiparallel vectors give a finite unit axis perpendicular to v1, not a 0/0 NaN."""
         from shepherd_score.alignment.utils.pca_np import rotation_axis_np
         for v1 in ([1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [0.6, -0.8, 0.0]):
             v1 = np.asarray(v1)
@@ -172,16 +167,13 @@ class TestPCA:
             assert np.isclose(np.dot(ax, v1), 0.0, atol=1e-6), "axis must be perpendicular to v1"
 
     def test_rotation_axis_np_generic_unchanged(self):
-        """For NON-degenerate (non-parallel) vectors the result is the plain normalized cross
-        product -- the fix must not alter this path."""
+        """Non-parallel vectors give the plain normalized cross product."""
         from shepherd_score.alignment.utils.pca_np import rotation_axis_np
         v1, v2 = np.array([1., 0., 0.]), np.array([0., 1., 0.])
         np.testing.assert_allclose(rotation_axis_np(v1, v2), [0., 0., 1.], atol=1e-7)
 
     def test_degenerate_molecules_align_without_eigh_crash(self):
-        """Linear / single-heavy-atom / symmetric-top molecules used to crash the per-pair torch
-        seeder with LinAlgError 'Eigenvalues did not converge' (NaN PCA axis -> NaN coords -> eigh).
-        They must now self-align to ~1.0 on the per-pair path."""
+        """Linear, single-heavy-atom and symmetric-top molecules self-align to ~1.0 per pair."""
         pytest.importorskip("rdkit")
         from rdkit import Chem
         from rdkit.Chem import AllChem
@@ -201,8 +193,7 @@ class TestPCA:
             assert float(np.asarray(mp.sim_aligned_vol_noH)) > 0.99, f"self-overlap too low for {smi}"
 
     def test_mmff_unparameterizable_raises_clear_error(self):
-        """A molecule MMFF cannot parameterize (H2) must raise a clear ValueError from
-        get_partial_charges, not the cryptic ``'NoneType' has no attribute 'GetMMFFPartialCharge'``."""
+        """A molecule MMFF cannot parameterize (H2) raises a clear ValueError on the charge property."""
         pytest.importorskip("rdkit")
         from rdkit import Chem
         from rdkit.Chem import AllChem
@@ -210,10 +201,8 @@ class TestPCA:
 
         m = Chem.AddHs(Chem.MolFromSmiles("[H][H]"))
         AllChem.EmbedMolecule(m, randomSeed=0)
-        # TWO things moved since this test was written. Charges are generated LAZILY, so
-        # CONSTRUCTION no longer raises -- a molecule nobody scores for ESP never needs them --
-        # and the default charge model is now 'xtb', which parameterizes H2 happily and never
-        # reaches MMFF. Force the MMFF path and touch the lazy property to exercise the guard.
+        # charges are lazy and the default model is xtb, so force the MMFF path and touch the
+        # property to exercise the guard
         mol = Molecule(m, charge_model="mmff")
         with pytest.raises(ValueError, match="MMFF94 could not parameterize"):
             _ = mol.partial_charges

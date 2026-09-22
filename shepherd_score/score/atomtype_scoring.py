@@ -1,18 +1,12 @@
 """
-Atom-identity ("atom-type") categorical overlap scoring with PyTorch.
+Atom-identity (categorical) Gaussian overlap scoring with PyTorch.
 
-This is the scoring channel for the ``vol_atomtype`` alignment mode: a Gaussian volume overlap
-that is *partitioned by a categorical per-atom label* (the atomic number / element identity), so
-only atoms of the SAME element contribute to the cross overlap. It is the same construction the
-pharmacophore "color" channel uses -- per-type masked Gaussian overlap, summed over types, then a
-self-normalised Tanimoto (or Tversky) -- but over an arbitrary categorical label instead of the
-eight hardcoded pharmacophore types in :mod:`shepherd_score.score.pharmacophore_scoring`.
-
-The overlap primitive is the shared atom-centred Gaussian ``VAB_2nd_order`` from
-:mod:`shepherd_score.score.gaussian_overlap`, so the width convention matches the ``vol`` shape
-channel (``alpha=0.81`` volumetric). Labels are compared by equality only (their numeric value is
-never used as a coordinate), so any integer-coded categorical scheme works; the ``vol_atomtype``
-mode passes heavy-atom atomic numbers (:meth:`shepherd_score.container.Molecule.get_atomic_numbers`).
+Scoring channel for the ``vol_atomtype`` alignment mode: a Gaussian volume overlap partitioned by
+a categorical per-atom label (the atomic number), so only atoms of the same element contribute to
+the cross overlap. It is the pharmacophore colour construction (per-type masked overlap, summed
+over types, then a self-normalised Tanimoto or Tversky) over an arbitrary integer label. The
+primitive is :func:`shepherd_score.score.gaussian_overlap.VAB_2nd_order`, so the width convention
+matches the ``vol`` channel (``alpha=0.81``). Labels are compared by equality only.
 """
 from typing import Literal, Union
 
@@ -25,8 +19,8 @@ _SIM_TYPE = Literal['tanimoto', 'tversky', 'tversky_ref', 'tversky_fit']
 
 
 def _sigma_for(similarity: str) -> Union[float, None]:
-    """Map a similarity name to its Tversky ``sigma`` (weight on the reference self-overlap), or
-    ``None`` for symmetric Tanimoto. Mirrors :func:`pharmacophore_scoring.get_overlap_pharm`."""
+    """Tversky ``sigma`` (weight on the reference self-overlap) for a similarity name, or ``None``
+    for symmetric Tanimoto; the same mapping as :func:`pharmacophore_scoring.get_overlap_pharm`."""
     s = similarity.lower()
     if s == 'tanimoto':
         return None
@@ -49,22 +43,17 @@ def get_overlap_atomtype(labels_1: torch.Tensor,
     """
     Compute the atom-identity (categorical) Gaussian overlap score.
 
-    Only atoms sharing the same categorical ``label`` (e.g. atomic number) contribute to the cross
-    overlap. For each label present, the per-label cross/self Gaussian overlaps are summed, then the
-    totals are reduced to a Tanimoto (or Tversky) similarity::
+    Only atoms sharing the same label (e.g. atomic number) contribute to the cross overlap. The
+    per-label cross and self overlaps are summed over labels, then reduced to a Tanimoto or
+    Tversky similarity::
 
         Tanimoto = Σ_t VAB_t / (Σ_t VAA_t + Σ_t VBB_t - Σ_t VAB_t)
         Tversky  = Σ_t VAB_t / (sigma·Σ_t VAA_t + (1-sigma)·Σ_t VBB_t)   (clamped to 1)
 
-    A label present in only one molecule contributes to that molecule's self-overlap sum (the
-    denominator) but not to the cross overlap -- exactly the pharmacophore-colour convention -- so
-    an element in the reference that the fit lacks correctly penalises the similarity. A molecule
-    scored against a copy of itself gives 1.000 for either reduction.
-
-    Only the ``centers`` are geometric; ``labels`` are used for equality masking only. Supports both
-    single-instance and batched (``B`` poses of the SAME label sets) inputs: pass 1-D ``labels`` and
-    optionally batched ``(B,N,3)`` centers (the multi-start optimiser repeats the poses, not the
-    labels).
+    A label present in only one molecule contributes to that molecule's self-overlap (the
+    denominator) but not to the cross overlap, as in the pharmacophore colour convention. Labels
+    are used for equality masking only. Batched ``(B,N,3)`` centers with 1-D labels are supported
+    (the multi-start optimiser repeats the poses, not the labels).
 
     Parameters
     ----------
@@ -93,8 +82,7 @@ def get_overlap_atomtype(labels_1: torch.Tensor,
         labels_2 = torch.as_tensor(labels_2)
 
     batched = centers_1.dim() == 3
-    # Running totals accumulate as python 0. -> tensor after the first label; a batch keeps a (B,)
-    # vector because each VAB_2nd_order over batched centers returns (B,).
+    # Running totals; batched centers keep a (B,) vector because VAB_2nd_order then returns (B,).
     VAB = torch.zeros(centers_1.shape[0], device=centers_1.device) if batched else torch.zeros((), device=centers_1.device)
     VAA = torch.zeros_like(VAB)
     VBB = torch.zeros_like(VAB)

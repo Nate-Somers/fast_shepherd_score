@@ -34,9 +34,7 @@ class _Mol:
 
 
 class _Pair:
-    """MoleculePair stand-in: ``*_molec.<arr>`` for the pool's ``extract``, and the
-    pre-cached ``_*_t`` tensors the single-process ``_align_batch_*`` reads directly
-    (normally set by ``MoleculePair.__init__``)."""
+    """MoleculePair stand-in with the ``*_molec`` arrays and the pre-cached ``_*_t`` tensors."""
     def __init__(self, ref, fit):
         self.ref_molec = _Mol(ref)
         self.fit_molec = _Mol(fit)
@@ -74,8 +72,7 @@ def _rand_rot(rng):
 
 
 def _se3_copy(ref, rng):
-    """A rigid SE(3) copy of ref (optimum score = 1.0) -- the benchmark's workload and
-    the representative real case: a well-defined optimum that converges cleanly."""
+    """A rigid SE(3) copy of ref, so the optimum score is 1.0."""
     R, t = _rand_rot(rng), (rng.standard_normal(3) * 2).astype(np.float32)
     v = ref["pharm_vecs"] @ R.T
     return dict(
@@ -103,10 +100,7 @@ def _make_pairs(k, rng, kind="se3"):
 @pytest.mark.parametrize("mode", ["vol", "surf", "esp", "pharm"])
 @pytest.mark.parametrize("num_workers", [2, 3])
 def test_pool_matches_single_process(mode, num_workers):
-    """Pooled (sharded) scores match the single-process batch on the representative
-    workload -- rigid SE(3) self-copies (optimum 1.0), the benchmark's case. Not strictly
-    bit-identical (the fine loop runs until EVERY pair in the batch has stopped improving,
-    so a shard plateaus a step or two apart), but a clean optimum converges to the same point."""
+    """Pooled matches single-process on SE(3) self-copies; per-shard early stop makes it close, not exact."""
     rng = np.random.default_rng(0)
     raw = _make_pairs(10, rng, kind="se3")
     sc_attr = bm._MODE_SPEC[_cpu_pool._LEGACY_MODE_ALIASES.get(mode, mode)]["out"][1]
@@ -124,10 +118,7 @@ def test_pool_matches_single_process(mode, num_workers):
 
 @pytest.mark.parametrize("mode", ["vol", "surf", "esp", "pharm"])
 def test_pool_distinct_pairs_sanity(mode):
-    """Distinct (different) molecules: a looser guard that the pool routes pairs and
-    kwargs correctly -- a real bug (wrong pairing / dropped charge) moves a score by
-    >>5e-2, while the early-stop drift from shard composition on these harder optima stays
-    under it (a pair runs as long as its slowest-converging batch-mate)."""
+    """Distinct molecules: a looser bound that still catches wrong pairing or dropped kwargs."""
     rng = np.random.default_rng(7)
     raw = _make_pairs(8, rng, kind="distinct")
     sc_attr = bm._MODE_SPEC[_cpu_pool._LEGACY_MODE_ALIASES.get(mode, mode)]["out"][1]
@@ -142,9 +133,7 @@ def test_pool_distinct_pairs_sanity(mode):
 
 @pytest.mark.parametrize("mode", ["vol", "surf", "esp", "pharm"])
 def test_pool_self_copy_exact(mode):
-    """Self-copy (fit == ref) is the optimum: every pair converges to ~1.0 immediately
-    and identically, so here pooled == single-process to float precision -- proving the
-    sharding mechanism itself is exact (the small drift above is purely early-stop)."""
+    """Self-copies converge immediately, so pooled equals single-process to float precision."""
     rng = np.random.default_rng(2)
     raw = _make_pairs(8, rng, kind="exact")            # fit = exact copy of ref
     sc_attr = bm._MODE_SPEC[_cpu_pool._LEGACY_MODE_ALIASES.get(mode, mode)]["out"][1]

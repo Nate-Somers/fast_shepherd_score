@@ -1,16 +1,7 @@
-"""Gates for the LEGACY translation-seeded accelerated path (``trans_init=True``).
-
-That path replaces the SO(3) multi-start with a coarse grid of pose hypotheses built around the
-reference molecule's own atom positions, scores the grid value-only and keeps the top-k as
-fine-loop starts. It had no test at all before this file, which is how a real regression survived
-review: the pre-registry drivers did not agree on WHICH cloud the grid is built from -- ``esp``,
-``pharm`` and ``vol_color`` used the cloud they seed from, but ``esp_combo`` used the SURFACE
-clouds while seeding from the volume centers -- and routing every mode through its seed channel
-moved ``vol_and_surf_esp`` scores by up to 1.24% relative. The choice now lives on the ModeSpec
-as ``coarse_channel`` and the first test below pins it per mode.
-
-Surfaces and charges are INJECTED (deterministic pseudo-random clouds) so the file needs neither
-open3d nor xtb: which cloud reaches ``build_coarse_grid`` does not depend on how it was produced.
+"""Gates for the translation-seeded accelerated path (``trans_init=True``): the coarse grid is
+built from the cloud each mode's ``coarse_channel`` names, the grid size follows the legacy
+contract, and self-copies still score ~1.0. Surfaces and charges are injected so the file needs
+neither open3d nor xtb.
 """
 import warnings
 
@@ -29,12 +20,8 @@ IBU = "CC(C)Cc1ccc(cc1)C(C)C(=O)O"
 CAF = "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"
 N_SURF = 75
 
-# Seven of the 21 modes expose ``trans_init`` publicly; five of them act on it, and those five map
-# here to the cloud their coarse grid is built from, as the PRE-REGISTRY driver built it. The
-# other two (``vol``, ``surf``) accept it and ignore it -- see the last test.
+# The five modes that act on ``trans_init`` -> the cloud their coarse grid is built from.
 # Hardcoded on purpose: deriving it from the spec would only restate the code under test.
-# "atoms" and "heavy" are the same cloud for these fixtures, so this table pins the surface /
-# anchor / atom distinction, which is the one that regressed.
 GRID_CLOUD = {
     "vol_esp": "atoms",
     "surf_esp": "surf",
@@ -102,8 +89,7 @@ def _spy(monkeypatch):
 
 @pytest.mark.parametrize("mode", sorted(GRID_CLOUD))
 def test_coarse_grid_is_built_from_the_documented_cloud(mode, monkeypatch):
-    """The grid must be built from the mode's ``coarse_channel`` -- its seed channel unless the
-    spec overrides it, which only the combo pair does."""
+    """The grid must be built from the mode's ``coarse_channel`` cloud."""
     from shepherd_score.container import MoleculePairBatch
 
     ref, fit = _mol(IBU), _mol(CAF, seed=1)
@@ -122,8 +108,7 @@ def test_coarse_grid_is_built_from_the_documented_cloud(mode, monkeypatch):
 
 
 def test_grid_size_follows_the_legacy_contract(monkeypatch):
-    """G = 10*P + 5 for P translation centers, and the batch layer takes P from the REFERENCE
-    molecule's atom positions."""
+    """G = 10*P + 5 for P translation centers, with P taken from the reference molecule's atoms."""
     from shepherd_score.container import MoleculePairBatch
 
     ref, fit = _mol(IBU), _mol(CAF, seed=1)
@@ -146,19 +131,13 @@ def _self_copy(mode):
 
 @pytest.mark.parametrize("mode", [m for m in sorted(GRID_CLOUD) if m != "vol_and_surf_esp"])
 def test_self_copy_scores_one_through_the_coarse_path(mode):
-    """A molecule aligned to a copy of itself still scores ~1.0 when the fine-loop starts come
-    from the coarse grid rather than the SO(3) multi-start."""
+    """A self-copy still scores ~1.0 when the fine-loop starts come from the coarse grid."""
     s = _self_copy(mode)
     assert 0.97 <= s <= 1.0 + 1e-5, f"{mode} trans_init self-copy scored {s}"
 
 
 def test_combo_self_copy_falls_short_of_one_as_it_always_has():
-    """``vol_and_surf_esp`` is the one mode that does NOT recover the identity pose from the
-    translation-seeded grid: its fine loop gets 60 steps from grid starts that are all far from
-    identity, and its blended shape+ESP objective does not close the gap. This is PRE-EXISTING,
-    not a refactor artifact -- 591f695 returns the same 0.5369912981987 on this fixture, to every
-    digit. Pinned as a floor so a future change that fixes it is noticed rather than silently
-    absorbed, and so the shortfall is not mistaken for a regression."""
+    """``vol_and_surf_esp`` cannot reach identity from grid starts; pinned so any change is noticed."""
     s = _self_copy("vol_and_surf_esp")
     assert 0.45 <= s < 0.97, (
         f"vol_and_surf_esp trans_init self-copy scored {s}; the shipped behaviour is ~0.54. "
@@ -168,12 +147,7 @@ def test_combo_self_copy_falls_short_of_one_as_it_always_has():
 
 @pytest.mark.parametrize("mode", ["vol", "surf"])
 def test_shape_modes_accept_trans_init_and_ignore_it(mode, monkeypatch):
-    """``vol`` and ``surf`` take the keyword and do nothing with it: the accelerated shape path
-    re-derives its own seeds and never builds a coarse grid. Scores are IDENTICAL either way.
-
-    Pinned because the keyword's presence in the signature reads as support, and a future change
-    that starts honouring it would silently move every caller's shape scores. Verified to hold on
-    591f695 as well (same bit pattern with the keyword on and off)."""
+    """``vol`` and ``surf`` accept the keyword and ignore it; scores are identical either way."""
     from shepherd_score.accel._modes import MODE_ATTRS
     from shepherd_score.container import MoleculePairBatch
 
@@ -193,10 +167,7 @@ def test_shape_modes_accept_trans_init_and_ignore_it(mode, monkeypatch):
 @pytest.mark.skipif(not (TORCH and torch.cuda.is_available()), reason="CUDA required")
 @pytest.mark.parametrize("mode", sorted(GRID_CLOUD))
 def test_triton_coarse_grid_matches_numba(mode, monkeypatch):
-    """The coarse path is device-dispatched like every other part of the engine, so the GPU must
-    build the grid from the same cloud and land in the same basin as the CPU. The grid itself is
-    built by the shared ``build_coarse_grid``; only the value-only scoring of it is per-device,
-    which is exactly where a channel mix-up would show up as a different top-k."""
+    """The GPU builds the grid from the same cloud and lands in the same basin as the CPU."""
     from shepherd_score.accel._modes import MODE_ATTRS
     from shepherd_score.container import MoleculePairBatch
 

@@ -1,11 +1,7 @@
-"""The typed CPU kernel wrappers convert their invariant inputs once per tensor object.
+"""``kernels/cpu.py::_np_cached`` converts invariant tensors to numpy once per tensor object.
 
-``kernels/cpu.py::_np_cached`` stashes the int64 / float64 numpy copy of a type, table or count
-tensor on the tensor itself, keyed by storage pointer, shape and in-place version counter. The
-eager fine loop calls the pharm wrapper every step with the same objects, so the (K, N_pad)
-type conversions -- 13% of a threaded pharm screen -- happen once per bucket instead of once per
-step. These tests pin the two properties the hoist relies on: a hit returns exactly what a fresh
-conversion would, and any change to the tensor (in-place write, new object) converts again.
+A hit must return exactly what a fresh conversion would, and any change to the tensor
+(in-place write, new object, other dtype) must convert again.
 """
 import numpy as np
 import pytest
@@ -48,8 +44,7 @@ def test_dtype_is_part_of_the_key():
 
 
 def test_pharm_wrapper_repeats_are_identical_and_track_mutation():
-    """Two calls with the same inputs return identical (O, dQ, dT); mutating the type array
-    changes the answer, i.e. the wrapper never serves the pre-mutation conversion."""
+    """Repeated calls give identical results and an in-place type mutation reaches the kernel."""
     torch.manual_seed(0)
     P, N, M = 6, 5, 4
     q = torch.nn.functional.normalize(torch.randn(P, 4), dim=1)

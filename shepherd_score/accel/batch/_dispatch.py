@@ -1,23 +1,13 @@
 # shepherd_score/accel/batch/_dispatch.py
-"""Multi-GPU dispatch, plus the per-mode tensor spec used by the CPU process pool
-(``cpu_pool.py``).
+"""Multi-GPU dispatch, plus the per-mode tensor spec used by the CPU process pool.
 
-Why the transparent path is single-GPU
---------------------------------------
-The alignment is **host-bound**, not kernel-bound, so driving N GPUs from one process
-serialises the per-pair host work on the GIL. The path that scales is **one OS process
-per GPU**. But once the parent holds CUDA tensors it cannot ``fork`` (CUDA + fork is
-unsafe), so workers must ``spawn``, and ``spawn`` re-imports the caller's ``__main__``
-module -- which silently breaks any entry script lacking an
-``if __name__ == '__main__':`` guard. A library must therefore not spawn behind the
-user's back. Consequently:
-
-* :func:`_run_distributed` (the transparent path) runs on a **single GPU** and emits a
-  one-time warning. It never spawns and never hangs.
-* The supported multi-GPU path is the explicit persistent pool
-  :class:`shepherd_score.accel.multi_gpu.MultiGPUAligner` (builds each GPU's shard once
-  and reuses it), where the user opts into multiprocessing deliberately, so the
-  ``__main__`` guard is their call.
+The transparent path runs on a single GPU. The alignment is host-bound, so driving several
+GPUs from one process serialises on the GIL; the path that scales is one process per GPU. A
+parent holding CUDA tensors cannot ``fork``, and ``spawn`` re-imports the caller's ``__main__``,
+which breaks any entry script without an ``if __name__ == '__main__':`` guard, so a library
+must not spawn behind the user's back. :func:`_run_distributed` therefore runs on one GPU with
+a one-time warning; the supported multi-GPU path is the explicit persistent pool
+:class:`shepherd_score.accel.multi_gpu.MultiGPUAligner`.
 """
 from __future__ import annotations
 import threading as _threading
@@ -35,24 +25,23 @@ _WARNED_SINGLE_GPU = False          # emit the "transparent multi-GPU is off" no
 
 
 def _dev_idx(device: torch.device) -> int:
-    """Cache-key component so per-device workspaces/buffers never collide under
-    the multi-GPU dispatcher. Constant 0 on a single GPU -> no behaviour change.
+    """Cache-key component so per-device workspaces never collide under multi-GPU dispatch.
 
-    A bare ``torch.device("cuda")`` has ``index is None``; it must still resolve to
-    a concrete GPU index (the current device), NOT to the CPU sentinel -1."""
+    A bare ``torch.device("cuda")`` has ``index is None`` and must resolve to the current
+    device, not to the CPU sentinel -1."""
     if device.type == "cuda":
         return device.index if device.index is not None else torch.cuda.current_device()
     return -1
 
 
-# Minimum pairs PER DEVICE before multi-GPU sharding is even considered. Below this a
-# single GPU is faster (sharding adds fixed per-call overhead).
+# Minimum pairs per device before multi-GPU sharding is considered; below this a single GPU
+# is faster, since sharding adds a fixed per-call overhead.
 _MIN_SHARD_PER_DEVICE = 4096
 
 
 def _should_distribute(pairs) -> bool:
-    """True when `pairs` is a multi-GPU-sized batch on CUDA (used to gate the
-    transparent dispatch in :func:`_run_distributed`)."""
+    """True when `pairs` is a multi-GPU-sized batch on CUDA; gates the transparent
+    dispatch in :func:`_run_distributed`."""
     if getattr(_DISPATCH_LOCAL, "active", False):
         return False                       # already inside a per-device shard
     if not torch.cuda.is_available() or torch.cuda.device_count() <= 1:
@@ -63,12 +52,11 @@ def _should_distribute(pairs) -> bool:
 
 
 # --- per-mode tensor spec (consumed by the CPU process pool, cpu_pool.py) -----
-# Each mode declares how to (a) pull its per-pair inputs off the pair as picklable numpy
-# arrays -- ``extract`` is a list of ``(side, reader)`` where ``side`` is ``"ref_molec"``,
-# ``"fit_molec"`` or ``"pair"`` and ``reader`` a callable over that object -- (b) rebuild the
-# cached device tensors inside a worker (``tensors``, positional with ``extract``), and (c) read
-# the results back (``out``). DERIVED from each mode's channels, so every registry mode has a
-# worker path; ``accel/_modes.py:PROCESS_MODES`` is the same set.
+# Each mode declares how to pull its per-pair inputs off the pair as picklable numpy arrays
+# (``extract``: ``(side, reader)`` pairs, side in ref_molec / fit_molec / pair), how to rebuild
+# the device tensors in a worker (``tensors``, positional with ``extract``) and which
+# attributes to read back (``out``). Derived from each mode's channels; ``_modes.PROCESS_MODES``
+# is the same set.
 _DTYPES = {"float32": torch.float32, "int64": torch.int64}
 
 
@@ -92,11 +80,8 @@ _MODE_SPEC = {m: _spec_entry(s) for m, s in SPECS.items() if s.process}
 
 
 class _ProcStandIn:
-    """Minimal MoleculePair stand-in used inside a worker process. Carries
-    only the cached device tensors the batched aligner reads (no RDKit / Molecule),
-    so nothing heavy crosses the process boundary -- the worker rebuilds tensors from
-    the numpy arrays it was handed. The aligner reads its inputs via the pre-set
-    ``_*_t`` attributes and writes ``transform_*``/``sim_aligned_*`` back here."""
+    """Minimal MoleculePair stand-in for a worker process: carries only the cached device
+    tensors the batched aligner reads (no RDKit / Molecule), and receives the results."""
     def __init__(self, device):
         self.device = device
 
@@ -115,11 +100,8 @@ def _run_single_gpu(align_fn, pairs, **kwargs):
 
 def _run_distributed(align_fn, pairs, **kwargs):
     """Transparent multi-GPU entry, called by the ``_align_batch_*`` hooks when
-    :func:`_should_distribute` is true.
-
-    Runs on a **single GPU** (plus a one-time warning): a transparent library call must not
-    silently ``spawn`` worker processes. For real multi-GPU throughput use
-    :class:`shepherd_score.accel.multi_gpu.MultiGPUAligner`."""
+    :func:`_should_distribute` is true. Runs on a single GPU with a one-time warning; for real
+    multi-GPU throughput use :class:`shepherd_score.accel.multi_gpu.MultiGPUAligner`."""
     global _WARNED_SINGLE_GPU
     if not _WARNED_SINGLE_GPU:
         import warnings

@@ -1,8 +1,8 @@
 """Helpers for the per-mode driver modules, which are thin entry points over ``engine``.
 
-The driver modules (``shape.py``, ``esp.py``, ``vol_color.py``, ...) keep their historical
-``coarse_fine_*`` / ``fast_optimize_*_batch`` signatures for callers that hand padded tensors
-straight to a driver; each now builds the engine's channel dict and calls :func:`run`.
+The driver modules keep their ``coarse_fine_*`` / ``fast_optimize_*_batch`` signatures for
+callers that hand padded tensors straight to a driver; each builds the engine's channel dict
+and calls :func:`run`.
 """
 from __future__ import annotations
 

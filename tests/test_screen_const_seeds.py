@@ -1,30 +1,8 @@
-"""Gate for the canonical store's constant seed set on EVERY mode that seeds from the atom cloud.
+"""Gate for the canonical store's constant seed set on every mode in ``CONST_SEED_MODES``.
 
-``_common.canonical_seed_quats`` used to reach one mode: ``screen._canonical_batch_kw`` gated on
-``mode == "vol"``, and no other driver could take an external seed set at all. On the same
-canonical store every other mode still ran ``batched_seeds_torch`` -- the per-molecule float64
-eigensolve, measured at 0.82-0.91 us/mol for vol / vol_color / vol_esp -- on coordinates already
-rotated into their principal frame, to rediscover a near-constant answer. The gate is now
-``accel._modes.CONST_SEED_MODES`` and the drivers accept ``seeds=``.
-
-WHAT THIS FILE ASSERTS, and why each half is needed:
-
-* WHICH generator ran. A parity number alone cannot tell the constant-seed path from the old one
-  (both produce a finite score vector and a sane ranking), so each test spies on
-  ``canonical_seed_quats`` AND on ``batched_seeds_torch`` at every module that binds it, and reads
-  the ``batch_kw`` the array aligner actually received. The control leg -- the same screen with
-  the gate emptied -- must show the OPPOSITE counts, or the spies prove nothing.
-* That the screen stays CORRECT under the constant set: the library's own molecule ranks first
-  and scores ~1 (the same anchors gate 5 uses), a returned pose re-scores to its reported score
-  (the transform is in the molecule's frame, which no score-based check can see), and a panel of
-  queries gets the same answer per query as the single-query screen.
-* That the modes seeding from OTHER clouds (surface, anchors) are left exactly as they were.
-
-Parity with the per-molecule seeds is NOT asserted bit-for-bit: the two seed sets differ by each
-molecule's own rotation, so scores legitimately move at the 1e-3 level (Shepherd-Score-Paper
-fig2_speed/validate_canonical.py measured 1.3e-3 mean for vol at N=99,000 with no enrichment
-change over 27 DUDE-Z targets). What is asserted is the top-1 and a rank correlation, on this
-12-molecule fixture, plus the correctness anchors above.
+Spies assert which seed generator ran (and that the control leg shows the opposite), the screen
+stays correct (self-copy anchor, poses re-score, panel equals single query), and modes seeding
+from other clouds are untouched. Parity with per-molecule seeds is by rank, not bit-for-bit.
 """
 import os
 
@@ -47,11 +25,8 @@ from tests.test_screen_arrays import (                                          
 _CLASS_A = tuple(m for m in screenmod._ARRAY_MODES if m in CONST_SEED_MODES)
 _CLASS_B = tuple(m for m in screenmod._ARRAY_MODES if m not in CONST_SEED_MODES)
 
-#: Every module that binds ``batched_seeds_torch`` by NAME, found rather than listed: a module
-#: that imports it at module level (``from ._common import batched_seeds_torch``) holds its own
-#: reference, so patching ``_common`` alone would miss it. The generic fine loop
-#: (``drivers.engine``) is the one caller now, but the list is computed so that a driver keeping
-#: its own binding is still caught -- a hardcoded list is how the spy silently covered nothing.
+#: Every module that binds ``batched_seeds_torch`` by name, found rather than listed, so a
+#: module-level import in any driver is patched too.
 def _seed_modules():
     import importlib
     import pkgutil
@@ -98,8 +73,7 @@ def plain_store(tmp_path_factory, molecules):
 
 
 def _spied_screen(monkeypatch, store_path, queries, mode, *, backend, gate_on=True, **kw):
-    """Screen ``queries`` (one or a panel) recording which seed generator ran and what
-    ``batch_kw`` reached the array aligner. Returns ``(scores (Q,N), hits, seen)``."""
+    """Screen ``queries`` recording which seed generator ran and the ``batch_kw`` the aligner got."""
     import importlib
     from shepherd_score.accel.drivers import _common
 
@@ -116,10 +90,7 @@ def _spied_screen(monkeypatch, store_path, queries, mode, *, backend, gate_on=Tr
             return fn(*a, **k)
         return spy_b
 
-    # Wrap whatever each module currently binds -- no identity guard. The guard version silently
-    # skipped the driver modules under pytest (their binding was not ``real_b`` by then), which
-    # left both legs reporting zero generator calls and proved nothing; wrapping a wrapper is
-    # harmless, since the inner spy counts and then calls the outer one.
+    # wrap whatever each module currently binds, with no identity guard; wrapping a wrapper is harmless
     for name in _SEED_MODULES:
         mod = importlib.import_module(name)
         if hasattr(mod, "batched_seeds_torch"):
@@ -158,9 +129,7 @@ def _spearman(a, b):
 # ---------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("mode", _CLASS_A)
 def test_constant_seeds_replace_the_eigensolve(monkeypatch, canon_store, molecules, mode):
-    """On a canonical store a class-A mode must build ONE constant set per query and never call
-    the per-molecule generator; with the gate emptied the same screen must do the reverse.
-    Both legs on the numba route, which takes the same array dispatch as triton."""
+    """Class-A modes build one constant set and skip the eigensolve; the control leg does the reverse."""
     _require_numba()
     s_on, h_on, seen_on = _spied_screen(monkeypatch, canon_store, [molecules[1]], mode,
                                         backend="numba")
@@ -187,8 +156,7 @@ def test_constant_seeds_replace_the_eigensolve(monkeypatch, canon_store, molecul
 
 @pytest.mark.parametrize("mode", _CLASS_B)
 def test_other_cloud_modes_keep_their_own_generator(monkeypatch, canon_store, molecules, mode):
-    """surf / surf_esp / pharm seed from the surface or anchor PCA, which the store does not
-    canonicalise, so on the SAME canonical store they must run their generator untouched."""
+    """Modes seeding from the surface or anchors keep their own generator on a canonical store."""
     _require_numba()
     _, hits, seen = _spied_screen(monkeypatch, canon_store, [molecules[1]], mode, backend="numba")
     assert seen["canonical"] == 0, f"{mode}: built a constant seed set it cannot use"
@@ -200,8 +168,7 @@ def test_other_cloud_modes_keep_their_own_generator(monkeypatch, canon_store, mo
 def test_vol_and_surf_esp_uses_constant_seeds_only_at_the_volumetric_alpha(monkeypatch,
                                                                             canon_store,
                                                                             molecules):
-    """At alpha == 0.81 its driver seeds from the atom clouds; at any other alpha from the
-    surfaces. The constant set is valid for the first and must be withheld from the second."""
+    """At alpha == 0.81 the driver seeds from atoms (constant set valid); at other alphas from surfaces."""
     _require_numba()
     _, _, seen = _spied_screen(monkeypatch, canon_store, [molecules[1]], "vol_and_surf_esp",
                                backend="numba")
@@ -218,8 +185,7 @@ def test_vol_and_surf_esp_uses_constant_seeds_only_at_the_volumetric_alpha(monke
 # ---------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("mode", _CLASS_A)
 def test_self_copy_anchor_holds_under_constant_seeds(monkeypatch, canon_store, molecules, mode):
-    """Gate 5's independent anchor, on the constant-seed path: the library's own id=1 ranks first
-    (symmetric modes) and scores ~1 (unless excused there)."""
+    """The self-copy ranks first (symmetric modes) and scores ~1 on the constant-seed path."""
     _require_numba()
     scores, hits, seen = _spied_screen(monkeypatch, canon_store, [molecules[1]], mode,
                                        backend="numba")
@@ -233,10 +199,7 @@ def test_self_copy_anchor_holds_under_constant_seeds(monkeypatch, canon_store, m
 @pytest.mark.parametrize("backend", ["numba", pytest.param("triton", marks=pytest.mark.cuda)])
 def test_vol_esp_transform_is_in_the_molecule_frame_under_constant_seeds(monkeypatch, tmp_path,
                                                                           backend):
-    """A returned pose must reproduce its own score, on the constant-seed path, INCLUDING the
-    molecule whose RemoveHs retained an H (whose strict-heavy frame differs from the atom frame
-    the store canonicalised -- the one case where the constant set is a perturbed seed rather
-    than an exact one). No score-based check can see a transform in the wrong frame."""
+    """A returned pose reproduces its own score under constant seeds, retained-H molecule included."""
     if backend == "triton":
         _require_fast_cuda()
     else:
@@ -259,9 +222,7 @@ def test_vol_esp_transform_is_in_the_molecule_frame_under_constant_seeds(monkeyp
 
 
 def test_a_panel_gets_one_constant_set_per_query(monkeypatch, canon_store, molecules):
-    """``screen_many`` over two queries must derive a seed set from EACH query's frame and give
-    every query the answer its single-query screen gives. Before, the gate demanded one query
-    and a panel silently fell back to the per-molecule generator."""
+    """``screen_many`` derives a seed set per query and matches each single-query screen."""
     _require_numba()
     qs = [molecules[1], molecules[4]]
     s_panel, h_panel, seen = _spied_screen(monkeypatch, canon_store, qs, "vol_color",
@@ -277,9 +238,7 @@ def test_a_panel_gets_one_constant_set_per_query(monkeypatch, canon_store, molec
 
 
 def test_constant_seed_screen_is_deterministic(monkeypatch, canon_store, molecules):
-    """The set depends on the query alone, never on batch composition, so two runs agree bit
-    for bit -- the reproducibility the per-molecule generator could not promise
-    (``_masked_principal_axes`` is batch-size dependent)."""
+    """The seed set depends on the query alone, so two runs agree bit for bit."""
     _require_numba()
     s1, _, _ = _spied_screen(monkeypatch, canon_store, [molecules[3]], "vol_lipo", backend="numba")
     with monkeypatch.context() as mp:
@@ -307,9 +266,7 @@ def test_constant_seeds_on_the_triton_route(monkeypatch, canon_store, molecules,
 @pytest.mark.parametrize("mode", tuple(screenmod._ARRAY_MODES))
 def test_store_is_canonical_by_default_exactly_for_the_constant_seed_modes(tmp_path, molecules,
                                                                              mode):
-    """``canonical=None`` must resolve to True for a store serving ANY constant-seed mode -- a
-    vol_esp-only store used to stay raw and forgo the speedup -- and to False for one serving only
-    the other-cloud modes, which would pay the score movement for nothing."""
+    """``canonical=None`` resolves True exactly when the store serves a constant-seed mode."""
     p = os.path.join(str(tmp_path), f"{mode}.fss")
     with ProfileStore.create(p, num_surf_points=64, modes=(mode,), dtype="float32") as store:
         store.add(molecules[0], id=0)
