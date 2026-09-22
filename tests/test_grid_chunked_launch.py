@@ -1,6 +1,8 @@
 """A batch larger than one CUDA grid slice must score the same as one split across slices.
 
-``drivers/terms._chunked`` slices a launch at the ``grid.z <= 65535`` hardware limit. The
+``drivers/terms._chunked`` slices a launch at the int32 pointer-offset ceiling
+``_launch_step`` derives from the pads (the old fixed 65,535 was the grid.z limit, which never
+applied to these 1-D grids; ``_CHUNK`` survives only as a cap these tests use to force slicing). The
 coordinate tensors are per-MOLECULE and the pose tensors per POSE, and the real-point counts
 ``N_real`` / ``M_real`` are per-molecule too -- so they must be sliced with the molecules. They
 were not: they were passed whole in ``kw``, so from the second grid slice on, every pose was

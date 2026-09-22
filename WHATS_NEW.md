@@ -677,15 +677,27 @@ pairwise path (Shepherd-Score-Paper, `paper/fig2_speed/validate_canonical.py` an
   lesson stands: before trusting a parity number here, run a GPU batch past 65,535 poses, build a
   store per mode, and use the real harness cell size — the figure's pairwise cell is N=100,000,
   not a toy fixture.
-- **The 65,535 slice is conservative, not a hardware limit** — and the comment calling it one (in
-  both trees, since 591f695) is wrong. Every kernel here launches a **1-D** grid (`grid = (K,)`,
-  `[(P,)]`), so the bound that applies is `grid.x`, which is 2^31-1. `grid.z <= 65535` never
-  enters into it. Measured at N=100,000: the pharmacophore kernel takes **3,167,232 poses in one
-  unchunked launch** and scores correctly, which is the direct evidence — the colour and
-  pharmacophore kernels are not sliced at all and are not at risk. The slicing costs extra
-  launches (`vol` issues about twelve where one would do); removing it is an untested change, so
-  it stays. **The bug fixed in 8127da9 was never about the limit** — it was that `_chunked`, once
-  it slices, must slice the per-molecule arguments along with the molecules.
+- **The 65,535 launch slice is gone; launches are sliced at the real bound.** Every kernel here
+  launches a **1-D** grid (`grid = (K,)`, `[(P,)]`), so the limit that applies is `grid.x` at
+  2^31-1 — `grid.z <= 65535`, which the old comment cited as a hardware limit, never entered into
+  it. The bound that does exist is the int32 pointer offset the kernels form as `mol * N_pad * 3`,
+  and `terms._launch_step` now derives that ceiling from the actual pads at call time (22.4M poses
+  at a 32-atom pad, 3.4M at a 208-point surface, int32-safe at a 1,024-point cloud). At `vol`'s
+  81,920-pose chunk the old slice split every captured fine step into two launches plus three
+  output copies; it is now one direct launch, as the pre-registry driver made it. **Measured, one
+  process per variant** (the captured-graph cache is keyed by shape, so an in-process A/B replays
+  the first variant's graph and reads 0.4% — a trap worth knowing): `vol` screen **+3.4% at 1e5,
+  +3.5% at 1e6**, `vol_esp` +4.9%, `surf` +4.4%, every score bit-identical. **The bug fixed in
+  8127da9 was never about the limit** — it was that `_chunked`, once it slices, must slice the
+  per-molecule arguments along with the molecules; that contract is unchanged.
+- **Where the engine rewrite's throughput went, bisected.** Against the pre-branch baseline
+  (b3599dc) at N=1e6 on one node, `vol` screen sat at −6.5% and the step is entirely inside the
+  engine commit — b3599dc, d3bf4bf and 591f695 are flat. Two changes recover most of it: the
+  launch ceiling above (~3.5 points on the screen path) and buffering the fine-loop reduction so
+  the captured step allocates nothing (~0.8 points on the screen path, roughly 8 on the pairwise
+  cell, where per-step allocation across many steps of one large batch mattered most). About two
+  points remain unexplained. Six of the seven modes measured were already faster than the
+  baseline before either change, `pharm` by 10.8%.
 - **`accel/` and `screen.py` have no Sphinx API pages**, so none of [§8](#8-api-reference) renders on
   the docs site. When adding them, set `autodoc_mock_imports = ["triton", "numba"]`.
 - **Bit-identity results come from non-early-stopping workloads.** A very small chunk or a
