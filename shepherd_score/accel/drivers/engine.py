@@ -123,9 +123,38 @@ def _masked_centroid(x, n_real):
     return (x * mask.unsqueeze(-1)).sum(1) / n.clamp(min=1).unsqueeze(-1)
 
 
+def term_self_overlaps(spec, chans: dict, params: dict, ref_shared: bool = False):
+    """``[(vaa, vbb) | None]`` per term over a whole bucket, so a caller that sub-batches the
+    bucket computes them ONCE and slices per chunk, instead of paying two eager kernel launches
+    per chunk. Measured on an L40S (vol screen, N=1e5, 13 chunks per screen): the per-chunk
+    version made 78 Triton dispatches per 3 screens where the pre-registry driver, which hoisted
+    per bucket, made 6 -- about 1.2% of wall time. Values are identical: the same kernel on the
+    same rows, and under ``ref_shared`` every chunk's row 0 IS the bucket's row 0."""
+    res = {c: spec.resolve_channel(c, params) for c in spec.channels}
+    seed = chans[res.get(spec.seed_channel, spec.seed_channel)].ref
+    B, device, dtype = int(seed.shape[0]), seed.device, seed.dtype
+    out = []
+    for tm in spec.terms:
+        if tm.reduction not in ("tanimoto", "tversky", "pharm_sim"):
+            out.append(None)
+            continue
+        ref = tuple(chans[res.get(n, n)].ref for n in tm.ref)
+        fit = tuple(chans[res.get(n, n)].fit for n in tm.fit)
+        n_real = chans[res.get(tm.ref[0], tm.ref[0])].n_real
+        m_real = chans[res.get(tm.fit[0], tm.fit[0])].m_real
+        tables = T.tables_for(tm, device, dtype, params)
+        if ref_shared and B > 1:
+            vaa = T.self_overlap(tm, tuple(x[:1] for x in ref), n_real[:1], tables, params)
+            vaa = vaa.expand(B).contiguous()
+        else:
+            vaa = T.self_overlap(tm, ref, n_real, tables, params)
+        out.append((vaa, T.self_overlap(tm, fit, m_real, tables, params)))
+    return out
+
+
 def assemble(spec, chans: dict, *, params: dict, num_seeds: int, seeds=None,
              ref_shared: bool = False, trans_centers=None, trans_centers_real=None,
-             num_repeats_per_trans: int = 10, topk: int = 30) -> Problem:
+             num_repeats_per_trans: int = 10, topk: int = 30, self_overlaps=None) -> Problem:
     """Resolve channels, centre (pharm family), seed, expand per pose, and precompute every
     reduction constant. ``chans`` maps CONCRETE channel names to :class:`Batch`."""
     res = {c: spec.resolve_channel(c, params) for c in spec.channels}
@@ -170,12 +199,17 @@ def assemble(spec, chans: dict, *, params: dict, num_seeds: int, seeds=None,
         obj = _Term(tm, T.TermInputs(ref, fit, n_real, m_real, tables, None, tp),
                     _weight_of(tm, spec, params, spec.terms))
         if tm.reduction in ("tanimoto", "tversky", "pharm_sim"):
-            if ref_shared and B > 1:
-                vaa = T.self_overlap(tm, tuple(x[:1] for x in ref), n_real[:1], tables, params)
-                vaa = vaa.expand(B).contiguous()
+            pre = None if self_overlaps is None else self_overlaps[len(term_objs)]
+            if pre is not None:                       # hoisted per bucket by the caller
+                vaa, vbb = pre
             else:
-                vaa = T.self_overlap(tm, ref, n_real, tables, params)
-            vbb = T.self_overlap(tm, fit, m_real, tables, params)
+                if ref_shared and B > 1:
+                    vaa = T.self_overlap(tm, tuple(x[:1] for x in ref), n_real[:1], tables,
+                                         params)
+                    vaa = vaa.expand(B).contiguous()
+                else:
+                    vaa = T.self_overlap(tm, ref, n_real, tables, params)
+                vbb = T.self_overlap(tm, fit, m_real, tables, params)
             obj.vaa, obj.vbb = vaa, vbb
         if tm.guard:
             has = n_real > 0
@@ -657,7 +691,7 @@ def _eager(pr: Problem, steps_fine, lr, es_patience, es_tol):
 def align(spec, chans: dict, *, params: dict, num_seeds: int, steps_fine: int, lr: float,
           early_stop_patience: int, early_stop_tol: float = 1e-5, seeds=None,
           ref_shared: bool = False, trans_centers=None, trans_centers_real=None,
-          num_repeats_per_trans: int = 10, topk: int = 30):
+          num_repeats_per_trans: int = 10, topk: int = 30, self_overlaps=None):
     """Batched coarse-to-fine alignment of one bucket of pairs in mode ``spec``.
 
     Returns ``(score (B,), q (B,4), t (B,3))`` -- each pair's best over its seeds. The graph
@@ -667,7 +701,8 @@ def align(spec, chans: dict, *, params: dict, num_seeds: int, steps_fine: int, l
     pr = assemble(spec, chans, params=params, num_seeds=num_seeds, seeds=seeds,
                   ref_shared=ref_shared, trans_centers=trans_centers,
                   trans_centers_real=trans_centers_real,
-                  num_repeats_per_trans=num_repeats_per_trans, topk=topk)
+                  num_repeats_per_trans=num_repeats_per_trans, topk=topk,
+                  self_overlaps=self_overlaps)
     B, P = pr.B, pr.P
     PK = int(pr.q.shape[0])
     best = bq = bt = None

@@ -247,7 +247,7 @@ def align_arrays(mode: str, ref: dict, fit: dict, *, params: dict, steps_fine: i
 
     Returns ``(scores (K,) float64 numpy, SE3 (K,4,4) float32 numpy)`` in SHARD order.
     """
-    from ..drivers.engine import Batch, align
+    from ..drivers.engine import Batch, align, term_self_overlaps
     from shepherd_score.alignment.utils.se3 import quaternions_to_SE3_batch
 
     spec = SPECS[mode]
@@ -347,8 +347,9 @@ def align_arrays(mode: str, ref: dict, fit: dict, *, params: dict, steps_fine: i
             chans["avoid"] = Batch(a_pad, None,
                                    torch.full((k,), Ka, dtype=torch.int32, device=device), None)
         cs = None if const_seeds is None else _const_seed_batch(const_seeds, k, device)
+        so = term_self_overlaps(spec, chans, params, ref_shared=True)   # once per bucket
 
-        def _proc(_s, _k, _ch=chans, _cs=cs):
+        def _proc(_s, _k, _ch=chans, _cs=cs, _so=so):
             sl = slice(_s, _s + _k)
             sub = {n: Batch(b.ref[sl], None if b.fit is None else b.fit[sl], b.n_real[sl],
                             None if b.m_real is None else b.m_real[sl])
@@ -356,7 +357,9 @@ def align_arrays(mode: str, ref: dict, fit: dict, *, params: dict, steps_fine: i
             return align(spec, sub, params=params, num_seeds=n_seeds, steps_fine=steps_fine,
                          lr=float(params["lr"]), early_stop_patience=es_patience,
                          early_stop_tol=early_stop_tol, ref_shared=True,
-                         seeds=None if _cs is None else (_cs[0][sl], _cs[1][sl]))
+                         seeds=None if _cs is None else (_cs[0][sl], _cs[1][sl]),
+                         self_overlaps=[None if p is None else (p[0][sl], p[1][sl])
+                                        for p in _so])
         sc, qb, tb = _subbatched_align(_proc, k, key=(mode,) + tuple(pads) + (n_seeds,),
                                        device=device, pose_cap=pose_cap, seeds=n_seeds)
         out_scores[rows_np] = sc.detach().cpu().numpy().astype(float)

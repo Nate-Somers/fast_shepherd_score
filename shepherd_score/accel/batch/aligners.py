@@ -266,12 +266,15 @@ def _run_bucket(spec, chans, K, key, device, *, params, n_seeds, steps_fine, es_
     """One bucket through the engine in memory-safe sub-batches; returns ``(scores, q, t)``."""
     from ..drivers import engine
 
+    so = engine.term_self_overlaps(spec, chans, params, ref_shared=ref_shared)   # per bucket
+
     def _proc(_s, _k):
         sl = slice(_s, _s + _k)
         return engine.align(
             spec, _slice_chans(chans, sl), params=params, num_seeds=n_seeds,
             steps_fine=steps_fine, lr=float(params["lr"]), early_stop_patience=es_patience,
             early_stop_tol=es_tol, ref_shared=ref_shared,
+            self_overlaps=[None if p is None else (p[0][sl], p[1][sl]) for p in so],
             seeds=None if seeds is None else (seeds[0][sl], seeds[1][sl]),
             trans_centers=None if trans_centers is None else trans_centers[sl],
             trans_centers_real=None if trans_centers_real is None else trans_centers_real[sl],
