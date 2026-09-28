@@ -22,5 +22,5 @@ set both arguments to partition a run. Outputs are written to the sample
 directory unless a save directory is accepted explicitly.
 
 xTB must be on `PATH` for the quantum-chemical evaluations. Docking also needs
-the `docking` extra and the Vina executable. Use each script's `--help` for its
+the `docking` extra, which installs the Vina Python API. Use each script's `--help` for its
 arguments. Pickled input must come from a trusted source.

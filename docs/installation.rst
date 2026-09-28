@@ -31,8 +31,8 @@ External executables
 
 xTB must be on ``PATH`` for xTB charges, quantum-chemical relaxation, and Fukui
 descriptors. ``Molecule(..., charge_model="mmff")`` uses RDKit MMFF94 charges.
-Docking needs the ``docking`` extra and the Vina executable. Protonation tools
-and visualization dependencies are documented in their API pages.
+Docking uses the Vina Python API installed by the ``docking`` extra. The optional ChemAxon protonation path requires a licensed ``cxcalc`` executable;
+the MolScrub path uses the Python dependency installed with this package.
 
 Documentation and tests
 -----------------------

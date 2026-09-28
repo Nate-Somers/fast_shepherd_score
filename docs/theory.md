@@ -71,7 +71,7 @@ $$w_{a,b;m} = \begin{cases} 1 & \text{if } m \text{ is non-directional}, \\ \fra
 ## Analytical Gradients
 
 Analytical gradients have been implemented for **pharmacophore**, **shape**, and
-**shape-with-avoid** alignment, replacing PyTorch autograd. All implementations
+**shape-with-avoid** alignment, replacing PyTorch autograd. The PyTorch implementations
 live in `shepherd_score/score/analytical_gradients/` (PyTorch in `_torch.py`,
 re-exported via `__init__.py`) and are called from the optimizer loops in
 `shepherd_score/alignment/_torch_analytical.py`. Accelerated Numba and Triton kernels are in `shepherd_score/accel/kernels/`.

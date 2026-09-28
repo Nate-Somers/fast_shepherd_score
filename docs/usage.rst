@@ -7,7 +7,12 @@ Molecules and profiles
 ``Molecule`` wraps an RDKit molecule with a 3D conformer. Features are generated
 or cached as requested. Set ``num_surf_points`` for surface modes and
 ``pharm_multi_vector=False`` for a single vector per directional pharmacophore.
-Pass partial charges explicitly when a particular charge model is required.
+Set ``charge_model="mmff"`` for MMFF94 charges or pass partial charges explicitly.
+The default is xTB, with a warning and MMFF94 fallback when xTB is unavailable.
+Charges are computed on demand; constructing a surface also computes its ESP.
+Pharmacophores are omitted unless ``pharm_multi_vector`` is set or their arrays
+are supplied. Mesh surface sampling is stochastic; reuse saved surface points
+and ESP arrays for comparisons that require identical features.
 
 .. code-block:: python
 
@@ -35,7 +40,8 @@ Scoring modes
 ``pharm`` compares typed, directional pharmacophores. ``vol_color``, ``vol_lipo``,
 ``vol_mr``, ``vol_fukui``, ``vol_atomtype``, and ``vol_pharm`` combine shape with
 additional molecular features. Tversky variants use asymmetric normalization.
-``vol_avoid`` adds an excluded-volume penalty.
+``vol_avoid`` adds an excluded-volume penalty and requires an explicit
+``avoid_points`` cloud in addition to the reference and fit molecules.
 
 ``vol_and_surf_esp`` combines shape with masked surface-potential agreement.
 Its accelerated optimizer uses shape gradients to generate poses and the

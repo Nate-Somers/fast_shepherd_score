@@ -23,7 +23,8 @@ The published CPU rates use Intel SVML; check it with
 `python -c "import numba.core.config as c; print(c.USING_SVML)"`.
 Other Numba builds are supported but may be slower and differ within numerical
 tolerances. xTB is required for xTB charges and Fukui descriptors; MMFF94 charges
-are available without xTB. GPU kernels require a supported CUDA/Triton system.
+are available without xTB via `charge_model="mmff"`. The default xTB charge
+path falls back to MMFF94 with a warning if xTB is unavailable. GPU kernels require a supported CUDA/Triton system.
 
 ## Align conformers
 
