@@ -4,6 +4,22 @@ Molecular conformer preparation, 3D similarity scoring, rigid alignment, and
 virtual screening with PyTorch, Numba CPU, and Triton GPU implementations.
 Scoring includes shape, electrostatics, pharmacophores, and composite objectives.
 
+## What this checkout adds
+
+The accelerated implementation adds batched rigid alignment on Numba CPUs and
+Triton GPUs, feature-based and Tversky scoring modes, disk-backed library stores,
+multi-query screening, and CPU-worker and multi-GPU execution. Stores reuse
+prepared features across queries; batch kernels optimize multiple starting poses
+without requiring a separate Python alignment call for each pair.
+
+Start with the [accelerated API guide](docs/accelerated_api.md) for a walkthrough
+of preparation, mode selection, batch alignment, stores, screening and parallel
+execution. The [usage guide](docs/usage.rst) is a shorter introduction;
+[scoring theory](docs/theory.md) explains the objectives, and the
+[API reference](docs/api/index.rst) documents signatures and parameters.
+The API guide includes a mode table and explains feature requirements and
+CPU/GPU differences.
+
 ## Installation
 
 Install this checkout to use the accelerated implementations described here:
