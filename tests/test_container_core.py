@@ -32,10 +32,7 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
-
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def _embed(smiles, seed=0xf00d):
     """Embed a SMILES into a 3D RDKit mol (with hydrogens)."""
@@ -59,10 +56,7 @@ def _pair(smiles_ref='c1ccccc1O', smiles_fit='c1ccccc1N', num_surf_points=75):
     fit = _mol(smiles_fit, num_surf_points=num_surf_points, seed=2)
     return MoleculePair(ref, fit, num_surf_points=num_surf_points, do_center=True)
 
-
-# ---------------------------------------------------------------------------
 # Surface
-# ---------------------------------------------------------------------------
 
 def test_surface_profile_backward_compat():
     mol = _mol('c1ccccc1O', num_surf_points=75)
@@ -88,10 +82,7 @@ def test_probe_radius_custom_and_settable():
     mol.probe_radius = 0.9
     assert mol.surface.probe_radius == 0.9
 
-
-# ---------------------------------------------------------------------------
 # Pharmacophore object storage
-# ---------------------------------------------------------------------------
 
 def test_pharmacophore_object_and_tuple_unpack():
     mol = _mol('c1ccccc1O')
@@ -137,10 +128,7 @@ def test_get_pharmacophore_passthrough_atom_ids_and_priority():
     assert mol.pharmacophore.labels is not None
     assert mol.pharmacophore.labels.shape == (mol.pharm_types.shape[0],)
 
-
-# ---------------------------------------------------------------------------
 # get_positions / get_charges helpers
-# ---------------------------------------------------------------------------
 
 def test_get_positions_and_charges_no_H():
     mol = _mol('c1ccccc1O', num_surf_points=40)
@@ -157,10 +145,7 @@ def test_get_positions_and_charges_no_H():
     assert mol.get_charges(no_H=False).shape == (n_all,)
     assert np.array_equal(mol.get_charges(no_H=False), mol.partial_charges)
 
-
-# ---------------------------------------------------------------------------
 # center_to in-place mutation through properties
-# ---------------------------------------------------------------------------
 
 def test_center_to_shifts_all_profiles():
     mol = _mol('c1ccccc1O', num_surf_points=40)
@@ -177,10 +162,7 @@ def test_center_to_shifts_all_profiles():
     # atom_pos is now centered at origin
     assert np.allclose(mol.atom_pos.mean(0), 0.0, atol=1e-5)
 
-
-# ---------------------------------------------------------------------------
 # AlignmentResult / MoleculePair alignment-result properties
-# ---------------------------------------------------------------------------
 
 def test_alignment_result_dataclass_defaults():
     ar = AlignmentResult()
@@ -209,10 +191,7 @@ def test_molecule_pair_alignment_setters():
     assert mp.sim_aligned_pharm is None
     assert np.array_equal(mp.transform_pharm, np.eye(4))
 
-
-# ---------------------------------------------------------------------------
 # Single-pair alignment + scoring end-to-end (torch/np)
-# ---------------------------------------------------------------------------
 
 @pytest.mark.torch
 @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires PyTorch")
@@ -257,10 +236,7 @@ def test_single_pair_score_np_matches_torch():
     assert np.isclose(mp.score_with_pharm(use='np'),
                       mp.score_with_pharm(use='torch'), atol=1e-4)
 
-
-# ---------------------------------------------------------------------------
 # JAX path (exercises _require_jax + use_jax branch)
-# ---------------------------------------------------------------------------
 
 @pytest.mark.jax
 def test_single_pair_align_vol_jax():
@@ -273,10 +249,7 @@ def test_single_pair_align_vol_jax():
     assert mp.sim_aligned_vol_noH is not None
     assert mp.transform_vol_noH.shape == (4, 4)
 
-
-# ---------------------------------------------------------------------------
 # Legacy-pickle upgrade (Molecule.__setstate__)
-# ---------------------------------------------------------------------------
 
 # Names a pre-refactor Molecule pickle carried flat in __dict__ that are now data descriptors;
 # without __setstate__ each raises AttributeError on an old pickle.

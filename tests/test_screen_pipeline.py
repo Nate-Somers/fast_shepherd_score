@@ -59,10 +59,7 @@ def canon_store(tmp_path_factory, molecules):
             store.add(m, id=i)
     return p
 
-
-# ---------------------------------------------------------------------------------------
 # 1) deferred canonical composition  (no GPU needed -- it is pure heap bookkeeping)
-# ---------------------------------------------------------------------------------------
 
 def test_deferred_composition_matches_composing_at_offer_time():
     """Composing at ``sorted()`` must equal composing at offer time, with a non-identity rotation."""
@@ -119,10 +116,7 @@ def test_raw_and_merge_raw_round_trip_composed_transforms():
     assert [np.asarray(h.transform).tolist() for h in b.sorted()] == \
            [np.asarray(h.transform).tolist() for h in a.sorted()]
 
-
-# ---------------------------------------------------------------------------------------
 # 2) device-side float16 widening
-# ---------------------------------------------------------------------------------------
 
 def test_to_device_matches_host_widening_exactly():
     """float16 -> float32 is exact, so widening on the device must give the same bits."""
@@ -138,10 +132,7 @@ def test_to_device_matches_host_widening_exactly():
     assert torch.equal(scr._to_device(b, dev, dtype=torch.float32),
                        torch.as_tensor(b, device=dev))
 
-
-# ---------------------------------------------------------------------------------------
 # 3) pose cap
-# ---------------------------------------------------------------------------------------
 
 @pytest.mark.cuda
 def test_pose_cap_bounds_the_subbatch_and_only_when_asked():
@@ -233,10 +224,7 @@ def test_pose_cap_graphs_every_chunk_on_a_narrow_fixture(monkeypatch, canon_stor
     assert np.array_equal(a[ok], b[ok]), "the sub-batch size changed a score"
     assert [h.id for h in hits] == [h.id for h in hits2]
 
-
-# ---------------------------------------------------------------------------------------
 # 4) upload-ahead
-# ---------------------------------------------------------------------------------------
 
 @pytest.mark.cuda
 def test_shard_upload_stages_through_pinned_memory(monkeypatch, canon_store):

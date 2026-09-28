@@ -77,6 +77,7 @@ def get_atom_coords(mol: rdkit.Chem.Mol,
             Chem.AllChem.EmbedMolecule(mol, maxAttempts = 200)
             if MMFF_optimize:
                 Chem.AllChem.MMFFOptimizeMolecule(mol)
+                Chem.SanitizeMol(mol)
 
             mol.GetConformer() # test whether conformer generation succeeded
         except Exception as e:
@@ -771,7 +772,8 @@ def get_electrostatics(mol: Chem.Mol, points: np.ndarray) -> np.ndarray:
     except ValueError as e:
         raise ValueError("Provided rdkit.Chem.Mol object did not have conformer embedded.", e)
 
-    molec_props = Chem.AllChem.MMFFGetMoleculeProperties(mol)
+    charge_mol = Chem.Mol(mol)
+    molec_props = Chem.AllChem.MMFFGetMoleculeProperties(charge_mol)
     if molec_props:
         charges = np.array([molec_props.GetMMFFPartialCharge(i) for i, _ in enumerate(mol.GetAtoms())])
     else:

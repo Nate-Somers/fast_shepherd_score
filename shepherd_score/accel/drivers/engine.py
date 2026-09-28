@@ -1,10 +1,4 @@
-"""The one batched coarse-to-fine SE(3) optimiser, driven by a :class:`~..._modes.ModeSpec`.
-
-Seed generation, per-pose expansion, self-overlaps, the CUDA-graph fine loop, the eager loop and
-the fused CPU hookup are written once here and read the mode's terms, reductions, blend weights
-and schedule from its spec. Inputs are padded per-pair tensors per channel (:class:`Batch`); the
-result is the per-pair best ``(score, q, t)`` over the seeds.
-"""
+"""Batched SE(3) optimization driven by mode specifications."""
 from __future__ import annotations
 
 from collections import namedtuple
@@ -32,10 +26,8 @@ _ESP_STRIDE = 5
 
 _PHARM_SIGMA = {"tversky": 0.95, "tversky_ref": 1.0, "tversky_fit": 0.05}
 
-
-# =============================================================================================
 # the assembled problem
-# =============================================================================================
+
 class _Term:
     """One term's per-pose tensors and reduction constants, in the fine-loop layout.
 
@@ -282,10 +274,8 @@ def _finish(spec, chans, term_objs, params, B, quats, t_seeds, device, dtype, c_
     pr.terms = out
     return pr
 
-
-# =============================================================================================
 # scoring one pose set (value only): the coarse grid
-# =============================================================================================
+
 @torch.no_grad()
 def _score_poses(pr: Problem, q, t):
     """Total score of ``q``/``t`` (per pose, replicated layout) from value-only evaluations."""
@@ -363,10 +353,8 @@ def _coarse_topk(pr0, cb, num_seeds, trans_centers, trans_centers_real, nrpt, to
     t_best = torch.gather(t_grid, 1, best_idx.unsqueeze(-1).expand(-1, -1, 3)).clone()
     return q_best, t_best
 
-
-# =============================================================================================
 # the fine step: value+grad of every term -> score, best-pose tracking, descent gradient, Adam
-# =============================================================================================
+
 class _State:
     """Loop-carried buffers (updated in place, so one body serves eager and graph replay)."""
     __slots__ = ("q", "t", "mq", "vq", "mt", "vt", "best", "bq", "bt", "gq", "gt", "lr")
@@ -545,10 +533,8 @@ def _apply_adam_pharm(st: _State):
     dQ_tan = st.gq - st.q * radial
     fused_adam_qt(st.q, st.t, dQ_tan, st.gt, st.mq, st.vq, st.mt, st.vt, st.lr)
 
-
-# =============================================================================================
 # CUDA-graph fine loop
-# =============================================================================================
+
 class _GraphedFineTerms(_GraphedFineBase):
     """Capture one generic fine step; replay = N steps. Persistent buffers hold every term's
     inputs and constants for the bucket shape; ``_load`` copies a bucket in. Value-only terms
@@ -631,10 +617,8 @@ def _graph_key(pr: Problem, steps, lr):
             key.append((name, v))
     return tuple(key)
 
-
-# =============================================================================================
 # eager fine loop
-# =============================================================================================
+
 def _eager(pr: Problem, steps_fine, lr, es_patience, es_tol):
     st = _State(pr.q, pr.t, lr)
     B, P = pr.B, pr.P
@@ -669,10 +653,8 @@ def _eager(pr: Problem, steps_fine, lr, es_patience, es_tol):
     _record_steps(ran, steps_fine, ran < steps_fine)
     return st.best, st.bq, st.bt
 
-
-# =============================================================================================
 # entry point
-# =============================================================================================
+
 def align(spec, chans: dict, *, params: dict, num_seeds: int, steps_fine: int, lr: float,
           early_stop_patience: int, early_stop_tol: float = 1e-5, seeds=None,
           ref_shared: bool = False, trans_centers=None, trans_centers_real=None,

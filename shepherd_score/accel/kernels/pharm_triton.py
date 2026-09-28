@@ -136,15 +136,13 @@ def _pharm_score_grad_kernel(
         tl.store(gRbo + 3, gR10); tl.store(gRbo + 4, gR11); tl.store(gRbo + 5, gR12)
         tl.store(gRbo + 6, gR20); tl.store(gRbo + 7, gR21); tl.store(gRbo + 8, gR22)
 
-
-# ===========================================================================
 #  Directionless "color" kernel for vol_color: the same same-type-only typed
 #  Gaussian, but isotropic (w=1, no vectors, no weight gradient). Takes the
 #  quaternion q (assumed unit; Adam renormalises each step) and emits dV/dq
 #  in-register with the shape kernel's tail, so the driver needs no
 #  rotation->quaternion projection. A = ref anchors (axis 0), B = fit anchors
 #  (axis 1, rotated); dx = A - rot(B), the shape-kernel sign convention.
-# ===========================================================================
+
 @triton.autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
                           for _w in (1, 2, 4, 8) for _s in (1, 2, 3, 4)],
                  key=['N_pad', 'M_pad'], cache_results=True)
@@ -283,14 +281,12 @@ def pharm_color_score_grad_se3_batch(
     )
     return O, dQ, dT
 
-
-# ===========================================================================
 #  Directional pharm value + quaternion gradient (pharm mode, in-register dQ).
 #  Same typed/directional Gaussian and weight as _pharm_score_grad_kernel, but
 #  takes q (assumes |q|=1) and emits dV/dq directly: the shape dR/dq tail applied
 #  to (positional force, fit anchor) plus (weight force, fit vector).
 #  Layout: REF = axis 0 (n), FIT = axis 1 (m); dx = ref - rot(fit).
-# ===========================================================================
+
 @triton.autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
                           for _w in (1, 2, 4, 8) for _s in (1, 2, 3, 4)],
                  key=['N_pad', 'M_pad'], cache_results=True)

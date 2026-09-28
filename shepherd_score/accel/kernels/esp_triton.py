@@ -379,15 +379,13 @@ def overlap_score_grad_esp_se3_batch(
     )
     return out_S, out_dQ, out_dT
 
-
-# ============================================================================
 #  ShaEP ESP surface-comparison kernel (vol_and_surf_esp), value only. For each
 #  real field point i of the observer molecule: the Coulomb ESP induced there by
 #  the other molecule's atoms, dropped if inside that molecule's vdW+probe volume,
 #      esp = sum_i  keep_i * exp( -(point_esp_i - sum_m q_m/d_im)^2 / lam )
 #  Points and atoms arrive in the world frame, so the kernel takes no pose and
 #  emits no gradient (the pose is steered by the shape gradient).
-# ============================================================================
+
 @triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _esp_comparison_tiled(

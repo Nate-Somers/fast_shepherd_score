@@ -19,10 +19,8 @@ import numpy as np
 # (esp -> surf_esp, esp_combo -> vol_and_surf_esp) are normalised in align_pairs.
 from ._modes import PROCESS_MODES as POOL_MODES, LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES
 
-
-# ---------------------------------------------------------------------------
 # Worker side (runs in each persistent child process)
-# ---------------------------------------------------------------------------
+
 def _run_shard(bm, torch, mode, rows, kwargs):
     """Run the batched aligner on one shard. ``rows`` holds one tuple of numpy arrays per pair,
     ordered as ``_MODE_SPEC[mode]['tensors']``; returns ``(scores (k,), transforms (k,4,4))``."""
@@ -74,10 +72,8 @@ def _worker_loop(task_q, res_q):
             import traceback
             res_q.put(("__ERR__", traceback.format_exc()))
 
-
-# ---------------------------------------------------------------------------
 # Pool (parent side)
-# ---------------------------------------------------------------------------
+
 class CpuAlignPool:
     """A fixed-size pool of persistent single-threaded worker processes.
 
@@ -157,10 +153,8 @@ def _shutdown_pool():
         _POOL.close()
         _POOL = None
 
-
-# ---------------------------------------------------------------------------
 # Public entry (parent side)
-# ---------------------------------------------------------------------------
+
 def align_pairs(mode, pairs, num_workers, align_kwargs):
     """Align ``pairs`` (``MoleculePair``) across the persistent CPU pool, writing
     ``sim_aligned_*`` / ``transform_*`` back in place. Also caches the per-pair input tensors

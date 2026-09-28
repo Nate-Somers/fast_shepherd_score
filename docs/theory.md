@@ -2,7 +2,7 @@
 # Representations, Scoring, and Alignment
 
 This page documents the mathematical formulations underlying ShEPhERD Score's interaction profile representations, similarity scoring functions, and analytical gradient derivations used during alignment.
-Alignment has been driven by the automatic differentiation engines of Jax and PyTorch. However, since v1.3.1, analytical gradients have been implemented for PyTorch which significantly reduces memory overhead and speeds up computation; this is now the default path for PyTorch-based alignment in `MoleculePair`.
+Reference scoring functions use PyTorch, NumPy, or optional JAX. Accelerated alignment uses analytic gradients in Numba and Triton; the PyTorch alignment API also supports analytic gradients for selected modes.
 We use the notation provided in [Adams et al. (2025)](https://openreview.net/forum?id=KSLkFYHlYg).
 
 ## Base Representations
@@ -10,10 +10,10 @@ We use the notation provided in [Adams et al. (2025)](https://openreview.net/for
 * **Shape:** Represented as a point cloud $\boldsymbol{x}_2 = \boldsymbol{S}_2 \in \mathbb{R}^{n_2\times3}$ (or atomic coordinates $\boldsymbol{C} \in \mathbb{R}^{n_1 \times 3}$).
 * **Electrostatic Potential (ESP):** Represented as $\boldsymbol{x}_3 = (\boldsymbol{S}_3, \boldsymbol{v})$ where $\boldsymbol{S}_3 \in \mathbb{R}^{n_3 \times 3}$ is a surface point cloud and $\boldsymbol{v} \in \mathbb{R}^{n_3}$ is the Coulombic potential at each point. The potential $\boldsymbol{v}$ is defined by atomic partial charges $\boldsymbol{q} \in \mathbb{R}^{n_1}$ and positions $\boldsymbol{r}$:
 
-$$\boldsymbol{v}[k] = \frac{1}{4 \pi \epsilon_0} \sum^{n_3}_{j=1} \frac{q[k]}{\|\boldsymbol{r}[k] - \boldsymbol{r}[j] \|^2}$$
+$$\boldsymbol{v}[k] = \frac{1}{4 \pi \epsilon_0} \sum^{n_1}_{j=1} \frac{q_j}{\|\boldsymbol{S}_3[k] - \boldsymbol{r}_j\|}$$
 
 * **Pharmacophores:** Represented as $\boldsymbol{x}_4 = (\boldsymbol{p}, \boldsymbol{P}, \boldsymbol{V})$.
-  * $\boldsymbol{p} \in \mathbb{R}^{n_4 \times N_p}$: one-hot encodings of $N_p$ types.
+  * $\boldsymbol{p} \in \mathbb{R}^{n_4 \times N_p}$: conceptual one-hot encodings of $N_p$ types; the API stores integer type indices.
   * $\boldsymbol{P} \in \mathbb{R}^{n_4 \times 3}$: 3D coordinates.
   * $\boldsymbol{V} \in \{ \mathbb{S}^2, \boldsymbol{0}\}^{n_4}$: relative unit vectors ($|\boldsymbol{V}[k]| = 1$) for directional pharmacophores, or zero vectors ($|\boldsymbol{V}[k]| = 0$) for directionless ones.
 
@@ -39,7 +39,7 @@ The variables $w_{a,b}$ and $\alpha$ from the general overlap function adapt bas
 
 **Shape Scoring**
 
-* *Volumetric (using atoms $\boldsymbol{C}$):* $w_{a,b} = 2.7$, $\alpha = 0.81$.
+* *Volumetric (using atoms $\boldsymbol{C}$):* $w_{a,b} = 1$, $\alpha = 0.81$.
 * *Surface (using points $\boldsymbol{S}$):* $w_{a,b} = 1$, $\alpha = \Psi(n_2)$ (a predefined constant based on $n_2$).
 
 **ESP Scoring**
@@ -58,7 +58,7 @@ $$O^\text{pharm}_{A,B;m} = \sum_{a \in \boldsymbol{Q}_{A,m}} \sum_{b \in \boldsy
 
 The total similarity sums the overlaps across all types:
 
-$$\text{sim}_{\text{pharm}}^{*}(\boldsymbol{x}_{4,A}, \boldsymbol{x}_{4,B}) = \frac{\sum_{m\in \mathcal{M}} O_{A,B; m}}{\sum_{m \in \mathcal{M}} O_{A,A; m} + O_{B,B; m} - O_{A,B; m}}$$
+$$\text{sim}_{\text{pharm}}^{*}(\boldsymbol{x}_{4,A}, \boldsymbol{x}_{4,B}) = \frac{\sum_{m\in \mathcal{M}} O_{A,B; m}}{\sum_{m \in \mathcal{M}} (O_{A,A; m} + O_{B,B; m} - O_{A,B; m})}$$
 
 The vector weighting $w_{a,b;m}$ depends on directionality ($\alpha_m$ is a constant per type):
 
@@ -74,8 +74,8 @@ Analytical gradients have been implemented for **pharmacophore**, **shape**, and
 **shape-with-avoid** alignment, replacing PyTorch autograd. All implementations
 live in `shepherd_score/score/analytical_gradients/` (PyTorch in `_torch.py`,
 re-exported via `__init__.py`) and are called from the optimizer loops in
-`shepherd_score/alignment/_torch_analytical.py`. The resulting speedup is
-approximately 2–2.5× over autograd.
+`shepherd_score/alignment/_torch_analytical.py`. Accelerated Numba and Triton kernels are in `shepherd_score/accel/kernels/`.
+See the performance page for measured workloads.
 
 The SE(3) parameter vector is always `(q_w, q_x, q_y, q_z, t_x, t_y, t_z)` —
 4 quaternion components followed by 3 translation components. All functions
@@ -101,7 +101,7 @@ $$\text{sim}^{*}(\boldsymbol{Q}_A, \boldsymbol{Q}_B) = \min\left(\frac{O_{A,B}}{
 
 The gradient scales directly by a constant factor (no quotient rule):
 
-$$\nabla_{\theta} S = -\frac{\mathbf{1}[S < 1.0]}{D} \nabla_{\theta} O_{A,B}$$
+$$\nabla_{\theta} S = \frac{\mathbf{1}[S < 1.0]}{D} \nabla_{\theta} O_{A,B}$$
 
 where the indicator function $\mathbf{1}[S < 1.0]$ is 1 when not clamped, 0
 otherwise. Sigma variants: `'tversky'`→0.95, `'tversky_ref'`→1.0,
@@ -111,7 +111,7 @@ otherwise. Sigma variants: `'tversky'`→0.95, `'tversky_ref'`→1.0,
 
 Let $\boldsymbol{\Delta}_{ab} = \boldsymbol{R}\boldsymbol{r}_a + \boldsymbol{t} - \boldsymbol{r}_b$ and $E_{ab} = \exp(-\frac{\alpha}{2}\|\boldsymbol{\Delta}_{ab}\|^2)$.
 
-For **shape**, the pair constant is $C_{ab} = w_{ab} \left(\frac{\pi}{2\alpha}\right)^{3/2}$ (with $w_{ab}=1$ for surface, $w_{ab}=2.7$ for volumetric).
+For **shape**, the pair constant is $C_{ab} = w_{ab} \left(\frac{\pi}{2\alpha}\right)^{3/2}$ (with $w_{ab}=1$ for surface, $w_{ab}=1$ for volumetric).
 For **ESP**, the pair constant absorbs the potential difference: $\tilde{C}_{ab} = \left(\frac{\pi}{2\alpha}\right)^{3/2} \exp\!\left(-\|\boldsymbol{v}_A[a]-\boldsymbol{v}_B[b]\|^2 / \lambda\right)$. The ESP potential is invariant to rigid motion, so $\tilde{C}_{ab}$ is a pure constant during alignment.
 
 Both cases share the same gradient structure (substituting $C_{ab}$ or $\tilde{C}_{ab}$):
@@ -195,3 +195,20 @@ Taminau, J., Thijs, G., & De Winter, H. (2008). Pharao: Pharmacophore alignment 
 
 Wahl, J. (2024). PheSA: An Open-Source Tool for Pharmacophore-Enhanced Shape Alignment. *Journal of Chemical Information and Modeling*, *64*(15), 5944-5953. https://doi.org/10.1021/acs.jcim.4c00516
 ```
+
+## Composite scores and accelerated alignment
+
+Shape-plus-field modes blend shape Tanimoto with a second normalized overlap.
+The field kernel weights pairs by `exp(-(a-b)**2 / lam)`; signed descriptors
+therefore compare values rather than multiplying descriptor signs.
+
+`vol_and_surf_esp` uses a masked surface-potential agreement term, not a Gaussian
+overlap ratio for its ESP channel. The accelerated implementation generates
+poses with shape gradients and selects them using the combined score. It does
+not differentiate the ESP agreement term.
+
+For volumetric and field Tversky modes the denominator is
+`a*O_AA + b*O_BB + (1-a-b)*O_AB`, with defaults `a=0.95`, `b=0.05`.
+These Gaussian-overlap ratios need not be bounded by one. The pharmacophore
+Tversky implementation clamps at one. Asymmetry reduces but does not eliminate
+the fitted molecule's self-overlap penalty.

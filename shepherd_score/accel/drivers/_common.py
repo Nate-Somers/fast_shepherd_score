@@ -519,10 +519,8 @@ def build_coarse_grid(A_batch: torch.Tensor,
 
     return q_grid, t_grid
 
-
-# --------------------------------------------------------------------------------------------
 # Canonical-frame seeds: the same rotations for every library molecule.
-# --------------------------------------------------------------------------------------------
+
 #: Proper sign-flip combinations of a principal frame (PCA fixes axes only up to sign); all
 #: four have det = +1, so each is a rotation rather than a reflection.
 _SIGN_FLIPS = (

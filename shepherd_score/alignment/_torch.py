@@ -2424,10 +2424,8 @@ def optimize_vol_atomtype_overlay(ref_centers: torch.Tensor,
         best_score = scores.detach().cpu()[best_idx]
     return best_alignment, best_transform, best_score
 
-
-# =============================================================================
 # vol_color_tversky -- vol_color (shape + directionless colour) scored with Tversky
-# =============================================================================
+
 def objective_vol_color_tversky_overlay(se3_params: torch.Tensor,
                                         ref_centers: torch.Tensor,
                                         fit_centers: torch.Tensor,
@@ -2580,10 +2578,8 @@ def optimize_vol_color_tversky_overlay(ref_centers: torch.Tensor,
         best_score = scores.detach().cpu()[best_idx]
     return best_alignment, best_transform, best_score
 
-
-# =============================================================================
 # vol_lipo_tversky -- vol_lipo (shape + lipophilicity) scored with Tversky per channel
-# =============================================================================
+
 def objective_vol_lipo_tversky_overlay(se3_params: torch.Tensor,
                                        ref_centers: torch.Tensor,
                                        fit_centers: torch.Tensor,

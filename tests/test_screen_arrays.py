@@ -299,13 +299,9 @@ def test_use_arrays_gates_on_mode_and_reads_enabled_live(monkeypatch):
     for mode in screenmod._ARRAY_MODES:
         assert screenmod._use_arrays(mode) is False, "ENABLED is read at call time, not import"
 
-
-# ------------------------------------------------------------------------------------------------
 # Canonical-frame stores: the transform must come back in the molecule's frame, not the store's.
 # Scores and ranking are correct either way, so the check re-scores each returned pose on the
 # molecule's own centred coordinates; a pose in the wrong frame does not reproduce its score.
-# ------------------------------------------------------------------------------------------------
-
 
 def _canonical_store(tmp_path, molecules):
     p = os.path.join(tmp_path, "canon.fss")
@@ -387,12 +383,9 @@ def test_canonical_transform_is_in_the_molecule_frame(tmp_path, molecules):
             f"id={mol_id} reported {reported:.6f} but its own pose re-scores to {rescored:.6f} "
             f"-- the transform is not in the molecule's frame")
 
-
-# ---------------------------------------------------------------------------------------------
 # vol_esp on a canonical store with a molecule whose Chem.RemoveHs retains an H: ``xyz_noH`` is
 # materialised only for that molecule and must be rotated like ``atom_pos``. A score comparison
 # cannot see a missing rotation; only re-scoring the returned pose can.
-# ---------------------------------------------------------------------------------------------
 
 _RETAINED_H_SMI = "[2H]OC(=O)c1ccccc1"          # the deuterium survives RemoveHs
 

@@ -200,10 +200,8 @@ def test_use_arrays_is_on_for_every_mode_this_file_drives():
     for mode in scr._ARRAY_MODES:
         assert scr._use_arrays(mode) is True
 
-
-# ------------------------------------------------------------------------------------------
 # End-to-end, and genuinely GPU-only: it needs TWO devices for _screen_many_multigpu to run.
-# ------------------------------------------------------------------------------------------
+
 _SMILES = ["CCO", "C1CCCCC1", "c1ccccc1O", "CC(=O)Nc1ccc(O)cc1",
            "CC(=O)Oc1ccccc1C(=O)O", "CC(C)Cc1ccc(cc1)C(C)C(=O)O",
            "C" * 18, "C" * 26, "C" * 34]

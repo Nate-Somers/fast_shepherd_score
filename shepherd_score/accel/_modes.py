@@ -1,27 +1,11 @@
-"""Single source of truth for the alignment modes.
-
-Pure data with no heavy imports, so every layer can import it freely. Two layers live here:
-
-* the flat tables every consumer reads (``MODE_ATTRS``, ``MODE_SEEDS``, ``MODE_STEPS``,
-  ``PROCESS_MODES``, ``CONST_SEED_MODES``, ``LEGACY_MODE_ALIASES``), and
-* the :class:`ModeSpec` declarations they are derived from (``SPECS``), which describe each
-  mode as data: the per-molecule channels it reads, the objective terms it optimises, how
-  they blend, and its optimiser schedule.
-
-Every mode-shaped consumer (the pairwise and screen aligners, the store schema, the tensor
-plumbing, the process-pool spec and the fine-loop engine) reads a :class:`ModeSpec`. To add
-a mode: register a spec here, plus a channel in ``accel/channels.py`` and a kernel if it
-needs new data or new math. ``tests/test_mode_registry.py`` pins the invariants.
-"""
+"""Alignment mode specifications, channels, and optimizer defaults."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
-
-# =============================================================================================
 # Objective terms and mode specs
-# =============================================================================================
+
 @dataclass(frozen=True)
 class Term:
     """One contribution to a mode's objective, computed by one kernel launch per fine step.
@@ -350,10 +334,8 @@ _reg(ModeSpec("vol_avoid", ("transform_vol_avoid", "sim_aligned_vol_avoid"), 16,
               params={"alpha": 0.81, "avoid_min_dist": 2.0, "avoid_weight": 1.0, **_LR},
               graph_budget=None, screen_lr=0.1))
 
-
-# =============================================================================================
 # Derived flat tables (the surface every consumer reads)
-# =============================================================================================
+
 #: Canonical mode id -> (transform_attr, score_attr) written in-place on a MoleculePair by
 #: ``MoleculePairBatch.align_with_<mode>``. Derived from SPECS, in public order.
 MODE_ATTRS = {m: s.attrs for m, s in SPECS.items()}

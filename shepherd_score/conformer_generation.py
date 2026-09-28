@@ -152,6 +152,7 @@ def embed_conformer(mol: Chem.Mol, attempts: int=50, MMFF_optimize: bool=False, 
         AllChem.EmbedMolecule(mol, maxAttempts = attempts, randomSeed = random_seed)
         if MMFF_optimize:
             AllChem.MMFFOptimizeMolecule(mol)
+            Chem.SanitizeMol(mol)
 
         mol.GetConformer() # test whether conformer generation succeeded
     except Exception:
@@ -261,6 +262,7 @@ def generate_conformer_ensemble(mol_3d: Chem.Mol,
                 maxIters = num_opt_steps,
 
             )
+    Chem.SanitizeMol(mol_3d)
     mols = [conf_to_mol(mol_3d, c) for c in cids]
 
     return mols
@@ -594,10 +596,10 @@ def fukui_from_single_point_conformer_with_xtb(conformer: Chem.Mol,
         f-_k = q_k(N-1) - q_k(N)     (electrophilic-attack susceptibility)
         f0_k = 0.5 * (f+_k + f-_k)   (radical)
 
-    where ``q_k(N)`` is the neutral charge, ``q_k(N+1)`` the anion (``--chrg charge-1``) and
-    ``q_k(N-1)`` the cation (``--chrg charge+1``), all at the same geometry. Each mono-ion is
+    where ``q_k(N)`` uses the supplied molecular charge, ``q_k(N+1)`` uses ``charge-1``, and
+    ``q_k(N-1)`` uses ``charge+1``, all at the same geometry. Each mono-ion is
     run with ``--uhf 1``. The ``vol_fukui`` alignment mode uses the dual descriptor
-    ``f+_k - f-_k`` (positive at nucleophilic, negative at electrophilic sites).
+    ``f+_k - f-_k`` (positive for susceptibility to nucleophilic attack, negative for electrophilic attack).
 
     Parameters mirror :func:`charges_from_single_point_conformer_with_xtb`.
 

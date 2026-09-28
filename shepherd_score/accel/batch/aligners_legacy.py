@@ -1,10 +1,4 @@
-"""The one objective without a kernel: pharmacophore ``extended_points`` scoring.
-
-``extended_points=True`` adds an anchor+vector Gaussian term with no directional weighting,
-which none of the dispatched kernels compute; ``drivers/pharm.py`` keeps the eager autograd
-driver for it. This module is the bucket/pad/write-back around that driver, kept apart from the
-generic aligner so the default path stays kernel-only.
-"""
+"""Autograd fallback for extended-point pharmacophore alignment."""
 from __future__ import annotations
 
 import torch

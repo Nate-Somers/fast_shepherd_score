@@ -15,10 +15,8 @@ from numba import njit, prange
 
 _K_PI = math.pi ** 1.5
 
-
-# ===========================================================================
 # shape (vol / surf, and vol_color's shape channel)
-# ===========================================================================
+
 @njit(parallel=True, fastmath=True, cache=True)
 def _overlap_grad_kernel_soa(A, B, q, t, Nr, Mr, alpha, need_grad):
     """SoA fp32 twin of cpu._overlap_grad_kernel. A (K,3,N), B (K,3,M) float32."""
@@ -57,10 +55,8 @@ def _overlap_grad_kernel_soa(A, B, q, t, Nr, Mr, alpha, need_grad):
         dQ[k, 0] = dQw; dQ[k, 1] = dQx; dQ[k, 2] = dQy; dQ[k, 3] = dQz
     return V, dQ, dT
 
-
-# ===========================================================================
 # ESP-weighted shape (vol_esp / surf_esp): shape kernel × charge Gaussian
-# ===========================================================================
+
 @njit(parallel=True, fastmath=True, cache=True)
 def _overlap_grad_esp_kernel_soa(A, B, CA, CB, q, t, Nr, Mr, alpha, inv_lam, need_grad):
     """SoA fp32 twin of cpu._overlap_grad_esp_kernel. A (K,3,N)/B (K,3,M); CA (K,N)/CB (K,M)."""

@@ -1,0 +1,6 @@
+prune .claude
+prune .codex
+prune .agents
+prune docs/_build
+prune outputs
+global-exclude __pycache__ *.py[cod]

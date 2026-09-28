@@ -35,10 +35,7 @@ from shepherd_score.score.constants import P_TYPES, P_ALPHAS
 
 P_TYPES_LWRCASE = tuple(map(str.lower, P_TYPES))
 
-
-# =====================================================================
 # Fixtures
-# =====================================================================
 
 def _random_unit_quaternion(seed=42):
     rng = np.random.RandomState(seed)
@@ -78,10 +75,7 @@ def _make_single_type_data(ptype_idx, n_ref=4, n_fit=3, seed=99, dtype=torch.flo
     fit_vecs = F.normalize(torch.tensor(rng.randn(n_fit, 3), dtype=dtype), p=2, dim=-1)
     return ref_pharms, fit_pharms, ref_anchors, fit_anchors, ref_vecs, fit_vecs
 
-
-# =====================================================================
 # Phase 1: Quaternion Jacobians
-# =====================================================================
 
 class TestRotationMatrixJacobians:
 
@@ -169,10 +163,7 @@ class TestProjectGradToQuaternion:
 
         torch.testing.assert_close(grad_q_raw_analytical, grad_auto, atol=1e-8, rtol=1e-8)
 
-
-# =====================================================================
 # Phase 2: Overlap Gradient
-# =====================================================================
 
 class TestOverlapGradientTranslation:
 
@@ -280,10 +271,7 @@ class TestOverlapGradientRotation:
     def test_rotation_grad_aromatic(self):
         self._compare_grad_R(ptype_idx=2)
 
-
-# =====================================================================
 # Phase 3: Tanimoto Chain Rule
-# =====================================================================
 
 class TestTanimotoChainRule:
 
@@ -317,10 +305,7 @@ class TestTanimotoChainRule:
         expected_scale = -U / (denom * denom)
         assert expected_scale < 0  # minimizing loss means negative scale on dO/d(params)
 
-
-# =====================================================================
 # Phase 4: Full Gradient Assembly
-# =====================================================================
 
 class TestFullAnalyticalGradient:
 
@@ -468,10 +453,7 @@ class TestFullAnalyticalGradient:
         torch.testing.assert_close(loss_a, loss_ag, atol=1e-6, rtol=1e-5)
         torch.testing.assert_close(grad_a, grad_ag, atol=1e-6, rtol=1e-5)
 
-
-# =====================================================================
 # Phase 4b: Extended Points Overlap Gradient Tests
-# =====================================================================
 
 class TestOverlapGradientExtendedPoints:
     """Finite-difference checks for compute_overlap_and_grad_pharm with extended_points."""
@@ -592,10 +574,7 @@ class TestOverlapGradientExtendedPoints:
                                     ref_vecs, fit_vecs, extended_points=True, only_extended=False)
         torch.testing.assert_close(grad_t_a, grad_t_fd, atol=1e-4, rtol=1e-4)
 
-
-# =====================================================================
 # Phase 5: Optimizer Integration
-# =====================================================================
 
 class TestOptimizePharmOverlayAnalytical:
 
@@ -788,10 +767,7 @@ class TestOptimizePharmOverlayAnalytical:
             assert abs(score_a.item() - score_ag.item()) < 1e-4, \
                 f"{sim} extended_points: analytical {score_a.item():.4f} vs autograd {score_ag.item():.4f}"
 
-
-# =====================================================================
 # Phase 6: Performance Benchmark
-# =====================================================================
 
 @pytest.mark.slow
 class TestAnalyticalPerformance:
@@ -830,10 +806,7 @@ class TestAnalyticalPerformance:
         print(f"\nAutograd: {time_ag:.3f}s, Analytical: {time_a:.3f}s, Speedup: {time_ag/time_a:.2f}x")
         assert time_a < time_ag, f"Analytical ({time_a:.3f}s) should be faster than autograd ({time_ag:.3f}s)"
 
-
-# =====================================================================
 # Shape Analytical Gradients
-# =====================================================================
 
 def _random_shape_data(n_ref=10, n_fit=8, seed=42, dtype=torch.float64):
     """Generate random point cloud data for shape scoring tests."""
@@ -1019,10 +992,7 @@ class TestShapeFullAnalyticalGradient:
         assert VAA > 0
         assert VBB > 0
 
-
-# =====================================================================
 # Shape Optimizer Integration
-# =====================================================================
 
 class TestOptimizeROCSOverlayAnalytical:
 
@@ -1123,10 +1093,7 @@ class TestShapeAnalyticalPerformance:
         print(f"\nShape - Autograd: {time_ag:.3f}s, Analytical: {time_a:.3f}s, Speedup: {time_ag/time_a:.2f}x")
         assert time_a < time_ag, f"Analytical ({time_a:.3f}s) should be faster than autograd ({time_ag:.3f}s)"
 
-
-# =====================================================================
 # Avoid-points analytical gradient tests
-# =====================================================================
 
 class TestAvoidAndGrad:
     """Tests for compute_avoid_and_grad — hard-sphere overlap + gradient."""
@@ -1390,10 +1357,7 @@ class TestOptimizeROCSOverlayAnalyticalWithAvoid:
         aligned, _, _ = result
         assert aligned.shape == fit.shape  # aligned is always fit_points aligned, not fit_avoid
 
-
-# =====================================================================
 # ESP Analytical Gradient Tests
-# =====================================================================
 
 def _random_esp_data(n_ref=8, n_fit=6, seed=42, dtype=torch.float64):
     """Generate random ESP data (points + charges)."""
@@ -1600,10 +1564,7 @@ class TestESPFullAnalyticalGradient:
         assert VAA > 0
         assert VBB > 0
 
-
-# =====================================================================
 # ESP Optimizer Integration
-# =====================================================================
 
 class TestOptimizeROCSESPOverlayAnalytical:
 

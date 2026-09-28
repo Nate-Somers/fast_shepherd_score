@@ -49,10 +49,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kentoabeywardane/shepherd-score"
-Repository = "https://github.com/kentoabeywardane/shepherd-score"
+Homepage = "https://github.com/coleygroup/shepherd-score"
+Repository = "https://github.com/coleygroup/shepherd-score"
 Documentation = "https://shepherd-score.readthedocs.io"
-"Bug Tracker" = "https://github.com/kentoabeywardane/shepherd-score/issues"
+"Bug Tracker" = "https://github.com/coleygroup/shepherd-score/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -155,4 +155,4 @@ addopts = [
     "--strict-config",
     "--cov=shepherd_score",
     "--cov-report=term-missing",
-] 
+]

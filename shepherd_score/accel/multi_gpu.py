@@ -203,10 +203,8 @@ def align_multi_gpu(pairs: Sequence,
         return scores, transforms, timing
     return scores, transforms
 
-
-# ---------------------------------------------------------------------------
 # Persistent pool: build+retain shards once, align resident data many times.
-# ---------------------------------------------------------------------------
+
 def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
     """Persistent worker: build and retain this GPU's shard once, then align it in place on every
     job. Only ``(mode, backend, kwargs)`` come in and ``(scores, transforms)`` go out per call;

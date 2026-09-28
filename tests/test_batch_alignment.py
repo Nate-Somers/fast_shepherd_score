@@ -31,10 +31,7 @@ except ImportError:
 
 pytestmark = pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")
 
-
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def _make_mol_pair(smiles_ref, smiles_fit):
     """Return a MoleculePair from two SMILES strings."""
@@ -67,10 +64,7 @@ def _make_mol_pair_with_pharm(smiles_ref, smiles_fit):
     fit_mol = _mol_obj(smiles_fit)
     return MoleculePair(ref_mol, fit_mol)
 
-
-# ---------------------------------------------------------------------------
 # masked scoring accuracy
-# ---------------------------------------------------------------------------
 
 @pytest.mark.jax
 def test_masked_scoring_matches_unmasked():
@@ -104,10 +98,7 @@ def test_masked_scoring_matches_unmasked():
         f"Masked score {score_masked:.6f} != unmasked {score_ref:.6f}"
     )
 
-
-# ---------------------------------------------------------------------------
 # masked alignment accuracy
-# ---------------------------------------------------------------------------
 
 @pytest.mark.jax
 def test_masked_alignment_matches_unmasked():
@@ -146,10 +137,7 @@ def test_masked_alignment_matches_unmasked():
         f"unmasked {float(score_unmasked):.4f}"
     )
 
-
-# ---------------------------------------------------------------------------
 # MoleculePairBatch end-to-end
-# ---------------------------------------------------------------------------
 
 @pytest.mark.jax
 def test_molecule_pair_batch_align_with_vol():
@@ -182,10 +170,7 @@ def test_molecule_pair_batch_align_with_vol():
             f"Pair {i}: aligned shape {aligned.shape} != ({expected_n}, 3)"
         )
 
-
-# ---------------------------------------------------------------------------
 # masked pharmacophore scoring matches unmasked
-# ---------------------------------------------------------------------------
 
 @pytest.mark.jax
 def test_masked_pharm_scoring_matches_unmasked():
@@ -242,10 +227,7 @@ def test_masked_pharm_scoring_matches_unmasked():
         f"Masked pharm score {score_masked:.6f} != unmasked {score_ref:.6f}"
     )
 
-
-# ---------------------------------------------------------------------------
 # masked pharmacophore alignment matches unmasked
-# ---------------------------------------------------------------------------
 
 @pytest.mark.jax
 def test_masked_pharm_alignment_matches_unmasked():
@@ -320,10 +302,7 @@ def test_masked_pharm_alignment_matches_unmasked():
         f"from unmasked {float(score_unmasked):.4f}"
     )
 
-
-# ---------------------------------------------------------------------------
 # MoleculePairBatch.align_with_pharm end-to-end
-# ---------------------------------------------------------------------------
 
 @pytest.mark.jax
 def test_molecule_pair_batch_align_with_pharm():
@@ -359,10 +338,7 @@ def test_molecule_pair_batch_align_with_pharm():
             f"Pair {i}: vectors shape {vecs.shape} != ({expected_n}, 3)"
         )
 
-
-# ---------------------------------------------------------------------------
 # masked ESP scoring accuracy
-# ---------------------------------------------------------------------------
 
 @pytest.mark.jax
 def test_masked_esp_scoring_matches_unmasked():
@@ -405,10 +381,7 @@ def test_masked_esp_scoring_matches_unmasked():
         f"Masked ESP score {score_masked:.6f} != unmasked {score_ref:.6f}"
     )
 
-
-# ---------------------------------------------------------------------------
 # masked ESP alignment accuracy
-# ---------------------------------------------------------------------------
 
 @pytest.mark.jax
 def test_masked_esp_alignment_matches_unmasked():
@@ -457,10 +430,7 @@ def test_masked_esp_alignment_matches_unmasked():
         f"unmasked {float(score_unmasked):.4f}"
     )
 
-
-# ---------------------------------------------------------------------------
 # MoleculePairBatch.align_with_vol_esp end-to-end
-# ---------------------------------------------------------------------------
 
 @pytest.mark.jax
 def test_molecule_pair_batch_align_with_vol_esp():

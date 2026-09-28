@@ -36,10 +36,8 @@ def _launch_step(S, args_mol):
     ceil = max(1, min(_CHUNK, _PID_MAX // (3 * max(pad, 1))))
     return ceil if S == 1 else max(S, (ceil // S) * S)
 
-
-# ---------------------------------------------------------------------------------------------
 # lookup tables for the typed kernels
-# ---------------------------------------------------------------------------------------------
+
 def build_element_tables(device, dtype, max_z: int = 100, alpha: float = 0.81):
     """Element-indexed ``(alphas, Ks, cats)`` for the colour kernel: every element an isotropic
     point Gaussian of width ``alpha`` (category 0); the pad label (Z=0) category 3 (skipped).
@@ -65,10 +63,8 @@ def tables_for(term, device, dtype, params):
         return build_element_tables(device, dtype, alpha=float(params["alpha"]))
     raise KeyError(term.tables)
 
-
-# ---------------------------------------------------------------------------------------------
 # chunked shape-family launches
-# ---------------------------------------------------------------------------------------------
+
 #: ``kw`` entries that are per molecule, not per pose, and so must be sliced with ``args_mol``
 #: in every chunk; passed whole, poses from the second chunk on read another molecule's counts.
 _MOL_KW = ("N_real", "M_real")
@@ -104,10 +100,8 @@ def _layout_kw(seeds_per_mol, poses_per_cta):
         extra["poses_per_cta"] = int(poses_per_cta)
     return extra
 
-
-# ---------------------------------------------------------------------------------------------
 # term evaluation
-# ---------------------------------------------------------------------------------------------
+
 class TermInputs:
     """The device tensors one term reads for a bucket of poses.
 
@@ -217,10 +211,8 @@ def esp_agreement(ti: TermInputs, q, t):
     esp_2 = esp_comparison_batch(pts2_t, cwh1, pc1, ptc2, rad1, N_real=m_surf, M_real=ti.n_real, **kw)
     return (esp_1 + esp_2) / (n_surf.to(pts1.dtype) + m_surf.to(pts1.dtype))
 
-
-# ---------------------------------------------------------------------------------------------
 # self-overlaps (pose-invariant)
-# ---------------------------------------------------------------------------------------------
+
 def self_overlap(term, side, n_real, tables, params):
     """``V_XX`` of one side of ``term`` (identity pose), per row. ``side`` is that side's channel
     tuple. Returns ``None`` for a term without a normalising self-overlap."""

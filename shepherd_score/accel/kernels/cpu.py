@@ -226,13 +226,11 @@ def _batch_self_overlap(P_pad: torch.Tensor, N_real: torch.Tensor, alpha: float 
                                            N_real=N_real, M_real=N_real, NEED_GRAD=False)
     return V
 
-
-# ===========================================================================
 #  ESP-weighted overlap (vol_esp / surf_esp): CPU twin of
 #  esp_triton._gauss_overlap_esp_se3_tiled. V = K * sum exp(-a/2 r^2) *
 #  exp(-(Ci-Cj)^2/lam); the charge weight is SE(3)-invariant, so the gradient is
 #  the shape gradient with the weight folded into g. The two exps are fused.
-# ===========================================================================
+
 @njit(parallel=True, fastmath=True, cache=True)
 def _overlap_grad_esp_kernel(A, B, CA, CB, q, t, Nr, Mr, alpha, inv_lam, need_grad):
     K = A.shape[0]
@@ -302,14 +300,12 @@ def overlap_score_grad_esp_se3_batch(A, B, charges_A, charges_B, q, t, *,
             torch.as_tensor(dQ, device=dev, dtype=dt),
             torch.as_tensor(dT, device=dev, dtype=dt))
 
-
-# ===========================================================================
 #  ShaEP ESP surface comparison (vol_and_surf_esp), value only: CPU twin of
 #  esp_triton._esp_comparison_tiled. For each real field point, the Coulomb ESP
 #  from the other molecule's atoms, the vdW+probe volume mask and a Gaussian of
 #  the ESP difference, summed over points. fp64 accumulation; no gradient (the
 #  pose is steered by the shape gradient).
-# ===========================================================================
+
 @njit(parallel=True, fastmath=True, cache=True)
 def _esp_comparison_kernel(P, A, Q, R, PE, Nr, Mr, inv_lam, coulomb, probe):
     K = P.shape[0]
@@ -361,14 +357,12 @@ def esp_comparison_batch(points, atoms, charges, point_esp, radii, *,
                                inv_lam, float(COULOMB_SCALING), float(probe_radius))
     return torch.as_tensor(S, device=dev, dtype=dt)
 
-
-# ===========================================================================
 #  Pharmacophore overlap value + grad (pharm): CPU twin of
 #  pharm_triton._pharm_score_grad_kernel. Typed Gaussians (per-type alpha/K/cat),
 #  directional weight w (cat 1 = (clamp(D,0,1)+2)/3, cat 2 = (|D|+2)/3, else 1),
 #  type-match and non-dummy (cat != 3) masking; returns O, grad_R (3x3), grad_t.
 #  FIT = i (rotated by R, t), REF = j (fixed); type/alpha/K/cat from FIT.
-# ===========================================================================
+
 @njit(parallel=True, fastmath=True, cache=True)
 def _pharm_grad_kernel(RaA, FaB, RvA, FvB, RtA, FtB, R, t, alphas, Ks, cats, Nr, Mr, need_grad):
     P = RaA.shape[0]
@@ -471,8 +465,6 @@ def pharm_score_grad_se3_batch(R, t, ref_types, fit_types, ref_anchors, fit_anch
             torch.as_tensor(gR, device=dev, dtype=dt),
             torch.as_tensor(gt, device=dev, dtype=dt))
 
-
-# ===========================================================================
 #  Directionless pharmacophore "color" overlap value + quaternion gradient
 #  (vol_color): the same same-type-only typed Gaussian as the pharm kernel, but
 #  isotropic (w = 1, no vectors, no weight gradient) and emitting dV/dq
@@ -480,7 +472,7 @@ def pharm_score_grad_se3_batch(R, t, ref_types, fit_types, ref_anchors, fit_anch
 #  quaternion projection. q is assumed unit (Adam renormalises each step).
 #  A = ref anchors, B = fit anchors (rotated); At/Bt = ref/fit type indices;
 #  dx = A - rot(B), the shape-kernel sign convention.
-# ===========================================================================
+
 @njit(parallel=True, fastmath=True, cache=True)
 def _pharm_color_grad_kernel(A, B, q, t, At, Bt, alphas, Ks, cats, Nr, Mr, need_grad):
     P = A.shape[0]
@@ -555,15 +547,13 @@ def pharm_color_score_grad_se3_batch(A, B, q, t, ref_types, fit_types, alphas, K
             torch.as_tensor(dQ, device=dev, dtype=dt),
             torch.as_tensor(dT, device=dev, dtype=dt))
 
-
-# ===========================================================================
 #  Directional pharmacophore overlap value + quaternion gradient (pharm): the
 #  typed/directional Gaussian and weight of _pharm_grad_kernel, but taking q
 #  (assumed unit) and emitting dV/dq directly, by applying the shape-kernel dR/dq
 #  tail twice: to the positional force (sum_j aKwE*(rotfit-ref)) with the
 #  body-frame fit anchor, and to the weight force (sum_j coeff*ref_vn) with the
 #  body-frame fit vector.
-# ===========================================================================
+
 @njit(parallel=True, fastmath=True, cache=True)
 def _pharm_grad_dq_kernel(A, B, q, t, At, Bt, RvA, FvB, alphas, Ks, cats, Nr, Mr, need_grad):
     P = A.shape[0]

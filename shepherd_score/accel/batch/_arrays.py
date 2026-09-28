@@ -171,10 +171,8 @@ def _const_seed_batch(const_seeds: torch.Tensor, k: int, device):
     return (const_seeds.unsqueeze(0).expand(k, -1, -1).contiguous(),
             torch.zeros(k, S, 3, device=device, dtype=torch.float32))
 
-
-# =============================================================================================
 # the generic array aligner
-# =============================================================================================
+
 def _counts_of(fit: dict, name: str, K: int, device):
     """``(counts (K,), starts (K,) or None, source tensor)`` for one channel's fit side."""
     flat, off = fit[name]

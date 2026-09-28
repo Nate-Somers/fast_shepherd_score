@@ -463,8 +463,8 @@ class Molecule:
     @property
     def fukui(self) -> np.ndarray:
         """Per-atom condensed Fukui dual descriptor ``f+ - f-`` (all atoms, with-H order), computed
-        lazily on first access from three gfn2-xTB single points and cached. Positive at
-        nucleophilic and negative at electrophilic sites. Pass ``fukui=...`` to the constructor to
+        lazily on first access from three gfn2-xTB single points and cached. Positive at sites susceptible to
+        nucleophilic attack and negative at sites susceptible to electrophilic attack. Pass ``fukui=...`` to the constructor to
         skip xTB.
         """
         if self._fukui is None:
@@ -477,7 +477,7 @@ class Molecule:
 
     def _generate_fukui(self) -> np.ndarray:
         """Condensed Fukui dual descriptor (f+ - f-) per atom from three gfn2-xTB single points
-        (neutral, cation, anion) at the same geometry. Unlike charges there is no non-QM fallback,
+        (the molecular charge and its adjacent charge states) at the same geometry. Unlike charges there is no non-QM fallback,
         so any xTB failure (e.g. a non-converging ion) propagates.
         """
         from shepherd_score.conformer_generation import fukui_from_single_point_conformer_with_xtb
@@ -2806,4 +2806,3 @@ class MoleculePair:
                                          pharm_vecs=transformed_pharm_vecs
                                          )
         return transformed_fit_molec
-

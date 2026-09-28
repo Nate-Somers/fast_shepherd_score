@@ -96,10 +96,8 @@ def _batch_upload(pairs, attr, src_fn, dtype, device, *, key_fn=None):
         if t.device != device:
             setattr(p, attr, t.to(device, non_blocking=True))
 
-
-# =============================================================================================
 # the generic aligner
-# =============================================================================================
+
 #: Keywords every mode accepts that are not objective parameters: the optimiser schedule, the
 #: legacy translation-seeded grid, and the screen front end's constant seeds and avoid cloud.
 _LOOP_KW = ("steps_fine", "num_repeats", "trans_init", "num_repeats_per_trans", "topk",

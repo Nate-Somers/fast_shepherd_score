@@ -15,11 +15,9 @@ from typing import Callable, Optional
 
 import numpy as np
 
-
-# =============================================================================================
 # Bases: which atom / point set a channel is indexed by. Channels sharing a basis share their
 # real counts and (on the object path) their padded width.
-# =============================================================================================
+
 #: basis -> (offset-table key in a store shard, dense?)
 BASES = {
     "atoms": "atom_off",       # Chem.RemoveHs coordinate set (retains isotope-labelled H)
@@ -97,10 +95,8 @@ class Channel:
     def prof(self) -> str:
         return self.profile or self.key
 
-
-# =============================================================================================
 # Readers (Molecule or MoleculeProfile -> numpy, host side)
-# =============================================================================================
+
 def _need(m, attr, what):
     v = getattr(m, attr, None)
     if v is None:
@@ -248,10 +244,8 @@ def basis_of(names) -> dict:
         out.setdefault(CHANNELS[n].basis, []).append(n)
     return out
 
-
-# =============================================================================================
 # Store-side helpers (numpy only)
-# =============================================================================================
+
 #: schema flags a store can carry, in a stable order. ``atoms`` needs none (always stored).
 SCHEMA_FLAGS = ("surf", "surf_esp", "charges", "with_H", "radii", "centers_w_H", "pharm",
                 "lipophilicity", "fukui", "mr", "atomtype")

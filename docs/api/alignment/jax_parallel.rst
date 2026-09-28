@@ -18,7 +18,7 @@ JAX Parallel Alignment
 This module provides multi-device volumetric alignment using
 :func:`jax.shard_map`.  It is the backend called by
 :meth:`shepherd_score.container.MoleculePairBatch.align_with_vol` when
-``use_shmap=True``.
+``backend="jax", use_shmap=True``.
 
 Overview
 --------
@@ -56,10 +56,10 @@ The recommended entry point is
    batch = MoleculePairBatch(pairs)
 
    # Default: single pass (n_buckets=1)
-   scores, aligned = batch.align_with_vol(num_workers=4, use_shmap=True)
+   scores, aligned = batch.align_with_vol(backend="jax", num_workers=4, use_shmap=True)
 
    # Bucketed: useful for >10k pairs with diverse molecule sizes
-   scores, aligned = batch.align_with_vol(num_workers=4, use_shmap=True, num_buckets=8)
+   scores, aligned = batch.align_with_vol(backend="jax", num_workers=4, use_shmap=True, num_buckets=8)
 
 See :doc:`../container/molecule_pair_batch` for details on bucketing and masking strategy.
 

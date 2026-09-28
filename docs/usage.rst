@@ -1,322 +1,73 @@
-Usage Guide
-===========
+Usage
+=====
 
-This guide covers the basic usage of shepherd-score for interaction profile extraction, 
-3D similarity scoring, alignment, and evaluation pipelines.
+Molecules and profiles
+----------------------
 
-Overview
---------
-
-The package has convenience wrappers and base functions. Most users should reach for the 
-convenience wrappers below; the base functions underneath are there if you need lower-level 
-control. Scoring can be done with either NumPy or Torch, but alignment requires Torch. There 
-are also JAX implementations for both scoring and alignment of gaussian overlap, ESP 
-similarity, and pharmacophore similarity.
-
-.. note::
-
-   Applicable xTB functions and evaluation pipeline evaluations are now parallelizable 
-   through the ``num_workers`` argument in the ``.evaluate`` method.
-
-Convenience Wrappers
---------------------
-
-Molecule Class
-~~~~~~~~~~~~~~
-
-:class:`shepherd_score.container.Molecule` accepts an RDKit ``Mol`` object (with an associated 
-conformer) and generates its interaction profiles, exposed via two properties:
-
-* ``.surface`` → :class:`~shepherd_score.container.profiles.Surface` (``positions``, ``esp``, ``probe_radius``)
-* ``.pharmacophore`` → :class:`~shepherd_score.pharm_utils.pharmacophore.Pharmacophore` (``types``, ``positions``, ``vectors``, ``atom_ids``, ``labels``)
-
-Pass ``return_atom_ids=True`` and/or ``priority_atoms=[...]`` to :meth:`~shepherd_score.container.Molecule.get_pharmacophore` 
-to populate ``.pharmacophore.atom_ids``/``.labels``, e.g. for priority-weighted pharmacophore scoring.
-
-MoleculePair Class
-~~~~~~~~~~~~~~~~~~
-
-:class:`shepherd_score.container.MoleculePair` operates on two :class:`~shepherd_score.container.Molecule` 
-objects and prepares their ``Surface``/``Pharmacophore`` profiles for scoring and alignment.
-
-MoleculePairBatch Class
-~~~~~~~~~~~~~~~~~~~~~~~
-
-:class:`shepherd_score.container.MoleculePairBatch` operates on a list of :class:`~shepherd_score.container.MoleculePair` 
-objects and enables accelerated alignment by padding all profile arrays to a common shape so a 
-single compiled kernel is reused across every pair. Supports optional multi-CPU parallelism.
-
-Base Functions
---------------
-
-Conformer Generation
-~~~~~~~~~~~~~~~~~~~~
-
-Useful conformer generation functions are found in the :mod:`shepherd_score.conformer_generation` module.
-
-Interaction Profile Extraction
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. list-table::
-   :header-rows: 1
-   :widths: 20 40 40
-
-   * - Interaction Profile
-     - Function
-     - Returns
-   * - Shape
-     - :func:`shepherd_score.generate_point_cloud.get_molecular_surface`
-     - ``np.ndarray`` (M,3) surface positions
-   * - Electrostatics
-     - :func:`shepherd_score.extract_profiles.get_electrostatic_potential`
-     - ``np.ndarray`` (M,) ESP per surface point
-   * - Pharmacophores
-     - :func:`shepherd_score.pharm_utils.pharmacophore.get_pharmacophores`
-     - :class:`~shepherd_score.pharm_utils.pharmacophore.Pharmacophore`
-
-:class:`~shepherd_score.pharm_utils.pharmacophore.Pharmacophore` is a lightweight dataclass; it also 
-unpacks as ``types, positions, vectors = get_pharmacophores(mol)``. The surface position/ESP arrays 
-are assembled into a matching :class:`~shepherd_score.container.profiles.Surface` dataclass by 
-:class:`~shepherd_score.container.Molecule` (above). Most users won't call these extraction functions 
-or construct the containers directly.
-
-Scoring
-~~~~~~~
-
-:mod:`shepherd_score.score` contains the base scoring functions with separate modules for those 
-dependent on PyTorch (``*.py``), NumPy (``*_np.py``), and JAX (``*_jax.py``).
-
-.. list-table::
-   :header-rows: 1
-   :widths: 30 70
-
-   * - Similarity
-     - Function
-   * - Shape
-     - :func:`shepherd_score.score.gaussian_overlap.get_overlap`
-   * - Electrostatics
-     - :func:`shepherd_score.score.electrostatic_scoring.get_overlap_esp`
-   * - Pharmacophores
-     - :func:`shepherd_score.score.pharmacophore_scoring.get_overlap_pharm`
-
-
-Extraction Example
-------------------
-
-Extraction of interaction profiles via the :class:`~shepherd_score.container.Molecule` convenience wrapper.
+``Molecule`` wraps an RDKit molecule with a 3D conformer. Features are generated
+or cached as requested. Set ``num_surf_points`` for surface modes and
+``pharm_multi_vector=False`` for a single vector per directional pharmacophore.
+Pass partial charges explicitly when a particular charge model is required.
 
 .. code-block:: python
 
    from shepherd_score.conformer_generation import embed_conformer_from_smiles
-   from shepherd_score.conformer_generation import charges_from_single_point_conformer_with_xtb
-   from shepherd_score.container import Molecule
+   from shepherd_score.container import Molecule, MoleculePair, MoleculePairBatch
 
-   # Embed conformer with RDKit and partial charges from xTB
-   ref_mol = embed_conformer_from_smiles('Oc1ccc(CC=C)cc1', MMFF_optimize=True)
-   partial_charges = charges_from_single_point_conformer_with_xtb(ref_mol)
+   rd = embed_conformer_from_smiles("CCOc1ccccc1", MMFF_optimize=True)
+   ref = Molecule(rd, num_surf_points=200, pharm_multi_vector=False,
+                  charge_model="mmff")
+   fit = Molecule(embed_conformer_from_smiles("CCNc1ccccc1", MMFF_optimize=True),
+                  num_surf_points=200, pharm_multi_vector=False, charge_model="mmff")
+   pair = MoleculePair(ref, fit)
+   scores, _ = MoleculePairBatch([pair]).align_with_vol(backend="numba")
 
-   # `Molecule` extracts and owns all interaction profiles
-   ref_molec = Molecule(
-       ref_mol,
-       # optional options otherwise .surface/.pharmacophore stay empty
-       num_surf_points=200,
-       partial_charges=partial_charges,  # If None, computed lazily with gfn2-xTB
-       pharm_multi_vector=False  # recommended
-       # e.g., carbonyls get one HBA vector rather than two
-   )
+The alignment writes the score and transform onto each pair. ``return_aligned``
+controls whether transformed arrays are also returned. Explicitly choose
+``backend="triton"`` for GPU or ``backend="numba"`` for CPU; the default selects
+according to the available device. JAX is available for the original modes.
 
-   # Surface point cloud + electrostatic potential
-   surf_pos = ref_molec.surface.positions  # np.array (200,3)
-   esp = ref_molec.surface.esp  # np.array (200,)
-
-   # Pharmacophores as a `Pharmacophore` container, unpacks as (types, positions, vectors)
-   # ref_molec.pharmacophore.types: np.array (P,)
-   # ref_molec.pharmacophore.{positions/vectors}: np.array (P,3)
-   pharm = ref_molec.pharmacophore
-
-3D Similarity Scoring Example
------------------------------
-
-An example of scoring the similarity of two different molecules using 3D surface, ESP, and 
-pharmacophore similarity metrics:
-
-.. code-block:: python
-
-   from shepherd_score.score.constants import ALPHA
-   from shepherd_score.conformer_generation import embed_conformer_from_smiles
-   from shepherd_score.conformer_generation import optimize_conformer_with_xtb
-   from shepherd_score.container import Molecule, MoleculePair
-
-   # Embed a random conformer with RDKit
-   ref_mol_rdkit = embed_conformer_from_smiles('Oc1ccc(CC=C)cc1', MMFF_optimize=True)
-   fit_mol_rdkit = embed_conformer_from_smiles('O=CCc1ccccc1', MMFF_optimize=True)
-
-   # Local relaxation with xTB
-   ref_mol, _, ref_charges = optimize_conformer_with_xtb(ref_mol_rdkit)
-   fit_mol, _, fit_charges = optimize_conformer_with_xtb(fit_mol_rdkit)
-
-   # Extract interaction profiles
-   ref_molec = Molecule(ref_mol,
-                        num_surf_points=200,
-                        partial_charges=ref_charges,
-                        pharm_multi_vector=False)
-   fit_molec = Molecule(fit_mol,
-                        num_surf_points=200,
-                        partial_charges=fit_charges,
-                        pharm_multi_vector=False)
-
-   # Centers the two molecules' COM's to the origin
-   mp = MoleculePair(ref_molec, fit_molec, num_surf_points=200, do_center=True)
-
-   # Compute the similarity score for each interaction profile
-   shape_score = mp.score_with_surf(ALPHA(mp.num_surf_points))
-   esp_score = mp.score_with_esp(ALPHA(mp.num_surf_points), lam=0.3)
-   pharm_score = mp.score_with_pharm()
-
-Alignment Example
------------------
-
-Next we show alignment using the same :class:`~shepherd_score.container.MoleculePair` class.
-
-.. code-block:: python
-
-   # Centers the two molecules' COM's to the origin
-   mp = MoleculePair(ref_molec, fit_molec, num_surf_points=200, do_center=True)
-
-   # Align fit_molec to ref_molec with your preferred objective function
-   # By default we use automatic differentiation via pytorch
-   surf_points_aligned = mp.align_with_surf(ALPHA(mp.num_surf_points),
-                                            num_repeats=50)
-   surf_points_esp_aligned = mp.align_with_surf_esp(ALPHA(mp.num_surf_points),
-                                               lam=0.3,
-                                               num_repeats=50)
-   pharm_pos_aligned, pharm_vec_aligned = mp.align_with_pharm(num_repeats=50)
-
-   # Optimal scores and SE(3) transformation matrices are stored as attributes
-   # mp.sim_aligned_surf, mp.sim_aligned_surf_esp, mp.sim_aligned_pharm
-   # mp.transform_surf, mp.transform_surf_esp, mp.transform_pharm
-
-   # Get a copy of the optimally aligned fit Molecule object
-   transformed_fit_molec = mp.get_transformed_molecule(
-       se3_transform=mp.transform_surf  # or mp.transform_surf_esp, mp.transform_pharm
-   )
-
-Alignment of many :class:`~shepherd_score.container.MoleculePair` objects at once is
-accelerated by :class:`~shepherd_score.container.MoleculePairBatch`, which pads every pair's
-arrays to a common shape so one compiled kernel is reused across the batch. The ``backend``
-argument defaults to ``None``, which resolves per device: the Triton kernels on CUDA, the numba
-kernels on CPU. JAX is not required; ``backend="jax"`` selects it when the ``jax`` extra is
-installed.
-
-.. code-block:: python
-
-   from shepherd_score.container import MoleculePairBatch
-
-   batch = MoleculePairBatch(pairs)  # `pairs` is a list of MoleculePair objects
-
-   # Device-aware default backend
-   scores, aligned = batch.align_with_vol(return_aligned=True)
-   scores, aligned = batch.align_with_vol_esp(lam=0.1, return_aligned=True)
-   scores, aligned = batch.align_with_surf(ALPHA(200), return_aligned=True)
-
-   # JAX path; its multi-CPU shard_map mode needs XLA_FLAGS set before JAX is imported
-   scores, aligned = batch.align_with_vol(backend="jax", num_workers=4, num_buckets=4,
-                                          use_shmap=True)
-
-Every alignment mode is reachable as ``align_with_<mode>`` on both
-:class:`~shepherd_score.container.MoleculePair` and
-:class:`~shepherd_score.container.MoleculePairBatch`. The canonical mode names, their default
-seed and step counts, and the legacy aliases ``esp`` (now ``surf_esp``) and ``esp_combo`` (now
-``vol_and_surf_esp``) live in ``shepherd_score/accel/_modes.py``.
-
-Virtual Screening
------------------
-
-For one query against a large library, featurise the library once into an on-disk
-:class:`~shepherd_score.screen.ProfileStore` and stream it past the query with
-:func:`~shepherd_score.screen.screen`. The store keeps only the arrays the requested modes need
-(``float16`` by default) in independent shards, so the library is never held in RAM.
-
-.. code-block:: python
-
-   import numpy as np
-   from shepherd_score.screen import ProfileStore, screen
-
-   # Build once; one store serves every mode listed at creation
-   store = ProfileStore.create("library.fss", num_surf_points=200, modes=("vol", "vol_esp"))
-   for molecule in library_molecules:   # featurised Molecule objects
-       store.add(molecule)
-   store.close()
-
-   # Screen as often as you like
-   store = ProfileStore.open("library.fss")
-   hits = screen(query_molecule, store, mode="vol", top_k=1000)
-   hits = screen(query_molecule, store, mode="vol_esp", top_k=1000, lam=0.1)
-
-   # Every score in library order, not only the top-K
-   scores = np.empty(len(store), dtype=np.float32)
-   screen(query_molecule, store, mode="vol", top_k=1, scores_out=scores)
-
-   # One worker process per GPU; close_multigpu_pool() releases them
-   hits = screen(query_molecule, store, mode="vol", ndev=4)
-
-``num_surf_points`` and the mode-specific keyword arguments must match how the query was built;
-:func:`~shepherd_score.screen.screen` raises if a required one is missing. A store directory is
-single-writer, so for a parallel build give each worker its own store and screen the parts in
-turn. See :doc:`api/screening` for the full API.
-
-Visualization
+Scoring modes
 -------------
 
-Utilize py3dmol to visualize the molecule and its interaction profiles.
+``vol`` and ``surf`` compare heavy-atom and surface point clouds. ``vol_esp`` and
+``surf_esp`` weight overlaps by partial charge and surface potential.
+``pharm`` compares typed, directional pharmacophores. ``vol_color``, ``vol_lipo``,
+``vol_mr``, ``vol_fukui``, ``vol_atomtype``, and ``vol_pharm`` combine shape with
+additional molecular features. Tversky variants use asymmetric normalization.
+``vol_avoid`` adds an excluded-volume penalty.
+
+``vol_and_surf_esp`` combines shape with masked surface-potential agreement.
+Its accelerated optimizer uses shape gradients to generate poses and the
+combined score to select poses; it does not differentiate the ESP agreement term.
+
+The registry in ``shepherd_score/accel/_modes.py`` specifies supported modes and
+their default seeds and step budgets. These budgets differ by mode. CPU and GPU
+early stopping and floating-point behavior can produce different local optima.
+
+Screening
+---------
 
 .. code-block:: python
 
-   from shepherd_score.visualize import draw_molecule
+   from shepherd_score.screen import ProfileStore, screen
 
-   draw_molecule(molec)
+   store = ProfileStore.create("library.fss", num_surf_points=200,
+                               modes=["vol", "surf_esp"])
+   store.add(fit, id="compound-1")
+   store.close()
+   hits = screen(ref, ProfileStore.open("library.fss"), mode="vol",
+                 backend="numba", top_k=1)
 
-Evaluation Pipelines
---------------------
+A store retains the channels required by its declared modes. Surface modes
+require a consistent surface-point count. Atom-seeded modes use canonical frames
+by default; returned transforms are mapped back to the input frame.
+See :doc:`api/screening` for multi-query and parallel screening.
 
-We implement three evaluations of generated 3D conformers. Evaluations can be done on an 
-individual basis or in a pipeline. Here we show the most basic use case in the unconditional setting.
+Evaluation
+----------
 
-* **ConfEval**: Checks validity, pre-/post-xTB relaxation, calculates 2D graph properties
-* **ConsistencyEval**: Inherits from ``ConfEval`` and evaluates the consistency of the 
-  molecule's jointly generated interaction profiles with the true interaction profiles using 
-  3D similarity scoring functions
-* **ConditionalEval**: Inherits from ``ConfEval`` and evaluates the 3D similarity between 
-  generated molecules and the target molecule
-
-.. note::
-
-   Evaluations can be run from any molecule's atomic numbers and positions with explicit 
-   hydrogens (i.e., straight from an xyz file). Pass ``timeout_minutes`` to cap per-molecule 
-   xTB wall time in ``ConfEval``, ``ConditionalEval``, and pipeline ``.evaluate()`` calls; 
-   timed-out molecules are recorded as failed. xTB optimization functions in
-   :mod:`shepherd_score.conformer_generation` also accept a ``timeout`` (seconds).
-
-Example:
-
-.. code-block:: python
-
-   from shepherd_score.evaluations.evaluate import ConfEval
-   from shepherd_score.evaluations.evaluate import UnconditionalEvalPipeline
-
-   # ConfEval evaluates the validity of a given molecule, optimizes it with xTB,
-   #   and also computes various 2D graph properties
-   # `atom_array` np.ndarray (N,) atomic numbers of the molecule (with explicit H)
-   # `position_array` np.ndarray (N,3) atom coordinates for the molecule
-   conf_eval = ConfEval(atoms=atom_array, positions=position_array)
-
-   # Alternatively, if you have a list of molecules you want to test:
-   uncond_pipe = UnconditionalEvalPipeline(
-       generated_mols=[(a, p) for a, p in zip(atom_arrays, position_arrays)]
-   )
-   uncond_pipe.evaluate(num_workers=4)
-
-   # Properties are stored as attributes and can be converted into pandas df's
-   global_series, sample_df = uncond_pipe.to_pandas()
-
-For more detailed examples, see the Jupyter notebooks in the ``examples/`` directory of the repository.
+The scripts and command examples in ``scripts/README.md`` evaluate generated
+ShEPhERD samples. The paper repository contains the throughput and retrieval
+benchmarks. The tutorials cover lower-level scoring and preparation workflows;
+their xTB examples require the executable to be installed.

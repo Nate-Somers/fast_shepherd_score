@@ -1357,7 +1357,7 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
     backend) the shard's fit tensors are built once on-device and reused across the panel via
     the direct array->kernel path, with no per-molecule ``MoleculeProfile``/``MoleculePair``.
 
-    Returns a list aligned with ``queries``: ``out[j]`` is query ``j``'s ``top_k`` ``Hit``s
+    Returns a list aligned with ``queries``: ``out[j]`` contains the top hits for query ``j``
     (sorted, descending).
 
     See :func:`screen` for the per-query parameters. ``scores_out`` may be a list of one

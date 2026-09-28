@@ -1,4 +1,4 @@
-"""MoleculePairBatch: batch of MoleculePair objects for fast sequential JAX alignment."""
+"""Batched molecular alignment with Numba, Triton, and optional JAX backends."""
 from contextlib import contextmanager
 from importlib.metadata import version as _pkg_version
 from typing import List, Optional, Tuple
@@ -105,15 +105,7 @@ def _pinned_torch_threads(pairs):
 
 
 class MoleculePairBatch:
-    """Batch of MoleculePair objects for fast sequential JAX alignment.
-
-    Pads all atom coordinate arrays to common max shapes so JAX's XLA compiler
-    reuses the same compiled function for every pair, avoiding recompilation.
-    This modifies each MoleculePair in-place (stores results on the pair).
-
-    This is currently optimized for CPU. A GPU-optimized version would
-    benefit from optimizing batches of pairs and using a GPU-optimized alignment.
-    """
+    """Align molecular pairs in batches and store scores and transforms on each pair."""
 
     def __init__(self, pairs: List[MoleculePair]):
         self.pairs = pairs

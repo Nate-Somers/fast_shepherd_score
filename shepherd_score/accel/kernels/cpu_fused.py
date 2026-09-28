@@ -48,10 +48,8 @@ def _warn_if_no_svml():
             "environment.yml (numba<=0.59 + icc_rt). Suppress via warnings filters.",
             RuntimeWarning, stacklevel=3)
 
-
-# =============================================================================================
 # njit tails
-# =============================================================================================
+
 @njit(parallel=True, fastmath=False, cache=True)
 def _tail_blend(Vg, dQg, dTg, kind, kc, cst, guard, useg, gpos, sims, wt, q, t, best, bq, bt,
                 gq, gt, score_now):
@@ -201,10 +199,8 @@ def _tail_adam(q, t, gq, gt, mq, vq, mt, vt, lr):
                                   + q[p, 3] * q[p, 3]))
         q[p, 0] = q[p, 0] / qn; q[p, 1] = q[p, 1] / qn; q[p, 2] = q[p, 2] / qn; q[p, 3] = q[p, 3] / qn
 
-
-# =============================================================================================
 # marshalling: torch -> numpy once; per-term kernel closures
-# =============================================================================================
+
 def _f32c(x):
     return np.ascontiguousarray(x.detach().cpu().numpy(), dtype=np.float32)
 
@@ -300,10 +296,8 @@ def _term_closure(tm, params):
         return _ev
     raise KeyError(kind)
 
-
-# =============================================================================================
 # the loop
-# =============================================================================================
+
 def run_fused(pr, steps, lr, es_patience, es_tol):
     """Run ``pr`` (an assembled :class:`~drivers.engine.Problem`, replicated layout, CPU fp32)
     through the fused loop. Returns torch ``(best, bq, bt)`` on the problem's device."""

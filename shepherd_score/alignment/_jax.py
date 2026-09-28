@@ -449,7 +449,7 @@ def _initialize_se3_params_jax(ref_points: Array,
 #     sampling.
 
 #     Parameters
-#     ----------
+
 #     num_samples : int
 #         Number of rotations to generate.
 

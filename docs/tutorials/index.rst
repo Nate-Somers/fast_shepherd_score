@@ -26,18 +26,13 @@ Tutorial Overview
 Running the Tutorials
 ---------------------
 
-To run these tutorials interactively, clone the repository and navigate to the 
-``examples/`` directory:
+From the repository checkout, install the package and open ``examples/``:
 
 .. code-block:: bash
 
-   git clone https://github.com/coleygroup/shepherd-score.git
-   cd shepherd-score/examples
+   python -m pip install -e .
+   python -m pip install jupyter
+   cd examples
    jupyter notebook
 
-Make sure you have the required dependencies installed:
-
-.. code-block:: bash
-
-   pip install "shepherd-score"
-   pip install jupyter
+See :doc:`../installation` for optional GPU and xTB dependencies.

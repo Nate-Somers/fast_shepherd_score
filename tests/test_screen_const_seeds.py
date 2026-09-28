@@ -123,10 +123,8 @@ def _spearman(a, b):
     ra = np.argsort(np.argsort(a)); rb = np.argsort(np.argsort(b))
     return float(np.corrcoef(ra, rb)[0, 1])
 
-
-# ---------------------------------------------------------------------------------------------
 # 1) which generator ran
-# ---------------------------------------------------------------------------------------------
+
 @pytest.mark.parametrize("mode", _CLASS_A)
 def test_constant_seeds_replace_the_eigensolve(monkeypatch, canon_store, molecules, mode):
     """Class-A modes build one constant set and skip the eigensolve; the control leg does the reverse."""
@@ -179,10 +177,8 @@ def test_vol_and_surf_esp_uses_constant_seeds_only_at_the_volumetric_alpha(monke
     assert seen2["canonical"] == 0 and seen2["batched"] >= 1
     assert "const_seeds" not in seen2["kw"][0]
 
-
-# ---------------------------------------------------------------------------------------------
 # 2) the screen is still a correct screen
-# ---------------------------------------------------------------------------------------------
+
 @pytest.mark.parametrize("mode", _CLASS_A)
 def test_self_copy_anchor_holds_under_constant_seeds(monkeypatch, canon_store, molecules, mode):
     """The self-copy ranks first (symmetric modes) and scores ~1 on the constant-seed path."""
@@ -259,10 +255,8 @@ def test_constant_seeds_on_the_triton_route(monkeypatch, canon_store, molecules,
     if mode not in _SELF_SCORE_NOT_ONE:
         assert scores[0, 1] == pytest.approx(1.0, abs=1e-2)
 
-
-# ---------------------------------------------------------------------------------------------
 # 3) the store default follows the registry
-# ---------------------------------------------------------------------------------------------
+
 @pytest.mark.parametrize("mode", tuple(screenmod._ARRAY_MODES))
 def test_store_is_canonical_by_default_exactly_for_the_constant_seed_modes(tmp_path, molecules,
                                                                              mode):

@@ -21,22 +21,18 @@ ShEPhERD Score Documentation
 evaluate conformers generated with *ShEPhERD* and other generative models.
 
 The formulation of the interaction profile representation, scoring, alignment, and evaluations are found in our 
-preprint `ShEPhERD: Diffusing shape, electrostatics, and pharmacophores for bioisosteric drug design <https://arxiv.org/abs/2411.04130>`_.
+ICLR 2025 paper `ShEPhERD: Diffusing shape, electrostatics, and pharmacophores for bioisosteric drug design <https://arxiv.org/abs/2411.04130>`_.
 
 *ShEPhERD*: **S**\ hape, **E**\ lectrostatics, and **Ph**\ armacophores **E**\ xplicit **R**\ epresentation **D**\ iffusion
 
 Quick Install
 -------------
 
-.. code-block:: bash
+Install this checkout for the accelerated API::
 
-   pip install shepherd-score
+   python -m pip install -e .
 
-   # With optional dependencies
-   pip install "shepherd-score[gpu]"      # Triton GPU kernels (needs a CUDA build of PyTorch)
-   pip install "shepherd-score[jax]"      # JAX implementations of scoring and alignment
-   pip install "shepherd-score[docking]"  # Docking evaluation tools
-   pip install "shepherd-score[all]"      # Everything
+See :doc:`installation` for optional backends and external executables.
 
 .. toctree::
    :caption: Information
