@@ -1,7 +1,7 @@
 # Alignment throughput
 
 These measurements come from the explicit selections in
-[`paper_results.py`](https://github.com/Nate-Somers/Shepherd-Score-Paper/blob/main/paper/fig2_speed/paper_results.py).
+[`paper_results.py`](https://github.com/Nate-Somers/Shepherd-Score-Paper/blob/main/figures/throughput/paper_results.py).
 They describe the recorded commits, not a new benchmark of this checkout.
 GPU: NVIDIA L40S. CPU: one AMD EPYC 9474F core with Numba/SVML.
 Rates exclude molecular preparation and index construction and include an
