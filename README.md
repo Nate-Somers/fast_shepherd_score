@@ -12,6 +12,11 @@ multi-query screening, and CPU-worker and multi-GPU execution. Stores reuse
 prepared features across queries; batch kernels optimize multiple starting poses
 without requiring a separate Python alignment call for each pair.
 
+Combined volume-and-surface ESP alignment optimizes both terms of its reported
+score. CPU and GPU use the same early-stopping patience where enabled; the
+combined-ESP CUDA-graph paths run the full step budget. See the API guide for
+mode-specific settings and CPU/GPU numerical differences.
+
 Start with the [accelerated API guide](docs/accelerated_api.md) for a walkthrough
 of preparation, mode selection, batch alignment, stores, screening and parallel
 execution. The [usage guide](docs/usage.rst) is a shorter introduction;

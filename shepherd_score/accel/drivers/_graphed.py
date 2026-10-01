@@ -138,9 +138,8 @@ class _GraphedFineBase:
             for _ in range(self.steps):
                 self.graph.replay()
             done = self.steps
-        # Replays executed == value+grad evaluations. Tagged graphed=True because the replay
-        # loop and the eager loop run different early-stop schedules. No-op unless _stats
-        # recording is enabled.
+        # Replays executed == value+grad evaluations. Record the execution path separately
+        # from its stopping policy. No-op unless _stats recording is enabled.
         _record_steps(done, self.steps, done < self.steps, graphed=True)
         return self._result()
 

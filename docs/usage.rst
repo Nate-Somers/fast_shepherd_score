@@ -48,8 +48,10 @@ Its accelerated optimizer follows the gradient of the combined score, including
 the ESP agreement term.
 
 The registry in ``shepherd_score/accel/_modes.py`` specifies supported modes and
-their default seeds and step budgets. These budgets differ by mode. CPU and GPU
-early stopping and floating-point behavior can produce different local optima.
+their default seeds and step budgets. Early stopping uses the same patience on
+CPU and GPU where enabled. The CUDA-graph paths for ``vol_and_surf_esp`` and
+``vol_and_surf_esp_tversky`` run the full step budget. Floating-point arithmetic
+and batch composition can affect the stopping point and the selected pose.
 
 Screening
 ---------

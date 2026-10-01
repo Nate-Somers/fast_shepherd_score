@@ -90,11 +90,12 @@ term and the ESP agreement term, so the optimizer follows the gradient of the
 combined score it reports.
 Mode defaults, channel requirements and optimization budgets are defined in
 [`accel/_modes.py`](../shepherd_score/accel/_modes.py). A step budget is a ceiling,
-not a fixed amount of work. The CPU, GPU eager and GPU CUDA-graph loops apply the
-same early-stopping rule and patience, but CPU and GPU rounding can still select
-different local optima, and batch composition decides when a batch stops. Do not
-assume identical scores or search effort merely because two calls use the same
-mode name.
+not a fixed amount of work. Where early stopping is enabled, the CPU, GPU eager
+and GPU CUDA-graph loops use the same patience and check for improvement every
+five steps. A batch stops only when every pair has stalled. The CUDA-graph paths
+for `vol_and_surf_esp` and `vol_and_surf_esp_tversky` always run their full step
+budget. CPU/GPU rounding and batch composition can still affect the stopping
+point and the selected pose.
 
 ## Build a library and screen it
 
