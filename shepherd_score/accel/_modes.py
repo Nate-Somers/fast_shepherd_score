@@ -22,14 +22,16 @@ class Term:
         ``"avoid"``   linear hard-sphere excluded-volume penalty
                        (``overlap_score_grad_avoid_se3_batch``; a fixed avoid cloud on the ref
                        slot, fit points on the fit slot);
-        ``"esp_cmp"`` the ShaEP surface-ESP agreement (value only, no gradient).
+        ``"esp_cmp"`` the ShaEP surface-ESP agreement
+                       (``esp_agreement_grad_se3_batch``; with-H atoms, charges, radii, surface
+                       points, surface ESP per side).
     ref / fit : channel names, in the kernel's argument order, for each side.
     params : call-kwarg names forwarded to the kernel (``"alpha"``, ``"lam"``, ``"avoid_min_dist"``).
     reduction : how the raw overlap becomes a similarity:
         ``"tanimoto"``  V / (VAA + VBB - V)            scale = (VAA+VBB) / denom^2
         ``"tversky"``   V / (k V + C), C = ta VAA + tb VBB, k = 1 - ta - tb; scale = C / denom^2
         ``"raw"``       the value itself (a penalty); scale = 1
-        ``"agreement"`` the esp_cmp average in [0, 1]; no gradient
+        ``"agreement"`` the esp_cmp average in [0, 1]; scale = 1
         ``"pharm_sim"`` the pharmacophore family's own reduction, selected by the call's
                         ``similarity`` keyword: a guarded Tanimoto, or a guarded Tversky
                         ``V / (sigma VAA + (1-sigma) VBB)`` clamped to 1 with sigma from
@@ -38,13 +40,13 @@ class Term:
                         gradient is the hinged ``-1(V < D)/D``.
     weight : the blend weight: a call-kwarg name, a float, or ``None`` for the complement of
         the other term's named weight (``1 - w``). Negative weights subtract (penalties).
-    grad : whether the term's kernel gradient steers the pose.
+    grad : whether the term's kernel gradient steers the pose. Every registered mode sets it,
+        so each optimiser follows the gradient of the score it reports; ``False`` makes the
+        term enter only the tracked score.
     guard : mask the term to zero for pairs where either side has no real points (the lipo
         family), so an empty channel contributes neither score nor gradient.
     tables : lookup-table set for the typed kernels: ``"color"`` (directionless pharmacophore),
         ``"pharm"`` (directional pharmacophore) or ``"element"`` (atomic numbers).
-    stride : for a value-only term, evaluate it only every few eager-loop steps (the combo
-        modes score their ESP term on a stride rather than every step).
     """
     kernel: str
     ref: Tuple[str, ...]
@@ -55,7 +57,6 @@ class Term:
     grad: bool = True
     guard: bool = False
     tables: Optional[str] = None
-    stride: bool = False
 
 
 @dataclass(frozen=True)
@@ -201,8 +202,7 @@ def _combo_terms(reduction="tanimoto"):
                  weight=None),
             Term("esp_cmp", ("cwh", "partial", "radii", "surf", "surf_esp"),
                  ("cwh", "partial", "radii", "surf", "surf_esp"),
-                 params=("lam", "probe_radius"), reduction="agreement", weight="esp_weight",
-                 grad=False, stride=True))
+                 params=("lam", "probe_radius"), reduction="agreement", weight="esp_weight"))
 
 
 _TV = {"tversky_alpha": 0.95, "tversky_beta": 0.05}

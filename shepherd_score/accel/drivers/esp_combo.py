@@ -1,8 +1,7 @@
 """``vol_and_surf_esp`` driver entry points (ShaEP-style shape + surface-ESP agreement).
 
-The pose is steered by the shape gradient only; the ESP agreement enters the tracked score.
-The eager loop scores the ESP term every ``_ESP_STRIDE`` steps (plus the last); the CUDA-graph
-step scores it every step (see ``engine._GraphedFineTerms``).
+Every fine step evaluates both terms with their gradients, so the pose follows the gradient of
+the blended score ``(1 - esp_weight) * shape + esp_weight * ESP agreement`` that the mode reports.
 """
 from __future__ import annotations
 
@@ -13,7 +12,6 @@ import torch
 from ..kernels.dispatch import overlap_score_grad_se3_batch, _batch_self_overlap, esp_comparison_batch
 from ._common import apply_se3_transform, quaternion_to_rotation_matrix  # noqa: F401
 from ._shim import batch, run
-from .engine import _ESP_STRIDE  # noqa: F401  (re-export)
 
 
 @torch.no_grad()

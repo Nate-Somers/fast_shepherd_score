@@ -379,12 +379,13 @@ def overlap_score_grad_esp_se3_batch(
     )
     return out_S, out_dQ, out_dT
 
-#  ShaEP ESP surface-comparison kernel (vol_and_surf_esp), value only. For each
+#  ShaEP ESP surface-comparison kernel, one direction, value only. For each
 #  real field point i of the observer molecule: the Coulomb ESP induced there by
 #  the other molecule's atoms, dropped if inside that molecule's vdW+probe volume,
 #      esp = sum_i  keep_i * exp( -(point_esp_i - sum_m q_m/d_im)^2 / lam )
 #  Points and atoms arrive in the world frame, so the kernel takes no pose and
-#  emits no gradient (the pose is steered by the shape gradient).
+#  emits no gradient. The aligners use _esp_agreement_grad_kernel below, which
+#  takes the pose and returns the SE(3) gradient.
 
 @triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
@@ -509,6 +510,199 @@ def esp_comparison_batch(
         out_S,
     )
     return out_S
+
+#  ShaEP surface-ESP agreement with its SE(3) gradient (vol_and_surf_esp and its Tversky
+#  variant). One CTA per pose. The fit molecule's atoms and surface points arrive in its own
+#  frame and are moved by R(q) x + t in-kernel (no torch transform, so no TF32 matmul), and
+#  both directions of the comparison are summed:
+#      V = (sum_i g_i + sum_j g_j) / (n_surf + m_surf),  g = keep * exp(-(pe - esp)^2 / lam)
+#  i over the reference surface (field from the moved fit atoms), j over the moved fit
+#  surface (field from the reference atoms). The vdW+probe mask is piecewise constant, so it
+#  contributes no gradient. Forces on the moved points are contracted into dV/dq with the
+#  shape kernel's _quat_grad_tail.
+
+@triton.autotune(configs=_OVERLAP_CONFIGS, key=["NS1", "NA1", "NS2", "NA2"], cache_results=True)
+@triton.jit
+def _esp_agreement_grad_kernel(
+    P1, PE1, A1, Q1, R1,          # reference: surface (K*NS1*3), surface ESP, with-H atoms, charges, radii
+    P2, PE2, A2, Q2, R2,          # fit, in its own frame (moved here by q, t)
+    Qp, Tp,                       # (K*4), (K*3)
+    NS1r, NA1r, NS2r, NA2r,       # (K,) real counts
+    NS1, NA1, NS2, NA2,           # pads
+    inv_lam, coul, probe,
+    V_ptr, dQ_ptr, dT_ptr,
+    BLOCK: tl.constexpr, NEED_GRAD: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    ns1 = tl.load(NS1r + pid); na1 = tl.load(NA1r + pid)
+    ns2 = tl.load(NS2r + pid); na2 = tl.load(NA2r + pid)
+    P1 = P1 + pid * NS1 * 3; PE1 = PE1 + pid * NS1
+    A1 = A1 + pid * NA1 * 3; Q1 = Q1 + pid * NA1; R1 = R1 + pid * NA1
+    P2 = P2 + pid * NS2 * 3; PE2 = PE2 + pid * NS2
+    A2 = A2 + pid * NA2 * 3; Q2 = Q2 + pid * NA2; R2 = R2 + pid * NA2
+    qr = tl.load(Qp + pid * 4 + 0); qi = tl.load(Qp + pid * 4 + 1)
+    qj = tl.load(Qp + pid * 4 + 2); qk = tl.load(Qp + pid * 4 + 3)
+    tx = tl.load(Tp + pid * 3 + 0); ty = tl.load(Tp + pid * 3 + 1); tz = tl.load(Tp + pid * 3 + 2)
+    r00, r01, r02, r10, r11, r12, r20, r21, r22 = _quat_to_rotmat(qr, qi, qj, qk)
+    inv_ln2 = 1.4426950408889634
+
+    total = 0.0
+    gw = 0.0; gx = 0.0; gy = 0.0; gz = 0.0
+    fTx = 0.0; fTy = 0.0; fTz = 0.0
+
+    # reference surface points vs moved fit atoms
+    for n0 in range(0, NS1, BLOCK):
+        offs_n = n0 + tl.arange(0, BLOCK)
+        mask_n = offs_n < ns1
+        n_idx = tl.where(mask_n, offs_n, 0)
+        px = tl.load(P1 + n_idx * 3 + 0, mask=mask_n, other=0.0)
+        py = tl.load(P1 + n_idx * 3 + 1, mask=mask_n, other=0.0)
+        pz = tl.load(P1 + n_idx * 3 + 2, mask=mask_n, other=0.0)
+        pe = tl.load(PE1 + n_idx, mask=mask_n, other=0.0)
+        esp = tl.zeros([BLOCK], dtype=tl.float32)
+        cnt = tl.zeros([BLOCK], dtype=tl.float32)
+        for m0 in range(0, NA2, BLOCK):
+            offs_m = m0 + tl.arange(0, BLOCK)
+            mask_m = offs_m < na2
+            m_idx = tl.where(mask_m, offs_m, 0)
+            bx = tl.load(A2 + m_idx * 3 + 0, mask=mask_m, other=0.0)
+            by = tl.load(A2 + m_idx * 3 + 1, mask=mask_m, other=0.0)
+            bz = tl.load(A2 + m_idx * 3 + 2, mask=mask_m, other=0.0)
+            qc = tl.load(Q2 + m_idx, mask=mask_m, other=0.0)
+            rad = tl.load(R2 + m_idx, mask=mask_m, other=0.0)
+            ax = r00 * bx + r01 * by + r02 * bz + tx
+            ay = r10 * bx + r11 * by + r12 * bz + ty
+            az = r20 * bx + r21 * by + r22 * bz + tz
+            dx = px[:, None] - ax[None, :]
+            dy = py[:, None] - ay[None, :]
+            dz = pz[:, None] - az[None, :]
+            d = tl.sqrt(dx * dx + dy * dy + dz * dz)
+            d = tl.where(d < 1e-6, 1e-6, d)
+            pair_m = mask_m[None, :]
+            esp += tl.sum(tl.where(pair_m, qc[None, :] / d, 0.0), axis=1)
+            blocked = (d < (rad[None, :] + probe)) & pair_m
+            cnt += tl.sum(tl.where(blocked, 1.0, 0.0), axis=1)
+        esp = esp * coul
+        diff = pe - esp
+        keep = mask_n & (cnt == 0.0)
+        g = tl.where(keep, tl.exp2((-(diff * diff) * inv_lam) * inv_ln2), 0.0)
+        total += tl.sum(g)
+        if NEED_GRAD:
+            c = tl.where(keep, 2.0 * inv_lam * g * diff * coul, 0.0)
+            for m0 in range(0, NA2, BLOCK):
+                offs_m = m0 + tl.arange(0, BLOCK)
+                mask_m = offs_m < na2
+                m_idx = tl.where(mask_m, offs_m, 0)
+                bx = tl.load(A2 + m_idx * 3 + 0, mask=mask_m, other=0.0)
+                by = tl.load(A2 + m_idx * 3 + 1, mask=mask_m, other=0.0)
+                bz = tl.load(A2 + m_idx * 3 + 2, mask=mask_m, other=0.0)
+                qc = tl.load(Q2 + m_idx, mask=mask_m, other=0.0)
+                ax = r00 * bx + r01 * by + r02 * bz + tx
+                ay = r10 * bx + r11 * by + r12 * bz + ty
+                az = r20 * bx + r21 * by + r22 * bz + tz
+                dx = px[:, None] - ax[None, :]
+                dy = py[:, None] - ay[None, :]
+                dz = pz[:, None] - az[None, :]
+                d = tl.sqrt(dx * dx + dy * dy + dz * dz)
+                d = tl.where(d < 1e-6, 1e-6, d)
+                w = tl.where(mask_m[None, :], c[:, None] * qc[None, :] / (d * d * d), 0.0)
+                fx = tl.sum(w * dx, axis=0)          # per fit atom: force on the moved atom
+                fy = tl.sum(w * dy, axis=0)
+                fz = tl.sum(w * dz, axis=0)
+                dw_, dx_, dy_, dz_ = _quat_grad_tail(fx, fy, fz, bx, by, bz, qr, qi, qj, qk)
+                gw += tl.sum(dw_); gx += tl.sum(dx_); gy += tl.sum(dy_); gz += tl.sum(dz_)
+                fTx += tl.sum(fx); fTy += tl.sum(fy); fTz += tl.sum(fz)
+
+    # moved fit surface points vs reference atoms
+    for n0 in range(0, NS2, BLOCK):
+        offs_n = n0 + tl.arange(0, BLOCK)
+        mask_n = offs_n < ns2
+        n_idx = tl.where(mask_n, offs_n, 0)
+        sx = tl.load(P2 + n_idx * 3 + 0, mask=mask_n, other=0.0)
+        sy = tl.load(P2 + n_idx * 3 + 1, mask=mask_n, other=0.0)
+        sz = tl.load(P2 + n_idx * 3 + 2, mask=mask_n, other=0.0)
+        pe = tl.load(PE2 + n_idx, mask=mask_n, other=0.0)
+        px = r00 * sx + r01 * sy + r02 * sz + tx
+        py = r10 * sx + r11 * sy + r12 * sz + ty
+        pz = r20 * sx + r21 * sy + r22 * sz + tz
+        esp = tl.zeros([BLOCK], dtype=tl.float32)
+        cnt = tl.zeros([BLOCK], dtype=tl.float32)
+        Gx = tl.zeros([BLOCK], dtype=tl.float32)
+        Gy = tl.zeros([BLOCK], dtype=tl.float32)
+        Gz = tl.zeros([BLOCK], dtype=tl.float32)
+        for m0 in range(0, NA1, BLOCK):
+            offs_m = m0 + tl.arange(0, BLOCK)
+            mask_m = offs_m < na1
+            m_idx = tl.where(mask_m, offs_m, 0)
+            ax = tl.load(A1 + m_idx * 3 + 0, mask=mask_m, other=0.0)
+            ay = tl.load(A1 + m_idx * 3 + 1, mask=mask_m, other=0.0)
+            az = tl.load(A1 + m_idx * 3 + 2, mask=mask_m, other=0.0)
+            qc = tl.load(Q1 + m_idx, mask=mask_m, other=0.0)
+            rad = tl.load(R1 + m_idx, mask=mask_m, other=0.0)
+            dx = px[:, None] - ax[None, :]
+            dy = py[:, None] - ay[None, :]
+            dz = pz[:, None] - az[None, :]
+            d = tl.sqrt(dx * dx + dy * dy + dz * dz)
+            d = tl.where(d < 1e-6, 1e-6, d)
+            pair_m = mask_m[None, :]
+            qd = tl.where(pair_m, qc[None, :] / d, 0.0)
+            esp += tl.sum(qd, axis=1)
+            if NEED_GRAD:
+                w = qd / (d * d)
+                Gx += tl.sum(w * dx, axis=1); Gy += tl.sum(w * dy, axis=1); Gz += tl.sum(w * dz, axis=1)
+            blocked = (d < (rad[None, :] + probe)) & pair_m
+            cnt += tl.sum(tl.where(blocked, 1.0, 0.0), axis=1)
+        esp = esp * coul
+        diff = pe - esp
+        keep = mask_n & (cnt == 0.0)
+        g = tl.where(keep, tl.exp2((-(diff * diff) * inv_lam) * inv_ln2), 0.0)
+        total += tl.sum(g)
+        if NEED_GRAD:
+            c = tl.where(keep, -2.0 * inv_lam * g * diff * coul, 0.0)
+            fx = c * Gx; fy = c * Gy; fz = c * Gz
+            dw_, dx_, dy_, dz_ = _quat_grad_tail(fx, fy, fz, sx, sy, sz, qr, qi, qj, qk)
+            gw += tl.sum(dw_); gx += tl.sum(dx_); gy += tl.sum(dy_); gz += tl.sum(dz_)
+            fTx += tl.sum(fx); fTy += tl.sum(fy); fTz += tl.sum(fz)
+
+    inv_n = 1.0 / (ns1 + ns2).to(tl.float32)
+    tl.store(V_ptr + pid, total * inv_n)
+    if NEED_GRAD:
+        tl.store(dQ_ptr + pid * 4 + 0, gw * inv_n); tl.store(dQ_ptr + pid * 4 + 1, gx * inv_n)
+        tl.store(dQ_ptr + pid * 4 + 2, gy * inv_n); tl.store(dQ_ptr + pid * 4 + 3, gz * inv_n)
+        tl.store(dT_ptr + pid * 3 + 0, fTx * inv_n); tl.store(dT_ptr + pid * 3 + 1, fTy * inv_n)
+        tl.store(dT_ptr + pid * 3 + 2, fTz * inv_n)
+
+
+def esp_agreement_grad_se3_batch(ref_atoms, ref_charges, ref_radii, ref_points, ref_point_esp,
+                                 fit_atoms, fit_charges, fit_radii, fit_points, fit_point_esp,
+                                 n_surf, m_surf, n_atoms, m_atoms, q, t, *,
+                                 probe_radius: float = 1.0, lam: float = 0.001,
+                                 NEED_GRAD: bool = True):
+    """The ShaEP surface-ESP agreement ``V`` (K,) of the reference with the fit moved by
+    ``(q, t)``, and ``dV/dq`` (K, 4), ``dV/dt`` (K, 3) (zeros when ``NEED_GRAD`` is False).
+
+    Shapes (padded, one row per pose): ``*_atoms`` (K, A_pad, 3) with-H atoms, ``*_charges`` and
+    ``*_radii`` (K, A_pad), ``*_points`` (K, S_pad, 3) surface points, ``*_point_esp`` (K, S_pad)
+    ESP at those points. The fit tensors are in the fit's own frame. ``n_surf``/``m_surf`` and
+    ``n_atoms``/``m_atoms`` are the real surface-point and atom counts. ``lam`` is the raw
+    weighting parameter; ``LAM_SCALING`` is applied here.
+    """
+    K = int(q.shape[0])
+    dev = q.device
+    i32 = lambda x: x.to(device=dev, dtype=torch.int32).contiguous()
+    c = lambda x: x.contiguous()
+    V = torch.empty(K, device=dev, dtype=ref_points.dtype)
+    dQ = torch.zeros(K, 4, device=dev, dtype=q.dtype)
+    dT = torch.zeros(K, 3, device=dev, dtype=t.dtype)
+    _esp_agreement_grad_kernel[(K,)](
+        c(ref_points), c(ref_point_esp), c(ref_atoms), c(ref_charges), c(ref_radii),
+        c(fit_points), c(fit_point_esp), c(fit_atoms), c(fit_charges), c(fit_radii),
+        c(q), c(t), i32(n_surf), i32(n_atoms), i32(m_surf), i32(m_atoms),
+        int(ref_points.shape[1]), int(ref_atoms.shape[1]), int(fit_points.shape[1]),
+        int(fit_atoms.shape[1]),
+        1.0 / (LAM_SCALING * float(lam)), float(COULOMB_SCALING), float(probe_radius),
+        V, dQ, dT, NEED_GRAD=bool(NEED_GRAD))
+    return V, dQ, dT
 
 
 @torch.no_grad()

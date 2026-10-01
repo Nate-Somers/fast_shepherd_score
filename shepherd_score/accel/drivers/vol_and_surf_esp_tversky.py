@@ -6,7 +6,7 @@ import torch
 
 from ._common import apply_se3_transform
 from .esp_combo import (coarse_fine_esp_combo_align_many, _batch_esp_comparison,  # noqa: F401
-                        _overlap_in_chunks_volumetric, _self_overlap_chunks, _ESP_STRIDE)
+                        _overlap_in_chunks_volumetric, _self_overlap_chunks)
 
 
 @torch.no_grad()

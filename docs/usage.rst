@@ -44,8 +44,8 @@ additional molecular features. Tversky variants use asymmetric normalization.
 ``avoid_points`` cloud in addition to the reference and fit molecules.
 
 ``vol_and_surf_esp`` combines shape with masked surface-potential agreement.
-Its accelerated optimizer uses shape gradients to generate poses and the
-combined score to select poses; it does not differentiate the ESP agreement term.
+Its accelerated optimizer follows the gradient of the combined score, including
+the ESP agreement term.
 
 The registry in ``shepherd_score/accel/_modes.py`` specifies supported modes and
 their default seeds and step budgets. These budgets differ by mode. CPU and GPU

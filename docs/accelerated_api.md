@@ -85,8 +85,9 @@ For `vol_and_surf_esp_tversky`, the change applies to the shape term.
 `align_with_esp` and `align_with_esp_combo` remain compatibility aliases for
 `surf_esp` and `vol_and_surf_esp`.
 
-`vol_and_surf_esp` uses shape gradients to generate poses and the combined
-objective to select them; its ESP agreement term is not differentiated.
+`vol_and_surf_esp` and `vol_and_surf_esp_tversky` differentiate both the shape
+term and the ESP agreement term, so the optimizer follows the gradient of the
+combined score it reports.
 Mode defaults, channel requirements and optimization budgets are defined in
 [`accel/_modes.py`](../shepherd_score/accel/_modes.py). A step budget is a ceiling,
 not a fixed amount of work. CPU/GPU early stopping and rounding can select
