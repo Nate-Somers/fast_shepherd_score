@@ -52,7 +52,7 @@ def _warn_if_no_svml():
 
 @njit(parallel=True, fastmath=False, cache=True)
 def _tail_blend(Vg, dQg, dTg, kind, kc, cst, guard, useg, gpos, sims, wt, q, t, best, bq, bt,
-                gq, gt, score_now):
+                gq, gt):
     """Per pose: reduce every gradient term (Tanimoto / Tversky / raw, guarded), blend the
     similarities in term order (value-only rows of ``sims`` prefilled by the host), track the
     best pre-Adam pose, and build the blended descent gradient into ``gq``/``gt``."""
@@ -109,20 +109,19 @@ def _tail_blend(Vg, dQg, dTg, kind, kc, cst, guard, useg, gpos, sims, wt, q, t, 
                     y0 = -y0; y1 = -y1; y2 = -y2
                 gq[p, 0] += x0; gq[p, 1] += x1; gq[p, 2] += x2; gq[p, 3] += x3
                 gt[p, 0] += y0; gt[p, 1] += y1; gt[p, 2] += y2
-        if score_now:
-            # ---- blend in term order: score = w0*s0 (+ w1*s1 ...) ---------------------------
-            s = sims[0, p]
-            if wt[0] != _F1:
-                s = s * wt[0]
-            for j in range(1, T):
-                c = sims[j, p]
-                if wt[j] != _F1:
-                    c = c * wt[j]
-                s = s + c
-            if s > best[p]:
-                best[p] = s
-                bq[p, 0] = q[p, 0]; bq[p, 1] = q[p, 1]; bq[p, 2] = q[p, 2]; bq[p, 3] = q[p, 3]
-                bt[p, 0] = t[p, 0]; bt[p, 1] = t[p, 1]; bt[p, 2] = t[p, 2]
+        # ---- blend in term order: score = w0*s0 (+ w1*s1 ...) -------------------------------
+        s = sims[0, p]
+        if wt[0] != _F1:
+            s = s * wt[0]
+        for j in range(1, T):
+            c = sims[j, p]
+            if wt[j] != _F1:
+                c = c * wt[j]
+            s = s + c
+        if s > best[p]:
+            best[p] = s
+            bq[p, 0] = q[p, 0]; bq[p, 1] = q[p, 1]; bq[p, 2] = q[p, 2]; bq[p, 3] = q[p, 3]
+            bt[p, 0] = t[p, 0]; bt[p, 1] = t[p, 1]; bt[p, 2] = t[p, 2]
 
 
 @njit(parallel=True, fastmath=False, cache=True)
@@ -217,20 +216,6 @@ def _cast3(V, dQ, dT):
     return V.astype(np.float32), dQ.astype(np.float32), dT.astype(np.float32)
 
 
-def _rotmat_np(q):
-    """float32 twin of ``drivers._common.quaternion_to_rotation_matrix`` (normalises first)."""
-    n = np.sqrt((q * q).sum(1, keepdims=True)).astype(np.float32)
-    n = np.maximum(n, np.float32(1e-12))
-    q = q / n
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    two = np.float32(2.0)
-    R = np.empty((q.shape[0], 3, 3), np.float32)
-    R[:, 0, 0] = 1 - two * (y * y + z * z); R[:, 0, 1] = two * (x * y - z * w); R[:, 0, 2] = two * (x * z + y * w)
-    R[:, 1, 0] = two * (x * y + z * w); R[:, 1, 1] = 1 - two * (x * x + z * z); R[:, 1, 2] = two * (y * z - x * w)
-    R[:, 2, 0] = two * (x * z - y * w); R[:, 2, 1] = two * (y * z + x * w); R[:, 2, 2] = 1 - two * (x * x + y * y)
-    return R
-
-
 def _term_closure(tm, params):
     """``(q_np, t_np) -> (V, dQ, dT)`` float32 for one term, marshalled once."""
     ti = tm.inputs
@@ -277,22 +262,22 @@ def _term_closure(tm, params):
         AV = _f32c(ti.ref[0]); B = _f32c(ti.fit[0]); d0 = float(params["avoid_min_dist"])
         return lambda q, t: _cast3(*_avoid_grad_kernel(AV, B, q, t, Nr, Mr, d0, True))
     if kind == "esp_cmp":
-        from .cpu import _esp_comparison_kernel
+        from .cpu import _esp_agreement_grad_kernel
         from ...score.constants import COULOMB_SCALING, LAM_SCALING
         cwh1, pc1, rad1, pts1, ptc1 = (_f32c(x) for x in ti.ref)
         cwh2, pc2, rad2, pts2, ptc2 = (_f32c(x) for x in ti.fit)
         n_surf = _i64(ti.params["_n_surf"]); m_surf = _i64(ti.params["_m_surf"])
-        nsf = n_surf.astype(np.float32); msf = m_surf.astype(np.float32)
         inv_lam = 1.0 / (LAM_SCALING * float(params["lam"]))
         coul = float(COULOMB_SCALING); probe = float(params["probe_radius"])
+        need = bool(tm.spec.grad)
+        Abuf = np.empty((cwh2.shape[0], cwh2.shape[1], 3), dtype=np.float64)
+        Fbuf = np.empty_like(Abuf)
 
         def _ev(q, t):
-            R = _rotmat_np(q)
-            cwh2_t = (np.einsum("bni,bji->bnj", cwh2, R) + t[:, None, :]).astype(np.float32)
-            pts2_t = (np.einsum("bni,bji->bnj", pts2, R) + t[:, None, :]).astype(np.float32)
-            e1 = _esp_comparison_kernel(pts1, cwh2_t, pc2, rad2, ptc1, n_surf, Mr, inv_lam, coul, probe)
-            e2 = _esp_comparison_kernel(pts2_t, cwh1, pc1, rad1, ptc2, m_surf, Nr, inv_lam, coul, probe)
-            return ((e1.astype(np.float32) + e2.astype(np.float32)) / (nsf + msf)), None, None
+            V, dQ, dT = _esp_agreement_grad_kernel(pts1, ptc1, n_surf, cwh1, pc1, rad1, Nr,
+                                                   pts2, ptc2, m_surf, cwh2, pc2, rad2, Mr,
+                                                   q, t, inv_lam, coul, probe, Abuf, Fbuf, need)
+            return _cast3(V, dQ, dT) if need else (V.astype(np.float32), None, None)
         return _ev
     raise KeyError(kind)
 
@@ -363,21 +348,18 @@ def run_fused(pr, steps, lr, es_patience, es_tol):
                 kind[g] = 2
             if tm.guard is not None:
                 useg[g] = True; guard[g] = tm.guard.detach().cpu().numpy().astype(np.bool_)
-        strided = any(tm.spec.stride for tm in pr.terms)
         step = -1
         for step in range(steps):
-            score_now = (not strided) or (step % 5 == 0) or (step == steps - 1)
             for g, i in enumerate(grad_ix):
                 V, dQ, dT = evals[i](q, t)
                 Vg[g] = V; dQg[g] = dQ; dTg[g] = dT
-            if score_now:
-                for i in val_ix:
-                    V, _, _ = evals[i](q, t)
-                    tm = pr.terms[i]
-                    sims[i] = V if tm.guard is None else np.where(
-                        tm.guard.detach().cpu().numpy(), V, np.float32(0.0))
+            for i in val_ix:
+                V, _, _ = evals[i](q, t)
+                tm = pr.terms[i]
+                sims[i] = V if tm.guard is None else np.where(
+                    tm.guard.detach().cpu().numpy(), V, np.float32(0.0))
             _tail_blend(Vg, dQg, dTg, kind, kc, cst, guard, useg, gpos, sims, wt, q, t, best,
-                        bq, bt, gq, gt, score_now)
+                        bq, bt, gq, gt)
             if step % 5 == 0:
                 cur = best.reshape(-1, S).max(axis=1)
                 improved = (cur - prev) > es_tol

@@ -17,9 +17,8 @@ from ..kernels.dispatch import (
     overlap_score_grad_se3_batch, overlap_score_grad_esp_se3_batch,
     overlap_score_grad_avoid_se3_batch, pharm_color_score_grad_se3_batch,
     pharm_grad_dq_se3_batch, _batch_self_overlap, _batch_self_overlap_esp,
-    esp_comparison_batch,
+    esp_agreement_grad_se3_batch,
 )
-from ._common import apply_se3_transform
 
 # Poses per kernel launch. The kernels launch a one-dimensional grid, so the bound that applies
 # is the int32 pointer offset formed as ``mol * N_pad * 3``, which ``_launch_step`` derives from
@@ -162,7 +161,8 @@ def evaluate(term, ti: TermInputs, q, t, *, need_grad=True, seeds_per_mol=1, pos
                   NEED_GRAD=need_grad)
         return _chunked(overlap_score_grad_avoid_se3_batch, K, S, (AV, B), (q, t), kw, {})
     if term.kernel == "esp_cmp":
-        return esp_agreement(ti, q, t), None, None
+        V, dQ, dT = esp_agreement(ti, q, t, need_grad=need_grad, seeds_per_mol=S)
+        return (V, dQ, dT) if need_grad else (V, None, None)
     raise KeyError(term.kernel)
 
 
@@ -195,21 +195,18 @@ def evaluate_fused_pair(t0, t1, ti0: TermInputs, ti1: TermInputs, q, t, params):
     return (Vs, dQs, dTs), (Oc, dQc, dTc)
 
 
-def esp_agreement(ti: TermInputs, q, t):
-    """The ShaEP surface-ESP agreement in [0, 1]: each molecule's surface ESP against the
-    Coulomb field of the other's transformed atoms, masked by vdW+probe, averaged over both
-    surfaces. Channels (per side): cwh, partial, radii, surf, surf_esp; real counts: with-H atoms
-    (``n_real``/``m_real``) and surface points (in ``params``)."""
-    cwh1, pc1, rad1, pts1, ptc1 = ti.ref
-    cwh2, pc2, rad2, pts2, ptc2 = ti.fit
+def esp_agreement(ti: TermInputs, q, t, *, need_grad=False, seeds_per_mol=1):
+    """The ShaEP surface-ESP agreement in [0, 1] and its SE(3) gradient: each molecule's surface
+    ESP against the Coulomb field of the other's transformed atoms, masked by vdW+probe,
+    averaged over both surfaces. Channels (per side): cwh, partial, radii, surf, surf_esp; real
+    counts: with-H atoms (``n_real``/``m_real``) and surface points (in ``params``). Returns
+    ``(V, dQ, dT)``; ``dQ``/``dT`` are zeros when ``need_grad`` is False."""
+    if int(seeds_per_mol) != 1:
+        raise ValueError("esp_cmp takes the replicated layout (one row per pose)")
     p = ti.params
-    n_surf, m_surf = p["_n_surf"], p["_m_surf"]
-    cwh2_t = apply_se3_transform(cwh2, q, t)
-    pts2_t = apply_se3_transform(pts2, q, t)
-    kw = dict(probe_radius=float(p["probe_radius"]), lam=float(p["lam"]))
-    esp_1 = esp_comparison_batch(pts1, cwh2_t, pc2, ptc1, rad2, N_real=n_surf, M_real=ti.m_real, **kw)
-    esp_2 = esp_comparison_batch(pts2_t, cwh1, pc1, ptc2, rad1, N_real=m_surf, M_real=ti.n_real, **kw)
-    return (esp_1 + esp_2) / (n_surf.to(pts1.dtype) + m_surf.to(pts1.dtype))
+    args_mol = (*ti.ref, *ti.fit, p["_n_surf"], p["_m_surf"], ti.n_real, ti.m_real)
+    kw = dict(probe_radius=float(p["probe_radius"]), lam=float(p["lam"]), NEED_GRAD=bool(need_grad))
+    return _chunked(esp_agreement_grad_se3_batch, int(q.shape[0]), 1, args_mol, (q, t), kw, {})
 
 # self-overlaps (pose-invariant)
 

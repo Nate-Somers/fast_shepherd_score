@@ -203,9 +203,10 @@ The field kernel weights pairs by `exp(-(a-b)**2 / lam)`; signed descriptors
 therefore compare values rather than multiplying descriptor signs.
 
 `vol_and_surf_esp` uses a masked surface-potential agreement term, not a Gaussian
-overlap ratio for its ESP channel. The accelerated implementation generates
-poses with shape gradients and selects them using the combined score. It does
-not differentiate the ESP agreement term.
+overlap ratio for its ESP channel. The accelerated implementation differentiates
+the shape term and the ESP agreement term and follows the gradient of the
+combined score. The van der Waals-plus-probe mask is piecewise constant, so its
+derivative is zero almost everywhere and the gradient omits it.
 
 For volumetric and field Tversky modes the denominator is
 `a*O_AA + b*O_BB + (1-a-b)*O_AB`, with defaults `a=0.95`, `b=0.05`.

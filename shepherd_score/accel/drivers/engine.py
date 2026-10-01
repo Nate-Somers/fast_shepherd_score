@@ -20,10 +20,6 @@ torch.backends.cuda.matmul.allow_tf32 = True
 #: ``None`` for a pair-level channel, and int32 real counts (``m_real`` ``None`` likewise).
 Batch = namedtuple("Batch", "ref fit n_real m_real")
 
-#: The eager loop scores a value-only (``stride``) term every this many steps, plus the last.
-#: The captured graph step has no stride (see ``_GraphedFineTerms``).
-_ESP_STRIDE = 5
-
 _PHARM_SIGMA = {"tversky": 0.95, "tversky_ref": 1.0, "tversky_fit": 0.05}
 
 # the assembled problem
@@ -446,10 +442,10 @@ def _reduce_grad_term(tm, V):
     return sim, scale
 
 
-def _step_generic(pr: Problem, st: _State, *, score_terms=True, update=True):
-    """One fine step of a non-pharm-style mode. Evaluates every gradient term (and, when
-    ``score_terms``, the value-only ones), tracks the best pose on the blended score, forms the
-    blended descent gradient and (when ``update``) applies the tangent-projected Adam step."""
+def _step_generic(pr: Problem, st: _State, *, update=True):
+    """One fine step of a non-pharm-style mode. Evaluates every term (value-only terms without
+    their gradient), tracks the best pose on the blended score, forms the blended descent
+    gradient and (when ``update``) applies the tangent-projected Adam step."""
     # Shape+colour modes fuse their two gradient kernels into one launch where it fits; None
     # when it does not apply (CPU tensors, or a pad past the fused kernel's single tile).
     fused = None
@@ -460,8 +456,6 @@ def _step_generic(pr: Problem, st: _State, *, score_terms=True, update=True):
     first = True
     for ti, tm in enumerate(pr.terms):
         if not tm.spec.grad:
-            if not score_terms:
-                continue
             V, _, _ = T.evaluate(tm.spec, tm.inputs, st.q, st.t, need_grad=False)
             sim = _reduce_value(tm, V, pr)
             contrib = sim if tm.weight == 1.0 else sim * tm.weight
@@ -473,9 +467,8 @@ def _step_generic(pr: Problem, st: _State, *, score_terms=True, update=True):
             V, dQ, dT = T.evaluate(tm.spec, tm.inputs, st.q, st.t, seeds_per_mol=pr.S_fine,
                                    poses_per_cta=pr.P_cta)
         sim, scale = _reduce_grad_term(tm, V)
-        if score_terms:
-            contrib = sim if tm.weight == 1.0 else sim * tm.weight
-            score = contrib if score is None else score + contrib
+        contrib = sim if tm.weight == 1.0 else sim * tm.weight
+        score = contrib if score is None else score + contrib
         sc = None if scale is None else scale.unsqueeze(1)
         if first:
             if sc is None:
@@ -491,8 +484,7 @@ def _step_generic(pr: Problem, st: _State, *, score_terms=True, update=True):
             tt = dT if sc is None else dT * sc
             st.gq.add_(tq * (-tm.weight) if tm.weight != 1.0 else -tq)
             st.gt.add_(tt * (-tm.weight) if tm.weight != 1.0 else -tt)
-    if score_terms:
-        _track_best(st, score)
+    _track_best(st, score)
     if update:
         fused_adam_qt_with_tangent_proj(st.q, st.t, st.gq, st.gt, st.mq, st.vq, st.mt, st.vt, st.lr)
     return score
@@ -537,8 +529,7 @@ def _apply_adam_pharm(st: _State):
 
 class _GraphedFineTerms(_GraphedFineBase):
     """Capture one generic fine step; replay = N steps. Persistent buffers hold every term's
-    inputs and constants for the bucket shape; ``_load`` copies a bucket in. Value-only terms
-    are scored every step here (no stride)."""
+    inputs and constants for the bucket shape; ``_load`` copies a bucket in."""
 
     def __init__(self, pr: Problem, steps, lr):
         f = lambda x: torch.empty_like(x)
@@ -622,16 +613,14 @@ def _graph_key(pr: Problem, steps, lr):
 def _eager(pr: Problem, steps_fine, lr, es_patience, es_tol):
     st = _State(pr.q, pr.t, lr)
     B, P = pr.B, pr.P
-    strided = any(tm.spec.stride for tm in pr.terms)
     prev_best = torch.full((B,), -float("inf"), device=pr.device, dtype=st.best.dtype)
     no_improve = 0
     step = -1
     for step in range(steps_fine):
-        score_now = (not strided) or (step % _ESP_STRIDE == 0) or (step == steps_fine - 1)
         if pr.spec.pharm_style:
             _step_pharm(pr, st, update=False)
         else:
-            _step_generic(pr, st, score_terms=score_now, update=False)
+            _step_generic(pr, st, update=False)
         # Early-stop check every 5 steps, per pair (each pair's own best over its seeds), so
         # one converged pair cannot halt the rest of the bucket. One host sync per check.
         if step % 5 == 0:

@@ -300,11 +300,11 @@ def overlap_score_grad_esp_se3_batch(A, B, charges_A, charges_B, q, t, *,
             torch.as_tensor(dQ, device=dev, dtype=dt),
             torch.as_tensor(dT, device=dev, dtype=dt))
 
-#  ShaEP ESP surface comparison (vol_and_surf_esp), value only: CPU twin of
+#  ShaEP ESP surface comparison, one direction, value only: CPU twin of
 #  esp_triton._esp_comparison_tiled. For each real field point, the Coulomb ESP
 #  from the other molecule's atoms, the vdW+probe volume mask and a Gaussian of
-#  the ESP difference, summed over points. fp64 accumulation; no gradient (the
-#  pose is steered by the shape gradient).
+#  the ESP difference, summed over points. fp64 accumulation. The aligners use
+#  _esp_agreement_grad_kernel below, which also returns the SE(3) gradient.
 
 @njit(parallel=True, fastmath=True, cache=True)
 def _esp_comparison_kernel(P, A, Q, R, PE, Nr, Mr, inv_lam, coulomb, probe):
@@ -356,6 +356,146 @@ def esp_comparison_batch(points, atoms, charges, point_esp, radii, *,
     S = _esp_comparison_kernel(Pn, An, Qn, Rn, PEn, Nr, Mr,
                                inv_lam, float(COULOMB_SCALING), float(probe_radius))
     return torch.as_tensor(S, device=dev, dtype=dt)
+
+#  ShaEP surface-ESP agreement with its SE(3) gradient (vol_and_surf_esp and its Tversky
+#  variant): CPU twin of esp_triton._esp_agreement_grad_kernel. Both directions of the
+#  comparison in one pass, with the fit molecule's atoms and surface points moved by
+#  R(q) x + t inside the kernel:
+#      V = (sum_i g_i + sum_j g_j) / (n_surf + m_surf),  g = keep * exp(-(pe - esp)^2 / lam)
+#  where i runs over the reference surface (field from the moved fit atoms) and j over the
+#  moved fit surface (field from the reference atoms). The vdW+probe mask is piecewise
+#  constant, so it contributes no gradient. fp64 accumulation; Abuf/Fbuf are (K, M_pad, 3)
+#  scratch for the moved fit atoms and the forces on them.
+
+@njit(parallel=True, fastmath=True, cache=True)
+def _esp_agreement_grad_kernel(P1, PE1, NS1, A1, Q1, R1, NA1, P2, PE2, NS2, A2, Q2, R2, NA2,
+                               q, t, inv_lam, coulomb, probe, Abuf, Fbuf, need_grad):
+    K = q.shape[0]
+    V = np.zeros(K, dtype=np.float64)
+    dQ = np.zeros((K, 4), dtype=np.float64)
+    dT = np.zeros((K, 3), dtype=np.float64)
+    for k in prange(K):
+        qr = q[k, 0]; qi = q[k, 1]; qj = q[k, 2]; qk_ = q[k, 3]
+        tx = t[k, 0]; ty = t[k, 1]; tz = t[k, 2]
+        r00 = 1.0 - 2.0 * (qj * qj + qk_ * qk_); r01 = 2.0 * (qi * qj - qk_ * qr); r02 = 2.0 * (qi * qk_ + qj * qr)
+        r10 = 2.0 * (qi * qj + qk_ * qr); r11 = 1.0 - 2.0 * (qi * qi + qk_ * qk_); r12 = 2.0 * (qj * qk_ - qi * qr)
+        r20 = 2.0 * (qi * qk_ - qj * qr); r21 = 2.0 * (qj * qk_ + qi * qr); r22 = 1.0 - 2.0 * (qi * qi + qj * qj)
+        m2 = NA2[k]
+        for m in range(m2):
+            bx = A2[k, m, 0]; by = A2[k, m, 1]; bz = A2[k, m, 2]
+            Abuf[k, m, 0] = r00 * bx + r01 * by + r02 * bz + tx
+            Abuf[k, m, 1] = r10 * bx + r11 * by + r12 * bz + ty
+            Abuf[k, m, 2] = r20 * bx + r21 * by + r22 * bz + tz
+            Fbuf[k, m, 0] = 0.0; Fbuf[k, m, 1] = 0.0; Fbuf[k, m, 2] = 0.0
+        # reference surface vs moved fit atoms
+        e1 = 0.0
+        for i in range(NS1[k]):
+            px = P1[k, i, 0]; py = P1[k, i, 1]; pz = P1[k, i, 2]
+            esp = 0.0
+            blocked = False
+            for m in range(m2):
+                dx = px - Abuf[k, m, 0]; dy = py - Abuf[k, m, 1]; dz = pz - Abuf[k, m, 2]
+                d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if d < 1e-6:
+                    d = 1e-6
+                esp += Q2[k, m] / d
+                if d < R2[k, m] + probe:
+                    blocked = True
+            esp *= coulomb
+            if not blocked:
+                diff = PE1[k, i] - esp
+                g = math.exp(-(diff * diff) * inv_lam)
+                e1 += g
+                if need_grad:
+                    c = 2.0 * inv_lam * g * diff * coulomb
+                    for m in range(m2):
+                        dx = px - Abuf[k, m, 0]; dy = py - Abuf[k, m, 1]; dz = pz - Abuf[k, m, 2]
+                        d2 = dx * dx + dy * dy + dz * dz
+                        d = math.sqrt(d2)
+                        if d < 1e-6:
+                            d = 1e-6
+                            d2 = 1e-12
+                        w = c * Q2[k, m] / (d2 * d)
+                        Fbuf[k, m, 0] += w * dx; Fbuf[k, m, 1] += w * dy; Fbuf[k, m, 2] += w * dz
+        gTx = 0.0; gTy = 0.0; gTz = 0.0
+        gQw = 0.0; gQx = 0.0; gQy = 0.0; gQz = 0.0
+        if need_grad:
+            for m in range(m2):
+                fx = Fbuf[k, m, 0]; fy = Fbuf[k, m, 1]; fz = Fbuf[k, m, 2]
+                bx = A2[k, m, 0]; by = A2[k, m, 1]; bz = A2[k, m, 2]
+                gTx += fx; gTy += fy; gTz += fz
+                gQw += fx * (-2.0 * qk_ * by + 2.0 * qj * bz) + fy * (2.0 * qk_ * bx - 2.0 * qi * bz) + fz * (-2.0 * qj * bx + 2.0 * qi * by)
+                gQx += fx * (2.0 * qj * by + 2.0 * qk_ * bz) + fy * (2.0 * qj * bx - 4.0 * qi * by - 2.0 * qr * bz) + fz * (2.0 * qk_ * bx + 2.0 * qr * by - 4.0 * qi * bz)
+                gQy += fx * (-4.0 * qj * bx + 2.0 * qi * by + 2.0 * qr * bz) + fy * (2.0 * qi * bx + 2.0 * qk_ * bz) + fz * (-2.0 * qr * bx + 2.0 * qk_ * by - 4.0 * qj * bz)
+                gQz += fx * (-4.0 * qk_ * bx - 2.0 * qr * by + 2.0 * qi * bz) + fy * (2.0 * qr * bx - 4.0 * qk_ * by + 2.0 * qj * bz) + fz * (2.0 * qi * bx + 2.0 * qj * by)
+        # moved fit surface vs reference atoms
+        e2 = 0.0
+        m1 = NA1[k]
+        for j in range(NS2[k]):
+            sx = P2[k, j, 0]; sy = P2[k, j, 1]; sz = P2[k, j, 2]
+            px = r00 * sx + r01 * sy + r02 * sz + tx
+            py = r10 * sx + r11 * sy + r12 * sz + ty
+            pz = r20 * sx + r21 * sy + r22 * sz + tz
+            esp = 0.0
+            Gx = 0.0; Gy = 0.0; Gz = 0.0
+            blocked = False
+            for n in range(m1):
+                dx = px - A1[k, n, 0]; dy = py - A1[k, n, 1]; dz = pz - A1[k, n, 2]
+                d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if d < 1e-6:
+                    d = 1e-6
+                inv = 1.0 / d
+                esp += Q1[k, n] * inv
+                if need_grad:
+                    w = Q1[k, n] * inv * inv * inv
+                    Gx += w * dx; Gy += w * dy; Gz += w * dz
+                if d < R1[k, n] + probe:
+                    blocked = True
+            esp *= coulomb
+            if not blocked:
+                diff = PE2[k, j] - esp
+                g = math.exp(-(diff * diff) * inv_lam)
+                e2 += g
+                if need_grad:
+                    c = -2.0 * inv_lam * g * diff * coulomb
+                    fx = c * Gx; fy = c * Gy; fz = c * Gz
+                    gTx += fx; gTy += fy; gTz += fz
+                    gQw += fx * (-2.0 * qk_ * sy + 2.0 * qj * sz) + fy * (2.0 * qk_ * sx - 2.0 * qi * sz) + fz * (-2.0 * qj * sx + 2.0 * qi * sy)
+                    gQx += fx * (2.0 * qj * sy + 2.0 * qk_ * sz) + fy * (2.0 * qj * sx - 4.0 * qi * sy - 2.0 * qr * sz) + fz * (2.0 * qk_ * sx + 2.0 * qr * sy - 4.0 * qi * sz)
+                    gQy += fx * (-4.0 * qj * sx + 2.0 * qi * sy + 2.0 * qr * sz) + fy * (2.0 * qi * sx + 2.0 * qk_ * sz) + fz * (-2.0 * qr * sx + 2.0 * qk_ * sy - 4.0 * qj * sz)
+                    gQz += fx * (-4.0 * qk_ * sx - 2.0 * qr * sy + 2.0 * qi * sz) + fy * (2.0 * qr * sx - 4.0 * qk_ * sy + 2.0 * qj * sz) + fz * (2.0 * qi * sx + 2.0 * qj * sy)
+        nrm = float(NS1[k] + NS2[k])
+        V[k] = (e1 + e2) / nrm
+        dT[k, 0] = gTx / nrm; dT[k, 1] = gTy / nrm; dT[k, 2] = gTz / nrm
+        dQ[k, 0] = gQw / nrm; dQ[k, 1] = gQx / nrm; dQ[k, 2] = gQy / nrm; dQ[k, 3] = gQz / nrm
+    return V, dQ, dT
+
+
+def esp_agreement_grad_se3_batch(ref_atoms, ref_charges, ref_radii, ref_points, ref_point_esp,
+                                 fit_atoms, fit_charges, fit_radii, fit_points, fit_point_esp,
+                                 n_surf, m_surf, n_atoms, m_atoms, q, t, *,
+                                 probe_radius: float = 1.0, lam: float = 0.001,
+                                 NEED_GRAD: bool = True):
+    """CPU drop-in for the Triton ``esp_agreement_grad_se3_batch``: the ShaEP surface-ESP
+    agreement ``V`` (K,) of the reference with the fit moved by ``(q, t)``, and ``dV/dq`` (K, 4),
+    ``dV/dt`` (K, 3) (zeros when ``NEED_GRAD`` is False). The fit tensors are in the fit's own
+    frame; ``n_surf``/``m_surf`` and ``n_atoms``/``m_atoms`` are the real surface-point and
+    with-H atom counts. ``lam`` is the raw weighting parameter; ``LAM_SCALING`` is applied here."""
+    dev, dt = q.device, ref_points.dtype
+    f = lambda x: np.ascontiguousarray(x.detach().cpu().numpy())
+    i = lambda x: x.detach().cpu().numpy().astype(np.int64)
+    A2 = f(fit_atoms)
+    K = int(q.shape[0])
+    Abuf = np.empty((K, A2.shape[1], 3), dtype=np.float64)
+    Fbuf = np.empty_like(Abuf)
+    V, dQ, dT = _esp_agreement_grad_kernel(
+        f(ref_points), f(ref_point_esp), i(n_surf), f(ref_atoms), f(ref_charges), f(ref_radii),
+        i(n_atoms), f(fit_points), f(fit_point_esp), i(m_surf), A2, f(fit_charges), f(fit_radii),
+        i(m_atoms), f(q), f(t), 1.0 / (LAM_SCALING * float(lam)), float(COULOMB_SCALING),
+        float(probe_radius), Abuf, Fbuf, bool(NEED_GRAD))
+    return (torch.as_tensor(V, device=dev, dtype=dt),
+            torch.as_tensor(dQ, device=dev, dtype=q.dtype),
+            torch.as_tensor(dT, device=dev, dtype=t.dtype))
 
 #  Pharmacophore overlap value + grad (pharm): CPU twin of
 #  pharm_triton._pharm_score_grad_kernel. Typed Gaussians (per-type alpha/K/cat),
