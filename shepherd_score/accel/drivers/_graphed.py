@@ -31,11 +31,9 @@ def graph_cap(work, budget=None):
     b = _GRAPH_WORK_BUDGET if budget is None else budget
     return max(_GRAPH_CAP_MIN, min(_GRAPH_CAP_CEIL, int(b) // max(int(work), 1)))
 # Replays between convergence tests in the blocked early-stop (one host sync per block). The
-# test is per pair, like the eager loop's, so one converged pair cannot halt the bucket.
+# test is per pair, like the eager loop's, so one converged pair cannot halt the bucket. The
+# replay loop uses the caller's patience unchanged, so it stops where the eager loop does.
 _GRAPH_ES_BLOCK = 5
-# Extra patience, in blocks, added to the eager patience for the replay loop; the multi-basin
-# modes (surf, surf_esp) land in near-equal optima and need it to not score below eager.
-_GRAPH_ES_MARGIN = 2
 
 # Process-wide LRU cache of captured graphs keyed by (device, mode, shapes, P, steps, params).
 # Bounded because each graph pins persistent GPU buffers; unbounded growth ends in OOM.
@@ -147,27 +145,31 @@ class _GraphedFineBase:
         return self._result()
 
 
+def _set_schedule(gf, es_patience, es_tol, es_seeds):
+    gf.es_patience = int(es_patience)
+    gf.es_tol = float(es_tol)
+    gf.es_seeds = int(es_seeds)
+
+
 def run_graphed(make, key, inputs, *, es_patience=0, es_tol=1e-5, es_seeds=0):
     """Fetch (or build+capture) the graph for ``key`` and run this bucket through it.
 
     ``make`` is a zero-arg factory for the subclass instance (called only on cache miss);
     ``inputs`` is the tuple forwarded to ``capture``/``run`` (and thence ``_load``). One
     captured graph serves every bucket of the same key (same shapes/P/steps/params).
-    ``es_patience``/``es_tol`` set the replay-loop blocked early-stop to match the driver's
-    eager early-stop (0 -> run a fixed ``steps`` replays), and ``es_seeds`` is the
-    driver's seed count per pair, which that early-stop needs to reduce ``best`` per
-    pair rather than over the whole bucket.
+    ``es_patience``/``es_tol`` set the replay-loop blocked early-stop, with the same patience
+    and tolerance as the driver's eager early-stop (0 -> run a fixed ``steps`` replays), and
+    ``es_seeds`` is the driver's seed count per pair, which that early-stop needs to reduce
+    ``best`` per pair rather than over the whole bucket. All three are properties of this
+    call, not of the cached graph, so they are set on every call, cache hit or miss.
     """
     gf = _FINE_GRAPH_CACHE.get(key)
     if gf is not None:
         _FINE_GRAPH_CACHE.move_to_end(key)       # mark most-recently-used
-        gf.es_seeds = int(es_seeds)              # a property of this call, not of
-        return gf.run(*inputs)                   # the cached graph
+        _set_schedule(gf, es_patience, es_tol, es_seeds)
+        return gf.run(*inputs)
     gf = make()
-    gf.es_seeds = int(es_seeds)
-    # Add the margin only when early-stop is enabled (es_patience > 0).
-    gf.es_patience = (int(es_patience) + _GRAPH_ES_MARGIN) if es_patience else 0
-    gf.es_tol = float(es_tol)
+    _set_schedule(gf, es_patience, es_tol, es_seeds)
     # Capture; if it OOMs, free LRU graphs and retry (rather than failing -> eager forever).
     while True:
         try:

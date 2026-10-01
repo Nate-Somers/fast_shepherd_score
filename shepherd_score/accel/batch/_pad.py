@@ -56,7 +56,10 @@ def _subbatched_align(process, K: int, *, key: tuple, device: torch.device,
     Chunking is score-identical only when every chunk runs the same number of fine steps: pairs
     are independent within a step, but the early-stop break is chunk-global (it fires once every
     pair in the chunk has stalled), so re-cutting the chunks can hand a pair a different step
-    count. With ``early_stop_patience=0`` any two schedules agree.
+    count. Any two schedules agree when early stopping cannot fire, i.e. a patience of at least
+    the number of checks in the budget. ``early_stop_patience=0`` does not do that: the graph
+    replay loop reads 0 as "no early stop", but the eager and fused CPU loops stop at the first
+    check where no pair improved.
 
     Bytes per pair is read from the fine loop's peak allocation and cached per
     ``key=(mode, N_pad, M_pad, num_seeds)``; each chunk is sized to keep its peak under

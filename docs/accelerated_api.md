@@ -89,9 +89,11 @@ For `vol_and_surf_esp_tversky`, the change applies to the shape term.
 objective to select them; its ESP agreement term is not differentiated.
 Mode defaults, channel requirements and optimization budgets are defined in
 [`accel/_modes.py`](../shepherd_score/accel/_modes.py). A step budget is a ceiling,
-not a fixed amount of work. CPU/GPU early stopping and rounding can select
-different local optima. Do not assume identical scores or search effort merely
-because two calls use the same mode name.
+not a fixed amount of work. The CPU, GPU eager and GPU CUDA-graph loops apply the
+same early-stopping rule and patience, but CPU and GPU rounding can still select
+different local optima, and batch composition decides when a batch stops. Do not
+assume identical scores or search effort merely because two calls use the same
+mode name.
 
 ## Build a library and screen it
 
