@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import triton
+from .tuning import autotune
 import triton.language as tl
 import torch
 
@@ -57,7 +58,7 @@ def _quat_grad_tail(fx, fy, fz, bx0, by0, bz0, qr, qi, qj, qk):
 
 # cache_results persists the chosen config per (N_pad, M_pad), so the autotune sweep runs
 # once per machine rather than once per process.
-@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
+@autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _gauss_overlap_se3_tiled(
     A_ptr, B_ptr,                 # flat (B * N_pad * 3), (B * M_pad * 3)
@@ -174,7 +175,7 @@ def _gauss_overlap_se3_tiled(
 
 # Multi-pose variant: POSES poses of one molecule per CTA, so the tile loads, the
 # quaternion->rotmat build and the loop overhead amortise over POSES poses.
-@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'])
+@autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'])
 @triton.jit
 def _gauss_overlap_se3_multipose(
     A_ptr, B_ptr,

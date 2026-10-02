@@ -7,12 +7,13 @@ rotated by R, t) is index i, REF (A, fixed) is index j; type/alpha/K/cat come fr
 """
 import torch
 import triton
+from .tuning import autotune
 import triton.language as tl
 
 
 # BLOCK is derived from the feature count (next power of two); autotune picks only the
 # warp and stage counts.
-@triton.autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
+@autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
                           for _w in (1, 2, 4, 8) for _s in (1, 2, 3, 4)],
                  key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
@@ -143,7 +144,7 @@ def _pharm_score_grad_kernel(
 #  rotation->quaternion projection. A = ref anchors (axis 0), B = fit anchors
 #  (axis 1, rotated); dx = A - rot(B), the shape-kernel sign convention.
 
-@triton.autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
+@autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
                           for _w in (1, 2, 4, 8) for _s in (1, 2, 3, 4)],
                  key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
@@ -287,7 +288,7 @@ def pharm_color_score_grad_se3_batch(
 #  to (positional force, fit anchor) plus (weight force, fit vector).
 #  Layout: REF = axis 0 (n), FIT = axis 1 (m); dx = ref - rot(fit).
 
-@triton.autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
+@autotune(configs=[triton.Config({}, num_warps=_w, num_stages=_s)
                           for _w in (1, 2, 4, 8) for _s in (1, 2, 3, 4)],
                  key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit

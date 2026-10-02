@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import triton
+from .tuning import autotune
 import triton.language as tl
 import torch
 
@@ -16,7 +17,7 @@ from ...score.constants import COULOMB_SCALING, LAM_SCALING
 
 # Autotuned per (N_pad, M_pad); cache_results persists the choice so the sweep runs once
 # per machine.
-@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
+@autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _gauss_overlap_esp_se3_tiled(
     A_ptr, B_ptr,                 # coordinates: flat (B * N_pad * 3), (B * M_pad * 3)
@@ -156,7 +157,7 @@ def _gauss_overlap_esp_se3_tiled(
         tl.store(dQ_ptr + 3, dQz)
 
 
-@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
+@autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _gauss_overlap_esp_se3_multipose(
     A_ptr, B_ptr,
@@ -387,7 +388,7 @@ def overlap_score_grad_esp_se3_batch(
 #  emits no gradient. The aligners use _esp_agreement_grad_kernel below, which
 #  takes the pose and returns the SE(3) gradient.
 
-@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
+@autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _esp_comparison_tiled(
     P_ptr, A_ptr,             # field points (B*N_pad*3), source atoms (B*M_pad*3)
@@ -521,7 +522,7 @@ def esp_comparison_batch(
 #  contributes no gradient. Forces on the moved points are contracted into dV/dq with the
 #  shape kernel's _quat_grad_tail.
 
-@triton.autotune(configs=_OVERLAP_CONFIGS, key=["NS1", "NA1", "NS2", "NA2"], cache_results=True)
+@autotune(configs=_OVERLAP_CONFIGS, key=["NS1", "NA1", "NS2", "NA2"], cache_results=True)
 @triton.jit
 def _esp_agreement_grad_kernel(
     P1, PE1, A1, Q1, R1,          # reference: surface (K*NS1*3), surface ESP, with-H atoms, charges, radii

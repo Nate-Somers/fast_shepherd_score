@@ -154,3 +154,30 @@ workers; the fork-based CPU interface requires a platform supporting fork.
 
 The existing tutorial notebooks also cover the original preparation and scoring
 workflows; they are not a complete walkthrough of the accelerated API.
+
+## Reproducible GPU launch configurations
+
+Triton normally selects kernel configurations by timing candidates and caching
+its choices. Those choices can vary between installations and affect throughput.
+To record the choices used by a representative warm-up:
+
+```python
+from shepherd_score.accel.kernels.tuning import export_configurations
+# Run the intended workloads once, outside timing.
+export_configurations("triton-configurations.json")
+```
+
+Start subsequent processes with `FSS_TRITON_CONFIGS=/absolute/path/triton-configurations.json`
+set before importing the kernels. They reuse the recorded configurations,
+including in spawned screening workers. A missing kernel/shape entry or a
+GPU-model, architecture, or Triton-version mismatch raises an error rather than
+silently tuning. Cover every workload shape before freezing the profile; the
+export includes only configurations used in the current process. Profiles from
+different runs must agree on overlapping entries before they are combined.
+
+This freezes launch choices, not wall-clock performance, and does not establish
+that the recorded choices are optimal. Keep the profile alongside the engine
+commit, software versions, inputs, and timing results. The default remains
+ordinary Triton autotuning when the environment variable is unset.
+
+For multi-GPU screening, `screen(..., ndev=4, worker_threads=1)` fixes host compute threads per worker. The default divides the allocated host CPUs among GPUs. Read-ahead threads are separate from this compute-thread limit.

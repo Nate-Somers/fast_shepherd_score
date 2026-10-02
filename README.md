@@ -106,3 +106,5 @@ Adams et al., *ShEPhERD: Diffusing shape, electrostatics, and pharmacophores for
 bioisosteric drug design*, ICLR 2025. The updated alignment benchmarks and
 manuscript are in the paper repository linked above.
 This package is distributed under the [MIT license](LICENSE).
+
+For reproducible GPU measurements, [record and replay Triton launch configurations](docs/accelerated_api.md#reproducible-gpu-launch-configurations).

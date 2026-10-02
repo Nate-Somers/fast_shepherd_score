@@ -1348,6 +1348,7 @@ def _normalize_scores_out(scores_out, n_queries):
 def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp", *,
                 backend: Optional[str] = None, do_center: Optional[bool] = None,
                 top_k: int = 1000, ndev: Optional[int] = None,
+                worker_threads: Optional[int] = None,
                 scores_out=None, alpha: Optional[float] = None,
                 progress: bool = False, **align_kwargs) -> List[List["Hit"]]:
     """Screen a panel of queries against ``store`` in a single streaming pass.
@@ -1424,7 +1425,8 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
             raise ValueError("scores_out is not supported with ndev>1 (multi-GPU screening "
                              "returns top-K hits only). Run single-process for full score vectors.")
         heaps = _screen_many_multigpu(qs, store.path, mode, ndev,
-                                      _fast_batch_kwargs(mode, align_kwargs), top_k, progress)
+                                      _fast_batch_kwargs(mode, align_kwargs), top_k, progress,
+                                      worker_threads=worker_threads)
         # The multi-GPU workers rebuild their own device tensors, so the avoid cloud crosses as
         # the plain numpy array in ``align_kwargs`` and is uploaded inside each worker.
         return [h.sorted() for h in heaps]
@@ -1446,6 +1448,7 @@ def screen_many(queries: Sequence, store: "ProfileStore", mode: str = "surf_esp"
 def screen(query, store: "ProfileStore", mode: str = "surf_esp", *,
            backend: Optional[str] = None, do_center: Optional[bool] = None,
            top_k: int = 1000, ndev: Optional[int] = None,
+           worker_threads: Optional[int] = None,
            scores_out: Optional[np.ndarray] = None, alpha: Optional[float] = None,
            progress: bool = False, **align_kwargs) -> List["Hit"]:
     """Stream ``store`` past a single ``query`` and return the ``top_k`` hits.
@@ -1475,6 +1478,10 @@ def screen(query, store: "ProfileStore", mode: str = "surf_esp", *,
         Stream shards across this many GPUs, one worker process per device (fast modes only).
         The workers are spawned on the first ``ndev>1`` call and kept for later screens;
         :func:`close_multigpu_pool` releases them (also run at interpreter exit).
+    worker_threads : int, optional
+        Host compute threads per GPU worker when ``ndev>1``. By default, divide
+        the available host CPUs among workers. Set explicitly for comparisons
+        at a fixed host-thread budget per GPU. This does not limit I/O threads.
     scores_out : np.ndarray, optional
         Preallocated ``(len(store),)`` array (e.g. an ``np.memmap``) written with every
         score in library order. Single-process only.
@@ -1493,7 +1500,8 @@ def screen(query, store: "ProfileStore", mode: str = "surf_esp", *,
         ``Hit(score, id, transform)`` sorted by score, descending (length ``<= top_k``).
     """
     return screen_many([query], store, mode, backend=backend, do_center=do_center,
-                       top_k=top_k, ndev=ndev, scores_out=scores_out, alpha=alpha,
+                       top_k=top_k, ndev=ndev, worker_threads=worker_threads,
+                       scores_out=scores_out, alpha=alpha,
                        progress=progress, **align_kwargs)[0]
 
 
@@ -1617,7 +1625,8 @@ def _mgpu_pool(ndev, threads):
     return _MGPU_POOL
 
 
-def _screen_many_multigpu(qs, store_path, mode, ndev, batch_kw, top_k, progress):
+def _screen_many_multigpu(qs, store_path, mode, ndev, batch_kw, top_k, progress,
+                         worker_threads=None):
     import os as _os
     import torch
     from queue import Empty
@@ -1627,7 +1636,9 @@ def _screen_many_multigpu(qs, store_path, mode, ndev, batch_kw, top_k, progress)
         cores = len(_os.sched_getaffinity(0))
     except AttributeError:
         cores = _os.cpu_count() or ndev
-    threads = max(1, cores // ndev)
+    if worker_threads is not None and (not isinstance(worker_threads, int) or worker_threads < 1):
+        raise ValueError('worker_threads must be a positive integer')
+    threads = worker_threads if worker_threads is not None else max(1, cores // ndev)
     ref_arrays_list = [_query_ref_arrays(q, mode) for q in qs]
 
     store = ProfileStore.open(store_path)

@@ -12,10 +12,11 @@ from __future__ import annotations
 import math
 import torch
 import triton
+from .tuning import autotune
 import triton.language as tl
 
 
-@triton.autotune(
+@autotune(
     configs=[triton.Config({}, num_warps=_w, num_stages=_s)
              for _w in (1, 2, 4) for _s in (1, 2, 3)],
     key=['Ns_pad', 'Ms_pad', 'Na_pad', 'Ma_pad'], cache_results=True)

@@ -11,13 +11,14 @@ the shape kernel (``shape_triton._gauss_overlap_se3_tiled``) with the Gaussian r
 from __future__ import annotations
 
 import triton
+from .tuning import autotune
 import triton.language as tl
 import torch
 
 from .shape_triton import _quat_to_rotmat, _quat_grad_tail, _OVERLAP_CONFIGS
 
 
-@triton.autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
+@autotune(configs=_OVERLAP_CONFIGS, key=['N_pad', 'M_pad'], cache_results=True)
 @triton.jit
 def _avoid_penalty_se3_tiled(
     A_ptr, B_ptr,                 # flat (B * N_pad * 3), (B * M_pad * 3): avoid points, fit-avoid
