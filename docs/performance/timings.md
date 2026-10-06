@@ -1,52 +1,68 @@
 # Alignment throughput
 
-These measurements come from the explicit selections in
-[`paper_results.py`](https://github.com/Nate-Somers/Shepherd-Score-Paper/blob/main/figures/throughput/paper_results.py).
-They describe the recorded commits, not a new benchmark of this checkout.
+These measurements are from the paper's archived campaign, plan
+`41cafa25cc59eadadd365825e62681d184685a89ed35d3dad2c4b6228bcd67db`, using FSS
+`47e2b119cb57` for inherited CPU measurements and `0bf841680552` for the updated
+GPU measurements. See the [paper archive](https://github.com/Nate-Somers/Shepherd-Score-Paper/blob/main/results/published.zip)
+and its assembled `table6_throughput_wide.csv` for full precision and measurement IDs.
+They are recorded results, not measurements of every subsequent checkout.
+
 GPU: NVIDIA L40S. CPU: one AMD EPYC 9474F core with Numba/SVML.
-Rates exclude molecular preparation and index construction and include an
-untimed warm-up before repeated measurements. See the manuscript SI for repeat
-counts, library composition, and CPU/GPU stopping differences.
+Each rate uses one timed run after one untimed warm-up. Molecular preparation,
+index construction, and pairwise batch assembly are outside these timers.
+GPU runs replay the archived Triton launch configurations; cache state and
+hardware still matter. The 100-million-conformer `vol` screening and GPU scaling
+measurements additionally pre-read the store before warm-up; that initial read
+is excluded from their times.
 
 ## Main modes
 
 Alignments per second. CPU screening uses 1,000 conformers, GPU screening ten
 million conformers, and GPU pairwise alignment 100,000 pairs. Pairwise results
-use the fixed 250-query by 400-library selection in `PAIRWISE_100K.json`,
-with disjoint compound sets and the median of three timed passes.
-`vol_avoid` is excluded because this workload supplies no avoid-point cloud.
+use 250 query compounds and 400 disjoint library compounds, one conformer each.
 
 | Mode | CPU screen | GPU screen | GPU pairwise |
 |---|---:|---:|---:|
-| `vol` | 2,567.3 | 1,079,056 | 111,681 |
-| `vol_esp` | 832.5 | 282,347 | 80,302 |
-| `surf` | 30.2 | 51,491 | 38,361 |
-| `surf_esp` | 28.1 | 38,066 | 27,519 |
-| `vol_and_surf_esp` | 121.6 | 62,574 | 23,484 |
-| `pharm` | 578.9 | 149,880 | 52,441 |
-| `vol_color` | 830.4 | 273,317 | 59,586 |
-| `vol_lipo` | 381.9 | 188,171 | 54,240 |
+| `vol` | 2,470.5 | 1,034,608 | 118,293 |
+| `vol_esp` | 841.6 | 368,212 | 82,823 |
+| `surf` | 25.7 | 50,726 | 40,090 |
+| `surf_esp` | 28.2 | 29,838 | 25,863 |
+| `vol_and_surf_esp` | 19.0 | 17,839 | 13,401 |
+| `pharm` | 574.1 | 170,039 | 63,658 |
+| `vol_color` | 813.0 | 348,793 | 60,728 |
+| `vol_lipo` | 468.4 | 209,397 | 58,493 |
 
-## Additional modes and existing Tversky variants
+## Additional modes evaluated in the SI
 
 CPU screening uses 1,000 conformers; GPU screening and pairwise alignment each
-use 100,000 conformer comparisons.
+use 100,000 comparisons.
 
 | Mode | CPU screen | GPU screen | GPU pairwise |
 |---|---:|---:|---:|
-| `vol_pharm` | 275.2 | 90,549 | 36,956 |
-| `vol_atomtype` | 258.2 | 185,938 | 55,282 |
-| `vol_mr` | 329.0 | 184,111 | 54,171 |
-| `surf_tversky` | 20.1 | 48,430 | 37,335 |
-| `surf_esp_tversky` | 19.1 | 37,421 | 27,717 |
-| `vol_and_surf_esp_tversky` | 119.9 | 62,078 | 23,417 |
-| `vol_color_tversky` | 813.5 | 266,032 | 58,354 |
-| `vol_lipo_tversky` | 458.4 | 183,799 | 53,290 |
-| `pharm_tversky` | 562.4 | 147,520 | 52,312 |
-| `vol_fukui` | 461.3 | 185,423 | 54,809 |
-| `vol_tversky` | 1,901.9 | 454,401 | 111,457 |
-| `vol_esp_tversky` | 823.4 | 275,017 | 78,064 |
+| `vol_pharm` | 280.0 | 98,648 | 39,251 |
+| `vol_atomtype` | 267.7 | 258,022 | 57,971 |
+| `vol_mr` | 323.2 | 214,050 | 57,154 |
+| `surf_tversky` | 20.6 | 38,053 | 31,136 |
+| `surf_esp_tversky` | 19.6 | 32,472 | 25,846 |
+| `vol_and_surf_esp_tversky` | 19.0 | 18,112 | 13,071 |
+| `vol_color_tversky` | 789.8 | 331,031 | 61,817 |
+| `vol_lipo_tversky` | 475.3 | 211,608 | 51,847 |
+| `pharm_tversky` | 572.6 | 163,818 | 62,641 |
+| `vol_fukui` | 461.7 | 213,585 | 58,101 |
 
-The SI reports preparation cost and multi-worker scaling separately. Multi-GPU
-scaling uses the fastest of three repeated screens, whereas these tables use
-median timings; those estimators should not be conflated.
+The package also implements `vol_tversky`, `vol_esp_tversky`, and `vol_avoid`.
+These are outside this 18-mode timing set; `vol_avoid` additionally requires an
+explicit avoid-point cloud.
+
+## Parallel screening
+
+CPU scaling uses 10,000 conformers and includes pair construction inside each
+persistent worker's timed call. One and 64 workers give 1,881 and 102,959
+alignments/s, respectively (54.72-fold speedup). This differs from the
+single-process stored-profile screening path.
+
+GPU scaling uses 100 million conformers with one host compute thread per GPU
+worker. Times on one, two, and four L40S GPUs are 96.69, 48.49, and 24.55 seconds,
+respectively (1.99-fold and 3.94-fold speedups). Each value is one timed run after
+warm-up, with worker startup excluded. These are observed timing ratios, not
+prescribed linear scaling.

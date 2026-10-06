@@ -62,7 +62,7 @@ $$\text{sim}_{\text{pharm}}^{*}(\boldsymbol{x}_{4,A}, \boldsymbol{x}_{4,B}) = \f
 
 The vector weighting $w_{a,b;m}$ depends on directionality ($\alpha_m$ is a constant per type):
 
-$$w_{a,b;m} = \begin{cases} 1 & \text{if } m \text{ is non-directional}, \\ \frac{\boldsymbol{V}[a]_{m}^\top \boldsymbol{V}[b]_{m} + 2}{3} & \text{if } m \text{ is directional}. \end{cases}$$
+$$w_{a,b;m} = \begin{cases} 1 & \text{if } m \text{ is non-directional}, \\ \frac{\operatorname{clamp}(\boldsymbol{V}[a]_{m}^\top \boldsymbol{V}[b]_{m},0,1) + 2}{3} & \text{if } m \text{ is directional}. \end{cases}$$
 
 *(Note: For aromatic rings, the absolute value of the dot product $|\boldsymbol{V}[a]_{m}^\top \boldsymbol{V}[b]_{m}|$ is used.)*
 
@@ -135,7 +135,7 @@ $$\nabla_{\boldsymbol{R}} O_{A,B} = \sum_{m} \sum_{a,b} K_m E_{ab} \left[ \nabla
 The directional weight gradients are:
 
 * **Non-directional** (Hydrophobe, ZnBinder, Anion, Cation): $\nabla_{\boldsymbol{R}} w' = \mathbf{0}$
-* **Directional** (Acceptor, Donor, Halogen): $w = (D_{ab}+2)/3 \implies \nabla_{\boldsymbol{R}} w' = \tfrac{1}{3}\boldsymbol{V}_b\boldsymbol{V}_a^\top$
+* **Directional** (Acceptor, Donor, Halogen): $w = (\operatorname{clamp}(D_{ab},0,1)+2)/3$, with $\nabla_{\boldsymbol{R}} w' = \tfrac{1}{3}\mathbf{1}[0<D_{ab}<1]\boldsymbol{V}_b\boldsymbol{V}_a^\top$ in the analytic implementation.
 * **Aromatic**: $w = (|D_{ab}|+2)/3 \implies \nabla_{\boldsymbol{R}} w' = \tfrac{1}{3}\operatorname{sgn}(D_{ab})\boldsymbol{V}_b\boldsymbol{V}_a^\top$
 
 where $D_{ab} = (\boldsymbol{R}\boldsymbol{V}_a)^\top \boldsymbol{V}_b$.
@@ -210,6 +210,7 @@ derivative is zero almost everywhere and the gradient omits it.
 
 For volumetric and field Tversky modes the denominator is
 `a*O_AA + b*O_BB + (1-a-b)*O_AB`, with defaults `a=0.95`, `b=0.05`.
-These Gaussian-overlap ratios need not be bounded by one. The pharmacophore
+`A` is the fixed reference and `B` is the fitted molecule in these
+accelerated Tversky modes. These Gaussian-overlap ratios need not be bounded by one. The pharmacophore
 Tversky implementation clamps at one. Asymmetry reduces but does not eliminate
 the fitted molecule's self-overlap penalty.

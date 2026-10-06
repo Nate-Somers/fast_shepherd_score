@@ -37,12 +37,15 @@ ref = prepare("CCOc1ccccc1")
 fit = prepare("CCNc1ccccc1")
 ```
 
-`Molecule` holds a conformer and its features. Set `num_surf_points=0` when
+`Molecule` holds a conformer and its features. Leave `num_surf_points=None` when
 surfaces are unnecessary. Pharmacophores require `pharm_multi_vector` to be
 specified or explicit feature arrays. Charges are lazy; requesting surface ESP
 also requests charges. The default charge model is xTB, with a warning and MMFF
-fallback when xTB is unavailable. Select a model explicitly for comparisons.
-Fukui fields require xTB and additional charge-state calculations.
+fallback when xTB is unavailable or fails. Select a model explicitly for comparisons.
+The default xTB charge call uses total charge zero; supply explicit charges
+when a different total charge is required. MMFF94 follows molecular formal
+charge. Fukui fields use the formal charge and its adjacent charge states,
+require xTB, and do not fall back to MMFF94.
 
 MMFF-relaxed conformers are sanitized to restore aromaticity. Surface sampling
 is stochastic: save and reuse its coordinates and ESP for reproducible
@@ -80,10 +83,19 @@ transformed arrays are returned as well. For parameter and return details, see
 
 Tversky variants are available for `vol`, `vol_esp`, `surf`, `surf_esp`,
 `vol_color`, `vol_lipo`, `pharm` and `vol_and_surf_esp`, with the
-`_tversky` suffix. They change normalization, not the input representation.
+`_tversky` suffix. They change normalization, not the input representation. The default Tversky
+weights are 0.95 on the fixed reference self-overlap and 0.05 on the fitted
+molecule self-overlap. Pharmacophore Tversky is clamped at one; other
+Gaussian-overlap Tversky ratios can exceed one.
 For `vol_and_surf_esp_tversky`, the change applies to the shape term.
 `align_with_esp` and `align_with_esp_combo` remain compatibility aliases for
 `surf_esp` and `vol_and_surf_esp`.
+
+`vol_color` ignores direction vectors, whereas `vol_pharm` and `pharm` use them.
+These modes read the pharmacophores already present on each molecule; choosing
+an alignment mode does not regenerate features or switch SMARTS definitions.
+`Molecule` defaults to `feature_set="shepherd"`; `feature_set="rdkit_base"` is
+an explicit alternative during preparation.
 
 `vol_and_surf_esp` and `vol_and_surf_esp_tversky` differentiate both the shape
 term and the ESP agreement term, so the optimizer follows the gradient of the
@@ -92,7 +104,8 @@ Mode defaults, channel requirements and optimization budgets are defined in
 [`accel/_modes.py`](../shepherd_score/accel/_modes.py). A step budget is a ceiling,
 not a fixed amount of work. Where early stopping is enabled, the CPU, GPU eager
 and GPU CUDA-graph loops use the same patience and check for improvement every
-five steps. A batch stops only when every pair has stalled. The CUDA-graph paths
+five steps. Each internal optimization sub-batch stops only after all its pairs fail to
+improve beyond the tolerance for the required consecutive checks. The CUDA-graph paths
 for `vol_and_surf_esp` and `vol_and_surf_esp_tversky` always run their full step
 budget. CPU/GPU rounding and batch composition can still affect the stopping
 point and the selected pose.
