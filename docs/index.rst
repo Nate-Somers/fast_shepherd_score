@@ -41,6 +41,7 @@ See :doc:`installation` for optional backends and external executables.
    installation
    usage
    accelerated_api
+   scoring_mode_skills
    theory
 
 .. toctree::

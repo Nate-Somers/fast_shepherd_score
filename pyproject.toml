@@ -105,6 +105,21 @@ exclude = ["tests*", "examples*", "scripts*", "docs*", ".github*"]
 [tool.setuptools.package-data]
 "shepherd_score" = ["*.yml", "*.yaml", "*.json", "*.txt", "*.fdef", "*.pdbqt"]
 
+[tool.setuptools.data-files]
+"share/shepherd-score/skills/design-scoring-mode" = [
+    ".claude/skills/design-scoring-mode/pitfalls.md",
+    ".claude/skills/design-scoring-mode/seams.md",
+    ".claude/skills/design-scoring-mode/SKILL.md",
+    ".claude/skills/design-scoring-mode/template_test.py",
+]
+"share/shepherd-score/skills/accelerate-scoring-mode" = [
+    ".claude/skills/accelerate-scoring-mode/kernel_anatomy.md",
+    ".claude/skills/accelerate-scoring-mode/parity_gates.md",
+    ".claude/skills/accelerate-scoring-mode/screen_wiring.md",
+    ".claude/skills/accelerate-scoring-mode/seams.md",
+    ".claude/skills/accelerate-scoring-mode/SKILL.md",
+]
+
 [tool.ruff]
 line-length = 88
 target-version = "py39"

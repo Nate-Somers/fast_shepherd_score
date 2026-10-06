@@ -157,6 +157,8 @@ workers; the fork-based CPU interface requires a platform supporting fork.
 
 ## Further reference
 
+- [Scoring-mode development skills](scoring_mode_skills.md): reference objectives,
+  accelerated implementations, and their validation workflow.
 - [Installation](installation.rst): optional backends and external executables.
 - [Batch alignment](api/container/molecule_pair_batch.rst): backend selection and methods.
 - [Screening and parallel APIs](api/screening.rst): stores, hits, queries and workers.

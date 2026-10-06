@@ -87,7 +87,11 @@ dmypy.json
 .pytype/
 cython_debug/
 environment.local.yml
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/design-scoring-mode/
+!.claude/skills/accelerate-scoring-mode/
 .codex/
 .agents/
 .pytest_cache/

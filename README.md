@@ -88,6 +88,8 @@ queries, CPU workers, and multiple GPUs.
 
 ## Evaluations and documentation
 
+- [Scoring-mode development skills](docs/scoring_mode_skills.md): build a tested
+  reference objective, then add its Numba/Triton batch and screening implementation.
 - [Generated-molecule evaluations](scripts/README.md)
 - [Tutorial notebooks](examples/)
 - [Measured throughput](docs/performance/timings.md)
