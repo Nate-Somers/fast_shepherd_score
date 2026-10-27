@@ -16,10 +16,9 @@ except ImportError:
     warnings.warn("PyTorch not available - skipping vol_esp_tversky tests")
 
 if TORCH_AVAILABLE:
-    from shepherd_score.alignment._torch import (
-        objective_vol_esp_tversky_overlay,
-        optimize_vol_esp_tversky_overlay,
-    )
+    from shepherd_score.alignment import optimize_se3
+    from shepherd_score.modes import VolESP
+    from .utils import mode_loss
     from shepherd_score.container import Molecule, MoleculePair
 
 MODE = "vol_esp_tversky"
@@ -83,8 +82,8 @@ def test_autograd_matches_finite_difference(ibuprofen):
     se3 = se3.clone().requires_grad_(True)
 
     def _obj(p):
-        return objective_vol_esp_tversky_overlay(p, ref, fit, rc, fc, alpha=0.81, lam=0.1,
-                                                 tversky_alpha=0.95, tversky_beta=0.05)
+        return mode_loss(VolESP(lam=0.1, similarity=(0.95, 0.05)), p,
+                         {'points': ref, 'charges': rc}, {'points': fit, 'charges': fc})
 
     val = _obj(se3)
     val.backward()
@@ -117,8 +116,9 @@ def test_optimizer_recovers_planted_pose(ibuprofen):
     rc = torch.tensor(chg, dtype=torch.float32)
     fc = torch.tensor(chg, dtype=torch.float32)
 
-    _, _, score = optimize_vol_esp_tversky_overlay(ref, fit, rc, fc, num_repeats=20,
-                                                   max_num_steps=200)
+    _, _, score = optimize_se3(VolESP(lam=0.1, similarity='tversky'),
+                               {'points': ref, 'charges': rc}, {'points': fit, 'charges': fc},
+                               num_repeats=20, max_num_steps=200)
     assert float(score) > 0.95, f"planted-pose recovery only {float(score):.3f}"
 
 

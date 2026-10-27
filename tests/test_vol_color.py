@@ -25,7 +25,6 @@ if TORCH_AVAILABLE:
         get_overlap_pharm as get_overlap_pharm_torch,
         get_pharm_combo_score as get_pharm_combo_score_torch,
     )
-    from shepherd_score.alignment import optimize_vol_color_overlay
 
 RTOL = 1e-5
 ATOL = 1e-7

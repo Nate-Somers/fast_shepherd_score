@@ -12,12 +12,9 @@ from rdkit.Chem import AllChem
 
 from shepherd_score.conformer_generation import embed_conformer_from_smiles
 from shepherd_score.container import Molecule, MoleculePair
-from shepherd_score.alignment._torch import (
-    objective_vol_atomtype_overlay,
-    objective_vol_color_tversky_overlay,
-    objective_vol_lipo_tversky_overlay,
-    optimize_vol_and_surf_esp_tversky_overlay,
-)
+from shepherd_score.alignment import optimize_se3
+from shepherd_score.modes import VolAndSurfESP, vol_atomtype, vol_color, vol_lipo
+from .utils import mode_loss
 
 torch.set_num_threads(2)
 
@@ -107,25 +104,26 @@ def test_gradient_vol_atomtype():
     rc, fc = _T(a.atom_pos), _T(b.atom_pos)
     rtp, ftp = _T(_heavy(a)), _T(_heavy(b))
     rl, fl = _T(a.get_atomic_numbers(True)), _T(b.get_atomic_numbers(True))
-    _fd_grad_check(lambda se3: objective_vol_atomtype_overlay(
-        se3, rc, fc, rtp, ftp, rl, fl, alpha=0.81, atomtype_weight=0.5))
+    _fd_grad_check(lambda se3: mode_loss(
+        vol_atomtype(), se3, ({'points': rc}, {'points': rtp, 'labels': rl}),
+        ({'points': fc}, {'points': ftp, 'labels': fl})))
 
 
 def test_gradient_vol_color_tversky():
     a, b = _mol("CC(=O)Oc1ccccc1C(=O)O"), _mol("COC(=O)c1ccccc1O")
-    _fd_grad_check(lambda se3: objective_vol_color_tversky_overlay(
-        se3, _T(a.atom_pos), _T(b.atom_pos),
-        torch.from_numpy(a.pharm_types), torch.from_numpy(b.pharm_types),
-        _T(a.pharm_ancs), _T(b.pharm_ancs), _T(a.pharm_vecs), _T(b.pharm_vecs),
-        alpha=0.81, color_weight=0.5))
+    def inputs(m):
+        return ({'points': _T(m.atom_pos)},
+                {'types': torch.from_numpy(m.pharm_types), 'anchors': _T(m.pharm_ancs),
+                 'vectors': _T(m.pharm_vecs)})
+    mode = vol_color(similarity=(0.95, 0.05), color_similarity='tversky')
+    _fd_grad_check(lambda se3: mode_loss(mode, se3, inputs(a), inputs(b)))
 
 
 def test_gradient_vol_lipo_tversky():
     a, b = _mol("CC(=O)Oc1ccccc1C(=O)O"), _mol("COC(=O)c1ccccc1O")
-    _fd_grad_check(lambda se3: objective_vol_lipo_tversky_overlay(
-        se3, _T(a.atom_pos), _T(b.atom_pos), _T(_heavy(a)), _T(_heavy(b)),
-        _T(a.get_lipophilicity(True)), _T(b.get_lipophilicity(True)),
-        alpha=0.81, lam=0.1, lipo_weight=0.5))
+    def inputs(m):
+        return {'points': _T(m.atom_pos)}, {'points': _T(_heavy(m)), 'values': _T(m.get_lipophilicity(True))}
+    _fd_grad_check(lambda se3: mode_loss(vol_lipo(similarity=(0.95, 0.05)), se3, inputs(a), inputs(b)))
 
 
 # --- Gate 5: retained-H basis (per-atom-field modes must not desync N vs N-1) ------------------
@@ -169,13 +167,13 @@ def _run_vas_tversky(ref, fit, **over):
     kw = dict(alpha=0.81, lam=0.001, probe_radius=1.0, esp_weight=0.5,
               num_repeats=8, max_num_steps=50)
     kw.update(over)
-    _, _, score = optimize_vol_and_surf_esp_tversky_overlay(
-        ref_centers_w_H=_T(ref["w_h"]), fit_centers_w_H=_T(fit["w_h"]),
-        ref_centers=_T(ref["heavy"]), fit_centers=_T(fit["heavy"]),
-        ref_points=_T(ref["surf"]), fit_points=_T(fit["surf"]),
-        ref_partial_charges=_T(ref["charges"]), fit_partial_charges=_T(fit["charges"]),
-        ref_surf_esp=_T(ref["surf_esp"]), fit_surf_esp=_T(fit["surf_esp"]),
-        ref_radii=_T(ref["radii"]), fit_radii=_T(fit["radii"]), **kw)
+    def inputs(d):
+        return {'centers_w_H': _T(d["w_h"]), 'centers': _T(d["heavy"]), 'points': _T(d["surf"]),
+                'partial_charges': _T(d["charges"]), 'surf_esp': _T(d["surf_esp"]),
+                'radii': _T(d["radii"])}
+    opt = {k: kw.pop(k) for k in ('num_repeats', 'max_num_steps')}
+    mode = VolAndSurfESP(similarity=(0.95, 0.05), **kw)
+    _, _, score = optimize_se3(mode, inputs(ref), inputs(fit), **opt)
     return float(score)
 
 

@@ -6,6 +6,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from shepherd_score.container._core import MoleculePair
+from shepherd_score.modes import ALIASES as MODE_ALIASES
+from shepherd_score.score.similarity import Similarity, tversky_weights
 from shepherd_score.container._batch_utils import (
     _pad_arrays,
     _dispatch_parallel,
@@ -109,6 +111,27 @@ class MoleculePairBatch:
 
     def __init__(self, pairs: List[MoleculePair]):
         self.pairs = pairs
+
+    def align(self, mode: str, similarity: Similarity = 'tanimoto', **kwargs):
+        """Align all pairs under the named ``mode``, as ``MoleculePair.align`` names them.
+
+        Dispatches to the accelerated ``align_with_<mode>`` method (``align_with_<mode>_tversky``
+        for a Tversky ``similarity``), so results land in that method's ``transform_*`` /
+        ``sim_aligned_*`` slots and ``kwargs`` are that method's keywords::
+
+            batch.align('vol', similarity='tversky', backend='triton')
+        """
+        name = MODE_ALIASES.get(mode, mode)
+        weights = tversky_weights(similarity)
+        if name == 'pharm':
+            return self.align_with_pharm(similarity=similarity, **kwargs)
+        if weights is not None:
+            kwargs.update(tversky_alpha=weights[0], tversky_beta=weights[1])
+            name = f'{name}_tversky'
+        method = getattr(self, f'align_with_{name}', None)
+        if method is None:
+            raise ValueError(f'No batched implementation of {mode!r} with similarity={similarity!r}.')
+        return method(**kwargs)
 
     # Backend names that route to the Triton/CUDA MoleculePair._align_batch_* path.
     _TRITON_BACKENDS = ("triton", "cuda", "gpu")

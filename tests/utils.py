@@ -27,3 +27,9 @@ def _configure_jax_platform():
         os.environ['JAX_PLATFORMS'] = 'cpu'
 
     return gpu_detected
+
+
+def mode_loss(mode, se3_params, ref, fit):
+    """``1 - mode.score`` with ``fit`` posed by ``se3_params``: the loss ``optimize_se3`` minimizes."""
+    from shepherd_score.alignment.utils.se3 import get_SE3_transform
+    return 1 - mode.score(ref, mode.pose(fit, get_SE3_transform(se3_params)))
