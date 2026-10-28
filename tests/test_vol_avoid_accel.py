@@ -54,7 +54,7 @@ def test_numba_batched_matches_per_pair_accel(cloud_name):
     """Batched-numba equals the per-pair accel entry point, which uses the same seed set."""
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     from shepherd_score.accel.drivers.avoid import fast_optimize_vol_avoid_overlay
-    from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS
+    from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS, SPECS
     nr, ns = MODE_SEEDS["vol_avoid"], MODE_STEPS["vol_avoid"]
 
     ref_m = _mol(IBU)
@@ -70,7 +70,8 @@ def test_numba_batched_matches_per_pair_accel(cloud_name):
     fc = torch.tensor(mp.fit_molec.atom_pos, dtype=torch.float32)
     _, _, sc_pp = fast_optimize_vol_avoid_overlay(
         rc, fc, torch.tensor(avoid, dtype=torch.float32),
-        avoid_weight=1.0, avoid_min_dist=2.0, num_repeats=nr, steps_fine=ns, lr=0.1)
+        avoid_weight=1.0, avoid_min_dist=2.0, num_repeats=nr, steps_fine=ns,
+        lr=SPECS["vol_avoid"].params["lr"])
 
     b = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,
                                         device=torch.device("cpu"))])

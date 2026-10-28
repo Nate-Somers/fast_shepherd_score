@@ -1,4 +1,5 @@
 """Batched molecular alignment with Numba, Triton, and optional JAX backends."""
+import warnings
 from contextlib import contextmanager
 from importlib.metadata import version as _pkg_version
 from typing import List, Optional, Tuple
@@ -47,6 +48,13 @@ def _default_seeds(mode: str) -> int:
     and per-pair branches all need a concrete count."""
     from shepherd_score.accel.batch.aligners import _seeds_for
     return _seeds_for(mode)
+
+
+def _default_lr(mode: str) -> float:
+    """Per-mode default Adam learning rate from the registry, resolving ``lr=None`` in
+    ``align_with_*``; see ``_default_steps``."""
+    from shepherd_score.accel._modes import SPECS, canonical
+    return float(SPECS[canonical(mode)].params["lr"])
 
 
 def _compute_bucket_splits(sizes_a, sizes_b, num_buckets):
@@ -182,14 +190,15 @@ class MoleculePairBatch:
 
     def _run_fast_or_fallthrough(self, backend, align_fn, align_kwargs, score_attr,
                                  transform_attr, fit_attr, return_aligned, *,
-                                 num_workers: int = 1, precheck=None):
+                                 num_workers: int = 1, precheck=None, has_jax: bool = False):
         """Shared ``backend=`` dispatch for the modes whose fast path is a single
         ``_triton_align`` call.
 
         Returns ``(handled, result)``: a triton/numba backend runs the batched path and returns
         ``(True, result)``; ``"jax"`` returns ``(False, None)`` so the caller runs its own path;
         any other value raises ``ValueError``. ``precheck`` runs after ``_prepare_numba`` so
-        mode-specific guards (e.g. ``no_H``) see the prepared pairs.
+        mode-specific guards (e.g. ``no_H``) see the prepared pairs. Modes without a JAX
+        implementation (``has_jax=False``) warn that ``"jax"`` runs per-pair PyTorch instead.
         """
         backend = _resolve_backend(backend)
         if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
@@ -202,6 +211,10 @@ class MoleculePairBatch:
                                             num_workers=num_workers)
         if backend != "jax":
             raise ValueError(f"unknown backend {backend!r}; use 'jax', 'triton', or 'numba'")
+        if not has_jax:
+            mode = align_fn.__name__.replace("_align_batch_", "")
+            warnings.warn(f"{mode} has no JAX implementation; backend='jax' falls back to "
+                          "per-pair PyTorch.", RuntimeWarning, stacklevel=3)
         return False, None
 
     def _triton_align(self, align_fn, align_kwargs, score_attr, transform_attr,
@@ -319,7 +332,7 @@ class MoleculePairBatch:
                        no_H: bool = True,
                        num_repeats: int = None,
                        trans_init: bool = False,
-                       lr: float = 0.1,
+                       lr: Optional[float] = None,
                        max_num_steps: int = None,
                        num_workers: int = 1,
                        use_shmap: bool = True,
@@ -354,7 +367,7 @@ class MoleculePairBatch:
         trans_init : bool
             If True, initialize translations to each ref atom position. Default is False.
         lr : float
-            Optimizer learning rate. Default is 0.1.
+            Optimizer learning rate. Default (``None``) is the per-mode registry value.
         max_num_steps : int
             Maximum optimization steps.
             Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
@@ -380,7 +393,7 @@ class MoleculePairBatch:
             separately with reduced per-bucket padding, which can be
             beneficial for large heterogeneous molecule sets.
         verbose : bool
-            Print scores per pair. Default is False.
+            Print scores per pair on the JAX path. Default is False; ignored by triton/numba.
         similarity : str or (float, float)
             ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
             explicit Tversky weights ``(a, b)``. A Tversky similarity runs the ``vol_tversky``
@@ -421,11 +434,14 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol")
         if num_repeats is None:
             num_repeats = _default_seeds("vol")
+        if lr is None:
+            lr = _default_lr("vol")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol,
-            dict(alpha=alpha, steps_fine=max_num_steps),
+            dict(alpha=alpha, num_repeats=num_repeats, lr=lr, trans_init=trans_init,
+                 steps_fine=max_num_steps),
             "sim_aligned_vol_noH", "transform_vol_noH", "_fit_xyz_t", return_aligned,
-            num_workers=num_workers, precheck=_no_H_guard)
+            num_workers=num_workers, precheck=_no_H_guard, has_jax=True)
         if handled:
             return _result
 
@@ -556,7 +572,7 @@ class MoleculePairBatch:
                            no_H: bool = True,
                            num_repeats: int = None,
                            trans_init: bool = False,
-                           lr: float = 0.1,
+                           lr: Optional[float] = None,
                            max_num_steps: int = None,
                            num_workers: int = 1,
                            use_shmap: bool = True,
@@ -593,7 +609,7 @@ class MoleculePairBatch:
         trans_init : bool
             If True, initialize translations to each ref atom position. Default is False.
         lr : float
-            Optimizer learning rate. Default is 0.1.
+            Optimizer learning rate. Default (``None``) is the per-mode registry value.
         max_num_steps : int
             Maximum optimization steps.
             Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
@@ -617,7 +633,7 @@ class MoleculePairBatch:
             separately with reduced per-bucket padding, which can be
             beneficial for large heterogeneous molecule sets.
         verbose : bool
-            Print scores per pair. Default is False.
+            Print scores per pair on the JAX path. Default is False; ignored by triton/numba.
         similarity : str or (float, float)
             ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
             explicit Tversky weights ``(a, b)``. A Tversky similarity runs the
@@ -659,12 +675,14 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_esp")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_esp")
+        if lr is None:
+            lr = _default_lr("vol_esp")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_esp,
             dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
                  trans_init=trans_init, lr=lr, steps_fine=max_num_steps),
             "sim_aligned_vol_esp_noH", "transform_vol_esp_noH", "_fit_xyz_t",
-            return_aligned, precheck=_no_H_guard)
+            return_aligned, precheck=_no_H_guard, has_jax=True)
         if handled:
             return _result
 
@@ -848,7 +866,7 @@ class MoleculePairBatch:
                         alpha: float,
                         num_repeats: int = None,
                         trans_init: bool = False,
-                        lr: float = 0.1,
+                        lr: Optional[float] = None,
                         max_num_steps: int = None,
                         use_jax: bool = True,
                         use_analytical: bool = True,
@@ -879,7 +897,7 @@ class MoleculePairBatch:
         trans_init : bool
             Apply translation initialization for alignment. Default is False.
         lr : float
-            Optimizer learning rate. Default is 0.1.
+            Optimizer learning rate. Default (``None``) is the per-mode registry value.
         max_num_steps : int
             Maximum optimization steps.
             Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
@@ -896,7 +914,7 @@ class MoleculePairBatch:
             Whether to use JAX shard_map for parallel alignment. Default is False.
             Performance is better when use_shmap is False on cpu.
         verbose : bool
-            Print scores per pair. Default is False.
+            Print scores per pair on the JAX path. Default is False; ignored by triton/numba.
         similarity : str or (float, float)
             ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
             explicit Tversky weights ``(a, b)``. A Tversky similarity runs the ``surf_tversky``
@@ -930,11 +948,14 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("surf")
         if num_repeats is None:
             num_repeats = _default_seeds("surf")
+        if lr is None:
+            lr = _default_lr("surf")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_surf,
-            dict(alpha=alpha, steps_fine=max_num_steps),
+            dict(alpha=alpha, num_repeats=num_repeats, lr=lr, trans_init=trans_init,
+                 steps_fine=max_num_steps),
             "sim_aligned_surf", "transform_surf", "_fit_surf_t", return_aligned,
-            num_workers=num_workers)
+            num_workers=num_workers, has_jax=True)
         if handled:
             return _result
 
@@ -1003,7 +1024,7 @@ class MoleculePairBatch:
                        lam: float = 0.3,
                        num_repeats: int = None,
                        trans_init: bool = False,
-                       lr: float = 0.1,
+                       lr: Optional[float] = None,
                        max_num_steps: int = None,
                        use_jax: bool = True,
                        use_analytical: bool = True,
@@ -1037,7 +1058,7 @@ class MoleculePairBatch:
         trans_init : bool
             Apply translation initialization for alignment. Default is False.
         lr : float
-            Optimizer learning rate. Default is 0.1.
+            Optimizer learning rate. Default (``None``) is the per-mode registry value.
         max_num_steps : int
             Maximum optimization steps.
             Default (``None``) is the per-mode value in ``shepherd_score/accel/_modes.py``
@@ -1054,7 +1075,7 @@ class MoleculePairBatch:
             Whether to use JAX shard_map for parallel alignment. Default is False.
             Performance is better when use_shmap is False on cpu.
         verbose : bool
-            Print scores per pair. Default is False.
+            Print scores per pair on the JAX path. Default is False; ignored by triton/numba.
         similarity : str or (float, float)
             ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
             explicit Tversky weights ``(a, b)``. A Tversky similarity runs the
@@ -1089,12 +1110,14 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("surf_esp")
         if num_repeats is None:
             num_repeats = _default_seeds("surf_esp")
+        if lr is None:
+            lr = _default_lr("surf_esp")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_surf_esp,
             dict(alpha=alpha, lam=lam, num_repeats=num_repeats,
                  trans_init=trans_init, lr=lr, steps_fine=max_num_steps),
             "sim_aligned_surf_esp", "transform_surf_esp", "_fit_surf_t", return_aligned,
-            num_workers=num_workers)
+            num_workers=num_workers, has_jax=True)
         if handled:
             return _result
 
@@ -1172,7 +1195,7 @@ class MoleculePairBatch:
                              esp_weight: float = 0.5,
                              num_repeats: int = None,
                              trans_init: bool = False,
-                             lr: float = 0.1,
+                             lr: Optional[float] = None,
                              max_num_steps: int = None,
                              verbose: bool = False,
                              backend: Optional[str] = None,
@@ -1226,6 +1249,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_and_surf_esp")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_and_surf_esp")
+        if lr is None:
+            lr = _default_lr("vol_and_surf_esp")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_and_surf_esp,
             dict(alpha=alpha, lam=lam, probe_radius=probe_radius,
@@ -1258,7 +1283,7 @@ class MoleculePairBatch:
                              alpha: float = 0.81,
                              num_repeats: int = None,
                              trans_init: bool = False,
-                             lr: float = 0.1,
+                             lr: Optional[float] = None,
                              max_num_steps: int = None,
                              verbose: bool = False,
                              backend: Optional[str] = None,
@@ -1314,6 +1339,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_color")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_color")
+        if lr is None:
+            lr = _default_lr("vol_color")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_color,
             dict(alpha=alpha, color_weight=color_weight, trans_init=trans_init,
@@ -1339,7 +1366,7 @@ class MoleculePairBatch:
                            tversky_beta: float = 0.05,
                            alpha: float = 0.81,
                            num_repeats: int = None,
-                           lr: float = 0.1,
+                           lr: Optional[float] = None,
                            max_num_steps: int = None,
                            verbose: bool = False,
                            backend: Optional[str] = None,
@@ -1389,10 +1416,12 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_tversky")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_tversky")
+        if lr is None:
+            lr = _default_lr("vol_tversky")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_tversky,
             dict(alpha=alpha, tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
-                 steps_fine=max_num_steps),
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
             "sim_aligned_vol_tversky", "transform_vol_tversky", "_fit_xyz_t",
             return_aligned)
         if handled:
@@ -1409,7 +1438,7 @@ class MoleculePairBatch:
                                alpha: float = 0.81,
                                lam: float = 0.1,
                                num_repeats: int = None,
-                               lr: float = 0.1,
+                               lr: Optional[float] = None,
                                max_num_steps: int = None,
                                verbose: bool = False,
                                backend: Optional[str] = None,
@@ -1462,10 +1491,12 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_esp_tversky")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_esp_tversky")
+        if lr is None:
+            lr = _default_lr("vol_esp_tversky")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_esp_tversky,
             dict(alpha=alpha, lam=lam, tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
-                 steps_fine=max_num_steps),
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
             "sim_aligned_vol_esp_tversky", "transform_vol_esp_tversky", "_fit_xyz_t",
             return_aligned)
         if handled:
@@ -1481,7 +1512,7 @@ class MoleculePairBatch:
                             alpha: float = 0.81,
                             lam: float = 0.1,
                             num_repeats: int = None,
-                            lr: float = 0.1,
+                            lr: Optional[float] = None,
                             max_num_steps: int = None,
                             verbose: bool = False,
                             backend: Optional[str] = None,
@@ -1547,6 +1578,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_lipo")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_lipo")
+        if lr is None:
+            lr = _default_lr("vol_lipo")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_lipo,
             dict(lipo_weight=lipo_weight, alpha=alpha, lam=lam,
@@ -1632,7 +1665,7 @@ class MoleculePairBatch:
 
     # ---- Experimental modes ----------------------------------------------------------------
     def align_with_vol_mr(self, mr_weight: float = 0.5, alpha: float = 0.81, lam: float = 0.1,
-                          num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                          num_repeats: int = None, lr: Optional[float] = None, max_num_steps: int = None,
                           verbose: bool = False, backend: Optional[str] = None,
                           return_aligned: bool = True):
         """Batched shape + molar-refractivity alignment (reuses the vol_lipo driver)."""
@@ -1640,6 +1673,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_mr")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_mr")
+        if lr is None:
+            lr = _default_lr("vol_mr")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_mr,
             dict(mr_weight=mr_weight, alpha=alpha, lam=lam,
@@ -1652,7 +1687,7 @@ class MoleculePairBatch:
             num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
 
     def align_with_vol_fukui(self, fukui_weight: float = 0.5, alpha: float = 0.81, lam: float = 0.1,
-                             num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                             num_repeats: int = None, lr: Optional[float] = None, max_num_steps: int = None,
                              verbose: bool = False, backend: Optional[str] = None,
                              return_aligned: bool = True):
         """Batched shape + condensed-Fukui reactivity alignment (reuses the vol_lipo driver)."""
@@ -1660,6 +1695,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_fukui")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_fukui")
+        if lr is None:
+            lr = _default_lr("vol_fukui")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_fukui,
             dict(fukui_weight=fukui_weight, alpha=alpha, lam=lam,
@@ -1673,7 +1710,7 @@ class MoleculePairBatch:
 
     def align_with_vol_avoid(self, avoid_points, avoid_weight: float = 1.0,
                              avoid_min_dist: float = 2.0, alpha: float = 0.81,
-                             num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                             num_repeats: int = None, lr: Optional[float] = None, max_num_steps: int = None,
                              verbose: bool = False, backend: Optional[str] = None,
                              return_aligned: bool = True):
         """Batched shape Tanimoto minus a linear hard-sphere excluded-volume penalty.
@@ -1687,6 +1724,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_avoid")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_avoid")
+        if lr is None:
+            lr = _default_lr("vol_avoid")
         # attach per-pair avoid clouds (a single cloud broadcasts to every pair)
         if isinstance(avoid_points, (list, tuple)):
             if len(avoid_points) != len(self.pairs):
@@ -1715,7 +1754,7 @@ class MoleculePairBatch:
         return np.array(scores), [None] * len(self.pairs)
 
     def _align_surf_tversky(self, tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
-                            alpha: float = 0.81, num_repeats: int = None, lr: float = 0.1,
+                            alpha: float = 0.81, num_repeats: int = None, lr: Optional[float] = None,
                             max_num_steps: int = None, verbose: bool = False,
                             backend: Optional[str] = None, return_aligned: bool = True):
         """Batched surface-shape Tversky alignment (reuses the vol_tversky driver)."""
@@ -1723,10 +1762,12 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("surf_tversky")
         if num_repeats is None:
             num_repeats = _default_seeds("surf_tversky")
+        if lr is None:
+            lr = _default_lr("surf_tversky")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_surf_tversky,
             dict(alpha=alpha, tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
-                 steps_fine=max_num_steps),
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
             "sim_aligned_surf_tversky", "transform_surf_tversky", "_fit_surf_t", return_aligned)
         if handled:
             return _result
@@ -1737,17 +1778,19 @@ class MoleculePairBatch:
 
     def _align_surf_esp_tversky(self, tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
                                 alpha: float = 0.81, lam: float = 0.3, num_repeats: int = None,
-                                lr: float = 0.1, max_num_steps: int = None, verbose: bool = False,
+                                lr: Optional[float] = None, max_num_steps: int = None, verbose: bool = False,
                                 backend: Optional[str] = None, return_aligned: bool = True):
         """Batched surface-ESP Tversky alignment (reuses the vol_esp_tversky driver)."""
         if max_num_steps is None:
             max_num_steps = _default_steps("surf_esp_tversky")
         if num_repeats is None:
             num_repeats = _default_seeds("surf_esp_tversky")
+        if lr is None:
+            lr = _default_lr("surf_esp_tversky")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_surf_esp_tversky,
             dict(lam=lam, alpha=alpha, tversky_alpha=tversky_alpha, tversky_beta=tversky_beta,
-                 steps_fine=max_num_steps),
+                 num_repeats=num_repeats, lr=lr, steps_fine=max_num_steps),
             "sim_aligned_surf_esp_tversky", "transform_surf_esp_tversky", "_fit_surf_t", return_aligned)
         if handled:
             return _result
@@ -1759,7 +1802,7 @@ class MoleculePairBatch:
     def _align_vol_lipo_tversky(self, lipo_weight: float = 0.5, alpha: float = 0.81,
                                 lam: float = 0.1, tversky_alpha: float = 0.95,
                                 tversky_beta: float = 0.05, num_repeats: int = None,
-                                lr: float = 0.1, max_num_steps: int = None,
+                                lr: Optional[float] = None, max_num_steps: int = None,
                                 verbose: bool = False, backend: Optional[str] = None,
                                 return_aligned: bool = True):
         """Batched vol_lipo scored with Tversky on both channels."""
@@ -1767,6 +1810,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_lipo_tversky")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_lipo_tversky")
+        if lr is None:
+            lr = _default_lr("vol_lipo_tversky")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_lipo_tversky,
             dict(lipo_weight=lipo_weight, alpha=alpha, lam=lam,
@@ -1782,7 +1827,7 @@ class MoleculePairBatch:
 
     def _align_vol_color_tversky(self, color_weight: float = 0.5, alpha: float = 0.81,
                                  tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
-                                 num_repeats: int = None, lr: float = 0.1,
+                                 num_repeats: int = None, lr: Optional[float] = None,
                                  max_num_steps: int = None, verbose: bool = False,
                                  backend: Optional[str] = None, return_aligned: bool = True):
         """Batched vol_color scored with Tversky on both channels."""
@@ -1790,6 +1835,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_color_tversky")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_color_tversky")
+        if lr is None:
+            lr = _default_lr("vol_color_tversky")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_color_tversky,
             dict(color_weight=color_weight, alpha=alpha, tversky_alpha=tversky_alpha,
@@ -1803,7 +1850,7 @@ class MoleculePairBatch:
             num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
 
     def align_with_vol_atomtype(self, atomtype_weight: float = 0.5, alpha: float = 0.81,
-                                num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                                num_repeats: int = None, lr: Optional[float] = None, max_num_steps: int = None,
                                 verbose: bool = False, backend: Optional[str] = None,
                                 return_aligned: bool = True):
         """Batched shape + element-identity alignment."""
@@ -1811,6 +1858,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_atomtype")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_atomtype")
+        if lr is None:
+            lr = _default_lr("vol_atomtype")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_atomtype,
             dict(atomtype_weight=atomtype_weight, alpha=alpha,
@@ -1824,7 +1873,7 @@ class MoleculePairBatch:
             max_num_steps=max_num_steps, verbose=verbose)
 
     def align_with_vol_pharm(self, color_weight: float = 0.5, alpha: float = 0.81,
-                             num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                             num_repeats: int = None, lr: Optional[float] = None, max_num_steps: int = None,
                              verbose: bool = False, backend: Optional[str] = None,
                              return_aligned: bool = True):
         """Batched shape + directional-pharmacophore alignment."""
@@ -1832,6 +1881,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_pharm")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_pharm")
+        if lr is None:
+            lr = _default_lr("vol_pharm")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_pharm,
             dict(color_weight=color_weight, alpha=alpha,
@@ -1845,7 +1896,7 @@ class MoleculePairBatch:
             max_num_steps=max_num_steps, verbose=verbose)
 
     def _align_pharm_tversky(self, extended_points: bool = False, only_extended: bool = False,
-                             num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                             num_repeats: int = None, lr: Optional[float] = None, max_num_steps: int = None,
                              verbose: bool = False, backend: Optional[str] = None,
                              return_aligned: bool = True):
         """Batched pharmacophore alignment scored with Tversky (reuses the pharm driver)."""
@@ -1853,6 +1904,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("pharm_tversky")
         if num_repeats is None:
             num_repeats = _default_seeds("pharm_tversky")
+        if lr is None:
+            lr = _default_lr("pharm_tversky")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_pharm_tversky,
             dict(extended_points=extended_points, only_extended=only_extended,
@@ -1869,7 +1922,7 @@ class MoleculePairBatch:
                                         tversky_beta: float = 0.05, alpha: float = 0.81,
                                         lam: float = 0.001, probe_radius: float = 1.0,
                                         esp_weight: float = 0.5, num_repeats: int = None,
-                                        lr: float = 0.1, max_num_steps: int = None,
+                                        lr: Optional[float] = None, max_num_steps: int = None,
                                         verbose: bool = False, backend: Optional[str] = None,
                                         return_aligned: bool = True):
         """Batched ShaEP-style vol_and_surf_esp with a Tversky shape channel."""
@@ -1877,6 +1930,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("vol_and_surf_esp_tversky")
         if num_repeats is None:
             num_repeats = _default_seeds("vol_and_surf_esp_tversky")
+        if lr is None:
+            lr = _default_lr("vol_and_surf_esp_tversky")
         handled, _result = self._run_fast_or_fallthrough(
             backend, MoleculePair._align_batch_vol_and_surf_esp_tversky,
             dict(alpha=alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight,
@@ -1898,7 +1953,7 @@ class MoleculePairBatch:
                          only_extended: bool = False,
                          num_repeats: int = None,
                          trans_init: bool = False,
-                         lr: float = 0.1,
+                         lr: Optional[float] = None,
                          max_num_steps: int = None,
                          num_workers: int = 1,
                          use_shmap: bool = True,
@@ -1932,7 +1987,7 @@ class MoleculePairBatch:
         trans_init : bool
             If True, initialize translations to each ref pharmacophore anchor.
         lr : float
-            Optimizer learning rate.
+            Optimizer learning rate. Default (``None``) is the per-mode registry value.
         max_num_steps : int
             Maximum optimization steps.
         num_workers : int
@@ -1978,6 +2033,8 @@ class MoleculePairBatch:
             max_num_steps = _default_steps("pharm")
         if num_repeats is None:
             num_repeats = _default_seeds("pharm")
+        if lr is None:
+            lr = _default_lr("pharm")
         backend = _resolve_backend(backend)
         if backend in self._TRITON_BACKENDS or backend in self._NUMBA_BACKENDS:
             if backend in self._NUMBA_BACKENDS:

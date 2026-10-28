@@ -10,7 +10,8 @@ Backends
 
 ``backend="numba"`` selects CPU kernels; ``backend="triton"`` selects CUDA kernels.
 The default resolves from the available device. ``backend="jax"`` selects the
-optional JAX implementation for supported original modes. Options specific to JAX,
+optional JAX implementation for ``vol``, ``vol_esp``, ``surf``, ``surf_esp`` and
+``pharm``; other modes warn and run per-pair PyTorch. Options specific to JAX,
 such as ``use_shmap`` and ``num_buckets``, do not select JAX automatically.
 
 .. code-block:: python
@@ -18,13 +19,14 @@ such as ``use_shmap`` and ``num_buckets``, do not select JAX automatically.
    from shepherd_score.container import MoleculePairBatch
 
    scores, aligned = MoleculePairBatch(pairs).align_with_vol(
-       backend="numba", return_aligned=True)
+       backend="numba")
 
 Every registered mode has an ``align_with_<mode>`` method. ``align_with_esp`` and
 ``align_with_esp_combo`` remain compatibility aliases for ``surf_esp`` and
-``vol_and_surf_esp``. Default seed and step counts are mode-specific; see
-``shepherd_score/accel/_modes.py``. Returned aligned arrays are built only when
-``return_aligned=True``.
+``vol_and_surf_esp``. ``num_repeats``, ``max_num_steps`` and ``lr`` default to
+``None``, which takes the mode's registry values in ``shepherd_score/accel/_modes.py``;
+explicit values override them on every backend. ``verbose`` only affects the JAX path. Aligned arrays are returned by default;
+pass ``return_aligned=False`` to skip building them.
 
 For JAX parallel alignment see :doc:`../alignment/jax_parallel`.
 For streaming libraries see :doc:`../screening`.

@@ -99,8 +99,6 @@ class ModeSpec:
     multipose : poses per CTA for the deduplicated multi-pose shape layout (surf only).
     pose_cap : bound the fine-loop sub-batch at ``_pad._FINE_CHUNK_POSES`` poses (vol only).
     lam_scaling : multiply ``lam`` by ``score.constants.LAM_SCALING`` (the surface convention).
-    honors_num_repeats : a caller's ``num_repeats`` overrides ``seeds`` (the pharm family); the
-        other modes accept the keyword and take the registry count.
     channel_switch : ``{virtual channel: (kwarg, value, if_equal, else)}``; the combo modes
         score volumetric shape when ``alpha == 0.81`` and surface shape otherwise.
     screen_lr : the fine-loop learning rate the screen front-end uses when the caller passes
@@ -131,7 +129,6 @@ class ModeSpec:
     multipose: int = 1
     pose_cap: bool = False
     lam_scaling: bool = False
-    honors_num_repeats: bool = False
     channel_switch: dict = field(default_factory=dict)
     coarse_channel: Optional[str] = None
     screen_lr: float = 0.075
@@ -246,7 +243,7 @@ _reg(ModeSpec("pharm", ("transform_pharm", "sim_aligned_pharm"), 32, 50, 5,
               params={"similarity": "tanimoto", "extended_points": False, "only_extended": False,
                       **_LR},
               center_clouds=True, pharm_style=True, graph_budget=10_000_000,
-              cpu_fused=False, honors_num_repeats=True, screen_lr=0.1))
+              cpu_fused=False, screen_lr=0.1))
 _reg(ModeSpec("vol_color", ("transform_vol_color", "sim_aligned_vol_color"), 16, 40, 2,
               seed_channel="atoms", channels=("atoms", "pharm_ancs", "pharm_types"), bucket=("atoms",),
               terms=_color_blend(), params={"alpha": 0.81, "color_weight": 0.5, **_LR},
@@ -310,7 +307,7 @@ _reg(ModeSpec("pharm_tversky", ("transform_pharm_tversky", "sim_aligned_pharm_tv
               params={"similarity": "tversky", "extended_points": False, "only_extended": False,
                       **_LR},
               center_clouds=True, pharm_style=True, graph_budget=10_000_000,
-              cpu_fused=False, honors_num_repeats=True, screen_lr=0.1))
+              cpu_fused=False, screen_lr=0.1))
 _reg(ModeSpec("vol_and_surf_esp_tversky",
               ("transform_vol_and_surf_esp_tversky", "sim_aligned_vol_and_surf_esp_tversky"),
               8, 60, 5, seed_channel="centers", channels=_COMBO_CH, bucket=("cwh", "surf", "centers"),
@@ -364,7 +361,7 @@ def spec_of(mode: str) -> ModeSpec:
 PROCESS_MODES = tuple(m for m, s in SPECS.items() if s.process)
 
 #: Per-mode (SO(3) seed count, fine step count) defaults, chosen at the accuracy/throughput
-#: knee; ``max_num_steps`` raises the budget, ``num_repeats`` only where ``honors_num_repeats``.
+#: knee; a caller's ``max_num_steps`` / ``num_repeats`` override them.
 MODE_SEEDS = {m: s.seeds for m, s in SPECS.items()}
 MODE_STEPS = {m: s.steps for m, s in SPECS.items()}
 

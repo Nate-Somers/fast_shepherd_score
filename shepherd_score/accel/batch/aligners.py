@@ -273,7 +273,7 @@ def _align_batch(spec, pairs, _fn, **kw) -> None:
     params = resolve_params(spec, kw, name)
     steps_fine = int(kw.get("steps_fine", _steps_for(spec.name)))
     nr = kw.get("num_repeats")
-    n_seeds = int(nr) if (spec.honors_num_repeats and nr is not None) else _seeds_for(spec.name)
+    n_seeds = int(nr) if nr is not None else _seeds_for(spec.name)
     trans_init = bool(kw.get("trans_init", False))
     nrpt = int(kw.get("num_repeats_per_trans", 10))
     topk = int(kw.get("topk", 30))

@@ -873,8 +873,7 @@ def _fast_batch_kwargs(mode: str, ak: dict) -> dict:
             kw[name] = ak[name]
         else:
             kw[name] = ak.get(name, default)
-    if spec.honors_num_repeats:
-        kw["num_repeats"] = ak.get("num_repeats", _seeds_for(mode))
+    kw["num_repeats"] = ak.get("num_repeats", _seeds_for(mode))
     return kw
 
 

@@ -55,7 +55,7 @@ their gradients, including the ESP term in combined volume-and-surface modes.
 4. Register a `ModeSpec`, including measured or explicitly inherited search
    settings. Copy the nearest mathematical objective, not just a similar mode
    name. Check `lam_scaling`, `pharm_style`, `channel_switch`, `seed_channel`,
-   `honors_num_repeats`, `graph_full_steps`, and CPU/graph gates individually.
+   `graph_full_steps`, and CPU/graph gates individually.
 5. Add `MoleculePairBatch.align_with_<mode>` in `container/_batch.py`, using the
    existing fast/fallback routing. Preserve device-aware `backend=None`.
    Ensure the per-pair result properties exist and audit effective defaults

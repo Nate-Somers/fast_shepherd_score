@@ -54,8 +54,7 @@ modes. These are distinct registrations. Do not register a spec that names
 unimplemented kernels or channels just to obtain default values.
 
 Public reference defaults and batched defaults must be checked separately.
-For example, `align_with_vol_tversky` currently defaults to 50 repeats and
-200 steps, whereas its accelerated spec has 10 seeds and 40 steps. Use explicit
-settings in comparisons. Accelerated `num_repeats` overrides seeds only where
-`ModeSpec.honors_num_repeats` permits it; do not infer the effective budget
-from the public argument alone.
+For example, the experimental `align_with_vol_pharm` currently defaults to 50
+repeats and 200 steps, whereas its accelerated spec has 32 seeds and 50 steps. Use
+explicit settings in comparisons. On accelerated paths `num_repeats=None` and
+`max_num_steps=None` take the registry seeds and steps; explicit values override them.

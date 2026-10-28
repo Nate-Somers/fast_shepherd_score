@@ -28,8 +28,8 @@ and ESP arrays for comparisons that require identical features.
    pair = MoleculePair(ref, fit)
    scores, _ = MoleculePairBatch([pair]).align_with_vol(backend="numba")
 
-The alignment writes the score and transform onto each pair. ``return_aligned``
-controls whether transformed arrays are also returned. Explicitly choose
+The alignment writes the score and transform onto each pair. Transformed arrays are
+also returned; pass ``return_aligned=False`` to skip them. Explicitly choose
 ``backend="triton"`` for GPU or ``backend="numba"`` for CPU; the default selects
 according to the available device. JAX is available for the original modes.
 

@@ -20,9 +20,11 @@ IBU = "CC(C)Cc1ccc(cc1)C(C)C(=O)O"
 CAF = "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"
 N_SURF = 75
 
-# The five modes that act on ``trans_init`` -> the cloud their coarse grid is built from.
+# Modes checked for ``trans_init`` -> the cloud their coarse grid is built from.
 # Hardcoded on purpose: deriving it from the spec would only restate the code under test.
 GRID_CLOUD = {
+    "vol": "atoms",
+    "surf": "surf",
     "vol_esp": "atoms",
     "surf_esp": "surf",
     "vol_and_surf_esp": "surf",
@@ -31,8 +33,8 @@ GRID_CLOUD = {
 }
 
 KW = {
-    "vol": dict(alpha=0.81),      # ignores trans_init; kept for the last test
-    "surf": dict(alpha=0.81),     # ignores trans_init; kept for the last test
+    "vol": dict(alpha=0.81),
+    "surf": dict(alpha=0.81),
     "vol_esp": dict(alpha=0.81, lam=0.3),
     "surf_esp": dict(alpha=0.81, lam=0.3),
     "vol_and_surf_esp": dict(alpha=0.81),
@@ -143,25 +145,6 @@ def test_combo_self_copy_falls_short_of_one_as_it_always_has():
         f"vol_and_surf_esp trans_init self-copy scored {s}; the shipped behaviour is ~0.54. "
         "Above 0.97 means the coarse path now reaches identity -- a real improvement, but check "
         "it against the rest of the parity gates before widening this bound.")
-
-
-@pytest.mark.parametrize("mode", ["vol", "surf"])
-def test_shape_modes_accept_trans_init_and_ignore_it(mode, monkeypatch):
-    """``vol`` and ``surf`` accept the keyword and ignore it; scores are identical either way."""
-    from shepherd_score.accel._modes import MODE_ATTRS
-    from shepherd_score.container import MoleculePairBatch
-
-    ref, fit = _mol(IBU), _mol(CAF, seed=1)
-    seen = _spy(monkeypatch)
-    got = []
-    for flag in (False, True):
-        p = _pair(ref, fit)
-        getattr(MoleculePairBatch([p]), "align_with_" + mode)(
-            backend="numba", trans_init=flag, **KW[mode])
-        got.append(float(getattr(p, MODE_ATTRS[mode][1])))
-
-    assert seen == {}, f"{mode} now builds a coarse grid for trans_init=True: {seen}"
-    assert got[0] == got[1], f"{mode} trans_init changed the score: {got[0]} -> {got[1]}"
 
 
 @pytest.mark.skipif(not (TORCH and torch.cuda.is_available()), reason="CUDA required")
