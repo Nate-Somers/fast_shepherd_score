@@ -60,3 +60,13 @@ def pharm_similarity_name(similarity: Similarity) -> str:
         if tuple(map(float, similarity)) == weights:
             return name
     raise ValueError(f'Pharmacophore similarity must be a name, not {similarity!r}.')
+
+
+def pharm_similarity(similarity: Similarity) -> Union[str, Tuple[float, float]]:
+    """The form ``get_overlap_pharm`` takes: the name where one matches, else the ``(a, b)``
+    weights. Matching a name keeps the named scorers' exact arithmetic."""
+    if isinstance(similarity, str):
+        return pharm_similarity_name(similarity)
+    weights = tversky_weights(similarity)
+    named = [name for name, w in TVERSKY_WEIGHTS.items() if w == weights]
+    return named[0] if named else weights

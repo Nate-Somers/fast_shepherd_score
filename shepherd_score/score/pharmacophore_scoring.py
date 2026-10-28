@@ -145,6 +145,22 @@ def tversky_func(VAB: torch.Tensor,
     return torch.clamp_max(VAB/(sigma*VAA + (1-sigma)*VBB), max=1.0)
 
 
+def tversky_weights_func(VAB: torch.Tensor,
+                         VAA: torch.Tensor,
+                         VBB: torch.Tensor,
+                         a: float,
+                         b: float
+                         ) -> torch.Tensor:
+    """
+    Computes Tversky similarity with explicit weights -> clamped to be max of 1.0.
+
+    Similarity = Overlap{1,2} / (Overlap{1,2} + a*(Overlap{1,1} - Overlap{1,2}) + b*(Overlap{2,2} - Overlap{1,2}))
+
+    Equal to ``tversky_func`` with ``sigma=a`` when ``a + b == 1``.
+    """
+    return torch.clamp_max(VAB/(VAB + a*(VAA - VAB) + b*(VBB - VAB)), max=1.0)
+
+
 def get_vector_volume_overlap_score(ptype_str: str,
                                     ptype_1: torch.Tensor,
                                     ptype_2: torch.Tensor,
@@ -385,14 +401,17 @@ def _compute_pharm_type_vab_only(
     cdist_21: torch.Tensor = None,
     vmm_21: torch.Tensor = None,
     allow_antiparallel: bool = False,
+    directionless: bool = False,
 ) -> torch.Tensor:
-    """Compute only VAB (cross-overlap) for a pharmacophore type, skipping self-overlaps."""
+    """Compute only VAB (cross-overlap) for a pharmacophore type, skipping self-overlaps.
+    ``directionless`` scores the type as a point Gaussian, without vector weighting."""
     ptype_str = ptype_str.lower()
     ptype_idx = P_TYPES_LWRCASE.index(ptype_str)
     alpha = P_ALPHAS[ptype_str]
     # For batched path, vmm_21 presence signals directional type.
     # For non-batched path, use type name since vmm_21 is always None there.
     has_vectors = vmm_21 is not None if batched else ptype_str in DIRECTIONAL_PTYPES
+    has_vectors = has_vectors and not directionless
 
     if batched:
         mask_1 = torch.where(ptype_1 == ptype_idx, 1, 0)
@@ -425,7 +444,7 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                       anchors_2: torch.Tensor,
                       vectors_1: torch.Tensor,
                       vectors_2: torch.Tensor,
-                      similarity: _SIM_TYPE = 'tanimoto',
+                      similarity: Union[_SIM_TYPE, Tuple[float, float]] = 'tanimoto',
                       extended_points: bool = False,
                       only_extended: bool = False,
                       precomputed_self_overlaps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -462,6 +481,7 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
         'tanimoto' (symmetric), 'tversky' (OpenEye's 95% normalization by mol 1),
         'tversky_ref' (Pharao's 100% normalization by mol 1),
         'tversky_fit' (Pharao's 100% normalization by mol 2). Default is 'tanimoto'.
+        An ``(a, b)`` pair gives Tversky with explicit weights (``tversky_weights_func``).
     extended_points : bool, optional
         Whether to score HBA/HBD with gaussian overlaps of extended points.
         Default is ``False``.
@@ -472,11 +492,12 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
         Pre-computed (total_VAA, total_VBB) self-overlaps. When provided (and
         ``extended_points`` is False), the per-type self-overlap computation is
         skipped and only the cross-overlap VAB is computed each call. Used to
-        avoid redundant self-overlap recomputation in optimization loops.
+        avoid redundant self-overlap recomputation in optimization loops. With
+        ``directionless=True`` they must be directionless too
+        (``compute_self_overlaps_pharm(..., directionless=True)``).
     directionless : bool, optional
         When ``True``, every type is scored as an isotropic point Gaussian (ROCS-style
-        "color"); ``extended_points`` is forced off and ``precomputed_self_overlaps`` is
-        rejected. Default ``False`` keeps the orientation-vector weighting for
+        "color"); ``extended_points`` is forced off. Default ``False`` keeps the orientation-vector weighting for
         HBA/HBD/aromatic/halogen. Same polarity as ``directionless`` in
         :func:`~shepherd_score.pharm_utils.pharmacophore.get_pharmacophores`.
 
@@ -499,7 +520,10 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
         vectors_2 = torch.Tensor(vectors_2)
 
     # Similarity scoring
-    if similarity.lower() == 'tanimoto':
+    if not isinstance(similarity, str):
+        a, b = similarity
+        similarity_func = partial(tversky_weights_func, a=float(a), b=float(b))
+    elif similarity.lower() == 'tanimoto':
         similarity_func = tanimoto_func
     elif similarity.lower() == 'tversky':
         similarity_func = partial(tversky_func, sigma=0.95)
@@ -517,12 +541,6 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
         # extended_points encodes directional geometry, so it cannot combine with this.
         extended_points = False
         only_extended = False
-        # A directional self-overlap precompute would corrupt the Tanimoto denominator.
-        if precomputed_self_overlaps is not None:
-            raise ValueError(
-                "Directionless pharmacophore scoring (`directionless=True`) is incompatible "
-                "with `precomputed_self_overlaps`; recompute self-overlaps directionless."
-            )
 
     # Determine if single instance or batched
     if len(ptype_1.shape) == 1 and len(ptype_2.shape) == 1:
@@ -677,7 +695,8 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                vectors_1, vectors_2, batched,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
-                                               allow_antiparallel=True)
+                                               allow_antiparallel=True,
+                                               directionless=directionless)
         elif directionless:
             if batched:
                 VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='aromatic',
@@ -727,7 +746,8 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                vectors_1, vectors_2, batched,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
-                                               allow_antiparallel=False)
+                                               allow_antiparallel=False,
+                                               directionless=directionless)
         elif directionless:
             if batched:
                 VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='acceptor',
@@ -787,7 +807,8 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                vectors_1, vectors_2, batched,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
-                                               allow_antiparallel=False)
+                                               allow_antiparallel=False,
+                                               directionless=directionless)
         elif directionless:
             if batched:
                 VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='donor',
@@ -847,7 +868,8 @@ def get_overlap_pharm(ptype_1: torch.Tensor,
                                                vectors_1, vectors_2, batched,
                                                cdist_21=cdist_21 if batched else None,
                                                vmm_21=vmm_21 if batched else None,
-                                               allow_antiparallel=False)
+                                               allow_antiparallel=False,
+                                               directionless=directionless)
         elif directionless:
             if batched:
                 VAB, VAA, VBB = get_volume_overlap_score_batch(ptype_str='halogen',

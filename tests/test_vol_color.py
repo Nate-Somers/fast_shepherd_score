@@ -1,6 +1,6 @@
 """Tests for the directionless "color" pharmacophore scoring and the ``vol_color`` combined
-shape + color alignment mode: torch vs NumPy parity, self-overlap, the precomputed-self-overlap
-guard, the combo scorer, RDKit BaseFeatures featurization, and the alignment path.
+shape + color alignment mode: torch vs NumPy parity, self-overlap, precomputed directionless
+self overlaps, the combo scorer, RDKit BaseFeatures featurization, and the alignment path.
 """
 import warnings
 
@@ -90,18 +90,30 @@ class TestDirectionlessScoring:
         )
         assert np.allclose(res_torch.numpy(), 1.0, rtol=1e-10, atol=1e-10)
 
-    def test_directionless_precompute_guard(self):
-        """directionless=True with precomputed_self_overlaps must raise."""
+    @pytest.mark.parametrize("similarity", ['tanimoto', 'tversky', 'tversky_ref', 'tversky_fit', (0.7, 0.3)])
+    def test_directionless_precomputed_self_overlaps(self, similarity):
+        """Directionless self overlaps from compute_self_overlaps_pharm give the same score as
+        recomputing them, unbatched and batched, and match the NumPy oracle."""
+        from shepherd_score.score.analytical_gradients import compute_self_overlaps_pharm
         ptype_1, ptype_2, anchors_1, anchors_2, vectors_1, vectors_2 = \
-            TestDataGenerator.generate_pharmacophore_data(6, 4, seed=3)
-        with pytest.raises(ValueError):
-            get_overlap_pharm_torch(
-                torch.from_numpy(ptype_1), torch.from_numpy(ptype_2),
-                torch.from_numpy(anchors_1), torch.from_numpy(anchors_2),
-                torch.from_numpy(vectors_1), torch.from_numpy(vectors_2),
-                directionless=True,
-                precomputed_self_overlaps=(torch.tensor(1.0), torch.tensor(1.0)),
-            )
+            TestDataGenerator.generate_pharmacophore_data(12, 10, seed=3)
+        args = [torch.from_numpy(x) for x in (ptype_1, ptype_2, anchors_1, anchors_2, vectors_1, vectors_2)]
+        cache = compute_self_overlaps_pharm(*args, directionless=True)
+
+        recomputed = get_overlap_pharm_torch(*args, similarity=similarity, directionless=True)
+        cached = get_overlap_pharm_torch(*args, similarity=similarity, directionless=True,
+                                         precomputed_self_overlaps=cache)
+        assert torch.allclose(cached, recomputed, rtol=RTOL, atol=ATOL)
+
+        batch = [x.repeat((3,) + (1,) * x.dim()) for x in args]
+        cached_batch = get_overlap_pharm_torch(*batch, similarity=similarity, directionless=True,
+                                               precomputed_self_overlaps=cache)
+        assert torch.allclose(cached_batch, recomputed.expand(3), rtol=RTOL, atol=ATOL)
+
+        if isinstance(similarity, str):
+            res_np = get_overlap_pharm_np(ptype_1, ptype_2, anchors_1, anchors_2, vectors_1, vectors_2,
+                                          similarity=similarity, directionless=True)
+            assert np.allclose(cached.numpy(), res_np, rtol=RTOL, atol=ATOL)
 
     @pytest.mark.parametrize("color_weight", [0.0, 0.3, 0.5, 1.0])
     def test_combo_color_weight_matches_np(self, color_weight):
