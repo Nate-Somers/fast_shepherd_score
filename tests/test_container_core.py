@@ -297,11 +297,56 @@ def test_legacy_pickle_defaults_post_refactor_state():
     back = pickle.loads(blob)
 
     assert back.surface_method == 'mesh'
-    assert back.__dict__['_charge_model'] == 'xtb'
+    assert back.__dict__['_charge_model'] == 'xtb_water'
     assert back.__dict__['_fukui'] is None
     # the lazy charge generator reads _charge_model
     back._charge_model = 'mmff'
     assert back.partial_charges.shape == (mol.mol.GetNumAtoms(),)
+
+
+def test_legacy_pickle_restores_flat_partial_charges():
+    """Old pickles stored charges as ``partial_charges``, now a property over ``_partial_charges``."""
+    import pickle
+    mol = _mol('CCO', num_surf_points=50, charge_model='mmff')
+    charges = mol.partial_charges
+    old = pickle.loads(_legacy_pickle_bytes(mol))
+    state = dict(old.__dict__)
+    state['partial_charges'] = state.pop('_partial_charges')
+    old = Molecule.__new__(Molecule)
+    old.__dict__.update(state)
+    back = pickle.loads(pickle.dumps(old))
+
+    assert 'partial_charges' not in back.__dict__
+    np.testing.assert_allclose(back.partial_charges, charges)
+
+
+@pytest.mark.parametrize('arg, value', [('charge_model', 'gasteiger'),
+                                        ('feature_set', 'rdkit'),
+                                        ('surface_method', 'sdf')])
+def test_molecule_rejects_unknown_option(arg, value):
+    with pytest.raises(ValueError, match=arg):
+        _mol('CCO', num_surf_points=None, **{arg: value})
+
+
+@pytest.mark.parametrize('charge_model, solvent', [('xtb_water', 'water'), ('xtb', None)])
+def test_xtb_charge_model_passes_solvent_and_formal_charge(monkeypatch, charge_model, solvent):
+    import shepherd_score.conformer_generation as cg
+    calls = {}
+
+    def fake_charges(mol, solvent=None, charge=0, **kw):
+        calls['charges'] = (solvent, charge)
+        return [0.0] * mol.GetNumAtoms()
+
+    def fake_fukui(mol, solvent=None, charge=0, **kw):
+        calls['fukui'] = (solvent, charge)
+        return np.zeros((mol.GetNumAtoms(), 3))
+
+    monkeypatch.setattr(cg, 'charges_from_single_point_conformer_with_xtb', fake_charges)
+    monkeypatch.setattr(cg, 'fukui_from_single_point_conformer_with_xtb', fake_fukui)
+    mol = _mol('CC[NH3+]', num_surf_points=None, charge_model=charge_model)
+    mol.partial_charges
+    mol.fukui
+    assert calls == {'charges': (solvent, 1), 'fukui': (solvent, 1)}
 
 
 def test_new_format_pickle_round_trips_unchanged():

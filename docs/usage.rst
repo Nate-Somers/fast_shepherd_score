@@ -8,7 +8,8 @@ Molecules and profiles
 or cached as requested. Set ``num_surf_points`` for surface modes and
 ``pharm_multi_vector=False`` for a single vector per directional pharmacophore.
 Set ``charge_model="mmff"`` for MMFF94 charges or pass partial charges explicitly.
-The default is xTB, with a warning and MMFF94 fallback when xTB is unavailable.
+The default is xTB in implicit water (``charge_model="xtb_water"``; ``"xtb"`` runs it
+in vacuum), with a warning and MMFF94 fallback when xTB is unavailable.
 Charges are computed on demand; constructing a surface also computes its ESP.
 Pharmacophores are omitted unless ``pharm_multi_vector`` is set or their arrays
 are supplied. Mesh surface sampling is stochastic; reuse saved surface points

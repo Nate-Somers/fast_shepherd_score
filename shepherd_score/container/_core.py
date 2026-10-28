@@ -2,7 +2,7 @@
 Molecule class to hold molecule geometries and extract interaction profiles.
 MoleculePair class facilitates alignment with interaction profiles.
 """
-from typing import Union, List, Optional, Tuple, Iterable
+from typing import Union, List, Optional, Tuple, Iterable, Literal
 from copy import deepcopy
 from functools import partial
 from dataclasses import dataclass, field
@@ -35,6 +35,10 @@ from shepherd_score.accel._modes import (
 )
 from shepherd_score.container.profiles import Surface
 
+
+_CHARGE_MODELS = ('xtb_water', 'xtb', 'mmff')
+_FEATURE_SETS = ('shepherd', 'rdkit_base')
+_SURFACE_METHODS = ('mesh', 'smooth_sdf')
 
 # Alignment modes tracked by MoleculePair (one AlignmentResult each). ``esp``/``esp_combo`` are
 # now ``surf_esp``/``vol_and_surf_esp``; the legacy names remain as delegating properties on
@@ -165,22 +169,22 @@ class Molecule:
                  probe_radius: Optional[float] = None,
                  surface_points: Optional[np.ndarray] = None,
                  partial_charges : Optional[np.ndarray] = None,
-                 charge_model: str = "xtb",
+                 charge_model: Literal['xtb_water', 'xtb', 'mmff'] = 'xtb_water',
                  electrostatics: Optional[np.ndarray] = None,
                  pharm_multi_vector: Optional[bool] = None,
                  pharm_types: Optional[np.ndarray] = None,
                  pharm_ancs: Optional[np.ndarray] = None,
                  pharm_vecs: Optional[np.ndarray] = None,
-                 feature_set: str = 'shepherd',
+                 feature_set: Literal['shepherd', 'rdkit_base'] = 'shepherd',
                  directionless: bool = False,
-                 surface_method: str = 'mesh',
+                 surface_method: Literal['mesh', 'smooth_sdf'] = 'mesh',
                  fukui: Optional[np.ndarray] = None
                  ):
         """
         Molecule constructor to extract interaction profiles.
 
         If `partial_charges` are not provided, they are generated lazily (only when first needed)
-        using `charge_model` -- gfn2-xTB by default, MMFF94 as a fallback.
+        using `charge_model` -- gfn2-xTB in implicit water by default, MMFF94 as a fallback.
 
         Parameters
         ----------
@@ -201,10 +205,11 @@ class Molecule:
             Partial charges for each atom. Shape: (N,).
             If ``None``, charges are generated lazily from ``charge_model`` the first time they are
             needed (an ESP mode, or the surface ESP built when a surface is generated).
-        charge_model : str
-            Charge model used when ``partial_charges`` is ``None``: ``'xtb'`` (default) runs a
-            gfn2-xTB single point, falling back to MMFF94 with a warning if ``xtb`` is unavailable;
-            ``'mmff'`` uses MMFF94 directly. Charges are computed lazily either way.
+        charge_model : {'xtb_water', 'xtb', 'mmff'}
+            Charge model used when ``partial_charges`` is ``None``: ``'xtb_water'`` (default) runs
+            a gfn2-xTB single point in ALPB water, ``'xtb'`` runs it in vacuum, and both fall back
+            to MMFF94 with a warning if ``xtb`` is unavailable; ``'mmff'`` uses MMFF94 directly.
+            xTB uses the molecule's formal charge. Charges are computed lazily either way.
         electrostatics : Optional[np.ndarray]
             Electrostatic potential if they were previously generated. Shape: (M,).
         pharm_multi_vector : Optional[bool]
@@ -216,7 +221,7 @@ class Molecule:
             Anchor positions of pharmacophore. Shape: (P,3).
         pharm_vecs : Optional[np.ndarray]
             Unit vectors relative to anchor positions of pharmacophore. Shape: (P,3).
-        feature_set : str
+        feature_set : {'shepherd', 'rdkit_base'}
             Pharmacophore feature definition used when pharmacophores are generated:
             ``'shepherd'`` (default) is the local ``smarts_features.fdef`` (8 types);
             ``'rdkit_base'`` is RDKit's ``BaseFeatures.fdef`` reduced to the 6 ROCS color types.
@@ -224,7 +229,7 @@ class Molecule:
             When ``True``, generate isotropic (zero-vector) "color" pharmacophores for all
             families, overriding ``pharm_multi_vector``. Default ``False``. Only used when
             pharmacophores are generated.
-        surface_method : str
+        surface_method : {'mesh', 'smooth_sdf'}
             How to generate the surface point cloud. ``'mesh'`` (default) uses Open3D ball
             pivoting plus Poisson-disk resampling; ``'smooth_sdf'`` uses the Open3D-free
             ``generate_point_cloud.get_molecular_surface_smooth_sdf`` and requires
@@ -233,7 +238,8 @@ class Molecule:
         fukui : Optional[np.ndarray]
             Per-atom condensed Fukui dual descriptor (f+ - f-) for the ``vol_fukui`` mode, in the
             same with-H order as ``partial_charges``. Shape: (N,). If ``None`` it is generated
-            lazily on first access from three gfn2-xTB single points.
+            lazily on first access from three gfn2-xTB single points (in ALPB water when
+            ``charge_model='xtb_water'``).
         """
         self.mol = mol
         self.atom_pos = Chem.RemoveHs(mol).GetConformer().GetPositions()
@@ -242,6 +248,11 @@ class Molecule:
         else:
             self.num_surf_points = len(surface_points)
         self.density = density
+        if surface_method not in _SURFACE_METHODS:
+            raise ValueError(
+                f"surface_method must be one of {_SURFACE_METHODS}, got {surface_method!r}")
+        if feature_set not in _FEATURE_SETS:
+            raise ValueError(f"feature_set must be one of {_FEATURE_SETS}, got {feature_set!r}")
         self.surface_method = surface_method
 
         if isinstance(partial_charges, list):
@@ -250,6 +261,8 @@ class Molecule:
         # Charges are generated lazily by the ``partial_charges`` property, so shape-only
         # molecules never pay for them.
         self._charge_model = str(charge_model).lower()
+        if self._charge_model not in _CHARGE_MODELS:
+            raise ValueError(f"charge_model must be one of {_CHARGE_MODELS}, got {charge_model!r}")
         if isinstance(partial_charges, np.ndarray):
             self._partial_charges = partial_charges
         else:
@@ -342,7 +355,10 @@ class Molecule:
         # Attributes added after the flat layout, defaulted to the constructor's values so an
         # old pickle does not raise on first read.
         state.setdefault("surface_method", "mesh")
-        state.setdefault("_charge_model", "xtb")
+        if "partial_charges" in state:
+            state.setdefault("_partial_charges", state.pop("partial_charges"))
+        state.setdefault("_partial_charges", None)
+        state.setdefault("_charge_model", "xtb_water")
         state.setdefault("_fukui", None)
 
         self.__dict__.update(state)
@@ -417,7 +433,7 @@ class Molecule:
     def partial_charges(self) -> np.ndarray:
         """Per-atom partial charges (all atoms, with-H order), computed lazily on first access.
 
-        Generated by ``charge_model`` (gfn2-xTB by default, falling back to MMFF94 with a warning
+        Generated by ``charge_model`` (gfn2-xTB in water by default, falling back to MMFF94 with a warning
         if ``xtb`` is unavailable or fails) and cached. Pass ``charge_model='mmff'`` or explicit
         ``partial_charges`` to skip xTB.
         """
@@ -430,13 +446,16 @@ class Molecule:
         self._partial_charges = value
 
     def _generate_partial_charges(self) -> np.ndarray:
-        """Generate charges per ``self._charge_model`` (default 'xtb'); MMFF94 fallback on failure."""
-        if self._charge_model == "xtb":
+        """Generate charges per ``self._charge_model`` (default 'xtb_water'); MMFF94 fallback on failure."""
+        if self._charge_model in ("xtb", "xtb_water"):
             try:
                 from shepherd_score.conformer_generation import (
                     charges_from_single_point_conformer_with_xtb)
                 return np.asarray(
-                    charges_from_single_point_conformer_with_xtb(self.mol), dtype=np.float32)
+                    charges_from_single_point_conformer_with_xtb(
+                        self.mol, solvent=self._xtb_solvent,
+                        charge=int(Chem.GetFormalCharge(self.mol))),
+                    dtype=np.float32)
             except Exception as e:
                 import warnings
                 warnings.warn(
@@ -478,6 +497,11 @@ class Molecule:
     def fukui(self, value) -> None:
         self._fukui = value
 
+    @property
+    def _xtb_solvent(self) -> Optional[str]:
+        """ALPB solvent for xTB calls: ``'water'`` under ``charge_model='xtb_water'``."""
+        return "water" if self._charge_model == "xtb_water" else None
+
     def _generate_fukui(self) -> np.ndarray:
         """Condensed Fukui dual descriptor (f+ - f-) per atom from three gfn2-xTB single points
         (the molecular charge and its adjacent charge states) at the same geometry. Unlike charges there is no non-QM fallback,
@@ -485,7 +509,7 @@ class Molecule:
         """
         from shepherd_score.conformer_generation import fukui_from_single_point_conformer_with_xtb
         fpm = fukui_from_single_point_conformer_with_xtb(
-            self.mol, charge=int(Chem.GetFormalCharge(self.mol)))   # (N,3) = [f+, f-, f0]
+            self.mol, solvent=self._xtb_solvent, charge=int(Chem.GetFormalCharge(self.mol)))   # (N,3) = [f+, f-, f0]
         return (fpm[:, 0] - fpm[:, 1]).astype(np.float32)           # signed dual descriptor f+ - f-
 
 
@@ -790,7 +814,7 @@ class Molecule:
                           exclude: List[int] = [],
                           check_access: bool = False,
                           scale: float = 1,
-                          feature_set: str = 'shepherd',
+                          feature_set: Literal['shepherd', 'rdkit_base'] = 'shepherd',
                           directionless: bool = False,
                           return_atom_ids: bool = False,
                           priority_atoms: Optional[Iterable[int]] = None,
@@ -813,7 +837,7 @@ class Molecule:
             Check if HBD/HBA are accessible to the molecular surface. Default ``False``.
         scale : float, optional
             Length of a pharmacophore vector in Angstroms. Default 1.
-        feature_set : str, optional
+        feature_set : {'shepherd', 'rdkit_base'}, optional
             ``'shepherd'`` (default, 8 types) or ``'rdkit_base'`` (6 ROCS color types).
             See :func:`get_pharmacophores`.
         directionless : bool, optional
