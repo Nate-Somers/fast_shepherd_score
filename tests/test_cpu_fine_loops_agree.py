@@ -75,7 +75,7 @@ def _scores(mode, mols, force_eager):
         args = ()
         if mode == "vol_avoid":                       # the one mode with a third input
             args = (np.asarray(mols[0].atom_pos, dtype=np.float32) + 40.0,)
-        getattr(batch, "align_with_" + mode)(*args, backend="numba", **KW.get(mode, {}))
+        batch._align_mode(mode, *args, backend="numba", **KW.get(mode, {}))
         return [float(getattr(p, MODE_ATTRS[mode][1])) for p in pairs]
     finally:
         cpu_fused.run_fused = real

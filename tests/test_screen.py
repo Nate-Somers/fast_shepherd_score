@@ -350,8 +350,8 @@ def test_vol_tversky_stream_matches_object(tmp_path, molecules):
     cq = copy.deepcopy(query); cq.center_to(cq.atom_pos.mean(0))
     profiles = [p for shard in store.iter_shards() for p in shard]
     pairs = [MoleculePair(cq, p, do_center=False) for p in profiles]
-    ref, _ = MoleculePairBatch(pairs).align_with_vol_tversky(
-        backend="numba", num_repeats=5, max_num_steps=50)
+    ref, _ = MoleculePairBatch(pairs).align_with_vol(
+        similarity="tversky", backend="numba", num_repeats=5, max_num_steps=50)
     for p, rs in zip(profiles, ref):
         assert by_id[p.id] == pytest.approx(float(rs), abs=1e-4)
 
@@ -384,8 +384,8 @@ def test_vol_esp_tversky_stream_matches_object(tmp_path, molecules):
     def _c(m):
         c = copy.deepcopy(m); c.center_to(c.atom_pos.mean(0)); return c
     pairs = [MoleculePair(cq, _c(m), do_center=False) for m in molecules]
-    ref, _ = MoleculePairBatch(pairs).align_with_vol_esp_tversky(
-        backend="numba", lam=0.1, num_repeats=16, max_num_steps=50)
+    ref, _ = MoleculePairBatch(pairs).align_with_vol_esp(
+        similarity="tversky", backend="numba", lam=0.1, num_repeats=16, max_num_steps=50)
     # identical inputs to one driver, so abs=1e-4; the Tversky score is not clamped to [0, 1]
     for i, rs in enumerate(ref):
         assert by_id[i] == pytest.approx(float(rs), abs=1e-4)

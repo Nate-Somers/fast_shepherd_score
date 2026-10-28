@@ -6,6 +6,8 @@ import warnings
 import numpy as np
 import pytest
 
+from .utils import align_per_pair
+
 try:
     import torch
     TORCH = True
@@ -55,7 +57,7 @@ def test_numba_self_copy_is_one(mode, attr, mols):
     ibu, _ = mols
     b = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(IBU), do_center=True,
                                         device=torch.device("cpu"))])
-    scores, _ = getattr(b, f"align_with_{mode}")(backend="numba")
+    scores, _ = b._align_mode(mode, backend="numba")
     assert np.isclose(float(scores[0]), 1.0, atol=1e-4), f"{mode} numba self-copy {scores[0]} != 1.0"
 
 
@@ -68,12 +70,11 @@ def test_numba_batched_matches_per_pair(mode, attr, mols):
     nr, ns = MODE_SEEDS[mode], MODE_STEPS[mode]
 
     mp = MoleculePair(_mol(IBU), _mol(CAF), do_center=True, device=torch.device("cpu"))
-    getattr(mp, f"align_with_{mode}")(num_repeats=nr, max_num_steps=ns)
-    ref = float(getattr(mp, attr))
+    ref = align_per_pair(mp, mode, num_repeats=nr, max_num_steps=ns)
 
     b = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,
                                         device=torch.device("cpu"))])
-    scores, _ = getattr(b, f"align_with_{mode}")(backend="numba")
+    scores, _ = b._align_mode(mode, backend="numba")
     bat = float(scores[0])
 
     assert abs(ref - bat) < 1e-2, f"{mode}: per-pair {ref:.5f} vs batched-numba {bat:.5f}"
@@ -87,9 +88,9 @@ def test_triton_matches_numba(mode, attr, mols):
     from shepherd_score.container import MoleculePair, MoleculePairBatch
     bn = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,
                                          device=torch.device("cpu"))])
-    sc_n, _ = getattr(bn, f"align_with_{mode}")(backend="numba")
+    sc_n, _ = bn._align_mode(mode, backend="numba")
     bt = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,
                                          device=torch.device("cuda"))])
-    sc_t, _ = getattr(bt, f"align_with_{mode}")(backend="triton")
+    sc_t, _ = bt._align_mode(mode, backend="triton")
     assert abs(float(sc_n[0]) - float(sc_t[0])) < 1e-2, (
         f"{mode}: numba {float(sc_n[0]):.5f} vs triton {float(sc_t[0]):.5f}")

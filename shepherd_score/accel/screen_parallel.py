@@ -21,7 +21,7 @@ from ._modes import MODE_ATTRS as _MODE_ATTRS
 _LIBRARY: list = []
 _POOL = None                       # {"key": (id(library), len(library), n_workers), "pool": Pool}
 
-_ALIGN_ATTR = {m: (f"align_with_{m}", score_attr) for m, (_tf, score_attr) in _MODE_ATTRS.items()}
+_SCORE_ATTR = {m: score_attr for m, (_tf, score_attr) in _MODE_ATTRS.items()}
 
 
 def _shard(task):
@@ -33,9 +33,9 @@ def _shard(task):
     numba.set_num_threads(1)          # active-count mask; the pool size is capped by the parent env
     from shepherd_score.container import MoleculePair, MoleculePairBatch
 
-    method, attr = _ALIGN_ATTR[mode]
+    attr = _SCORE_ATTR[mode]
     pairs = [MoleculePair(query, _LIBRARY[i], do_center=True) for i in index_range]
-    getattr(MoleculePairBatch(pairs), method)(backend="numba", **kw)
+    MoleculePairBatch(pairs)._align_mode(mode, backend="numba", **{"return_aligned": False, **kw})
     return [(i, float(getattr(p, attr))) for i, p in zip(index_range, pairs)]
 
 
@@ -133,8 +133,8 @@ def screen_parallel(query, library, mode, n_workers=None, **align_kwargs):
     (e.g. ``alpha=0.81`` for surf, ``lam=0.3`` for vol_esp). Always forks, even for one worker,
     so this process never runs numba itself; the pool is kept for later calls against the same
     library (see the module docstring)."""
-    if mode not in _ALIGN_ATTR:
-        raise ValueError(f"unknown mode {mode!r}; expected one of {sorted(_ALIGN_ATTR)}")
+    if mode not in _SCORE_ATTR:
+        raise ValueError(f"unknown mode {mode!r}; expected one of {sorted(_SCORE_ATTR)}")
     n = len(library)
     n_workers = max(1, min(n_workers or os.cpu_count() or 1, n))
     chunks = _chunks(n, n_workers)

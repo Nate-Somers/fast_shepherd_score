@@ -22,10 +22,10 @@ from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
 from shepherd_score.pharm_utils.pharmacophore import get_pharmacophores, Pharmacophore
 from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
 from shepherd_score.score.pharmacophore_scoring import _SIM_TYPE, get_overlap_pharm
-from shepherd_score.alignment import optimize_ROCS_overlay
+from shepherd_score.score.similarity import Similarity, tversky_weights
 from shepherd_score.alignment._optimize import optimize_se3, tree_map
-from shepherd_score.modes import (Mode, get_mode, Vol, VolESP, Surf, SurfESP, VolAndSurfESP, Pharm,
-                                  vol_color, vol_lipo, vol_mr, vol_fukui, vol_atomtype)
+from shepherd_score.modes import (Mode, get_mode, Vol, VolAvoid, VolESP, Surf, SurfESP, VolAndSurfESP,
+                                  Pharm, vol_color, vol_lipo, vol_mr, vol_fukui, vol_atomtype)
 from shepherd_score.alignment.utils.se3_np import apply_SE3_transform_np, apply_SO3_transform_np
 from shepherd_score.accel import batch as _ba
 from shepherd_score.accel._modes import (
@@ -34,19 +34,6 @@ from shepherd_score.accel._modes import (
     LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES,
 )
 from shepherd_score.container.profiles import Surface
-
-
-def _default_seeds(mode: str) -> int:
-    """Per-mode default SE(3) seed count (``MODE_SEEDS`` in ``accel/_modes.py``), shared with the
-    batched path; resolves ``num_repeats=None`` in ``align_with_*``."""
-    from shepherd_score.accel.batch.aligners import _seeds_for
-    return _seeds_for(mode)
-
-
-def _default_steps(mode: str) -> int:
-    """Per-mode default fine-step count (``MODE_STEPS``); see ``_default_seeds``."""
-    from shepherd_score.accel.batch.aligners import _steps_for
-    return _steps_for(mode)
 
 
 # Alignment modes tracked by MoleculePair (one AlignmentResult each). ``esp``/``esp_combo`` are
@@ -75,8 +62,10 @@ def _require_jax():
     """
     try:
         import jax.numpy as jnp
-    except ImportError:
-        raise ImportError('jax.numpy and torch is required for this function. Install Jax or just use Torch.')
+    except ImportError as exc:
+        raise ImportError(
+            "The 'jax' backend needs JAX. Install it with: pip install \"shepherd-score[jax]\", "
+            "or use backend='analytical' or 'torch' (use_jax=False).") from exc
     return jnp
 
 
@@ -105,6 +94,14 @@ def _legacy_backend(use_jax: bool = False, use_analytical: bool = True) -> str:
     if use_jax:
         return 'jax'
     return 'auto' if use_analytical else 'torch'
+
+
+def _similarity_slot(base: str, similarity: Similarity, slot: Optional[str] = None) -> str:
+    """Result slot for ``align_with_<base>(similarity=...)``: ``<base>_tversky`` for a Tversky
+    similarity, as ``MoleculePairBatch`` stores it; otherwise ``slot`` (default ``base``)."""
+    if tversky_weights(similarity) is not None and base + '_tversky' in _ALIGN_KEYS:
+        return base + '_tversky'
+    return slot or base
 
 
 def _alignment_property(key: str, field_name: str) -> property:
@@ -1083,8 +1080,7 @@ class MoleculePair:
         return torch.from_numpy(arr).to(torch.float32).to(self.device)
 
     # Alignment-result accessors (backwards-compatible with the loose
-    # ``transform_*`` / ``sim_aligned_*`` attributes). One property pair
-    # per mode in _ALIGN_KEYS, generated via _alignment_property().
+    # ``transform_*`` / ``sim_aligned_*`` attributes).
     for _key in _ALIGN_KEYS:
         locals()[f'transform_{_key}'] = _alignment_property(_key, 'transform')
         locals()[f'sim_aligned_{_key}'] = _alignment_property(_key, 'score')
@@ -1200,30 +1196,24 @@ class MoleculePair:
         with torch.no_grad():
             return np.asarray(mode.score(ref, fit).cpu())
 
-    def _align_legacy(self, slot: str, mode: Mode, *, defaults: Optional[str] = None,
-                      num_repeats: Optional[int] = None, max_num_steps: Optional[int] = None,
-                      **opt):
-        """Run :meth:`align` for an ``align_with_*`` method: resolve ``None`` seed/step counts from
-        the per-mode defaults and store the result in the method's ``transform_*`` /
-        ``sim_aligned_*`` slot. Returns the aligned fit inputs."""
-        defaults = defaults or slot
-        res = self.align(mode,
-                         num_repeats=_default_seeds(defaults) if num_repeats is None else num_repeats,
-                         max_num_steps=_default_steps(defaults) if max_num_steps is None else max_num_steps,
-                         **opt)
+    def _align_and_store(self, slot: str, mode: Mode, **opt):
+        """Run :meth:`align` for an ``align_with_*`` method and store the result in the method's
+        ``transform_*`` / ``sim_aligned_*`` slot. Returns the aligned fit inputs."""
+        res = self.align(mode, **opt)
         self._alignments[slot].score = res.score
         self._alignments[slot].transform = res.transform
         return res.aligned
 
     def align_with_vol(self,
                        no_H: bool = True,
-                       num_repeats: int = None,
+                       num_repeats: int = 50,
                        trans_init: bool = False,
                        lr: float = 0.1,
-                       max_num_steps: int = None,
+                       max_num_steps: int = 200,
                        use_jax: bool = False,
                        use_analytical: bool = True,
-                       verbose: bool = False) -> np.ndarray:
+                       verbose: bool = False,
+                       similarity: Similarity = 'tanimoto') -> np.ndarray:
         """
         Align fit_molec to ref_molec using volumetric similarity.
 
@@ -1236,7 +1226,7 @@ class MoleculePair:
             Whether to not include hydrogens in volumetric similarity. Default is ``True``.
         num_repeats : int, optional
             Number of different random initializations of SO(3) transformation parameters.
-            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 50.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s center of mass (COM) is translated to
             each ``ref_molec``'s atoms, with 10 rotations for each translation. So the
@@ -1247,7 +1237,7 @@ class MoleculePair:
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
             Maximum number of steps to optimize over.
-            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 200.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         use_analytical : bool, optional
@@ -1255,16 +1245,22 @@ class MoleculePair:
             ``use_jax=True``. Default is ``True``.
         verbose : bool, optional
             Print initial and final similarity scores with scores every 100 steps. Default is ``False``.
+        similarity : str or (float, float), optional
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            Tversky weights ``(a, b)``. A Tversky similarity stores the result in
+            ``self.sim_aligned_vol_tversky`` / ``self.transform_vol_tversky`` and
+            runs the generic PyTorch optimizer.
 
         Returns
         -------
         aligned_fit_points : np.ndarray
             Coordinates of transformed atoms. Shape: (N, 3).
         """
-        return self._align_legacy('vol_noH' if no_H else 'vol', Vol(no_H=no_H), defaults='vol',
-                                  num_repeats=num_repeats, trans_init=trans_init, lr=lr,
-                                  max_num_steps=max_num_steps, verbose=verbose,
-                                  backend=_legacy_backend(use_jax, use_analytical))['points']
+        slot = _similarity_slot('vol', similarity, 'vol_noH' if no_H else 'vol')
+        return self._align_and_store(slot, Vol(no_H=no_H, similarity=similarity),
+                                     num_repeats=num_repeats, trans_init=trans_init, lr=lr,
+                                     max_num_steps=max_num_steps, verbose=verbose,
+                                     backend=_legacy_backend(use_jax, use_analytical))['points']
 
 
     def align_with_vol_avoid(self,
@@ -1272,11 +1268,12 @@ class MoleculePair:
                              avoid_weight: float = 1.0,
                              avoid_min_dist: float = 2.0,
                              no_H: bool = True,
-                             num_repeats: int = None,
+                             num_repeats: int = 50,
                              trans_init: bool = False,
                              lr: float = 0.1,
-                             max_num_steps: int = None,
-                             verbose: bool = False) -> np.ndarray:
+                             max_num_steps: int = 200,
+                             verbose: bool = False,
+                             use_analytical: bool = True) -> np.ndarray:
         """Align fit_molec to ref_molec by volumetric similarity minus a linear hard-sphere
         excluded-volume penalty that keeps the fit out of a fixed cloud of ``avoid_points``:
 
@@ -1300,46 +1297,32 @@ class MoleculePair:
             Score the shape channel without hydrogens. Default ``True``.
         num_repeats, trans_init, lr, max_num_steps, verbose
             As in :meth:`align_with_vol`.
+        use_analytical : bool, optional
+            Whether to use analytical gradients instead of PyTorch autograd. Default is ``True``.
 
         Returns
         -------
         aligned_fit_points : np.ndarray (M,3)
         """
-        if num_repeats is None:
-            num_repeats = _default_seeds("vol_avoid")
-        if max_num_steps is None:
-            max_num_steps = _default_steps("vol_avoid")
-        ref_atom_pos = self.ref_molec.get_positions(no_H)
-        fit_atom_pos = self.fit_molec.get_positions(no_H)
-        avoid_t = self._to_tensor(np.ascontiguousarray(np.asarray(avoid_points, dtype=np.float32)))
-        aligned_fit_points, se3_transform, score = optimize_ROCS_overlay(
-            ref_points=self._to_tensor(ref_atom_pos),
-            fit_points=self._to_tensor(fit_atom_pos),
-            alpha=0.81,
-            avoid_points=avoid_t,
-            avoid_min_dist=avoid_min_dist,
-            avoid_weight=avoid_weight,
-            num_repeats=num_repeats,
-            trans_centers=self._to_tensor(self.ref_molec.atom_pos) if trans_init else None,
-            lr=lr,
-            max_num_steps=max_num_steps,
-            verbose=verbose,
-        )
-        self.transform_vol_avoid = se3_transform.numpy()
-        self.sim_aligned_vol_avoid = score.numpy()
-        return aligned_fit_points.numpy()
+        mode = VolAvoid(no_H=no_H, avoid_points=avoid_points, avoid_weight=avoid_weight,
+                        avoid_min_dist=avoid_min_dist)
+        return self._align_and_store('vol_avoid', mode, num_repeats=num_repeats,
+                                     trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
+                                     verbose=verbose,
+                                     backend=_legacy_backend(False, use_analytical))['points']
 
 
     def align_with_vol_esp(self,
                            lam: float = 0.1,
                            no_H: bool = True,
-                           num_repeats: int = None,
+                           num_repeats: int = 50,
                            trans_init: bool = False,
                            lr: float = 0.1,
-                           max_num_steps: int = None,
+                           max_num_steps: int = 200,
                            use_jax: bool = False,
                            use_analytical: bool = True,
-                           verbose: bool = False) -> np.ndarray:
+                           verbose: bool = False,
+                           similarity: Similarity = 'tanimoto') -> np.ndarray:
         """
         Align fit_molec to ref_molec using volume similarity weighted by partial charge
         Toggle ``no_H`` parameter for scoring with or without hydrogens.
@@ -1359,7 +1342,7 @@ class MoleculePair:
             Whether to not include hydrogens in volumetric similarity. Default is ``True``.
         num_repeats : int, optional
             Number of different random initializations of SO(3) transformation parameters.
-            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 50.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s center of mass
             (COM) is translated to each ``ref_molec``'s atoms, with 10 rotations for each translation.
@@ -1370,33 +1353,41 @@ class MoleculePair:
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
             Maximum number of steps to optimize over.
-            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 200.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         verbose : bool, optional
             Print initial and final similarity scores with scores every 100 steps.
             Default is ``False``.
+        similarity : str or (float, float), optional
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            Tversky weights ``(a, b)``. A Tversky similarity stores the result in
+            ``self.sim_aligned_vol_esp_tversky`` / ``self.transform_vol_esp_tversky`` and
+            runs the generic PyTorch optimizer.
 
         Returns
         -------
         aligned_fit_points : np.ndarray
             Coordinates of transformed atoms. Shape: (N, 3).
         """
-        return self._align_legacy('vol_esp_noH' if no_H else 'vol_esp', VolESP(lam=lam, no_H=no_H),
-                                  defaults='vol_esp', num_repeats=num_repeats, trans_init=trans_init,
-                                  lr=lr, max_num_steps=max_num_steps, verbose=verbose,
-                                  backend=_legacy_backend(use_jax, use_analytical))['points']
+        slot = _similarity_slot('vol_esp', similarity,
+                                          'vol_esp_noH' if no_H else 'vol_esp')
+        return self._align_and_store(slot, VolESP(lam=lam, no_H=no_H, similarity=similarity),
+                                     num_repeats=num_repeats, trans_init=trans_init,
+                                     lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+                                     backend=_legacy_backend(use_jax, use_analytical))['points']
 
 
     def align_with_surf(self,
                         alpha: float,
-                        num_repeats: int = None,
+                        num_repeats: int = 50,
                         trans_init: bool = False,
                         lr: float = 0.1,
-                        max_num_steps: int = None,
+                        max_num_steps: int = 200,
                         use_jax: bool = False,
                         use_analytical: bool = True,
-                        verbose: bool = False) -> np.ndarray:
+                        verbose: bool = False,
+                        similarity: Similarity = 'tanimoto') -> np.ndarray:
         """
         Align fit_molec to ref_molec using surface similarity.
 
@@ -1409,7 +1400,7 @@ class MoleculePair:
             Gaussian width parameter for overlap.
         num_repeats : int, optional
             Number of different random initializations of SO(3) transformation parameters.
-            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 50.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s center of mass
             (COM) is translated to each ``ref_molec``'s atoms, with 10 rotations for each
@@ -1421,7 +1412,7 @@ class MoleculePair:
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
             Maximum number of steps to optimize over.
-            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 200.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         use_analytical : bool, optional
@@ -1429,27 +1420,35 @@ class MoleculePair:
             ``use_jax=True``. Default is ``True``.
         verbose : bool, optional
             Print initial and final similarity scores with scores every 100 steps. Default is ``False``.
+        similarity : str or (float, float), optional
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            Tversky weights ``(a, b)``. A Tversky similarity stores the result in
+            ``self.sim_aligned_surf_tversky`` / ``self.transform_surf_tversky`` and
+            runs the generic PyTorch optimizer.
 
         Returns
         -------
         aligned_fit_points : np.ndarray
             Coordinates of transformed atoms. Shape: (N, 3).
         """
-        return self._align_legacy('surf', Surf(alpha=alpha), num_repeats=num_repeats,
-                                  trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
-                                  verbose=verbose, backend=_legacy_backend(use_jax, use_analytical))['points']
+        slot = _similarity_slot('surf', similarity)
+        return self._align_and_store(slot, Surf(alpha=alpha, similarity=similarity),
+                                     num_repeats=num_repeats, trans_init=trans_init, lr=lr,
+                                     max_num_steps=max_num_steps, verbose=verbose,
+                                     backend=_legacy_backend(use_jax, use_analytical))['points']
 
 
     def align_with_surf_esp(self,
                        alpha: float,
                        lam: float = 0.3,
-                       num_repeats: int = None,
+                       num_repeats: int = 50,
                        trans_init: bool = False,
                        lr: float = 0.1,
-                       max_num_steps: int = None,
+                       max_num_steps: int = 200,
                        use_jax: bool = False,
                        use_analytical: bool = True,
-                       verbose: bool = False) -> np.ndarray:
+                       verbose: bool = False,
+                       similarity: Similarity = 'tanimoto') -> np.ndarray:
         """
         Align fit_molec to ref_molec using surface-ESP similarity (formerly ``align_with_esp``,
         which is kept as an alias).
@@ -1468,7 +1467,7 @@ class MoleculePair:
             Weighting factor for ESP scoring. Scaled internally. Default is 0.3.
         num_repeats : int, optional
             Number of different random initializations of SO(3) transformation parameters.
-            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 50.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s COM is translated to
             each ``ref_molecs``'s atoms, with 10 rotations for each translation. So the
@@ -1479,21 +1478,28 @@ class MoleculePair:
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
             Maximum number of steps to optimize over.
-            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 200.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         verbose : bool, optional
             Print initial and final similarity scores with scores every 100 steps.
             Default is ``False``.
+        similarity : str or (float, float), optional
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            Tversky weights ``(a, b)``. A Tversky similarity stores the result in
+            ``self.sim_aligned_surf_esp_tversky`` / ``self.transform_surf_esp_tversky`` and
+            runs the generic PyTorch optimizer.
 
         Returns
         -------
         aligned_fit_points : np.ndarray
             Coordinates of transformed atoms. Shape: (N, 3).
         """
-        return self._align_legacy('surf_esp', SurfESP(alpha=alpha, lam=lam), num_repeats=num_repeats,
-                                  trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
-                                  verbose=verbose, backend=_legacy_backend(use_jax, use_analytical))['points']
+        slot = _similarity_slot('surf_esp', similarity)
+        return self._align_and_store(slot, SurfESP(alpha=alpha, lam=lam, similarity=similarity),
+                                     num_repeats=num_repeats, trans_init=trans_init, lr=lr,
+                                     max_num_steps=max_num_steps, verbose=verbose,
+                                     backend=_legacy_backend(use_jax, use_analytical))['points']
 
 
     def align_with_vol_and_surf_esp(self,
@@ -1501,12 +1507,13 @@ class MoleculePair:
                              lam: float = 0.001,
                              probe_radius: float = 1.0,
                              esp_weight: float = 0.5,
-                             num_repeats: int = None,
+                             num_repeats: int = 50,
                              trans_init: bool = False,
                              lr: float = 0.1,
-                             max_num_steps: int = None,
+                             max_num_steps: int = 200,
                              use_jax: bool = False,
-                             verbose: bool = False):
+                             verbose: bool = False,
+                             similarity: Similarity = 'tanimoto'):
         """
         Align using ShaEP similarity score (formerly ``align_with_esp_combo``, which is kept as
         an alias).
@@ -1530,7 +1537,7 @@ class MoleculePair:
             How much to weight shape vs esp_combo similarity ([0,1]). Default is 0.5.
         num_repeats : int, optional
             Number of different random initializations of SO(3) transformation parameters.
-            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 50.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s COM is translated
             to each ``ref_molecs``'s atoms, with 10 rotations for each translation. So the
@@ -1541,22 +1548,30 @@ class MoleculePair:
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
             Maximum number of steps to optimize over.
-            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 200.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         verbose : bool, optional
             Print initial and final similarity scores with scores every 100 steps.
             Default is ``False``.
+        similarity : str or (float, float), optional
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            Tversky weights ``(a, b)``. A Tversky similarity stores the result in
+            ``self.sim_aligned_vol_and_surf_esp_tversky`` /
+            ``self.transform_vol_and_surf_esp_tversky`` and runs the generic PyTorch optimizer.
+            Tversky applies to the shape term; the ESP agreement is unchanged.
 
         Returns
         -------
         aligned_fit_points : np.ndarray (N, 3)
             Coordinates of transformed atoms. Shape: (N, 3).
         """
-        mode = VolAndSurfESP(alpha=alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight)
-        return self._align_legacy('vol_and_surf_esp', mode, num_repeats=num_repeats,
-                                  trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
-                                  verbose=verbose, backend=_legacy_backend(use_jax))['points']
+        mode = VolAndSurfESP(alpha=alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight,
+                             similarity=similarity)
+        slot = _similarity_slot('vol_and_surf_esp', similarity)
+        return self._align_and_store(slot, mode, num_repeats=num_repeats,
+                                     trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
+                                     verbose=verbose, backend=_legacy_backend(use_jax))['points']
 
 
     # legacy method aliases (esp -> surf_esp, esp_combo -> vol_and_surf_esp)
@@ -1567,24 +1582,26 @@ class MoleculePair:
     def align_with_vol_color(self,
                              color_weight: float = 0.5,
                              alpha: float = 0.81,
-                             similarity: _SIM_TYPE = 'tanimoto',
+                             similarity: Similarity = 'tanimoto',
                              directionless: bool = True,
                              extended_points: bool = False,
                              only_extended: bool = False,
-                             num_repeats: int = None,
+                             num_repeats: int = 50,
                              trans_init: bool = False,
                              lr: float = 0.1,
-                             max_num_steps: int = None,
-                             verbose: bool = False) -> np.ndarray:
+                             max_num_steps: int = 200,
+                             verbose: bool = False,
+                             color_similarity: Optional[Similarity] = None) -> np.ndarray:
         """
         Align using a ROCS-style combined atom-centred Gaussian *shape* (volume) and
         directionless *color* (pharmacophore) overlay (a TanimotoCombo analogue).
 
         The optimized objective is
-        ``(1 - color_weight) * shape_Tanimoto + color_weight * color_Tanimoto``. By default the
-        color channel is directionless (isotropic point Gaussians); pass ``directionless=False``
-        to keep the orientation-vector weighting. For ROCS feature parity, build the
-        ``Molecule`` objects with ``feature_set='rdkit_base'``.
+        ``(1 - color_weight) * shape_Tanimoto + color_weight * color_Tanimoto``, or the Tversky
+        form of both under ``similarity``. By default the color channel is directionless
+        (isotropic point Gaussians); pass ``directionless=False`` to keep the orientation-vector
+        weighting. For ROCS feature parity, build the ``Molecule`` objects with
+        ``feature_set='rdkit_base'``.
 
         Optimally aligned score is stored in ``self.sim_aligned_vol_color`` and the optimal
         SE(3) transformation in ``self.transform_vol_color``.
@@ -1596,8 +1613,11 @@ class MoleculePair:
             Default is 0.5.
         alpha : float, optional
             Gaussian width for the shape overlap. Default is 0.81 (volumetric, heavy atoms).
-        similarity : str, optional
-            Similarity for the color channel. Default is 'tanimoto'.
+        similarity : str or (float, float), optional
+            Similarity for both channels: ``'tanimoto'`` (default), ``'tversky'``,
+            ``'tversky_ref'``, ``'tversky_fit'`` or Tversky weights ``(a, b)``. A Tversky
+            similarity stores the result in ``self.sim_aligned_vol_color_tversky`` /
+            ``self.transform_vol_color_tversky``.
         directionless : bool, optional
             ``True`` (default) scores color as isotropic point Gaussians; ``False`` uses the
             orientation-vector cosine weighting. Same polarity as the extraction-side
@@ -1605,42 +1625,48 @@ class MoleculePair:
         extended_points, only_extended : bool, optional
             Forwarded to the color scorer (ignored when ``directionless=True``).
         num_repeats : int, optional
-            Number of SE(3) initializations. Default (``None``) is ``MODE_SEEDS['vol_color']``.
+            Number of SE(3) initializations. Default is 50.
         trans_init : bool, optional
             Translation-seeded initialization from the reference atoms. Default is ``False``.
         lr : float, optional
             Learning rate. Default is 0.1.
         max_num_steps : int, optional
-            Maximum optimization steps. Default (``None``) is ``MODE_STEPS['vol_color']``.
+            Maximum optimization steps. Default is 200.
         verbose : bool, optional
             Print progress. Default is ``False``.
+        color_similarity : str or (float, float), optional
+            Similarity for the color channel alone. Default (``None``) is ``similarity``.
 
         Returns
         -------
         aligned_fit_centers : np.ndarray (M, 3)
             Transformed fit atom (heavy-atom) coordinates.
         """
-        mode = vol_color(color_weight=color_weight, alpha=alpha, color_similarity=similarity,
-                         directionless=directionless, extended_points=extended_points,
-                         only_extended=only_extended)
-        return self._align_legacy('vol_color', mode, num_repeats=num_repeats, trans_init=trans_init,
-                                  lr=lr, max_num_steps=max_num_steps, verbose=verbose)[0]['points']
+        mode = vol_color(color_weight=color_weight, alpha=alpha, similarity=similarity,
+                         color_similarity=color_similarity, directionless=directionless,
+                         extended_points=extended_points, only_extended=only_extended)
+        slot = _similarity_slot('vol_color', similarity)
+        return self._align_and_store(slot, mode, num_repeats=num_repeats,
+                                     trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
+                                     verbose=verbose)[0]['points']
 
 
     def align_with_vol_lipo(self,
                             lipo_weight: float = 0.5,
                             alpha: float = 0.81,
                             lam: float = 0.1,
-                            num_repeats: Optional[int] = None,
+                            num_repeats: int = 50,
                             trans_init: bool = False,
                             lr: float = 0.1,
-                            max_num_steps: Optional[int] = None,
-                            verbose: bool = False) -> np.ndarray:
+                            max_num_steps: int = 200,
+                            verbose: bool = False,
+                            similarity: Similarity = 'tanimoto') -> np.ndarray:
         """
         Align using a combined atom-centred Gaussian *shape* (volume) + *lipophilicity* overlay.
 
         The optimized objective is
-        ``(1 - lipo_weight) * shape_Tanimoto + lipo_weight * lipo_Tanimoto``. The shape channel is
+        ``(1 - lipo_weight) * shape_Tanimoto + lipo_weight * lipo_Tanimoto`` (or the Tversky form
+        of both under ``similarity``). The shape channel is
         the heavy-atom Gaussian volume overlap of the ``vol`` mode; the lipophilicity channel
         overlays the per-atom Crippen logP contributions at the heavy-atom centres like a
         partial-charge field (``get_overlap_esp`` with logP as the charge), so hydrophobic
@@ -1661,65 +1687,6 @@ class MoleculePair:
             Width of the value-matching kernel in the lipophilicity overlap, used raw as in
             ``align_with_vol_esp``. Default is 0.1.
         num_repeats : int, optional
-            Number of SE(3) initializations. Default (``None``) is ``MODE_SEEDS['vol_lipo']``.
-        trans_init : bool, optional
-            Translation-seeded initialization from the reference atoms. Default is ``False``.
-        lr : float, optional
-            Learning rate. Default is 0.1.
-        max_num_steps : int, optional
-            Maximum optimization steps. Default (``None``) is ``MODE_STEPS['vol_lipo']``.
-        verbose : bool, optional
-            Print progress. Default is ``False``.
-
-        Returns
-        -------
-        aligned_fit_centers : np.ndarray (M, 3)
-            Transformed fit atom (heavy-atom, shape-channel) coordinates.
-        """
-        mode = vol_lipo(lipo_weight=lipo_weight, alpha=alpha, lam=lam)
-        return self._align_legacy('vol_lipo', mode, num_repeats=num_repeats, trans_init=trans_init,
-                                  lr=lr, max_num_steps=max_num_steps, verbose=verbose)[0]['points']
-
-
-    def align_with_vol_tversky(self,
-                               tversky_alpha: float = 0.95,
-                               tversky_beta: float = 0.05,
-                               alpha: float = 0.81,
-                               no_H: bool = True,
-                               num_repeats: int = 50,
-                               trans_init: bool = False,
-                               lr: float = 0.1,
-                               max_num_steps: int = 200,
-                               verbose: bool = False) -> np.ndarray:
-        """
-        Align fit_molec to ref_molec using an asymmetric "fits-inside" volumetric *shape* overlay
-        scored with **Tversky** rather than Tanimoto.
-
-        The optimized objective is the Tversky shape similarity
-        ``AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))`` where ``AB`` is the
-        cross overlap of the reference with the SE(3)-transformed fit, ``AA`` the reference
-        self-overlap, and ``BB`` the fit self-overlap (atom-centred Gaussian volume integrals).
-        With the defaults (``tversky_alpha=0.95``, ``tversky_beta=0.05``) missing reference volume
-        is penalized heavily while extra fit volume is barely penalized, so the score rewards the
-        *reference* (query) being contained in the fit -- useful for scaffold hopping / finding
-        larger elaborated actives. The objective is asymmetric: swapping ref and fit changes the
-        score. Only the fit is transformed.
-
-        Optimally aligned score is stored in ``self.sim_aligned_vol_tversky`` and the optimal
-        SE(3) transformation in ``self.transform_vol_tversky``.
-
-        Parameters
-        ----------
-        tversky_alpha : float, optional
-            Weight on missing reference volume ``AA - AB``. Default is 0.95. Named to avoid
-            colliding with the Gaussian width ``alpha``.
-        tversky_beta : float, optional
-            Weight on extra fit volume ``BB - AB``. Default is 0.05.
-        alpha : float, optional
-            Gaussian width for the shape overlap. Default is 0.81 (volumetric, heavy atoms).
-        no_H : bool, optional
-            Whether to exclude hydrogens (heavy-atom overlay). Default is ``True``.
-        num_repeats : int, optional
             Number of SE(3) initializations. Default is 50.
         trans_init : bool, optional
             Translation-seeded initialization from the reference atoms. Default is ``False``.
@@ -1729,93 +1696,33 @@ class MoleculePair:
             Maximum optimization steps. Default is 200.
         verbose : bool, optional
             Print progress. Default is ``False``.
+        similarity : str or (float, float), optional
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            Tversky weights ``(a, b)``. A Tversky similarity stores the result in
+            ``self.sim_aligned_vol_lipo_tversky`` / ``self.transform_vol_lipo_tversky`` and
+            runs the generic PyTorch optimizer.
+            Applies to both channels.
 
         Returns
         -------
-        aligned_fit_points : np.ndarray (M, 3)
-            Transformed fit atom (heavy-atom) coordinates.
+        aligned_fit_centers : np.ndarray (M, 3)
+            Transformed fit atom (heavy-atom, shape-channel) coordinates.
         """
-        mode = Vol(alpha=alpha, no_H=no_H, similarity=(tversky_alpha, tversky_beta))
-        return self._align_legacy('vol_tversky', mode, num_repeats=num_repeats, trans_init=trans_init,
-                                  lr=lr, max_num_steps=max_num_steps, verbose=verbose)['points']
-
-
-    def align_with_vol_esp_tversky(self,
-                                   tversky_alpha: float = 0.95,
-                                   tversky_beta: float = 0.05,
-                                   alpha: float = 0.81,
-                                   lam: float = 0.1,
-                                   no_H: bool = True,
-                                   num_repeats: int = None,
-                                   trans_init: bool = False,
-                                   lr: float = 0.1,
-                                   max_num_steps: int = None,
-                                   verbose: bool = False) -> np.ndarray:
-        """
-        Align fit_molec to ref_molec using the asymmetric "fits-inside" ``vol_esp_tversky``
-        overlay: the ``vol_esp`` electrostatic-weighted volumetric overlap scored with **Tversky**
-        rather than Tanimoto, as ``vol_tversky`` is to ``vol``.
-
-        The optimized objective is the Tversky ESP similarity
-        ``AB / (AB + tversky_alpha * (AA - AB) + tversky_beta * (BB - AB))`` where ``AB`` is the
-        cross electrostatic-weighted Gaussian overlap (``VAB_2nd_order_esp``) of the reference with
-        the SE(3)-transformed fit, ``AA`` the reference ESP self-overlap, and ``BB`` the fit ESP
-        self-overlap. With the defaults (``tversky_alpha=0.95``, ``tversky_beta=0.05``) missing
-        reference volume is penalized heavily while extra fit volume is barely penalized, so the
-        score rewards the *reference* (query) being contained in the fit. The objective is
-        asymmetric: swapping ref and fit changes the score. Only the fit is transformed.
-
-        ``lam`` defaults to 0.1 and, as in ``align_with_vol_esp``, is used raw (not scaled by
-        ``LAM_SCALING``).
-
-        Optimally aligned score is stored in ``self.sim_aligned_vol_esp_tversky`` and the optimal
-        SE(3) transformation in ``self.transform_vol_esp_tversky``.
-
-        Parameters
-        ----------
-        tversky_alpha : float, optional
-            Weight on missing reference volume ``AA - AB``. Default is 0.95. Named to avoid
-            colliding with the Gaussian width ``alpha``.
-        tversky_beta : float, optional
-            Weight on extra fit volume ``BB - AB``. Default is 0.05.
-        alpha : float, optional
-            Gaussian width for the overlap. Default is 0.81 (volumetric, heavy atoms).
-        lam : float, optional
-            Width of the ESP kernel, used raw. Default is 0.1.
-        no_H : bool, optional
-            Whether to exclude hydrogens (heavy-atom overlay). Default is ``True``.
-        num_repeats : int, optional
-            Number of SE(3) initializations.
-            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
-        trans_init : bool, optional
-            Translation-seeded initialization from the reference atoms. Default is ``False``.
-        lr : float, optional
-            Learning rate. Default is 0.1.
-        max_num_steps : int, optional
-            Maximum optimization steps.
-            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
-        verbose : bool, optional
-            Print progress. Default is ``False``.
-
-        Returns
-        -------
-        aligned_fit_points : np.ndarray (M, 3)
-            Transformed fit atom (heavy-atom) coordinates.
-        """
-        mode = VolESP(alpha=alpha, lam=lam, no_H=no_H, similarity=(tversky_alpha, tversky_beta))
-        return self._align_legacy('vol_esp_tversky', mode, num_repeats=num_repeats,
-                                  trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
-                                  verbose=verbose)['points']
+        mode = vol_lipo(lipo_weight=lipo_weight, alpha=alpha, lam=lam, similarity=similarity)
+        slot = _similarity_slot('vol_lipo', similarity)
+        return self._align_and_store(slot, mode, num_repeats=num_repeats,
+                                     trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
+                                     verbose=verbose)[0]['points']
 
 
     def align_with_pharm(self,
                          similarity: _SIM_TYPE = 'tanimoto',
                          extended_points: bool = False,
                          only_extended: bool = False,
-                         num_repeats: int = None,
+                         num_repeats: int = 50,
                          trans_init: bool = False,
                          lr: float = 0.1,
-                         max_num_steps: int = None,
+                         max_num_steps: int = 200,
                          use_jax: bool = False,
                          verbose: bool = False,
                          use_vectorized: bool = True,
@@ -1842,7 +1749,7 @@ class MoleculePair:
             (ignore anchor overlaps). Default is ``False``.
         num_repeats : int, optional
             Number of different random initializations of SO(3) transformation parameters.
-            Default (``None``) is the per-mode ``MODE_SEEDS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 50.
         trans_init : bool, optional
             Apply translation initializiation for alignment. ``fit_molec``'s COM is translated to
             each ``ref_molecs``'s pharmacophore, with 10 rotations for each translation. So the
@@ -1853,7 +1760,7 @@ class MoleculePair:
             Learning rate or step-size for optimization. Default is 0.1.
         max_num_steps : int, optional
             Maximum number of steps to optimize over.
-            Default (``None``) is the per-mode ``MODE_STEPS`` value in ``shepherd_score/accel/_modes.py``.
+            Default is 200.
         use_jax : bool, optional
             Whether to use Jax instead of PyTorch. Default is ``False``.
         verbose : bool, optional
@@ -1880,56 +1787,98 @@ class MoleculePair:
         else:
             backend = _legacy_backend(False, use_analytical)
         mode = Pharm(similarity=similarity, extended_points=extended_points, only_extended=only_extended)
-        aligned = self._align_legacy('pharm', mode, num_repeats=num_repeats, trans_init=trans_init,
-                                     lr=lr, max_num_steps=max_num_steps, verbose=verbose,
-                                     backend=backend)
+        aligned = self._align_and_store('pharm', mode, num_repeats=num_repeats, trans_init=trans_init,
+                                        lr=lr, max_num_steps=max_num_steps, verbose=verbose,
+                                        backend=backend)
         return aligned['anchors'], aligned['vectors']
 
 
-    # Experimental modes. Each reuses an eager optimizer from ``alignment/_torch.py`` and keeps
-    # that optimizer's literal 50-seed / 200-step defaults, whereas ``MoleculePairBatch`` resolves
-    # ``None`` to ``MODE_SEEDS`` / ``MODE_STEPS``; pass ``num_repeats`` / ``max_num_steps``
-    # explicitly when comparing the two paths.
     def align_with_vol_pharm(self,
                              color_weight: float = 0.5,
                              alpha: float = 0.81,
-                             similarity: _SIM_TYPE = 'tanimoto',
+                             similarity: Similarity = 'tanimoto',
                              extended_points: bool = False,
                              only_extended: bool = False,
                              num_repeats: int = 50,
                              trans_init: bool = False,
                              lr: float = 0.1,
                              max_num_steps: int = 200,
-                             verbose: bool = False) -> np.ndarray:
+                             verbose: bool = False,
+                             color_similarity: Optional[Similarity] = None) -> np.ndarray:
         """Align using a combined atom-centred Gaussian *shape* (volume) and *directional
-        pharmacophore* overlay: the ``vol_color`` combo with the orientation-vector weighting kept
-        (``directionless=False``). Score and transform are stored in
-        ``self.sim_aligned_vol_pharm`` / ``self.transform_vol_pharm``."""
-        mode = vol_color(color_weight=color_weight, alpha=alpha, color_similarity=similarity,
-                         directionless=False, extended_points=extended_points,
-                         only_extended=only_extended)
-        return self._align_legacy('vol_pharm', mode, num_repeats=num_repeats, trans_init=trans_init,
-                                  lr=lr, max_num_steps=max_num_steps, verbose=verbose)[0]['points']
+        pharmacophore* overlay. This is equivalent to the ``vol_color`` combo with the
+        orientation-vector weighting kept (``directionless=False``).
+
+        Score and transform are stored in ``self.sim_aligned_vol_pharm`` /
+        ``self.transform_vol_pharm``.
+
+        Parameters
+        ----------
+        color_weight : float, optional
+            Weight of the color channel. Default is 0.5.
+        alpha : float, optional
+            Alpha parameter for the Gaussian overlap. Default is 0.81.
+        similarity : Similarity, optional
+            Similarity function to use for the shape channel. Default is 'tanimoto'.
+        extended_points : bool, optional
+            Whether to score HBA/HBD with gaussian overlaps of extended points. Default is ``False``.
+        only_extended : bool, optional
+            When ``extended_points`` is ``True``, decide whether to only score the extended points
+            (ignore anchor overlaps). Default is ``False``.
+        num_repeats : int, optional
+            Number of different random initializations of SO(3) transformation parameters.
+            Default is 50.
+        trans_init : bool, optional
+            Apply translation initializiation for alignment. ``fit_molec``'s COM is translated to
+            each ``ref_molecs``'s pharmacophore, with 10 rotations for each translation. So the
+            number of initializations scales as (# translation centers * 10 + 5) where 5 is from
+            the identity and 4 PCA with aligned COM's. If ``None``, then ``num_repeats`` rotations
+            are done with aligned COM's. Default is ``False``.
+        lr : float, optional
+            Learning rate or step-size for optimization. Default is 0.1.
+        max_num_steps : int, optional
+            Maximum number of steps to optimize over.
+            Default is 200.
+        verbose : bool, optional
+            Print initial and final similarity scores with scores every 100 steps.
+            Default is ``False``.
+        color_similarity : Similarity, optional
+            Similarity function to use for the color channel. Default is ``similarity``.
+
+        Returns
+        -------
+        aligned_fit_points : np.ndarray
+            Aligned coordinates of pharmacophore positions. Shape: (P, 3).
+        """
+        mode = vol_color(color_weight=color_weight, alpha=alpha, similarity=similarity,
+                         color_similarity=color_similarity, directionless=False,
+                         extended_points=extended_points, only_extended=only_extended)
+        return self._align_and_store('vol_pharm', mode, num_repeats=num_repeats, trans_init=trans_init,
+                                     lr=lr, max_num_steps=max_num_steps, verbose=verbose)[0]['points']
 
 
     def align_with_vol_atomtype(self,
                                 atomtype_weight: float = 0.5,
                                 alpha: float = 0.81,
-                                similarity: _SIM_TYPE = 'tanimoto',
+                                similarity: Similarity = 'tanimoto',
                                 num_repeats: int = 50,
                                 trans_init: bool = False,
                                 lr: float = 0.1,
                                 max_num_steps: int = 200,
-                                verbose: bool = False) -> np.ndarray:
+                                verbose: bool = False,
+                                type_similarity: Optional[Similarity] = None) -> np.ndarray:
         """Align using a combined atom-centred Gaussian *shape* (volume) and *atom-identity*
         overlay, ``(1 - atomtype_weight) * shape + atomtype_weight * identity``. The identity
         channel is a Gaussian overlap in which only same-element atoms contribute. Score and
         transform are stored in ``self.sim_aligned_vol_atomtype`` /
-        ``self.transform_vol_atomtype``."""
-        mode = vol_atomtype(atomtype_weight=atomtype_weight, alpha=alpha, type_similarity=similarity)
-        return self._align_legacy('vol_atomtype', mode, num_repeats=num_repeats,
-                                  trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
-                                  verbose=verbose)[0]['points']
+        ``self.transform_vol_atomtype``. ``similarity`` applies to both channels;
+        ``type_similarity`` (default ``similarity``) overrides it for the identity channel, which
+        takes only the named similarities."""
+        mode = vol_atomtype(atomtype_weight=atomtype_weight, alpha=alpha, similarity=similarity,
+                            type_similarity=type_similarity)
+        return self._align_and_store('vol_atomtype', mode, num_repeats=num_repeats,
+                                     trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
+                                     verbose=verbose)[0]['points']
 
 
     def align_with_vol_mr(self,
@@ -1945,9 +1894,9 @@ class MoleculePair:
         overlay, ``(1 - mr_weight) * shape + mr_weight * mr``: ``vol_lipo`` with the per-atom
         Crippen MR contribution in place of logP. Score and transform are stored in
         ``self.sim_aligned_vol_mr`` / ``self.transform_vol_mr``."""
-        return self._align_legacy('vol_mr', vol_mr(mr_weight=mr_weight, alpha=alpha, lam=lam),
-                                  num_repeats=num_repeats, trans_init=trans_init, lr=lr,
-                                  max_num_steps=max_num_steps, verbose=verbose)[0]['points']
+        return self._align_and_store('vol_mr', vol_mr(mr_weight=mr_weight, alpha=alpha, lam=lam),
+                                     num_repeats=num_repeats, trans_init=trans_init, lr=lr,
+                                     max_num_steps=max_num_steps, verbose=verbose)[0]['points']
 
 
     def align_with_vol_fukui(self,
@@ -1964,139 +1913,9 @@ class MoleculePair:
         per-atom Fukui dual descriptor ``f+ - f-`` (``Molecule.fukui``) in place of logP, so
         nucleophilic sites overlap nucleophilic and electrophilic overlap electrophilic. Score and
         transform are stored in ``self.sim_aligned_vol_fukui`` / ``self.transform_vol_fukui``."""
-        return self._align_legacy('vol_fukui', vol_fukui(fukui_weight=fukui_weight, alpha=alpha, lam=lam),
-                                  num_repeats=num_repeats, trans_init=trans_init, lr=lr,
-                                  max_num_steps=max_num_steps, verbose=verbose)[0]['points']
-
-
-    def align_with_surf_tversky(self,
-                                tversky_alpha: float = 0.95,
-                                tversky_beta: float = 0.05,
-                                alpha: float = 0.81,
-                                num_repeats: int = 50,
-                                trans_init: bool = False,
-                                lr: float = 0.1,
-                                max_num_steps: int = 200,
-                                verbose: bool = False) -> np.ndarray:
-        """Align using the *surface* shape overlay scored with Tversky rather than Tanimoto, as
-        ``vol_tversky`` is to ``vol``. Requires surfaces. Score and transform are stored in
-        ``self.sim_aligned_surf_tversky`` / ``self.transform_surf_tversky``."""
-        mode = Surf(alpha=alpha, similarity=(tversky_alpha, tversky_beta))
-        return self._align_legacy('surf_tversky', mode, num_repeats=num_repeats, trans_init=trans_init,
-                                  lr=lr, max_num_steps=max_num_steps, verbose=verbose)['points']
-
-
-    def align_with_surf_esp_tversky(self,
-                                    tversky_alpha: float = 0.95,
-                                    tversky_beta: float = 0.05,
-                                    alpha: float = 0.81,
-                                    lam: float = 0.3,
-                                    num_repeats: int = 50,
-                                    trans_init: bool = False,
-                                    lr: float = 0.1,
-                                    max_num_steps: int = 200,
-                                    verbose: bool = False) -> np.ndarray:
-        """Align using the *surface ESP* overlay scored with Tversky rather than Tanimoto, as
-        ``vol_esp_tversky`` is to ``vol_esp``. ``lam`` is scaled by ``LAM_SCALING`` as in
-        ``align_with_surf_esp``. Requires surfaces. Score and transform are stored in
-        ``self.sim_aligned_surf_esp_tversky`` / ``self.transform_surf_esp_tversky``."""
-        mode = SurfESP(alpha=alpha, lam=lam, similarity=(tversky_alpha, tversky_beta))
-        return self._align_legacy('surf_esp_tversky', mode, num_repeats=num_repeats,
-                                  trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
-                                  verbose=verbose)['points']
-
-
-    def align_with_vol_color_tversky(self,
-                                     color_weight: float = 0.5,
-                                     alpha: float = 0.81,
-                                     tversky_alpha: float = 0.95,
-                                     tversky_beta: float = 0.05,
-                                     directionless: bool = True,
-                                     extended_points: bool = False,
-                                     only_extended: bool = False,
-                                     num_repeats: int = 50,
-                                     trans_init: bool = False,
-                                     lr: float = 0.1,
-                                     max_num_steps: int = 200,
-                                     verbose: bool = False) -> np.ndarray:
-        """Align using the ``vol_color`` shape+colour combo scored with an asymmetric **Tversky**
-        reduction on both channels (shape via ``tversky_alpha``/``tversky_beta``; colour via the
-        OpenEye 0.95 Tversky). Requires pharmacophores. Score and transform are stored in
-        ``self.sim_aligned_vol_color_tversky`` / ``self.transform_vol_color_tversky``."""
-        mode = vol_color(color_weight=color_weight, alpha=alpha,
-                         similarity=(tversky_alpha, tversky_beta), color_similarity='tversky',
-                         directionless=directionless, extended_points=extended_points,
-                         only_extended=only_extended)
-        return self._align_legacy('vol_color_tversky', mode, num_repeats=num_repeats,
-                                  trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
-                                  verbose=verbose)[0]['points']
-
-
-    def align_with_vol_lipo_tversky(self,
-                                    lipo_weight: float = 0.5,
-                                    alpha: float = 0.81,
-                                    lam: float = 0.1,
-                                    tversky_alpha: float = 0.95,
-                                    tversky_beta: float = 0.05,
-                                    num_repeats: int = 50,
-                                    trans_init: bool = False,
-                                    lr: float = 0.1,
-                                    max_num_steps: int = 200,
-                                    verbose: bool = False) -> np.ndarray:
-        """Align using the ``vol_lipo`` shape+lipophilicity combo scored with an asymmetric
-        **Tversky** reduction per channel (shape and the Crippen-logP ESP channel). Score and
-        transform are stored in ``self.sim_aligned_vol_lipo_tversky`` /
-        ``self.transform_vol_lipo_tversky``."""
-        mode = vol_lipo(lipo_weight=lipo_weight, alpha=alpha, lam=lam,
-                        similarity=(tversky_alpha, tversky_beta))
-        return self._align_legacy('vol_lipo_tversky', mode, num_repeats=num_repeats,
-                                  trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
-                                  verbose=verbose)[0]['points']
-
-
-    def align_with_vol_and_surf_esp_tversky(self,
-                                            tversky_alpha: float = 0.95,
-                                            tversky_beta: float = 0.05,
-                                            alpha: float = 0.81,
-                                            lam: float = 0.001,
-                                            probe_radius: float = 1.0,
-                                            esp_weight: float = 0.5,
-                                            num_repeats: int = 50,
-                                            trans_init: bool = False,
-                                            lr: float = 0.1,
-                                            max_num_steps: int = 200,
-                                            verbose: bool = False) -> np.ndarray:
-        """Align using the ShaEP-style ``vol_and_surf_esp`` score with the SHAPE channel scored by
-        **Tversky** rather than Tanimoto (the surface-ESP agreement channel is a point-to-point
-        potential average, not an overlap ratio, so Tversky is not applied to it). Requires surfaces.
-        Score and transform are stored in ``self.sim_aligned_vol_and_surf_esp_tversky`` /
-        ``self.transform_vol_and_surf_esp_tversky``."""
-        mode = VolAndSurfESP(alpha=alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight,
-                             similarity=(tversky_alpha, tversky_beta))
-        return self._align_legacy('vol_and_surf_esp_tversky', mode, num_repeats=num_repeats,
-                                  trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
-                                  verbose=verbose)['points']
-
-
-    def align_with_pharm_tversky(self,
-                                 extended_points: bool = False,
-                                 only_extended: bool = False,
-                                 num_repeats: int = 50,
-                                 trans_init: bool = False,
-                                 lr: float = 0.1,
-                                 max_num_steps: int = 200,
-                                 use_analytical: bool = True,
-                                 verbose: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-        """Align using pharmacophore similarity scored with Tversky rather than Tanimoto, i.e.
-        ``align_with_pharm`` with ``similarity='tversky'`` as its own mode. Requires pharmacophores.
-        Score and transform are stored in ``self.sim_aligned_pharm_tversky`` /
-        ``self.transform_pharm_tversky``; returns the aligned anchors and vectors like
-        ``align_with_pharm``."""
-        mode = Pharm(similarity='tversky', extended_points=extended_points, only_extended=only_extended)
-        aligned = self._align_legacy('pharm_tversky', mode, num_repeats=num_repeats,
-                                     trans_init=trans_init, lr=lr, max_num_steps=max_num_steps,
-                                     verbose=verbose, backend=_legacy_backend(False, use_analytical))
-        return aligned['anchors'], aligned['vectors']
+        return self._align_and_store('vol_fukui', vol_fukui(fukui_weight=fukui_weight, alpha=alpha, lam=lam),
+                                     num_repeats=num_repeats, trans_init=trans_init, lr=lr,
+                                     max_num_steps=max_num_steps, verbose=verbose)[0]['points']
 
 
     def score_with_surf(self,

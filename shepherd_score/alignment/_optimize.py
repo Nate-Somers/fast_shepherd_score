@@ -10,13 +10,22 @@ from shepherd_score.alignment._torch import _initialize_se3_params, _initialize_
 from shepherd_score.alignment.utils.se3 import get_SE3_transform
 
 
-def tree_map(fn, tree):
-    """Apply ``fn`` to every array in a dict / tuple nest (the shape of ``Mode.inputs``)."""
+def tree_map(fn, tree, _results_by_id=None):
+    """Apply ``fn`` to every array in a dict / tuple nest (the shape of ``Mode.inputs``).
+
+    An array object that appears more than once (``Combined`` terms sharing coordinates) is
+    passed to ``fn`` once, and every occurrence gets that one result, so the sharing survives
+    tensor conversion and repetition. ``_results_by_id`` maps ``id(array)`` to its result and
+    is only passed internally, by the recursion.
+    """
+    results_by_id = {} if _results_by_id is None else _results_by_id
     if isinstance(tree, dict):
-        return {k: tree_map(fn, v) for k, v in tree.items()}
+        return {k: tree_map(fn, v, results_by_id) for k, v in tree.items()}
     if isinstance(tree, (tuple, list)):
-        return type(tree)(tree_map(fn, v) for v in tree)
-    return fn(tree)
+        return type(tree)(tree_map(fn, v, results_by_id) for v in tree)
+    if id(tree) not in results_by_id:
+        results_by_id[id(tree)] = fn(tree)
+    return results_by_id[id(tree)]
 
 
 def optimize_se3(mode,

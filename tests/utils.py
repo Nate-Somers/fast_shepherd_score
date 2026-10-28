@@ -33,3 +33,18 @@ def mode_loss(mode, se3_params, ref, fit):
     """``1 - mode.score`` with ``fit`` posed by ``se3_params``: the loss ``optimize_se3`` minimizes."""
     from shepherd_score.alignment.utils.se3 import get_SE3_transform
     return 1 - mode.score(ref, mode.pose(fit, get_SE3_transform(se3_params)))
+
+
+def align_per_pair(pair, mode, **kw):
+    """Run the per-pair ``MoleculePair`` method for an ``accel/_modes.py`` registry mode and
+    return its score. A ``<base>_tversky`` mode runs ``align_with_<base>(similarity='tversky')``,
+    which writes the ``<base>_tversky`` slot, except ``pharm``, whose upstream method writes
+    ``sim_aligned_pharm``."""
+    base = mode[:-len('_tversky')] if mode.endswith('_tversky') else mode
+    if base != mode:
+        kw['similarity'] = 'tversky'
+    if base in ('surf', 'surf_esp', 'vol_and_surf_esp'):
+        kw.setdefault('alpha', 0.81)
+    getattr(pair, f'align_with_{base}')(**kw)
+    slot = 'pharm' if mode == 'pharm_tversky' else mode
+    return float(getattr(pair, f'sim_aligned_{slot}'))

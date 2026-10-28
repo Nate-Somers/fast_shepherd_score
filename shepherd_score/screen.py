@@ -1282,8 +1282,8 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                 start = sh["start"]
                 for qi, q in enumerate(qs_ref):
                     pairs = [MoleculePair(q, p, do_center=False) for p in profiles]
-                    result = getattr(MoleculePairBatch(pairs), "align_with_" + mode)(
-                        backend=backend, **align_kwargs)
+                    result = MoleculePairBatch(pairs)._align_mode(
+                        mode, backend=backend, **{"return_aligned": False, **align_kwargs})
                     scores = np.asarray(result[0], dtype=float)
                     _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi,
                                 start, rot)

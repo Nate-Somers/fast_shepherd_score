@@ -14,7 +14,7 @@ from shepherd_score.conformer_generation import embed_conformer_from_smiles
 from shepherd_score.container import Molecule, MoleculePair
 from shepherd_score.alignment import optimize_se3
 from shepherd_score.modes import VolAndSurfESP, vol_atomtype, vol_color, vol_lipo
-from .utils import mode_loss
+from .utils import align_per_pair, mode_loss
 
 torch.set_num_threads(2)
 
@@ -44,8 +44,7 @@ def _mol(smiles, surface=False):
 
 
 def _run(pair, mode):
-    getattr(pair, f"align_with_{mode}")(**_KW)
-    return float(getattr(pair, NONSURF_MODES.get(mode) or SURF_MODES[mode]))
+    return align_per_pair(pair, mode, **_KW)
 
 
 # --- Gate 1: self-overlap = 1.000 (non-surface modes) -----------------------------------------
@@ -196,6 +195,5 @@ def test_surf_modes_self_overlap(mode):
     # align_with_surf_* guards on the pair's num_surf_points, not on the molecules' surfaces
     pair = MoleculePair(m, m, do_center=True, num_surf_points=100,
                         device=torch.device("cpu"))
-    getattr(pair, f"align_with_{mode}")(**_KW)
-    s = float(getattr(pair, SURF_MODES[mode]))
+    s = align_per_pair(pair, mode, **_KW)
     assert np.isclose(s, 1.0, atol=5e-3), f"{mode} self-overlap {s} != 1.000"

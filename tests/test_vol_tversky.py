@@ -56,7 +56,7 @@ def _heavy_pos(ibuprofen):
 # --- Gate 1: self-overlap is exactly 1.000 ----------------------------------------------------
 def test_self_overlap_is_one(ibuprofen):
     pair = _make_pair(ibuprofen)
-    pair.align_with_vol_tversky(num_repeats=20, max_num_steps=200)
+    pair.align_with_vol(similarity="tversky", num_repeats=20, max_num_steps=200)
     score = float(pair.sim_aligned_vol_tversky)
     assert np.isclose(score, 1.0, atol=1e-4), f"self-overlap {score} != 1.000"
 
@@ -115,10 +115,10 @@ def test_optimizer_recovers_planted_pose(ibuprofen):
 def test_deterministic_given_seed(ibuprofen):
     torch.manual_seed(SEED)
     pair_a = _make_pair(ibuprofen)
-    pair_a.align_with_vol_tversky(num_repeats=20, max_num_steps=100)
+    pair_a.align_with_vol(similarity="tversky", num_repeats=20, max_num_steps=100)
     torch.manual_seed(SEED)
     pair_b = _make_pair(ibuprofen)
-    pair_b.align_with_vol_tversky(num_repeats=20, max_num_steps=100)
+    pair_b.align_with_vol(similarity="tversky", num_repeats=20, max_num_steps=100)
     assert np.isclose(float(pair_a.sim_aligned_vol_tversky),
                       float(pair_b.sim_aligned_vol_tversky), atol=0.0)
 
@@ -134,12 +134,12 @@ def test_tversky_asymmetry_fits_inside():
 
     # query (small) as ref, big as fit
     mp_fwd = MoleculePair(small, big, do_center=True, device=torch.device('cpu'))
-    mp_fwd.align_with_vol_tversky(num_repeats=30, max_num_steps=200)
+    mp_fwd.align_with_vol(similarity="tversky", num_repeats=30, max_num_steps=200)
     fwd = float(mp_fwd.sim_aligned_vol_tversky)
 
     # reverse: big as ref, query (small) as fit
     mp_rev = MoleculePair(big, small, do_center=True, device=torch.device('cpu'))
-    mp_rev.align_with_vol_tversky(num_repeats=30, max_num_steps=200)
+    mp_rev.align_with_vol(similarity="tversky", num_repeats=30, max_num_steps=200)
     rev = float(mp_rev.sim_aligned_vol_tversky)
 
     assert fwd > rev, f"expected fits-inside fwd ({fwd:.3f}) > reverse ({rev:.3f})"

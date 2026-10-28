@@ -8,7 +8,8 @@ import pytest
 import torch
 
 from shepherd_score.container import MoleculePairBatch
-from shepherd_score.modes import MODES, Combined, Mode, Vol, blend, get_mode
+from shepherd_score.alignment import optimize_ROCS_overlay
+from shepherd_score.modes import MODES, Avoid, Combined, Mode, Vol, VolAvoid, blend, get_mode, vol_color
 from shepherd_score.score.gaussian_overlap import VAB_2nd_order
 from shepherd_score.score.pharmacophore_scoring import tversky_func
 from shepherd_score.score.similarity import similarity_from_overlaps
@@ -25,31 +26,105 @@ def _self_pair():
     return MoleculePair(m, m, num_surf_points=NUM_SURF_POINTS, device=torch.device('cpu'))
 
 
+def _far_cloud(pair):
+    return pair.ref_molec.atom_pos + 40.0
+
+
 @pytest.mark.parametrize('name', sorted(MODES))
 @pytest.mark.parametrize('similarity', ['tanimoto', 'tversky'])
 def test_every_mode_scores_one_on_itself(name, similarity):
     pair = _self_pair()
-    assert np.isclose(pair.score(name, similarity=similarity), 1.0, atol=1e-5)
-    res = pair.align(name, similarity=similarity, **FAST)
+    kw = {'avoid_points': _far_cloud(pair)} if name == 'vol_avoid' else {}
+    assert np.isclose(pair.score(name, similarity=similarity, **kw), 1.0, atol=1e-5)
+    res = pair.align(name, similarity=similarity, **FAST, **kw)
     assert np.isclose(res.score, 1.0, atol=5e-3)
     assert res.transform.shape == (4, 4)
 
 
-@pytest.mark.parametrize('name, legacy, kw', [
-    ('vol', 'vol_tversky', {}),
-    ('vol_esp', 'vol_esp_tversky', {}),
-    ('surf', 'surf_tversky', {}),
-    ('surf_esp', 'surf_esp_tversky', {}),
-    ('vol_lipo', 'vol_lipo_tversky', {}),
-    ('vol_and_surf_esp', 'vol_and_surf_esp_tversky', {}),
-    ('pharm', 'pharm_tversky', {}),
+@pytest.mark.parametrize('name, kw', [
+    ('vol', {}),
+    ('vol_esp', {}),
+    ('surf', {'alpha': 0.81}),
+    ('surf_esp', {'alpha': 0.81}),
+    ('vol_lipo', {}),
+    ('vol_color', {}),
+    ('vol_and_surf_esp', {'alpha': 0.81}),
 ])
-def test_similarity_argument_matches_tversky_methods(name, legacy, kw):
+def test_similarity_argument_stores_in_tversky_slot(name, kw):
     pair = make_pair(0, 1)
+    assert not hasattr(pair, f'align_with_{name}_tversky')
     res = pair.align(name, similarity='tversky', **FAST, **kw)
-    getattr(pair, f'align_with_{legacy}')(**FAST)
-    assert np.allclose(res.score, getattr(pair, f'sim_aligned_{legacy}'), atol=1e-6)
-    assert np.allclose(res.transform, getattr(pair, f'transform_{legacy}'), atol=1e-5)
+    getattr(pair, f'align_with_{name}')(similarity='tversky', **FAST, **kw)
+    assert np.allclose(res.score, getattr(pair, f'sim_aligned_{name}_tversky'), atol=1e-6)
+    assert np.allclose(res.transform, getattr(pair, f'transform_{name}_tversky'), atol=1e-5)
+
+
+def test_pharm_similarity_keeps_its_slot():
+    pair = make_pair(0, 1)
+    res = pair.align('pharm', similarity='tversky', **FAST)
+    pair.align_with_pharm(similarity='tversky', **FAST)
+    assert np.allclose(res.score, pair.sim_aligned_pharm, atol=1e-6)
+
+
+def test_vol_color_similarity_covers_both_channels():
+    pair = make_pair(0, 1)
+    pair.align_with_vol_color(similarity=(0.7, 0.3), **FAST)
+    both = pair.align(vol_color(similarity=(0.7, 0.3), color_similarity=(0.7, 0.3)), **FAST)
+    assert np.allclose(pair.sim_aligned_vol_color_tversky, both.score, atol=1e-6)
+    # colour-only Tversky keeps the Tanimoto slot
+    pair.align_with_vol_color(color_similarity='tversky', **FAST)
+    colour = pair.align(vol_color(color_similarity='tversky'), **FAST)
+    assert np.allclose(pair.sim_aligned_vol_color, colour.score, atol=1e-6)
+
+
+def test_pharm_weights_match_names():
+    pair = make_pair(0, 1)
+    for name, weights in [('tversky', (0.95, 0.05)), ('tversky_ref', (1.0, 0.0))]:
+        assert np.isclose(pair.score('pharm', similarity=name),
+                          pair.score('pharm', similarity=weights), atol=1e-6)
+    assert np.isfinite(pair.score('pharm', similarity=(0.7, 0.3)))
+
+
+def _near_cloud(pair):
+    rng = np.random.default_rng(0)
+    return (pair.ref_molec.atom_pos.mean(0) + [3.0, 0, 0] + rng.normal(size=(20, 3))).astype(np.float32)
+
+
+def test_vol_avoid_matches_the_old_optimizer():
+    pair = make_pair(0, 1)
+    avoid = _near_cloud(pair)
+    t = pair._to_tensor
+    _, se3, ref = optimize_ROCS_overlay(t(pair.ref_molec.get_positions(True)),
+                                        t(pair.fit_molec.get_positions(True)), 0.81,
+                                        avoid_points=t(avoid), num_repeats=16, max_num_steps=50)
+    pair.align_with_vol_avoid(avoid, use_analytical=False, num_repeats=16, max_num_steps=50)
+    assert np.isclose(pair.sim_aligned_vol_avoid, float(ref), atol=1e-6)
+    assert np.allclose(pair.transform_vol_avoid, se3.numpy(), atol=1e-4)
+    pair.align_with_vol_avoid(avoid, num_repeats=16, max_num_steps=50)    # analytical
+    assert np.isclose(pair.sim_aligned_vol_avoid, float(ref), atol=1e-4)
+
+
+def test_vol_avoid_is_vol_minus_weighted_penalty():
+    pair = make_pair(0, 1)
+    avoid = _near_cloud(pair)
+    blended = Combined(terms=((1.0, Vol()), (-0.5, Avoid(avoid, min_dist=3.0))))
+    assert np.isclose(pair.score(VolAvoid(avoid_points=avoid, avoid_weight=0.5, avoid_min_dist=3.0)),
+                      pair.score(blended), atol=1e-5)
+    assert np.isclose(pair.score(VolAvoid(avoid_points=_far_cloud(pair))), pair.score('vol'), atol=1e-6)
+    with pytest.raises(ValueError, match='avoid_points'):
+        VolAvoid()
+
+
+def test_combined_poses_shared_arrays_once():
+    pair = make_pair(0, 1)
+    mode = Combined(terms=((1.0, Vol()), (-1.0, Avoid(_near_cloud(pair)))))
+    ref, fit = pair._mode_inputs(mode, pair._as_tensor)
+    assert fit[0]['points'] is fit[1]['points']
+    posed = mode.pose(fit, torch.eye(4, device=fit[0]['points'].device))
+    assert posed[0]['points'] is posed[1]['points']
+    # vol_color's terms read different arrays and stay separate
+    ref, fit = pair._mode_inputs(vol_color(), pair._as_tensor)
+    assert fit[0]['points'] is not fit[1]['anchors']
 
 
 def test_tversky_name_and_weights_agree():
@@ -124,3 +199,30 @@ def test_batch_align_dispatches_similarity():
     MoleculePairBatch(pairs).align('vol', similarity='tversky', backend='numba')
     assert all(p.sim_aligned_vol_tversky is not None for p in pairs)
     assert all(p.sim_aligned_vol_noH is None for p in pairs)
+
+
+def test_batch_similarity_runs_the_tversky_driver():
+    batch = MoleculePairBatch([make_pair(0, 1), make_pair(2, 3)])
+    assert not hasattr(batch, 'align_with_vol_tversky')
+    scores, aligned = batch.align_with_vol(backend='numba', similarity=(0.7, 0.3))
+    assert all(a is not None for a in aligned)
+    ref, _ = batch._align_mode('vol_tversky', backend='numba', tversky_alpha=0.7, tversky_beta=0.3)
+    assert np.allclose(scores, ref, atol=1e-6)
+    assert np.allclose(scores, [p.sim_aligned_vol_tversky for p in batch.pairs], atol=1e-6)
+
+
+def test_batch_align_runs_registry_tversky_modes():
+    batch = MoleculePairBatch([make_pair(0, 1), make_pair(2, 3)])
+    scores, _ = batch.align('vol_tversky', backend='numba', tversky_alpha=0.7, tversky_beta=0.3)
+    ref, _ = batch.align_with_vol(backend='numba', similarity=(0.7, 0.3))
+    assert np.allclose(scores, ref, atol=1e-6)
+    scores, *_ = batch.align('pharm_tversky', backend='numba')
+    assert np.allclose(scores, [p.sim_aligned_pharm_tversky for p in batch.pairs], atol=1e-6)
+    with pytest.raises(ValueError, match='already a Tversky mode'):
+        batch.align('vol_tversky', similarity='tversky')
+
+
+def test_batch_tversky_rejects_unsupported_options():
+    batch = MoleculePairBatch([make_pair(0, 1)])
+    with pytest.raises(NotImplementedError, match='trans_init'):
+        batch.align_with_vol(backend='numba', similarity='tversky', trans_init=True)

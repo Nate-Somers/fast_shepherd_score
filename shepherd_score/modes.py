@@ -1,7 +1,7 @@
 """
 Alignment modes.
 
-A mode says which arrays to read off a ``Molecule`` and how to score a posed fit against the
+A mode defines which arrays to read from a ``Molecule`` and how to score a posed fit against the
 reference. Everything else (seeding, the SE(3) optimizer, result bookkeeping) is shared, so a
 new mode is a small class and needs no new ``MoleculePair`` method::
 
@@ -9,25 +9,29 @@ new mode is a small class and needs no new ``MoleculePair`` method::
     pair.align("surf_esp", lam=0.3, similarity="tversky")
     pair.align(MyMode(width=1.2))                  # or a Mode instance
 
-Writing a mode: subclass ``Mode`` as a frozen dataclass, implement ``inputs`` and ``overlap``
-(a Gaussian-type cross overlap; the similarity reduction is applied for you), and list which
-inputs move with the pose in ``points`` / ``vectors``. Override ``score`` instead of
-``overlap`` when the score is not an overlap ratio. Blend modes with ``Combined``.
+Writing a mode:
+1. Subclass ``Mode`` as a frozen dataclass
+2. Implement ``inputs`` and ``overlap`` (a Gaussian-type cross overlap; without similarity reduction
+3. list which inputs move with the pose in ``points`` / ``vectors``
+4. Override ``score`` instead of ``overlap`` when the score is not an overlap ratio.
+
+Optionally, blend modes with ``Combined``.
 """
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, ClassVar, Dict, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, Optional, Tuple
 
 import numpy as np
 import torch
 
 from shepherd_score.alignment.utils.se3 import apply_SE3_transform, apply_SO3_transform
 from shepherd_score.score.constants import LAM_SCALING
-from shepherd_score.score.gaussian_overlap import VAB_2nd_order
+from shepherd_score.score.gaussian_overlap import VAB_2nd_order, get_linear_hard_sphere_overlap
 from shepherd_score.score.electrostatic_scoring import VAB_2nd_order_esp, _esp_comparison
 from shepherd_score.score.pharmacophore_scoring import get_overlap_pharm
 from shepherd_score.score.atomtype_scoring import get_overlap_atomtype
-from shepherd_score.score.similarity import Similarity, similarity_from_overlaps, pharm_similarity_name
+from shepherd_score.score.similarity import (Similarity, similarity_from_overlaps, pharm_similarity,
+                                             pharm_similarity_name)
 
 
 def _esp_overlap(points_1, points_2, values_1, values_2, alpha, lam):
@@ -55,6 +59,23 @@ def _repeat_to_batch(ref: dict, fit: dict, key: str) -> dict:
     return ref
 
 
+def _pose_moved(mode, inputs: dict, se3: torch.Tensor, already_posed: dict) -> dict:
+    """``Mode.pose`` that reuses earlier results. ``already_posed`` maps
+    ``(id(array), transform)`` to that array under ``se3``; arrays found there are not
+    transformed again, and new results are added to it."""
+    posed = dict(inputs)
+    for keys, transform in ((mode.points, apply_SE3_transform), (mode.vectors, apply_SO3_transform)):
+        for k in keys:
+            x = inputs[k]
+            if transform is apply_SE3_transform and x.shape[-2] == 0:
+                continue
+            key = (id(x), transform)
+            if key not in already_posed:
+                already_posed[key] = transform(x, se3)
+            posed[k] = already_posed[key]
+    return posed
+
+
 class Mode:
     """Base class for alignment modes. See the module docstring."""
     name: ClassVar[str] = ''
@@ -80,13 +101,7 @@ class Mode:
         return similarity_from_overlaps(self.overlap(ref, fit), AA, BB, self.similarity)
 
     def pose(self, inputs: dict, se3: torch.Tensor) -> dict:
-        posed = dict(inputs)
-        for k in self.points:
-            if inputs[k].shape[-2] > 0:
-                posed[k] = apply_SE3_transform(inputs[k], se3)
-        for k in self.vectors:
-            posed[k] = apply_SO3_transform(inputs[k], se3)
-        return posed
+        return _pose_moved(self, inputs, se3, {})
 
     def seed_points(self, inputs: dict) -> torch.Tensor:
         return inputs[self.seed]
@@ -149,6 +164,74 @@ class Surf(_Shape):
 
     def inputs(self, mol):
         return {'points': mol.surf_pos}
+
+
+# ---------------------------------------------------------------------------------------------
+# Excluded volume
+
+def _as_points(points, like: torch.Tensor) -> torch.Tensor:
+    return torch.as_tensor(np.asarray(points, dtype=np.float32), dtype=like.dtype, device=like.device)
+
+
+@dataclass(frozen=True, eq=False)    # eq=False: holds an array
+class Avoid(Mode):
+    """Linear hard-sphere penalty ``sum relu((min_dist - d) / min_dist)`` between the fit's atoms
+    and ``avoid_points``, a fixed (K, 3) cloud in the reference frame that belongs to neither
+    molecule. It is positive, so weight it negatively in a ``Combined``."""
+    name: ClassVar[str] = 'avoid'
+    avoid_points: Any = None
+    min_dist: float = 2.0
+    no_H: bool = True
+
+    def __post_init__(self):
+        if self.avoid_points is None:
+            raise ValueError(f'{type(self).__name__} needs avoid_points, a (K, 3) cloud in the '
+                             'reference frame.')
+
+    def inputs(self, mol):
+        return {'points': mol.get_positions(self.no_H)}
+
+    def prepare(self, ref, fit):
+        return _as_points(self.avoid_points, fit['points'])
+
+    def score(self, ref, fit, cache=None):
+        avoid = cache if cache is not None else self.prepare(ref, fit)
+        return get_linear_hard_sphere_overlap(fit['points'], avoid, self.min_dist)
+
+
+def _rocs_avoid_analytical(ref, fit, alpha, avoid_points, avoid_min_dist, avoid_weight, **opt):
+    from shepherd_score.alignment import optimize_ROCS_overlay_analytical
+    aligned, se3, score = optimize_ROCS_overlay_analytical(
+        ref['points'], fit['points'], alpha, avoid_points=_as_points(avoid_points, ref['points']),
+        avoid_min_dist=avoid_min_dist, avoid_weight=avoid_weight, **opt)
+    return {'points': aligned}, se3, score
+
+
+@dataclass(frozen=True, eq=False)
+class VolAvoid(Vol):
+    """``vol`` minus ``avoid_weight`` times the ``Avoid`` penalty on the same atoms."""
+    name: ClassVar[str] = 'vol_avoid'
+    avoid_points: Any = None
+    avoid_weight: float = 1.0
+    avoid_min_dist: float = 2.0
+
+    def __post_init__(self):
+        object.__setattr__(self, '_avoid', Avoid(self.avoid_points, self.avoid_min_dist, self.no_H))
+
+    def prepare(self, ref, fit):
+        return super().prepare(ref, fit), self._avoid.prepare(ref, fit)
+
+    def score(self, ref, fit, cache=None):
+        shape, avoid = cache if cache is not None else self.prepare(ref, fit)
+        return super().score(ref, fit, shape) - self.avoid_weight * self._avoid.score(ref, fit, avoid)
+
+    def backends(self):
+        if self.similarity != 'tanimoto':
+            return {}
+        return {'analytical': partial(_rocs_avoid_analytical, alpha=self.alpha,
+                                      avoid_points=self.avoid_points,
+                                      avoid_min_dist=self.avoid_min_dist,
+                                      avoid_weight=self.avoid_weight)}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -287,8 +370,9 @@ def _pharm_optimizer(fn, ref, fit, **opt):
 class Pharm(Mode):
     """Directional pharmacophore overlap.
 
-    ``similarity`` uses the pharmacophore scorer's own reduction (Tversky in the
-    ``AB / (a AA + b BB)`` form, clamped at 1), so only the named similarities are accepted.
+    ``similarity`` uses the pharmacophore scorer's own reduction, in which Tversky is clamped at
+    1. The analytical and JAX optimizers take only the named similarities, so other ``(a, b)``
+    weights run on the generic optimizer.
     """
     name: ClassVar[str] = 'pharm'
     points: ClassVar[Tuple[str, ...]] = ('anchors',)
@@ -304,22 +388,30 @@ class Pharm(Mode):
         return {'types': mol.pharm_types, 'anchors': mol.pharm_ancs, 'vectors': mol.pharm_vecs}
 
     def prepare(self, ref, fit):
-        return None
+        """Self overlaps (VAA, VBB), as ``optimize_pharm_overlay`` precomputes them. ``None`` for
+        directional extended points, which the scorer always recomputes."""
+        if self.extended_points and not self.directionless:
+            return None
+        from shepherd_score.score.analytical_gradients import compute_self_overlaps_pharm
+        return compute_self_overlaps_pharm(ref['types'], fit['types'], ref['anchors'], fit['anchors'],
+                                           ref['vectors'], fit['vectors'],
+                                           directionless=self.directionless)
 
     def score(self, ref, fit, cache=None):
         ref = _repeat_to_batch(ref, fit, 'anchors')
         return get_overlap_pharm(ref['types'], fit['types'], ref['anchors'], fit['anchors'],
                                  ref['vectors'], fit['vectors'],
-                                 similarity=pharm_similarity_name(self.similarity),
+                                 similarity=pharm_similarity(self.similarity),
                                  extended_points=self.extended_points,
                                  only_extended=self.only_extended,
-                                 directionless=self.directionless)
+                                 directionless=self.directionless,
+                                 precomputed_self_overlaps=cache)
 
     def trans_centers(self, mol):
         return mol.pharm_ancs
 
     def backends(self):
-        if self.directionless:
+        if self.directionless or not isinstance(pharm_similarity(self.similarity), str):
             return {}
         from shepherd_score.alignment import optimize_pharm_overlay_analytical
         kw = dict(similarity=pharm_similarity_name(self.similarity),
@@ -404,12 +496,30 @@ class AtomType(Mode):
 # ---------------------------------------------------------------------------------------------
 # Blends
 
+def _poses_by_default(mode: Mode) -> bool:
+    """Whether ``mode`` moves its inputs with the base ``Mode.pose`` (so poses can be shared)."""
+    return type(mode).pose is Mode.pose
+
+
 @dataclass(frozen=True)
 class Combined(Mode):
     """Weighted sum of modes, all moved by one pose: ``sum(w_i * mode_i)``.
 
+    A convenience class for combining modes: each term is scored separately under the generic
+    autograd optimizer.
+
+    This is a generic operator and may not be optimized for speed. Speedups can be achieved
+    by creating a new mode with a fused objective, analytical optimizer, or batched kernel
+    in ``accel``.
+
     Seeding and ``trans_init`` follow the first mode. Inputs and aligned outputs are tuples
     with one entry per mode.
+
+    There may be several terms that move the same set of input coordinates
+    For example, in ``vol_lipo``, both the shape and the logP field sit on the heavy atoms.
+    ``inputs`` compares the arrays each term moves with the pose (its ``points`` and ``vectors``),
+    once per alignment, and gives terms with equal values one shared array object.
+    ``pose`` then transforms each shared array once per optimizer step instead of once per term.
     """
     terms: Tuple[Tuple[float, Mode], ...] = ()
     label: str = 'combined'
@@ -419,7 +529,21 @@ class Combined(Mode):
         return tuple({r for _, m in self.terms for r in m.requires})
 
     def inputs(self, mol):
-        return tuple(m.inputs(mol) for _, m in self.terms)
+        seen = []
+        out = []
+        for _, m in self.terms:
+            x = m.inputs(mol)
+            if _poses_by_default(m):
+                x = dict(x)
+                for k in (*m.points, *m.vectors):
+                    same = next((s for s in seen if np.shape(s) == np.shape(x[k])
+                                 and np.array_equal(s, x[k])), None)
+                    if same is None:
+                        seen.append(x[k])
+                    else:
+                        x[k] = same
+            out.append(x)
+        return tuple(out)
 
     def prepare(self, ref, fit):
         return tuple(m.prepare(r, f) for (_, m), r, f in zip(self.terms, ref, fit))
@@ -429,7 +553,9 @@ class Combined(Mode):
         return sum(w * m.score(r, f, c) for (w, m), r, f, c in zip(self.terms, ref, fit, cache))
 
     def pose(self, inputs, se3):
-        return tuple(m.pose(x, se3) for (_, m), x in zip(self.terms, inputs))
+        already_posed = {}    # shared by all terms, so a shared array is transformed once
+        return tuple(_pose_moved(m, x, se3, already_posed) if _poses_by_default(m) else m.pose(x, se3)
+                     for (_, m), x in zip(self.terms, inputs))
 
     def seed_points(self, inputs):
         return self.terms[0][1].seed_points(inputs[0])
@@ -492,6 +618,7 @@ def vol_atomtype(atomtype_weight: float = 0.5, alpha: float = 0.81,
 
 MODES: Dict[str, Callable[..., Mode]] = {
     'vol': Vol,
+    'vol_avoid': VolAvoid,
     'vol_esp': VolESP,
     'surf': Surf,
     'surf_esp': SurfESP,

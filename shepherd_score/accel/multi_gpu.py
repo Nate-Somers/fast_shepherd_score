@@ -59,7 +59,8 @@ def _worker(rank, mode, backend, do_center, threads, align_kwargs, shard_mols, o
         t_build = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        getattr(MoleculePairBatch(pairs), "align_with_" + mode)(backend=backend, **align_kwargs)
+        MoleculePairBatch(pairs)._align_mode(
+            mode, backend=backend, **{"return_aligned": False, **align_kwargs})
         torch.cuda.synchronize()
         t_align = time.perf_counter() - t0
 
@@ -232,7 +233,8 @@ def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
                 break
             mode, backend, kwargs = job
             t0 = time.perf_counter()
-            getattr(batch, "align_with_" + mode)(backend=backend, **kwargs)
+            batch._align_mode(
+                mode, backend=backend, **{"return_aligned": False, **kwargs})
             torch.cuda.synchronize()
             t_align = time.perf_counter() - t0
             sc_attr, tf_attr = _SCORE_ATTR[mode], _TRANSFORM_ATTR[mode]

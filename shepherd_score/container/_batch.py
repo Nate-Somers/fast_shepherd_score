@@ -106,8 +106,21 @@ def _pinned_torch_threads(pairs):
         torch.set_num_threads(prev)
 
 
+def _reject_for_tversky(mode: str, unsupported: dict) -> None:
+    """Raise for options that the ``<mode>_tversky`` drivers do not implement."""
+    used = [name for name, on in unsupported.items() if on]
+    if used:
+        raise NotImplementedError(
+            f"{mode} with a Tversky similarity does not support {', '.join(used)}.")
+
+
 class MoleculePairBatch:
     """Align molecular pairs in batches and store scores and transforms on each pair."""
+
+    # Backend names that route to the Triton/CUDA MoleculePair._align_batch_* path.
+    _TRITON_BACKENDS = ("triton", "cuda", "gpu")
+    # Backend names that run the same batched drivers on CPU with the numba kernels.
+    _NUMBA_BACKENDS = ("numba", "cpu")
 
     def __init__(self, pairs: List[MoleculePair]):
         self.pairs = pairs
@@ -115,28 +128,41 @@ class MoleculePairBatch:
     def align(self, mode: str, similarity: Similarity = 'tanimoto', **kwargs):
         """Align all pairs under the named ``mode``, as ``MoleculePair.align`` names them.
 
-        Dispatches to the accelerated ``align_with_<mode>`` method (``align_with_<mode>_tversky``
-        for a Tversky ``similarity``), so results land in that method's ``transform_*`` /
-        ``sim_aligned_*`` slots and ``kwargs`` are that method's keywords::
+        Calls the accelerated ``align_with_<mode>`` method, so results land in that method's
+        ``transform_*`` / ``sim_aligned_*`` slots and ``kwargs`` are that method's keywords::
 
             batch.align('vol', similarity='tversky', backend='triton')
+
+        A registry ``<base>_tversky`` name (e.g. ``'vol_tversky'``, ``'pharm_tversky'``) runs that
+        mode's batched driver and takes its keywords, ``tversky_alpha`` / ``tversky_beta``::
+
+            batch.align('vol_tversky', tversky_alpha=0.7, tversky_beta=0.3)
         """
         name = MODE_ALIASES.get(mode, mode)
-        weights = tversky_weights(similarity)
-        if name == 'pharm':
-            return self.align_with_pharm(similarity=similarity, **kwargs)
-        if weights is not None:
-            kwargs.update(tversky_alpha=weights[0], tversky_beta=weights[1])
-            name = f'{name}_tversky'
+        if name.endswith('_tversky'):
+            if similarity != 'tanimoto':
+                raise ValueError(f'{mode!r} is already a Tversky mode; pass similarity= to '
+                                 f"align({name[:-len('_tversky')]!r}) instead.")
+            if not hasattr(self, f'_align_{name}'):
+                raise ValueError(f'No batched implementation of {mode!r}.')
+            return self._align_mode(name, **kwargs)
         method = getattr(self, f'align_with_{name}', None)
         if method is None:
-            raise ValueError(f'No batched implementation of {mode!r} with similarity={similarity!r}.')
+            raise ValueError(f'No batched implementation of {mode!r}.')
+        if similarity != 'tanimoto':
+            kwargs['similarity'] = similarity
         return method(**kwargs)
 
-    # Backend names that route to the Triton/CUDA MoleculePair._align_batch_* path.
-    _TRITON_BACKENDS = ("triton", "cuda", "gpu")
-    # Backend names that run the same batched drivers on CPU with the numba kernels.
-    _NUMBA_BACKENDS = ("numba", "cpu")
+    def _align_mode(self, mode: str, *args, **kwargs):
+        """Run an ``accel/_modes.py`` registry mode by name.
+
+        The registry keeps separate ``<base>_tversky`` modes, with their own drivers and result
+        slots, for screening. Their public form is ``align_with_<base>(similarity=...)``; this
+        runs them with the registry's own keywords (``tversky_alpha`` / ``tversky_beta``).
+        """
+        name = MODE_ALIASES.get(mode, mode)
+        prefix = '_align_' if name.endswith('_tversky') else 'align_with_'
+        return getattr(self, prefix + name)(*args, **kwargs)
 
     def _prepare_numba(self):
         """Move every pair onto CPU for a ``backend="numba"`` call. Kernel selection is
@@ -185,9 +211,11 @@ class MoleculePairBatch:
 
         ``num_workers > 1`` on the CPU path shards the pairs across the persistent process
         pool (:mod:`shepherd_score.accel.cpu_pool`) for modes in ``cpu_pool.POOL_MODES``;
-        it is ignored on CUDA tensors. Sharding does not change the optimization problem, but
-        the fine loop's early stop runs until every pair in a shard has converged, so results
-        agree to convergence tolerance rather than bitwise.
+        it is ignored on CUDA tensors.
+
+        Sharding changes early stopping criteria (runs until every pair within a shard has
+        converged), so there may be slightly more optimization steps taken compared to a
+        single-process run.
 
         Scores and SE(3) transforms are read from the results the batched path stores on each
         pair. ``aligned_list`` is only built when ``return_aligned=True``, batched per device
@@ -195,8 +223,7 @@ class MoleculePairBatch:
         """
         pairs = self.pairs
         mode = align_fn.__name__.replace("_align_batch_", "")
-        if (num_workers and num_workers > 1 and pairs
-                and pairs[0].device.type == "cpu"):
+        if (num_workers and num_workers > 1 and pairs and pairs[0].device.type == "cpu"):
             from shepherd_score.accel import cpu_pool as _cpu_pool
             if mode in _cpu_pool.POOL_MODES:
                 _cpu_pool.align_pairs(mode, pairs, num_workers, align_kwargs)
@@ -300,7 +327,8 @@ class MoleculePairBatch:
                        verbose: bool = False,
                        backend: Optional[str] = None,
                        alpha: float = 0.81,
-                       return_aligned: bool = False,
+                       return_aligned: bool = True,
+                       similarity: Similarity = 'tanimoto',
                        ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using padded masked volumetric similarity via JAX.
 
@@ -353,6 +381,11 @@ class MoleculePairBatch:
             beneficial for large heterogeneous molecule sets.
         verbose : bool
             Print scores per pair. Default is False.
+        similarity : str or (float, float)
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            explicit Tversky weights ``(a, b)``. A Tversky similarity runs the ``vol_tversky``
+            driver and stores results in ``transform_vol_tversky`` /
+            ``sim_aligned_vol_tversky``; its scores are not clipped to [0, 1].
         backend : str, optional
             ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
             (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
@@ -361,7 +394,8 @@ class MoleculePairBatch:
         alpha : float
             Gaussian width for the batched path. Default is 0.81.
         return_aligned : bool
-            Build ``aligned_list`` on the batched path. Default is False (entries are ``None``).
+            Build ``aligned_list`` on the batched path. Default is True; pass False to skip it
+            (entries are ``None``) when only scores and transforms are needed.
 
         Returns
         -------
@@ -370,6 +404,15 @@ class MoleculePairBatch:
         aligned_list : list of np.ndarray
             Aligned fit atom coordinates (unpadded) for each pair.
         """
+        weights = tversky_weights(similarity)
+        if weights is not None:
+            _reject_for_tversky('vol', {'no_H=False': not no_H, 'trans_init': trans_init,
+                                         'num_workers > 1': num_workers > 1,
+                                         'num_buckets > 1': num_buckets > 1})
+            return self._align_vol_tversky(
+                tversky_alpha=weights[0], tversky_beta=weights[1],
+                alpha=alpha, num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps,
+                verbose=verbose, backend=backend, return_aligned=return_aligned)
         def _no_H_guard():
             if not no_H:
                 raise NotImplementedError(
@@ -521,7 +564,8 @@ class MoleculePairBatch:
                            verbose: bool = False,
                            backend: Optional[str] = None,
                            alpha: float = 0.81,
-                           return_aligned: bool = False,
+                           return_aligned: bool = True,
+                           similarity: Similarity = 'tanimoto',
                            ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using padded masked volumetric ESP similarity via JAX.
 
@@ -574,6 +618,11 @@ class MoleculePairBatch:
             beneficial for large heterogeneous molecule sets.
         verbose : bool
             Print scores per pair. Default is False.
+        similarity : str or (float, float)
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            explicit Tversky weights ``(a, b)``. A Tversky similarity runs the
+            ``vol_esp_tversky`` driver and stores results in ``transform_vol_esp_tversky`` /
+            ``sim_aligned_vol_esp_tversky``; its scores are not clipped to [0, 1].
         backend : str, optional
             ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
             (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
@@ -582,7 +631,8 @@ class MoleculePairBatch:
         alpha : float
             Gaussian width for the batched path. Default is 0.81.
         return_aligned : bool
-            Build ``aligned_list`` on the batched path. Default is False (entries are ``None``).
+            Build ``aligned_list`` on the batched path. Default is True; pass False to skip it
+            (entries are ``None``) when only scores and transforms are needed.
 
         Returns
         -------
@@ -591,6 +641,15 @@ class MoleculePairBatch:
         aligned_list : list of np.ndarray
             Aligned fit atom coordinates (unpadded) for each pair.
         """
+        weights = tversky_weights(similarity)
+        if weights is not None:
+            _reject_for_tversky('vol_esp', {'no_H=False': not no_H, 'trans_init': trans_init,
+                                         'num_workers > 1': num_workers > 1,
+                                         'num_buckets > 1': num_buckets > 1})
+            return self._align_vol_esp_tversky(
+                tversky_alpha=weights[0], tversky_beta=weights[1],
+                alpha=alpha, lam=lam, num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps,
+                verbose=verbose, backend=backend, return_aligned=return_aligned)
         # Build raw (unpadded) per-pair data tuples (plain numpy — picklable).
         def _no_H_guard():
             if not no_H:
@@ -766,6 +825,25 @@ class MoleculePairBatch:
             aligned_list.append(aligned_pts)
         return scores, aligned_list
 
+    def _delegate_mode(self, mode: str, slot: str, **kwargs):
+        """Per-pair fallback for the ``<base>_tversky`` registry modes, which have no
+        ``MoleculePair.align_with_*`` method of their own: run ``MoleculePair.align`` on each
+        pair and store the result in that mode's ``transform_<slot>`` / ``sim_aligned_<slot>``.
+
+        Returns scores and the aligned fit points (for ``pharm``, ``(anchors, vectors)``).
+        """
+        aligned_list = []
+        scores = np.zeros(len(self.pairs))
+        for i, pair in enumerate(self.pairs):
+            res = pair.align(mode, **kwargs)
+            setattr(pair, f'transform_{slot}', res.transform)
+            setattr(pair, f'sim_aligned_{slot}', res.score)
+            scores[i] = float(res.score)
+            aligned = res.aligned[0] if isinstance(res.aligned, tuple) else res.aligned
+            aligned_list.append((aligned['anchors'], aligned['vectors']) if mode == 'pharm'
+                                else aligned['points'])
+        return scores, aligned_list
+
     def align_with_surf(self,
                         alpha: float,
                         num_repeats: int = None,
@@ -778,7 +856,8 @@ class MoleculePairBatch:
                         use_shmap: bool = False,
                         verbose: bool = False,
                         backend: Optional[str] = None,
-                        return_aligned: bool = False,
+                        return_aligned: bool = True,
+                        similarity: Similarity = 'tanimoto',
                         ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using surface similarity.
 
@@ -818,13 +897,19 @@ class MoleculePairBatch:
             Performance is better when use_shmap is False on cpu.
         verbose : bool
             Print scores per pair. Default is False.
+        similarity : str or (float, float)
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            explicit Tversky weights ``(a, b)``. A Tversky similarity runs the ``surf_tversky``
+            driver and stores results in ``transform_surf_tversky`` /
+            ``sim_aligned_surf_tversky``; its scores are not clipped to [0, 1].
         backend : str, optional
             ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
             (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
             ``MoleculePair._align_batch_surf`` path (multi-GPU-aware); ``"jax"`` runs the path
             below. ``max_num_steps`` is the batched path's ``steps_fine``.
         return_aligned : bool
-            Build ``aligned_list`` on the batched path. Default is False (entries are ``None``).
+            Build ``aligned_list`` on the batched path. Default is True; pass False to skip it
+            (entries are ``None``) when only scores and transforms are needed.
 
         Returns
         -------
@@ -833,6 +918,14 @@ class MoleculePairBatch:
         aligned_list : list of np.ndarray
             Aligned fit surface coordinates for each pair.
         """
+        weights = tversky_weights(similarity)
+        if weights is not None:
+            _reject_for_tversky('surf', {'trans_init': trans_init,
+                                      'num_workers > 1': num_workers > 1})
+            return self._align_surf_tversky(
+                tversky_alpha=weights[0], tversky_beta=weights[1],
+                alpha=alpha, num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps,
+                verbose=verbose, backend=backend, return_aligned=return_aligned)
         if max_num_steps is None:
             max_num_steps = _default_steps("surf")
         if num_repeats is None:
@@ -918,7 +1011,8 @@ class MoleculePairBatch:
                        use_shmap: bool = False,
                        verbose: bool = False,
                        backend: Optional[str] = None,
-                       return_aligned: bool = False,
+                       return_aligned: bool = True,
+                       similarity: Similarity = 'tanimoto',
                        ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using ESP+surface similarity.
 
@@ -961,6 +1055,11 @@ class MoleculePairBatch:
             Performance is better when use_shmap is False on cpu.
         verbose : bool
             Print scores per pair. Default is False.
+        similarity : str or (float, float)
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            explicit Tversky weights ``(a, b)``. A Tversky similarity runs the
+            ``surf_esp_tversky`` driver and stores results in ``transform_surf_esp_tversky`` /
+            ``sim_aligned_surf_esp_tversky``; its scores are not clipped to [0, 1].
         backend : str, optional
             ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
             (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
@@ -968,7 +1067,8 @@ class MoleculePairBatch:
             ``LAM_SCALING`` to ``lam``); ``"jax"`` runs the path below. ``max_num_steps`` is the
             batched path's ``steps_fine``.
         return_aligned : bool
-            Build ``aligned_list`` on the batched path. Default is False (entries are ``None``).
+            Build ``aligned_list`` on the batched path. Default is True; pass False to skip it
+            (entries are ``None``) when only scores and transforms are needed.
 
         Returns
         -------
@@ -977,6 +1077,14 @@ class MoleculePairBatch:
         aligned_list : list of np.ndarray
             Aligned fit surface coordinates for each pair.
         """
+        weights = tversky_weights(similarity)
+        if weights is not None:
+            _reject_for_tversky('surf_esp', {'trans_init': trans_init,
+                                          'num_workers > 1': num_workers > 1})
+            return self._align_surf_esp_tversky(
+                tversky_alpha=weights[0], tversky_beta=weights[1],
+                alpha=alpha, lam=lam, num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps,
+                verbose=verbose, backend=backend, return_aligned=return_aligned)
         if max_num_steps is None:
             max_num_steps = _default_steps("surf_esp")
         if num_repeats is None:
@@ -1068,7 +1176,8 @@ class MoleculePairBatch:
                              max_num_steps: int = None,
                              verbose: bool = False,
                              backend: Optional[str] = None,
-                             return_aligned: bool = False,
+                             return_aligned: bool = True,
+                             similarity: Similarity = 'tanimoto',
                              ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using ShaEP-style ESP-combo similarity (formerly
         ``align_with_esp_combo``, which is kept as an alias).
@@ -1082,22 +1191,37 @@ class MoleculePairBatch:
             ShaEP combo parameters (see ``MoleculePair.align_with_vol_and_surf_esp``).
         num_repeats, trans_init, lr, max_num_steps, verbose
             Standard optimization controls.
+        similarity : str or (float, float)
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            explicit Tversky weights ``(a, b)``. A Tversky similarity runs the
+            ``vol_and_surf_esp_tversky`` driver and stores results in
+            ``transform_vol_and_surf_esp_tversky`` / ``sim_aligned_vol_and_surf_esp_tversky``;
+            its scores are not clipped to [0, 1]. Tversky applies to the shape channel; the ESP
+            term is unchanged.
         backend : str, optional
             ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
             (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
             ``MoleculePair._align_batch_vol_and_surf_esp`` driver (multi-GPU-aware); ``"jax"``
             runs the per-pair path via ``MoleculePair.align_with_vol_and_surf_esp``.
         return_aligned : bool
-            For the batched backend, build the aligned-fit-surface list when ``True``.
+            For the batched backend, build the aligned-fit-surface list. Default is True.
 
         Returns
         -------
         scores : np.ndarray
             Shape: (N,).
         aligned_list : list of np.ndarray
-            Aligned fit surface coordinates per pair (``None`` entries unless
-            ``return_aligned=True`` on the batched backend).
+            Aligned fit surface coordinates per pair (``None`` entries when
+            ``return_aligned=False`` on the batched backend).
         """
+        weights = tversky_weights(similarity)
+        if weights is not None:
+            _reject_for_tversky('vol_and_surf_esp', {'trans_init': trans_init})
+            return self._align_vol_and_surf_esp_tversky(
+                tversky_alpha=weights[0], tversky_beta=weights[1],
+                alpha=alpha, lam=lam, probe_radius=probe_radius, esp_weight=esp_weight,
+                num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps,
+                verbose=verbose, backend=backend, return_aligned=return_aligned)
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_and_surf_esp")
         if num_repeats is None:
@@ -1138,7 +1262,8 @@ class MoleculePairBatch:
                              max_num_steps: int = None,
                              verbose: bool = False,
                              backend: Optional[str] = None,
-                             return_aligned: bool = False,
+                             return_aligned: bool = True,
+                             similarity: Similarity = 'tanimoto',
                              ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using the ROCS/ROSHAMBO-style ``vol_color`` combo
         (atom-Gaussian shape + directionless pharmacophore color).
@@ -1154,6 +1279,12 @@ class MoleculePairBatch:
             Gaussian width for the shape overlap (default 0.81, volumetric).
         num_repeats, trans_init, lr, max_num_steps, verbose
             Standard optimization controls.
+        similarity : str or (float, float)
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            explicit Tversky weights ``(a, b)``. A Tversky similarity runs the
+            ``vol_color_tversky`` driver and stores results in ``transform_vol_color_tversky`` /
+            ``sim_aligned_vol_color_tversky``; its scores are not clipped to [0, 1]. Tversky
+            applies to both the shape and colour channels.
         backend : str, optional
             ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
             (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
@@ -1161,16 +1292,24 @@ class MoleculePairBatch:
             gradient of both channels. ``"jax"`` runs the per-pair PyTorch path sequentially
             (there is no JAX kernel for this mode).
         return_aligned : bool
-            For the batched backend, build the aligned-fit-atom list when ``True``.
+            For the batched backend, build the aligned-fit-atom list. Default is True.
 
         Returns
         -------
         scores : np.ndarray
             Shape: (N,).
         aligned_list : list of np.ndarray
-            Aligned fit atom coordinates per pair (``None`` entries unless
-            ``return_aligned=True`` on the batched backend).
+            Aligned fit atom coordinates per pair (``None`` entries when
+            ``return_aligned=False`` on the batched backend).
         """
+        weights = tversky_weights(similarity)
+        if weights is not None:
+            _reject_for_tversky('vol_color', {'trans_init': trans_init})
+            return self._align_vol_color_tversky(
+                tversky_alpha=weights[0], tversky_beta=weights[1],
+                color_weight=color_weight, alpha=alpha, num_repeats=num_repeats, lr=lr,
+                max_num_steps=max_num_steps,
+                verbose=verbose, backend=backend, return_aligned=return_aligned)
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_color")
         if num_repeats is None:
@@ -1195,17 +1334,17 @@ class MoleculePairBatch:
             verbose=verbose,
         )
 
-    def align_with_vol_tversky(self,
-                               tversky_alpha: float = 0.95,
-                               tversky_beta: float = 0.05,
-                               alpha: float = 0.81,
-                               num_repeats: int = None,
-                               lr: float = 0.1,
-                               max_num_steps: int = None,
-                               verbose: bool = False,
-                               backend: Optional[str] = None,
-                               return_aligned: bool = False,
-                               ) -> Tuple[np.ndarray, List[np.ndarray]]:
+    def _align_vol_tversky(self,
+                           tversky_alpha: float = 0.95,
+                           tversky_beta: float = 0.05,
+                           alpha: float = 0.81,
+                           num_repeats: int = None,
+                           lr: float = 0.1,
+                           max_num_steps: int = None,
+                           verbose: bool = False,
+                           backend: Optional[str] = None,
+                           return_aligned: bool = True,
+                           ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using the asymmetric "fits-inside" ``vol_tversky`` shape overlay.
 
         Same atom-centred Gaussian *shape* channel as ``vol`` (heavy atoms), scored with a
@@ -1236,15 +1375,15 @@ class MoleculePairBatch:
             ``MoleculePair._align_batch_vol_tversky`` driver. ``"jax"`` runs the per-pair PyTorch
             path (there is no JAX kernel for this mode).
         return_aligned : bool
-            For the batched backend, build the aligned-fit-atom list when ``True``.
+            For the batched backend, build the aligned-fit-atom list. Default is True.
 
         Returns
         -------
         scores : np.ndarray
             Shape: (N,). NOT clipped to [0, 1].
         aligned_list : list of np.ndarray
-            Aligned fit atom coordinates per pair (``None`` entries unless
-            ``return_aligned=True`` on the batched backend).
+            Aligned fit atom coordinates per pair (``None`` entries when
+            ``return_aligned=False`` on the batched backend).
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_tversky")
@@ -1259,29 +1398,23 @@ class MoleculePairBatch:
         if handled:
             return _result
 
-        return self._delegate_alignment(
-            'align_with_vol_tversky', 'sim_aligned_vol_tversky',
-            tversky_alpha=tversky_alpha,
-            tversky_beta=tversky_beta,
-            alpha=alpha,
-            num_repeats=num_repeats,
-            lr=lr,
-            max_num_steps=max_num_steps,
-            verbose=verbose,
-        )
+        return self._delegate_mode(
+            'vol', 'vol_tversky',
+            similarity=(tversky_alpha, tversky_beta), alpha=alpha, num_repeats=num_repeats, lr=lr,
+            max_num_steps=max_num_steps, verbose=verbose)
 
-    def align_with_vol_esp_tversky(self,
-                                   tversky_alpha: float = 0.95,
-                                   tversky_beta: float = 0.05,
-                                   alpha: float = 0.81,
-                                   lam: float = 0.1,
-                                   num_repeats: int = None,
-                                   lr: float = 0.1,
-                                   max_num_steps: int = None,
-                                   verbose: bool = False,
-                                   backend: Optional[str] = None,
-                                   return_aligned: bool = False,
-                                   ) -> Tuple[np.ndarray, List[np.ndarray]]:
+    def _align_vol_esp_tversky(self,
+                               tversky_alpha: float = 0.95,
+                               tversky_beta: float = 0.05,
+                               alpha: float = 0.81,
+                               lam: float = 0.1,
+                               num_repeats: int = None,
+                               lr: float = 0.1,
+                               max_num_steps: int = None,
+                               verbose: bool = False,
+                               backend: Optional[str] = None,
+                               return_aligned: bool = True,
+                               ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using the asymmetric "fits-inside" ``vol_esp_tversky`` overlay.
 
         The ``vol_esp`` electrostatic-weighted heavy-atom Gaussian overlap (``VAB_2nd_order_esp``,
@@ -1315,15 +1448,15 @@ class MoleculePairBatch:
             ``MoleculePair._align_batch_vol_esp_tversky`` driver. ``"jax"`` runs the per-pair
             PyTorch path (there is no JAX kernel for this mode).
         return_aligned : bool
-            For the batched backend, build the aligned-fit-atom list when ``True``.
+            For the batched backend, build the aligned-fit-atom list. Default is True.
 
         Returns
         -------
         scores : np.ndarray
             Shape: (N,). NOT clipped to [0, 1].
         aligned_list : list of np.ndarray
-            Aligned fit atom coordinates per pair (``None`` entries unless
-            ``return_aligned=True`` on the batched backend).
+            Aligned fit atom coordinates per pair (``None`` entries when
+            ``return_aligned=False`` on the batched backend).
         """
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_esp_tversky")
@@ -1338,17 +1471,10 @@ class MoleculePairBatch:
         if handled:
             return _result
 
-        return self._delegate_alignment(
-            'align_with_vol_esp_tversky', 'sim_aligned_vol_esp_tversky',
-            tversky_alpha=tversky_alpha,
-            tversky_beta=tversky_beta,
-            alpha=alpha,
-            lam=lam,
-            num_repeats=num_repeats,
-            lr=lr,
-            max_num_steps=max_num_steps,
-            verbose=verbose,
-        )
+        return self._delegate_mode(
+            'vol_esp', 'vol_esp_tversky',
+            similarity=(tversky_alpha, tversky_beta), alpha=alpha, lam=lam,
+            num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
 
     def align_with_vol_lipo(self,
                             lipo_weight: float = 0.5,
@@ -1359,7 +1485,8 @@ class MoleculePairBatch:
                             max_num_steps: int = None,
                             verbose: bool = False,
                             backend: Optional[str] = None,
-                            return_aligned: bool = False,
+                            return_aligned: bool = True,
+                            similarity: Similarity = 'tanimoto',
                             ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Align all pairs using the ``vol_lipo`` overlay: atom-centred Gaussian *shape*
         (volume) + per-atom *lipophilicity* overlap, blended
@@ -1387,22 +1514,35 @@ class MoleculePairBatch:
         num_repeats, lr, max_num_steps, verbose
             Standard optimization controls. ``num_repeats`` / ``max_num_steps`` default
             (``None``) to the per-mode ``MODE_SEEDS`` / ``MODE_STEPS`` in ``accel/_modes.py``.
+        similarity : str or (float, float)
+            ``'tanimoto'`` (default), ``'tversky'``, ``'tversky_ref'``, ``'tversky_fit'`` or
+            explicit Tversky weights ``(a, b)``. A Tversky similarity runs the
+            ``vol_lipo_tversky`` driver and stores results in ``transform_vol_lipo_tversky`` /
+            ``sim_aligned_vol_lipo_tversky``; its scores are not clipped to [0, 1]. Tversky
+            applies to both the shape and lipophilicity channels.
         backend : str, optional
             ``None`` (default) resolves to ``"triton"`` on CUDA, else ``"numba"``. ``"triton"``
             (aliases ``"cuda"``/``"gpu"``) and ``"numba"`` (alias ``"cpu"``) route to the batched
             ``MoleculePair._align_batch_vol_lipo`` driver. ``"jax"`` runs the per-pair PyTorch
             path (there is no JAX kernel for this mode).
         return_aligned : bool
-            For the batched backend, build the aligned-fit-atom list when ``True``.
+            For the batched backend, build the aligned-fit-atom list. Default is True.
 
         Returns
         -------
         scores : np.ndarray
             Shape: (N,).
         aligned_list : list of np.ndarray
-            Aligned fit atom coordinates per pair (``None`` entries unless
-            ``return_aligned=True`` on the batched backend).
+            Aligned fit atom coordinates per pair (``None`` entries when
+            ``return_aligned=False`` on the batched backend).
         """
+        weights = tversky_weights(similarity)
+        if weights is not None:
+            return self._align_vol_lipo_tversky(
+                tversky_alpha=weights[0], tversky_beta=weights[1],
+                lipo_weight=lipo_weight, alpha=alpha, lam=lam, num_repeats=num_repeats, lr=lr,
+                max_num_steps=max_num_steps,
+                verbose=verbose, backend=backend, return_aligned=return_aligned)
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_lipo")
         if num_repeats is None:
@@ -1494,7 +1634,7 @@ class MoleculePairBatch:
     def align_with_vol_mr(self, mr_weight: float = 0.5, alpha: float = 0.81, lam: float = 0.1,
                           num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
                           verbose: bool = False, backend: Optional[str] = None,
-                          return_aligned: bool = False):
+                          return_aligned: bool = True):
         """Batched shape + molar-refractivity alignment (reuses the vol_lipo driver)."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_mr")
@@ -1514,7 +1654,7 @@ class MoleculePairBatch:
     def align_with_vol_fukui(self, fukui_weight: float = 0.5, alpha: float = 0.81, lam: float = 0.1,
                              num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
                              verbose: bool = False, backend: Optional[str] = None,
-                             return_aligned: bool = False):
+                             return_aligned: bool = True):
         """Batched shape + condensed-Fukui reactivity alignment (reuses the vol_lipo driver)."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_fukui")
@@ -1535,7 +1675,7 @@ class MoleculePairBatch:
                              avoid_min_dist: float = 2.0, alpha: float = 0.81,
                              num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
                              verbose: bool = False, backend: Optional[str] = None,
-                             return_aligned: bool = False):
+                             return_aligned: bool = True):
         """Batched shape Tanimoto minus a linear hard-sphere excluded-volume penalty.
 
         ``avoid_points`` is the fixed reference-frame cloud to keep the fit out of: a single
@@ -1574,10 +1714,10 @@ class MoleculePairBatch:
             scores.append(float(p.sim_aligned_vol_avoid))
         return np.array(scores), [None] * len(self.pairs)
 
-    def align_with_surf_tversky(self, tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
-                                alpha: float = 0.81, num_repeats: int = None, lr: float = 0.1,
-                                max_num_steps: int = None, verbose: bool = False,
-                                backend: Optional[str] = None, return_aligned: bool = False):
+    def _align_surf_tversky(self, tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
+                            alpha: float = 0.81, num_repeats: int = None, lr: float = 0.1,
+                            max_num_steps: int = None, verbose: bool = False,
+                            backend: Optional[str] = None, return_aligned: bool = True):
         """Batched surface-shape Tversky alignment (reuses the vol_tversky driver)."""
         if max_num_steps is None:
             max_num_steps = _default_steps("surf_tversky")
@@ -1590,15 +1730,15 @@ class MoleculePairBatch:
             "sim_aligned_surf_tversky", "transform_surf_tversky", "_fit_surf_t", return_aligned)
         if handled:
             return _result
-        return self._delegate_alignment(
-            'align_with_surf_tversky', 'sim_aligned_surf_tversky',
-            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta, alpha=alpha,
-            num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
+        return self._delegate_mode(
+            'surf', 'surf_tversky',
+            similarity=(tversky_alpha, tversky_beta), alpha=alpha, num_repeats=num_repeats, lr=lr,
+            max_num_steps=max_num_steps, verbose=verbose)
 
-    def align_with_surf_esp_tversky(self, tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
-                                    alpha: float = 0.81, lam: float = 0.3, num_repeats: int = None,
-                                    lr: float = 0.1, max_num_steps: int = None, verbose: bool = False,
-                                    backend: Optional[str] = None, return_aligned: bool = False):
+    def _align_surf_esp_tversky(self, tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
+                                alpha: float = 0.81, lam: float = 0.3, num_repeats: int = None,
+                                lr: float = 0.1, max_num_steps: int = None, verbose: bool = False,
+                                backend: Optional[str] = None, return_aligned: bool = True):
         """Batched surface-ESP Tversky alignment (reuses the vol_esp_tversky driver)."""
         if max_num_steps is None:
             max_num_steps = _default_steps("surf_esp_tversky")
@@ -1611,17 +1751,17 @@ class MoleculePairBatch:
             "sim_aligned_surf_esp_tversky", "transform_surf_esp_tversky", "_fit_surf_t", return_aligned)
         if handled:
             return _result
-        return self._delegate_alignment(
-            'align_with_surf_esp_tversky', 'sim_aligned_surf_esp_tversky',
-            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta, alpha=alpha, lam=lam,
+        return self._delegate_mode(
+            'surf_esp', 'surf_esp_tversky',
+            similarity=(tversky_alpha, tversky_beta), alpha=alpha, lam=lam,
             num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
 
-    def align_with_vol_lipo_tversky(self, lipo_weight: float = 0.5, alpha: float = 0.81,
-                                    lam: float = 0.1, tversky_alpha: float = 0.95,
-                                    tversky_beta: float = 0.05, num_repeats: int = None,
-                                    lr: float = 0.1, max_num_steps: int = None,
-                                    verbose: bool = False, backend: Optional[str] = None,
-                                    return_aligned: bool = False):
+    def _align_vol_lipo_tversky(self, lipo_weight: float = 0.5, alpha: float = 0.81,
+                                lam: float = 0.1, tversky_alpha: float = 0.95,
+                                tversky_beta: float = 0.05, num_repeats: int = None,
+                                lr: float = 0.1, max_num_steps: int = None,
+                                verbose: bool = False, backend: Optional[str] = None,
+                                return_aligned: bool = True):
         """Batched vol_lipo scored with Tversky on both channels."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_lipo_tversky")
@@ -1635,17 +1775,16 @@ class MoleculePairBatch:
             "sim_aligned_vol_lipo_tversky", "transform_vol_lipo_tversky", "_fit_xyz_t", return_aligned)
         if handled:
             return _result
-        return self._delegate_alignment(
-            'align_with_vol_lipo_tversky', 'sim_aligned_vol_lipo_tversky',
-            lipo_weight=lipo_weight, alpha=alpha, lam=lam, tversky_alpha=tversky_alpha,
-            tversky_beta=tversky_beta, num_repeats=num_repeats, lr=lr,
-            max_num_steps=max_num_steps, verbose=verbose)
+        return self._delegate_mode(
+            'vol_lipo', 'vol_lipo_tversky',
+            similarity=(tversky_alpha, tversky_beta), lipo_weight=lipo_weight, alpha=alpha,
+            lam=lam, num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
 
-    def align_with_vol_color_tversky(self, color_weight: float = 0.5, alpha: float = 0.81,
-                                     tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
-                                     num_repeats: int = None, lr: float = 0.1,
-                                     max_num_steps: int = None, verbose: bool = False,
-                                     backend: Optional[str] = None, return_aligned: bool = False):
+    def _align_vol_color_tversky(self, color_weight: float = 0.5, alpha: float = 0.81,
+                                 tversky_alpha: float = 0.95, tversky_beta: float = 0.05,
+                                 num_repeats: int = None, lr: float = 0.1,
+                                 max_num_steps: int = None, verbose: bool = False,
+                                 backend: Optional[str] = None, return_aligned: bool = True):
         """Batched vol_color scored with Tversky on both channels."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_color_tversky")
@@ -1658,16 +1797,15 @@ class MoleculePairBatch:
             "sim_aligned_vol_color_tversky", "transform_vol_color_tversky", "_fit_xyz_t", return_aligned)
         if handled:
             return _result
-        return self._delegate_alignment(
-            'align_with_vol_color_tversky', 'sim_aligned_vol_color_tversky',
-            color_weight=color_weight, alpha=alpha, tversky_alpha=tversky_alpha,
-            tversky_beta=tversky_beta, num_repeats=num_repeats, lr=lr,
-            max_num_steps=max_num_steps, verbose=verbose)
+        return self._delegate_mode(
+            'vol_color', 'vol_color_tversky',
+            similarity=(tversky_alpha, tversky_beta), color_weight=color_weight, alpha=alpha,
+            num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
 
     def align_with_vol_atomtype(self, atomtype_weight: float = 0.5, alpha: float = 0.81,
                                 num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
                                 verbose: bool = False, backend: Optional[str] = None,
-                                return_aligned: bool = False):
+                                return_aligned: bool = True):
         """Batched shape + element-identity alignment."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_atomtype")
@@ -1688,7 +1826,7 @@ class MoleculePairBatch:
     def align_with_vol_pharm(self, color_weight: float = 0.5, alpha: float = 0.81,
                              num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
                              verbose: bool = False, backend: Optional[str] = None,
-                             return_aligned: bool = False):
+                             return_aligned: bool = True):
         """Batched shape + directional-pharmacophore alignment."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_pharm")
@@ -1706,10 +1844,10 @@ class MoleculePairBatch:
             color_weight=color_weight, alpha=alpha, num_repeats=num_repeats, lr=lr,
             max_num_steps=max_num_steps, verbose=verbose)
 
-    def align_with_pharm_tversky(self, extended_points: bool = False, only_extended: bool = False,
-                                 num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
-                                 verbose: bool = False, backend: Optional[str] = None,
-                                 return_aligned: bool = False):
+    def _align_pharm_tversky(self, extended_points: bool = False, only_extended: bool = False,
+                             num_repeats: int = None, lr: float = 0.1, max_num_steps: int = None,
+                             verbose: bool = False, backend: Optional[str] = None,
+                             return_aligned: bool = True):
         """Batched pharmacophore alignment scored with Tversky (reuses the pharm driver)."""
         if max_num_steps is None:
             max_num_steps = _default_steps("pharm_tversky")
@@ -1722,18 +1860,18 @@ class MoleculePairBatch:
             "sim_aligned_pharm_tversky", "transform_pharm_tversky", "_fit_pharm_ancs_t", return_aligned)
         if handled:
             return _result
-        return self._delegate_alignment(
-            'align_with_pharm_tversky', 'sim_aligned_pharm_tversky',
-            extended_points=extended_points, only_extended=only_extended,
+        return self._delegate_mode(
+            'pharm', 'pharm_tversky',
+            similarity='tversky', extended_points=extended_points, only_extended=only_extended,
             num_repeats=num_repeats, lr=lr, max_num_steps=max_num_steps, verbose=verbose)
 
-    def align_with_vol_and_surf_esp_tversky(self, tversky_alpha: float = 0.95,
-                                            tversky_beta: float = 0.05, alpha: float = 0.81,
-                                            lam: float = 0.001, probe_radius: float = 1.0,
-                                            esp_weight: float = 0.5, num_repeats: int = None,
-                                            lr: float = 0.1, max_num_steps: int = None,
-                                            verbose: bool = False, backend: Optional[str] = None,
-                                            return_aligned: bool = False):
+    def _align_vol_and_surf_esp_tversky(self, tversky_alpha: float = 0.95,
+                                        tversky_beta: float = 0.05, alpha: float = 0.81,
+                                        lam: float = 0.001, probe_radius: float = 1.0,
+                                        esp_weight: float = 0.5, num_repeats: int = None,
+                                        lr: float = 0.1, max_num_steps: int = None,
+                                        verbose: bool = False, backend: Optional[str] = None,
+                                        return_aligned: bool = True):
         """Batched ShaEP-style vol_and_surf_esp with a Tversky shape channel."""
         if max_num_steps is None:
             max_num_steps = _default_steps("vol_and_surf_esp_tversky")
@@ -1748,9 +1886,9 @@ class MoleculePairBatch:
             "_fit_surf_t", return_aligned)
         if handled:
             return _result
-        return self._delegate_alignment(
-            'align_with_vol_and_surf_esp_tversky', 'sim_aligned_vol_and_surf_esp_tversky',
-            tversky_alpha=tversky_alpha, tversky_beta=tversky_beta, alpha=alpha, lam=lam,
+        return self._delegate_mode(
+            'vol_and_surf_esp', 'vol_and_surf_esp_tversky',
+            similarity=(tversky_alpha, tversky_beta), alpha=alpha, lam=lam,
             probe_radius=probe_radius, esp_weight=esp_weight, num_repeats=num_repeats, lr=lr,
             max_num_steps=max_num_steps, verbose=verbose)
 
@@ -1767,7 +1905,7 @@ class MoleculePairBatch:
                          num_buckets: int = 1,
                          verbose: bool = False,
                          backend: Optional[str] = None,
-                         return_aligned: bool = False,
+                         return_aligned: bool = True,
                          ) -> Tuple[np.ndarray, List[np.ndarray], List[np.ndarray]]:
         """Align all pairs using padded masked pharmacophore similarity via JAX.
 
@@ -1824,8 +1962,8 @@ class MoleculePairBatch:
             below. ``max_num_steps`` is the batched path's ``steps_fine``.
         return_aligned : bool
             Build the aligned anchors (rotated and translated) and vectors (rotated only) on
-            the batched path from the cached fit tensors. Default is False (entries are
-            ``None``).
+            the batched path from the cached fit tensors. Default is True; pass False to skip
+            them (entries are ``None``).
 
         Returns
         -------

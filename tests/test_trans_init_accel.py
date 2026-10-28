@@ -97,8 +97,8 @@ def test_coarse_grid_is_built_from_the_documented_cloud(mode, monkeypatch):
     assert len(set(w.values())) == len(w), f"fixture clouds are not distinguishable: {w}"
 
     seen = _spy(monkeypatch)
-    getattr(MoleculePairBatch([_pair(ref, fit)]), "align_with_" + mode)(
-        backend="numba", trans_init=True, **KW[mode])
+    MoleculePairBatch([_pair(ref, fit)])._align_mode(
+        mode, backend="numba", trans_init=True, **KW[mode])
 
     assert seen, f"{mode}: trans_init=True did not reach the coarse-grid path"
     want = GRID_CLOUD[mode]
@@ -124,8 +124,8 @@ def _self_copy(mode):
     from shepherd_score.accel._modes import MODE_ATTRS
     from shepherd_score.container import MoleculePairBatch
     p = _pair(_mol(IBU), _mol(IBU))
-    getattr(MoleculePairBatch([p]), "align_with_" + mode)(
-        backend="numba", trans_init=True, **KW[mode])
+    MoleculePairBatch([p])._align_mode(
+        mode, backend="numba", trans_init=True, **KW[mode])
     return float(getattr(p, MODE_ATTRS[mode][1]))
 
 
@@ -176,8 +176,8 @@ def test_triton_coarse_grid_matches_numba(mode, monkeypatch):
     for backend in ("numba", "triton"):
         seen = _spy(monkeypatch)
         p = _pair(ref, fit)
-        getattr(MoleculePairBatch([p]), "align_with_" + mode)(
-            backend=backend, trans_init=True, **KW[mode])
+        MoleculePairBatch([p])._align_mode(
+            mode, backend=backend, trans_init=True, **KW[mode])
         out.append(float(getattr(p, MODE_ATTRS[mode][1])))
         clouds.append(seen.get("n"))
 

@@ -118,7 +118,7 @@ def test_numba_vol_tversky_matches_reference_and_self_copy():
     # per-pair eager reference on the two distinct asymmetric directions
     def _ref(ref_mol, fit_mol):
         mp = MoleculePair(Molecule(ref_mol), Molecule(fit_mol), do_center=True, device=cpu)
-        mp.align_with_vol_tversky(num_repeats=50, max_num_steps=200)
+        mp.align_with_vol(similarity="tversky", num_repeats=50, max_num_steps=200)
         return float(mp.sim_aligned_vol_tversky)
 
     ref_fwd = _ref(ibu, caf)
@@ -127,7 +127,7 @@ def test_numba_vol_tversky_matches_reference_and_self_copy():
     # batched numba backend on the same distinct pairs
     pairs = [MoleculePair(Molecule(ibu), Molecule(caf), do_center=True, device=cpu),
              MoleculePair(Molecule(caf), Molecule(ibu), do_center=True, device=cpu)]
-    scores, _ = MoleculePairBatch(pairs).align_with_vol_tversky(backend="numba")
+    scores, _ = MoleculePairBatch(pairs).align_with_vol(backend="numba", similarity="tversky")
     assert abs(float(scores[0]) - ref_fwd) < 1e-3, (float(scores[0]), ref_fwd)
     assert abs(float(scores[1]) - ref_rev) < 1e-3, (float(scores[1]), ref_rev)
     # asymmetry: query (small ref) contained in bigger fit scores higher forward than reverse
@@ -136,7 +136,7 @@ def test_numba_vol_tversky_matches_reference_and_self_copy():
     # self-copy == ~1.0 (Tversky(A,A)=1 for any weights) under numba
     selfp = [MoleculePair(Molecule(ibu), Molecule(ibu), do_center=True, device=cpu),
              MoleculePair(Molecule(caf), Molecule(caf), do_center=True, device=cpu)]
-    sscores, _ = MoleculePairBatch(selfp).align_with_vol_tversky(backend="numba")
+    sscores, _ = MoleculePairBatch(selfp).align_with_vol(backend="numba", similarity="tversky")
     assert np.allclose(np.asarray(sscores, dtype=float), 1.0, atol=1e-4), sscores
 
 
@@ -158,7 +158,7 @@ def test_numba_vol_esp_tversky_matches_reference_and_self_copy():
     # per-pair eager reference on the two distinct asymmetric directions (matched seed/step budget)
     def _ref(ref_mol, fit_mol):
         mp = MoleculePair(Molecule(ref_mol), Molecule(fit_mol), do_center=True, device=cpu)
-        mp.align_with_vol_esp_tversky(num_repeats=16, max_num_steps=50, lam=0.1)
+        mp.align_with_vol_esp(similarity="tversky", num_repeats=16, max_num_steps=50, lam=0.1)
         return float(mp.sim_aligned_vol_esp_tversky)
 
     ref_fwd = _ref(ibu, caf)
@@ -167,7 +167,7 @@ def test_numba_vol_esp_tversky_matches_reference_and_self_copy():
     # batched numba backend on the same distinct pairs
     pairs = [MoleculePair(Molecule(ibu), Molecule(caf), do_center=True, device=cpu),
              MoleculePair(Molecule(caf), Molecule(ibu), do_center=True, device=cpu)]
-    scores, _ = MoleculePairBatch(pairs).align_with_vol_esp_tversky(backend="numba", lam=0.1)
+    scores, _ = MoleculePairBatch(pairs).align_with_vol_esp(backend="numba", lam=0.1, similarity="tversky")
     assert abs(float(scores[0]) - ref_fwd) < 1e-2, (float(scores[0]), ref_fwd)
     assert abs(float(scores[1]) - ref_rev) < 1e-2, (float(scores[1]), ref_rev)
     # (the fits-inside asymmetry is charge-dependent under ESP weighting; test_vol_esp_tversky.py
@@ -176,7 +176,7 @@ def test_numba_vol_esp_tversky_matches_reference_and_self_copy():
     # self-copy == ~1.0 (Tversky(A,A)=1 for any weights) under numba
     selfp = [MoleculePair(Molecule(ibu), Molecule(ibu), do_center=True, device=cpu),
              MoleculePair(Molecule(caf), Molecule(caf), do_center=True, device=cpu)]
-    sscores, _ = MoleculePairBatch(selfp).align_with_vol_esp_tversky(backend="numba", lam=0.1)
+    sscores, _ = MoleculePairBatch(selfp).align_with_vol_esp(backend="numba", lam=0.1, similarity="tversky")
     assert np.allclose(np.asarray(sscores, dtype=float), 1.0, atol=1e-4), sscores
 
 
