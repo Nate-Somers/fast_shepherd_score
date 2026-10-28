@@ -505,6 +505,33 @@ def test_vol_esp_stream_retained_h(tmp_path):
         assert fast_by_id[i] == pytest.approx(float(rs), abs=1e-4)
 
 
+@pytest.mark.parametrize("modes", [("vol_esp",), ("vol_and_surf_esp",)])
+def test_reload_retained_h_keeps_heavy_arrays_aligned(tmp_path, modes):
+    """Profiles read back from a store keep their heavy charges, ``nonH`` index and heavy centres
+    when an earlier molecule's RemoveHs retained an H (which shifts the heavy offsets)."""
+    smis = ["[2H]OC(=O)c1ccccc1", "CC(=O)Oc1ccccc1C(=O)O", "c1ccccc1O"]
+    mols = [_build_molecule(s, seed=i) for i, s in enumerate(smis)]
+    assert len(mols[0].atom_pos) != len(mols[0]._nonH_atoms_idx)
+
+    store_path = os.path.join(tmp_path, "lib.fss")
+    with ProfileStore.create(store_path, num_surf_points=64, modes=modes,
+                             dtype="float32", pre_centered=True) as store:
+        for i, m in enumerate(mols):
+            store.add(m, id=i)
+    profiles = ProfileStore.open(store_path).read_profiles(0)
+
+    with_h = "vol_and_surf_esp" in modes
+    for m, p in zip(mols, profiles):
+        if with_h:
+            np.testing.assert_allclose(p.partial_charges, m.partial_charges, atol=1e-6)
+            np.testing.assert_array_equal(p._nonH_atoms_idx, m._nonH_atoms_idx)
+        else:
+            np.testing.assert_allclose(p.partial_charges,
+                                       m.partial_charges[m._nonH_atoms_idx], atol=1e-6)
+        heavy = p.atom_pos if p.atom_pos_noH is None else p.atom_pos_noH
+        assert len(heavy) == len(m._nonH_atoms_idx)
+
+
 def test_vol_lipo_stream_retained_h(tmp_path):
     """vol_lipo stores the RemoveHs and true-heavy bases independently when an H is retained."""
     import copy, glob

@@ -702,12 +702,16 @@ class ProfileStore:
         surf_pos = data["surf_pos"] if sch["surf"] else None
         surf_esp = data["surf_esp"] if sch["surf_esp"] else None
         all_off = data["all_off"] if (sch["charges"] and sch["with_H"]) else None
+        # Heavy charges, ``nonH`` and ``xyz_noH`` are laid out by strict-heavy count, which differs
+        # from ``atom_off`` (the RemoveHs count) when RemoveHs retained an H.
+        heavy_off = data["heavy_off"] if "heavy_off" in files else atom_off
         offs = {flag: data[off_key] for _b, flag, off_key, _a in _BASIS_TABLE
                 if sch.get(flag, False)}
 
         out = []
         for i in range(n):
             a0, a1 = int(atom_off[i]), int(atom_off[i + 1])
+            h0, h1 = int(heavy_off[i]), int(heavy_off[i + 1])
             kw = dict(atom_pos=atom_pos[a0:a1], id=_id_to_py(ids[i]))
             if sch["surf"]:
                 kw["surf_pos"] = surf_pos[i]
@@ -717,13 +721,17 @@ class ProfileStore:
                 if sch["with_H"]:
                     c0, c1 = int(all_off[i]), int(all_off[i + 1])
                     kw["partial_charges"] = data["charges"][c0:c1]
-                    kw["nonH_atoms_idx"] = data["nonH"][a0:a1]
+                    kw["nonH_atoms_idx"] = data["nonH"][h0:h1]
                     if sch["radii"] and "radii" in files:
                         kw["radii"] = data["radii"][c0:c1]
                     if sch["centers_w_H"] and "cwh" in files:
                         kw["centers_w_H"] = data["cwh"][c0:c1]
                 else:
-                    kw["partial_charges"] = data["charges"][a0:a1]
+                    kw["partial_charges"] = data["charges"][h0:h1]
+                if "xyz_noH" in files:
+                    hp = data["xyz_noH"][h0:h1]
+                    if hp.shape != kw["atom_pos"].shape or not np.array_equal(hp, kw["atom_pos"]):
+                        kw["atom_pos_noH"] = hp
             for _b, flag, _off_key, attrs in _BASIS_TABLE:
                 if not sch.get(flag, False):
                     continue
