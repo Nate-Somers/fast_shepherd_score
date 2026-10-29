@@ -132,3 +132,29 @@ def test_dedup_survives_a_partially_warm_batch():
         assert torch.equal(p._ref_xyz_t, want)
     for p in pairs[1::2]:
         assert p._ref_xyz_t is warm[id(p)], "an untouched warm pair was replaced"
+
+
+@pytest.mark.cuda
+def test_moving_cuda_tensors_to_cpu_waits_for_the_copy():
+    """Pairs built on CUDA (the default with a GPU) and aligned on numba move their cached
+    tensors to the CPU. That copy must finish before the numba kernels read the host memory,
+    even with the GPU busy; a non-blocking copy let them read a partly written buffer."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    pytest.importorskip("numba")
+    from shepherd_score.container import MoleculePair, MoleculePairBatch
+    from .legacy_fixture import load_molecules
+    mols = load_molecules()
+    idx = [(0, 1), (2, 3), (1, 2), (3, 0)]
+
+    def scores(device, busy):
+        pairs = [MoleculePair(mols[i], mols[j], do_center=False, device=torch.device(device))
+                 for i, j in idx]
+        if busy:                                   # queue GPU work ahead of the copy
+            a = torch.randn(8192, 8192, device="cuda")
+            for _ in range(20):
+                a = a @ a
+                a = a / a.norm()
+        return MoleculePairBatch(pairs).align_with_vol(backend="numba", similarity=(0.7, 0.3))[0]
+
+    np.testing.assert_array_equal(scores("cuda", True), scores("cpu", False))

@@ -86,10 +86,13 @@ def _batch_upload(pairs, attr, src_fn, dtype, device, *, key_fn=None):
                 _ten[id(key_fn(p))] = t.clone()                # one allocation per molecule
             for p in cold:
                 setattr(p, attr, _ten[id(key_fn(p))])
-    for p in pairs:                                            # warm wrong-device path
+    # Warm wrong-device path. Only a copy onto CUDA may be non-blocking: the kernels that read
+    # it queue behind it on the stream. A copy off the GPU must block, since the numba kernels
+    # read host memory directly and would race a copy still in flight.
+    for p in pairs:
         t = getattr(p, attr)
         if t.device != device:
-            setattr(p, attr, t.to(device, non_blocking=True))
+            setattr(p, attr, t.to(device, non_blocking=device.type == "cuda"))
 
 # the generic aligner
 
