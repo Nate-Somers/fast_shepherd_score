@@ -152,7 +152,7 @@ def test_screen_rejects_unsupported_mode(tmp_path):
 
 
 def test_screen_guards(tmp_path):
-    """esp_combo requires explicit alpha; no_H=False is rejected (heavy-atom only)."""
+    """no_H=False is rejected (heavy-atom only)."""
     store_path = os.path.join(tmp_path, "lib.fss")
     with ProfileStore.create(store_path, num_surf_points=64,
                              modes=("vol", "esp", "esp_combo"), pre_centered=False) as store:
@@ -161,9 +161,6 @@ def test_screen_guards(tmp_path):
 
     class _Q:
         num_surf_points = 64
-    # the legacy name resolves to vol_and_surf_esp; the message reports the canonical name
-    with pytest.raises(ValueError, match="requires an explicit alpha"):
-        screen(_Q(), store, mode="esp_combo", backend="numba")
     with pytest.raises(ValueError, match="heavy atoms only"):
         screen(_Q(), store, mode="vol", backend="numba", no_H=False)
 

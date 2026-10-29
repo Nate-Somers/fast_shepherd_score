@@ -1,5 +1,6 @@
 """
-Alignment modes.
+Alignment modes for Torch (autograd and analytical) and JAX.
+For accelerated modes, look at shepherd_score/accel/_modes.py.
 
 A mode defines which arrays to read from a ``Molecule`` and how to score a posed fit against the
 reference. Everything else (seeding, the SE(3) optimizer, result bookkeeping) is shared, so a

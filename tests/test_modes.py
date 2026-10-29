@@ -222,7 +222,7 @@ def test_batch_align_runs_registry_tversky_modes():
         batch.align('vol_tversky', similarity='tversky')
 
 
-def test_batch_tversky_rejects_unsupported_options():
+def test_batch_tversky_keeps_the_heavy_atom_guard():
     batch = MoleculePairBatch([make_pair(0, 1)])
-    with pytest.raises(NotImplementedError, match='trans_init'):
-        batch.align_with_vol(backend='numba', similarity='tversky', trans_init=True)
+    with pytest.raises(NotImplementedError, match='heavy atoms only'):
+        batch.align_with_vol(backend='numba', similarity='tversky', no_H=False)

@@ -72,10 +72,10 @@ def _scores(mode, mols, force_eager):
         pairs = [MoleculePair(mols[0], f, do_center=True, device=torch.device("cpu"))
                  for f in mols]
         batch = MoleculePairBatch(pairs)
-        args = ()
+        extra = {}
         if mode == "vol_avoid":                       # the one mode with a third input
-            args = (np.asarray(mols[0].atom_pos, dtype=np.float32) + 40.0,)
-        batch._align_mode(mode, *args, backend="numba", **KW.get(mode, {}))
+            extra["avoid_points"] = np.asarray(mols[0].atom_pos, dtype=np.float32) + 40.0
+        batch._align_mode(mode, backend="numba", **extra, **KW.get(mode, {}))
         return [float(getattr(p, MODE_ATTRS[mode][1])) for p in pairs]
     finally:
         cpu_fused.run_fused = real

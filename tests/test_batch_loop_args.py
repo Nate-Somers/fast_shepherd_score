@@ -1,5 +1,6 @@
 """MoleculePairBatch forwards num_repeats / lr / trans_init to the batched drivers, resolves
-``None`` to the registry defaults, and warns when ``backend='jax'`` has no JAX kernel."""
+``None`` to the registry defaults (accel) or 50 / 0.1 / 200 (jax, torch), and warns when
+``backend='jax'`` has no JAX kernel."""
 import warnings
 
 import pytest
@@ -26,7 +27,7 @@ def _mol(smiles, seed):
     params = AllChem.ETKDGv3()
     params.randomSeed = seed
     AllChem.EmbedMolecule(m, params)
-    return Molecule(m, num_surf_points=40, charge_model='mmff')
+    return Molecule(m, num_surf_points=40, charge_model='mmff', pharm_multi_vector=False)
 
 
 def _batch():
@@ -39,14 +40,15 @@ class _Recorded(Exception):
 
 
 def _record(monkeypatch, mode):
-    """Replace ``MoleculePair._align_batch_<mode>`` with a stub that records its keywords."""
+    """Replace ``accel.batch.aligners._align_batch_<mode>`` with a stub that records its keywords."""
+    from shepherd_score.accel.batch import aligners
     seen = {}
 
     def stub(pairs, **kw):
         seen.update(kw)
         raise _Recorded
 
-    monkeypatch.setattr(MoleculePair, f'_align_batch_{mode}', staticmethod(stub))
+    monkeypatch.setattr(aligners, f'_align_batch_{mode}', stub)
     return seen
 
 
@@ -65,14 +67,22 @@ def test_explicit_loop_args_reach_driver(monkeypatch, mode):
 
 @pytest.mark.parametrize('mode', ['vol', 'surf', 'vol_esp', 'vol_color'])
 def test_none_loop_args_take_registry_defaults(monkeypatch, mode):
-    seen = _record(monkeypatch, mode)
-    kw = {'alpha': 0.81} if mode == 'surf' else {'lam': 0.1} if mode == 'vol_esp' else {}
-    with pytest.raises(_Recorded):
-        getattr(_batch(), f'align_with_{mode}')(backend=_backend(), **kw)
+    from shepherd_score.accel.drivers import engine
+    seen = []
+    real = engine.align
+
+    def spy(*a, **kw):
+        seen.append(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(engine, 'align', spy)
+    kw = {'alpha': 0.81} if mode == 'surf' else {}
+    getattr(_batch(), f'align_with_{mode}')(backend=_backend(), **kw)
     spec = SPECS[mode]
-    assert seen['num_repeats'] == spec.seeds
-    assert seen['steps_fine'] == spec.steps
-    assert seen['lr'] == spec.params['lr']
+    assert seen
+    assert {c['num_seeds'] for c in seen} == {spec.seeds}
+    assert {c['steps_fine'] for c in seen} == {spec.steps}
+    assert {c['lr'] for c in seen} == {spec.params['lr']}
 
 
 def test_engine_honors_num_repeats(monkeypatch):
@@ -90,12 +100,88 @@ def test_engine_honors_num_repeats(monkeypatch):
 
 
 def test_jax_backend_warns_without_jax_kernel():
-    batch = _batch()
     with pytest.warns(RuntimeWarning, match='no JAX implementation'):
-        handled, _ = batch._run_fast_or_fallthrough(
-            'jax', MoleculePair._align_batch_vol_color, {}, None, None, None, False)
-    assert not handled
+        _batch().align_with_vol_color(backend='jax', num_repeats=1, max_num_steps=1)
+    pytest.importorskip('jax')
     with warnings.catch_warnings():
-        warnings.simplefilter('error')
-        batch._run_fast_or_fallthrough(
-            'jax', MoleculePair._align_batch_vol, {}, None, None, None, False, has_jax=True)
+        warnings.simplefilter('error', RuntimeWarning)
+        _batch().align_with_vol(backend='jax', num_repeats=1, max_num_steps=1)
+
+
+def _spy_pair_align(monkeypatch):
+    calls = []
+    real = MoleculePair.align
+
+    def spy(self, mode, **kw):
+        calls.append((mode, kw))
+        return real(self, mode, **kw)
+
+    monkeypatch.setattr(MoleculePair, 'align', spy)
+    return calls
+
+
+@pytest.mark.parametrize('backend', ['jax', 'torch'])
+def test_reference_backends_default_to_50_200(monkeypatch, backend):
+    """``jax`` / ``torch`` take MoleculePair's 50 seeds / lr 0.1 / 200 steps, not the registry's."""
+    calls = _spy_pair_align(monkeypatch)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        _batch().align_with_vol_lipo(backend=backend)
+    (mode, kw), = calls
+    assert (kw['num_repeats'], kw['lr'], kw['max_num_steps']) == (50, 0.1, 200)
+
+
+def test_jax_vol_defaults_and_alpha(monkeypatch):
+    """The padded JAX ``vol`` / ``vol_esp`` paths take 50 / 0.1 / 200 and pass ``alpha`` through."""
+    pytest.importorskip('jax')
+    import shepherd_score.alignment_jax as aj
+    for name in ('optimize_ROCS_overlay_jax_mask', 'optimize_ROCS_esp_overlay_jax_mask'):
+        seen = {}
+
+        def stub(**kw):
+            seen.update(kw)
+            raise _Recorded
+
+        monkeypatch.setattr(aj, name, stub)
+        method = 'align_with_vol' if 'esp' not in name else 'align_with_vol_esp'
+        with pytest.raises(_Recorded):
+            getattr(_batch(), method)(backend='jax', alpha=0.5)
+        assert seen['alpha'] == 0.5
+        assert (seen['num_repeats'], seen['lr'], seen['max_num_steps']) == (50, 0.1, 200)
+
+
+def test_vol_esp_forwards_num_workers(monkeypatch):
+    from shepherd_score.accel import cpu_pool
+    pytest.importorskip('numba')
+    seen = {}
+
+    def stub(mode, pairs, num_workers, kw):
+        seen.update(mode=mode, num_workers=num_workers)
+        raise _Recorded
+
+    monkeypatch.setattr(cpu_pool, 'align_pairs', stub)
+    with pytest.raises(_Recorded):
+        _batch().align_with_vol_esp(backend='numba', num_workers=2)
+    assert seen == {'mode': 'vol_esp', 'num_workers': 2}
+
+
+def test_vol_avoid_reference_path_alpha_and_aligned(monkeypatch):
+    calls = _spy_pair_align(monkeypatch)
+    batch = _batch()
+    cloud = batch.pairs[0].ref_molec.atom_pos + 30.0
+    scores, aligned = batch.align_with_vol_avoid(cloud, alpha=0.6, backend='torch',
+                                                 num_repeats=2, max_num_steps=3)
+    (mode, kw), = calls
+    assert mode == 'vol_avoid' and kw['alpha'] == 0.6
+    assert aligned[0].shape == batch.pairs[0].fit_molec.atom_pos.shape
+    assert scores[0] == pytest.approx(float(batch.pairs[0].sim_aligned_vol_avoid))
+    _, none = batch.align_with_vol_avoid(cloud, backend='torch', num_repeats=2, max_num_steps=3,
+                                         return_aligned=False)
+    assert none == [None]
+
+
+def test_tversky_accepts_trans_init():
+    """The Tversky registry modes take ``trans_init`` like every other mode."""
+    scores, _ = _batch().align_with_vol(similarity='tversky', trans_init=True, num_repeats=2,
+                                        max_num_steps=3, backend=_backend())
+    assert scores.shape == (1,) and scores[0] > 0

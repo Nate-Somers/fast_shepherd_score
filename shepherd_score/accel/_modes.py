@@ -219,7 +219,7 @@ _reg(ModeSpec("vol", ("transform_vol_noH", "sim_aligned_vol_noH"), 10, 30, 2,
               params={"alpha": 0.81, **_LR}, pose_cap=True))
 _reg(ModeSpec("vol_esp", ("transform_vol_esp_noH", "sim_aligned_vol_esp_noH"), 16, 50, 5,
               seed_channel="heavy", channels=("heavy", "charges"), bucket=("heavy",),
-              terms=(_HEAVY_ESP,), params={"alpha": 0.81, "lam": None, **_LR},
+              terms=(_HEAVY_ESP,), params={"alpha": 0.81, "lam": 0.1, **_LR},
               cpu_fused_max_pad=100, screen_lr=0.1))
 _reg(ModeSpec("surf", ("transform_surf", "sim_aligned_surf"), 8, 40, 2,
               seed_channel="surf", channels=("surf",), bucket=("surf",), terms=(_SURF,),
@@ -231,7 +231,7 @@ _reg(ModeSpec("surf_esp", ("transform_surf_esp", "sim_aligned_surf_esp"), 8, 40,
 _reg(ModeSpec("vol_and_surf_esp", ("transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp"),
               8, 60, 5, seed_channel="centers", channels=_COMBO_CH, bucket=("cwh", "surf", "centers"),
               work="combo", terms=_combo_terms(),
-              params={"alpha": None, "lam": 0.001, "probe_radius": 1.0, "esp_weight": 0.5, **_LR},
+              params={"alpha": 0.81, "lam": 0.001, "probe_radius": 1.0, "esp_weight": 0.5, **_LR},
               graph_budget=8_000_000, graph_full_steps=True, channel_switch=_COMBO_SWITCH,
               coarse_channel="surf", screen_lr=0.1))
 _reg(ModeSpec("pharm", ("transform_pharm", "sim_aligned_pharm"), 32, 50, 5,

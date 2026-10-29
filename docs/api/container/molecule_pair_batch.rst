@@ -11,7 +11,9 @@ Backends
 ``backend="numba"`` selects CPU kernels; ``backend="triton"`` selects CUDA kernels.
 The default resolves from the available device. ``backend="jax"`` selects the
 optional JAX implementation for ``vol``, ``vol_esp``, ``surf``, ``surf_esp`` and
-``pharm``; other modes warn and run per-pair PyTorch. Options specific to JAX,
+``pharm``; other modes run each pair's ``MoleculePair.align``, with JAX where the
+mode has a JAX optimizer and otherwise PyTorch with a warning. ``backend="torch"``
+runs each pair's ``MoleculePair.align`` with PyTorch. Options specific to JAX,
 such as ``use_shmap`` and ``num_buckets``, do not select JAX automatically.
 
 .. code-block:: python
@@ -24,9 +26,11 @@ such as ``use_shmap`` and ``num_buckets``, do not select JAX automatically.
 Every registered mode has an ``align_with_<mode>`` method. ``align_with_esp`` and
 ``align_with_esp_combo`` remain compatibility aliases for ``surf_esp`` and
 ``vol_and_surf_esp``. ``num_repeats``, ``max_num_steps`` and ``lr`` default to
-``None``, which takes the mode's registry values in ``shepherd_score/accel/_modes.py``;
-explicit values override them on every backend. ``verbose`` only affects the JAX path. Aligned arrays are returned by default;
-pass ``return_aligned=False`` to skip building them.
+``None``, which takes the mode's registry values in ``shepherd_score/accel/_modes.py``
+on the numba and triton backends, and ``MoleculePair``'s 50 / 0.1 / 200 on the ``jax``
+and ``torch`` backends; explicit values override them on every backend. ``verbose`` only
+affects the ``jax`` and ``torch`` paths. Aligned arrays are returned by default; pass
+``return_aligned=False`` to skip building them.
 
 For JAX parallel alignment see :doc:`../alignment/jax_parallel`.
 For streaming libraries see :doc:`../screening`.
