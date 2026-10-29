@@ -130,7 +130,7 @@ def term_self_overlaps(spec, chans: dict, params: dict, ref_shared: bool = False
 def assemble(spec, chans: dict, *, params: dict, num_seeds: int, seeds=None,
              ref_shared: bool = False, trans_centers=None, trans_centers_real=None,
              num_repeats_per_trans: int = 10, topk: int = 30, self_overlaps=None) -> Problem:
-    """Resolve channels, centre (pharm family), seed, expand per pose, and precompute every
+    """Resolve channels, center (pharm family), seed, expand per pose, and precompute every
     reduction constant. ``chans`` maps concrete channel names to :class:`Batch`."""
     res = {c: spec.resolve_channel(c, params) for c in spec.channels}
     seed_ch = res[spec.seed_channel] if spec.seed_channel in res else spec.resolve_channel(
@@ -139,7 +139,7 @@ def assemble(spec, chans: dict, *, params: dict, num_seeds: int, seeds=None,
     device, dtype = sb.ref.device, sb.ref.dtype
     B = int(sb.ref.shape[0])
 
-    # ---- pharm family: centre both clouds on their own real-point centroids ---------------
+    # ---- pharm family: center both clouds on their own real-point centroids ---------------
     c_ref = c_fit = None
     if spec.center_clouds:
         from ..channels import CHANNELS
@@ -446,7 +446,7 @@ def _step_generic(pr: Problem, st: _State, *, update=True):
     """One fine step of a non-pharm-style mode. Evaluates every term (value-only terms without
     their gradient), tracks the best pose on the blended score, forms the blended descent
     gradient and (when ``update``) applies the tangent-projected Adam step."""
-    # Shape+colour modes fuse their two gradient kernels into one launch where it fits; None
+    # Shape+color modes fuse their two gradient kernels into one launch where it fits; None
     # when it does not apply (CPU tensors, or a pad past the fused kernel's single tile).
     fused = None
     if pr.spec.fused_pair and len(pr.terms) == 2:

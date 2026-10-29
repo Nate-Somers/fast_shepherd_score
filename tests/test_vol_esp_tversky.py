@@ -1,6 +1,6 @@
 """Reference-mode gates for the asymmetric ``vol_esp_tversky`` overlay (``vol_esp`` with a Tversky
 reduction): self-overlap = 1.0, autograd vs finite difference at a non-identity pose, planted-pose
-recovery, determinism, the retained-H basis (heavy centres indexed by ``_nonH_atoms_idx``), and
+recovery, determinism, the retained-H basis (heavy centers indexed by ``_nonH_atoms_idx``), and
 Tversky asymmetry (a small query scores higher as the reference than as the fit).
 """
 import warnings
@@ -51,7 +51,7 @@ def _make_pair(ibuprofen):
 
 
 def _heavy_pos_charges(ibuprofen):
-    """Strict-heavy centres and heavy charges, centred to the heavy COM."""
+    """Strict-heavy centers and heavy charges, centered to the heavy COM."""
     m = Molecule(ibuprofen)
     pos = m.mol.GetConformer().GetPositions()[m._nonH_atoms_idx].astype(np.float32)
     pos = pos - pos.mean(0)
@@ -136,7 +136,7 @@ def test_deterministic_given_seed(ibuprofen):
 
 # --- Gate 5: retained-H molecule (REQUIRED -- this mode reads per-atom charges) ----------------
 def test_retained_h_molecule():
-    """A retained-H molecule must not desync heavy charges from centres, and self-copy scores ~1.0."""
+    """A retained-H molecule must not desync heavy charges from centers, and self-copy scores ~1.0."""
     from rdkit import Chem
     from rdkit.Chem import AllChem
     m = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))       # deuterium survives RemoveHs

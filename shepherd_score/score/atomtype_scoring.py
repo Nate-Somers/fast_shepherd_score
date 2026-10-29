@@ -3,7 +3,7 @@ Atom-identity (categorical) Gaussian overlap scoring with PyTorch.
 
 Scoring channel for the ``vol_atomtype`` alignment mode: a Gaussian volume overlap partitioned by
 a categorical per-atom label (the atomic number), so only atoms of the same element contribute to
-the cross overlap. It is the pharmacophore colour construction (per-type masked overlap, summed
+the cross overlap. It is the pharmacophore color construction (per-type masked overlap, summed
 over types, then a self-normalised Tanimoto or Tversky) over an arbitrary integer label. The
 primitive is :func:`shepherd_score.score.gaussian_overlap.VAB_2nd_order`, so the width convention
 matches the ``vol`` channel (``alpha=0.81``). Labels are compared by equality only.
@@ -51,7 +51,7 @@ def get_overlap_atomtype(labels_1: torch.Tensor,
         Tversky  = Σ_t VAB_t / (sigma·Σ_t VAA_t + (1-sigma)·Σ_t VBB_t)   (clamped to 1)
 
     A label present in only one molecule contributes to that molecule's self-overlap (the
-    denominator) but not to the cross overlap, as in the pharmacophore colour convention. Labels
+    denominator) but not to the cross overlap, as in the pharmacophore color convention. Labels
     are used for equality masking only. Batched ``(B,N,3)`` centers with 1-D labels are supported
     (the multi-start optimiser repeats the poses, not the labels).
 

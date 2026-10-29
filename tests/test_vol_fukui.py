@@ -53,7 +53,7 @@ def _mode_inputs(centers, field_pos, field):
 
 
 def _fukui_inputs(molec):
-    """Extract the (shape_centres, fukui_centres, fukui) float32 tensors a Molecule feeds vol_fukui."""
+    """Extract the (shape_centers, fukui_centers, fukui) float32 tensors a Molecule feeds vol_fukui."""
     centers = torch.as_tensor(molec.atom_pos, dtype=torch.float32)
     fukui_pos = torch.as_tensor(
         np.ascontiguousarray(molec.mol.GetConformer().GetPositions()[molec._nonH_atoms_idx]),
@@ -135,7 +135,7 @@ def test_deterministic_given_seed():
 
 # --- Gate 5: retained-H molecule --------------------------------------------------------------
 def test_retained_h_molecule():
-    """A retained-H molecule must not desync the heavy Fukui field from its centres."""
+    """A retained-H molecule must not desync the heavy Fukui field from its centers."""
     m = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))     # deuterium survives RemoveHs
     params = AllChem.ETKDGv3(); params.randomSeed = 0
     assert AllChem.EmbedMolecule(m, params) == 0
@@ -148,7 +148,7 @@ def test_retained_h_molecule():
     assert len(fukui) == len(mol._nonH_atoms_idx)
     assert len(fukui) != mol.atom_pos.shape[0]
 
-    # the shape centres (N rows) and Fukui centres (N-1 rows) differ in length; a wrong pairing
+    # the shape centers (N rows) and Fukui centers (N-1 rows) differ in length; a wrong pairing
     # would raise a broadcast error here
     centers, fukui_pos, fukui_t = _fukui_inputs(mol)
     assert centers.shape[0] != fukui_pos.shape[0]                 # shape N vs fukui N-1

@@ -193,7 +193,7 @@ def _init_se3_batch(raw_refs, raw_fits, trans_centers_list, num_repeats):
     raw_refs, raw_fits : list of np.ndarray
         Unpadded atom coordinate arrays for each pair.
     trans_centers_list : list of np.ndarray or None
-        Per-pair translation initialisation centres, or ``None``.
+        Per-pair translation initialisation centers, or ``None``.
     num_repeats : int
         Number of random SE(3) repeats when ``trans_centers`` is ``None``.
 

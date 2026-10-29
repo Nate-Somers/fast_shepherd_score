@@ -71,10 +71,10 @@ def test_vol_color_similarity_covers_both_channels():
     pair.align_with_vol_color(similarity=(0.7, 0.3), **FAST)
     both = pair.align(vol_color(similarity=(0.7, 0.3), color_similarity=(0.7, 0.3)), **FAST)
     assert np.allclose(pair.sim_aligned_vol_color_tversky, both.score, atol=1e-6)
-    # colour-only Tversky keeps the Tanimoto slot
+    # color-only Tversky keeps the Tanimoto slot
     pair.align_with_vol_color(color_similarity='tversky', **FAST)
-    colour = pair.align(vol_color(color_similarity='tversky'), **FAST)
-    assert np.allclose(pair.sim_aligned_vol_color, colour.score, atol=1e-6)
+    color = pair.align(vol_color(color_similarity='tversky'), **FAST)
+    assert np.allclose(pair.sim_aligned_vol_color, color.score, atol=1e-6)
 
 
 def test_pharm_weights_match_names():

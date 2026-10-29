@@ -42,7 +42,7 @@ def _warn_if_no_svml():
         _SVML_WARNED = True
         import warnings
         warnings.warn(
-            "fast_shepherd_score CPU alignment is running WITHOUT numba SVML "
+            "CPU alignment is running WITHOUT numba SVML "
             "(USING_SVML=False; numba>=0.61 dropped it), so the overlap kernels are unvectorized "
             "and ~3-6x slower than they should be. For full CPU speed, build the conda "
             "environment.yml (numba<=0.59 + icc_rt). Suppress via warnings filters.",

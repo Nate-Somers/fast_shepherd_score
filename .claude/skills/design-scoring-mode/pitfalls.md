@@ -33,7 +33,7 @@ do not impose a universal unit-self-score gate on composite objectives.
 ## Charge and width conventions
 
 `LAM_SCALING = COULOMB_SCALING**2`. Surface ESP modes scale the user's `lam`
-internally; atom-centred ESP/descriptor modes use it without that scaling.
+internally; atom-centered ESP/descriptor modes use it without that scaling.
 Read both the public method and `ModeSpec.lam_scaling` to avoid scaling twice.
 Typical public defaults are 0.1 for atom ESP/descriptor modes, 0.3 for surface
 ESP, and 0.001 for combined volume-and-surface ESP.

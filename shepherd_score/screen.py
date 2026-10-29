@@ -151,9 +151,9 @@ class MoleculeProfile:
         self.pharm_types = None if pharm_types is None else np.asarray(pharm_types)
         self.pharm_ancs = _f32(pharm_ancs)
         self.pharm_vecs = _f32(pharm_vecs)
-        # Per-channel true-heavy centres and per-atom scalars (already heavy-sliced); their counts
+        # Per-channel true-heavy centers and per-atom scalars (already heavy-sliced); their counts
         # can differ from atom_pos when RemoveHs retained an H. ``atomic_numbers`` is a
-        # categorical label the colour kernel matches on, kept float32 like the other channels.
+        # categorical label the color kernel matches on, kept float32 like the other channels.
         self.lipo_pos = _f32(lipo_pos)
         self.lipophilicity = _f32(lipophilicity)
         self.fukui_pos = _f32(fukui_pos)
@@ -189,7 +189,7 @@ class MoleculeProfile:
             self.mol = _MolShim(self.mol.GetConformer().GetPositions() - mu)
 
     def get_lipo_positions(self):
-        """True-heavy lipophilicity centres; mirrors ``Molecule.get_lipo_positions()``."""
+        """True-heavy lipophilicity centers; mirrors ``Molecule.get_lipo_positions()``."""
         return self.lipo_pos
 
     def get_lipophilicity(self, no_H: bool = True):
@@ -197,7 +197,7 @@ class MoleculeProfile:
         return self.lipophilicity
 
     def get_fukui_positions(self):
-        """True-heavy Fukui centres; mirrors ``Molecule.get_fukui_positions()``."""
+        """True-heavy Fukui centers; mirrors ``Molecule.get_fukui_positions()``."""
         return self.fukui_pos
 
     def get_fukui(self, no_H: bool = True):
@@ -205,7 +205,7 @@ class MoleculeProfile:
         return self.fukui
 
     def get_mr_positions(self):
-        """True-heavy molar-refractivity centres; mirrors ``Molecule.get_mr_positions()``."""
+        """True-heavy molar-refractivity centers; mirrors ``Molecule.get_mr_positions()``."""
         return self.mr_pos
 
     def get_molar_refractivity(self, no_H: bool = True):
@@ -213,7 +213,7 @@ class MoleculeProfile:
         return self.molar_refractivity
 
     def get_atomtype_positions(self):
-        """True-heavy element-label centres; mirrors ``Molecule.get_atomtype_positions()``."""
+        """True-heavy element-label centers; mirrors ``Molecule.get_atomtype_positions()``."""
         return self.atomtype_pos
 
     def get_atomic_numbers(self, no_H: bool = True):
@@ -473,8 +473,8 @@ class ProfileStore:
             raise ValueError("dtype must be 'float16' or 'float32'")
         modes = tuple(modes)
         if canonical is None:
-            # Canonical when the store serves a constant-seed mode and is pre-centred; a store
-            # serving only surface- or anchor-seeded modes keeps raw centred coordinates.
+            # Canonical when the store serves a constant-seed mode and is pre-centered; a store
+            # serving only surface- or anchor-seeded modes keeps raw centered coordinates.
             canonical = bool(pre_centered) and any(_canon_mode(m) in _CONST_SEED_MODES
                                                    for m in modes)
         elif canonical and not pre_centered:
@@ -597,7 +597,7 @@ class ProfileStore:
             else:
                 out["charges"] = np.concatenate([r.partial_charges for r in recs]).astype(dt)
                 heavy_lens = [len(r.partial_charges) for r in recs]
-            # Heavy centres 1:1 with the heavy charges, emitted only when some molecule's RemoveHs
+            # Heavy centers 1:1 with the heavy charges, emitted only when some molecule's RemoveHs
             # retained an H; the reader falls back to atom_off when the keys are absent.
             if any(r.atom_pos_noH is not None for r in recs):
                 out["heavy_off"] = offsets(heavy_lens)

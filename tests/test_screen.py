@@ -91,7 +91,7 @@ def test_store_heavy_charges_identity_index(tmp_path):
 
 
 def test_store_pre_centered(tmp_path):
-    """pre_centered=True centres on the heavy-atom COM without changing geometry (canonical=False isolates that)."""
+    """pre_centered=True centers on the heavy-atom COM without changing geometry (canonical=False isolates that)."""
     store_path = os.path.join(tmp_path, "lib.fss")
     p = _synthetic_profile(0, with_full_charges=False)
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol",),
@@ -104,7 +104,7 @@ def test_store_pre_centered(tmp_path):
 
 
 def test_store_is_canonical_by_default_only_when_it_serves_vol(tmp_path):
-    """``canonical=None`` resolves True only for a pre-centred store serving a constant-seed mode."""
+    """``canonical=None`` resolves True only for a pre-centered store serving a constant-seed mode."""
     p = _synthetic_profile(0, with_full_charges=False)
 
     vol = os.path.join(tmp_path, "vol.fss")
@@ -364,7 +364,7 @@ def test_vol_esp_tversky_stream_matches_object(tmp_path, molecules):
         for i, m in enumerate(molecules):
             store.add(m, id=i)
     store = ProfileStore.open(store_path)
-    # Reuses vol_esp's store schema (heavy centres + charges); no new per-molecule data.
+    # Reuses vol_esp's store schema (heavy centers + charges); no new per-molecule data.
     assert store.supports("vol_esp_tversky") and store.supports("vol_esp")
     assert store.schema["charges"]
     # the heavy charges reached disk; read through the store rather than re-deriving the layout
@@ -416,7 +416,7 @@ def test_vol_lipo_stream_matches_object(tmp_path, molecules):
     pairs = [MoleculePair(cq, p, do_center=False) for p in profiles]
     ref, _ = MoleculePairBatch(pairs).align_with_vol_lipo(
         backend="numba", num_repeats=16, max_num_steps=50)
-    # abs=1e-2: the query is re-centred independently (fp noise), which can flip a near-tie seed
+    # abs=1e-2: the query is re-centered independently (fp noise), which can flip a near-tie seed
     # in the two-channel objective; wrong or empty lipo data would move scores far more
     for p, rs in zip(profiles, ref):
         assert by_id[p.id] == pytest.approx(float(rs), abs=1e-2)
@@ -504,7 +504,7 @@ def test_vol_esp_stream_retained_h(tmp_path):
 
 @pytest.mark.parametrize("modes", [("vol_esp",), ("vol_and_surf_esp",)])
 def test_reload_retained_h_keeps_heavy_arrays_aligned(tmp_path, modes):
-    """Profiles read back from a store keep their heavy charges, ``nonH`` index and heavy centres
+    """Profiles read back from a store keep their heavy charges, ``nonH`` index and heavy centers
     when an earlier molecule's RemoveHs retained an H (which shifts the heavy offsets)."""
     smis = ["[2H]OC(=O)c1ccccc1", "CC(=O)Oc1ccccc1C(=O)O", "c1ccccc1O"]
     mols = [_build_molecule(s, seed=i) for i, s in enumerate(smis)]

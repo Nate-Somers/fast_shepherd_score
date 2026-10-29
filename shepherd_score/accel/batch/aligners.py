@@ -119,7 +119,7 @@ def resolve_params(spec, kw: dict, fn_name: str) -> dict:
             raise TypeError(f"{fn_name}() missing required keyword-only argument: {k!r}")
     if spec.lam_scaling:
         # Surface convention: the caller's ``lam`` is raw and is scaled once by LAM_SCALING here,
-        # for both the cross-overlap and the self-overlaps; the atom-centred ESP modes take it
+        # for both the cross-overlap and the self-overlaps; the atom-centered ESP modes take it
         # raw (see score/constants.py).
         from ...score.constants import LAM_SCALING
         params["lam"] = LAM_SCALING * float(params["lam"])

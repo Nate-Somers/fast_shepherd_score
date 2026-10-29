@@ -46,7 +46,7 @@ def _mode_inputs(centers, field_pos, field):
 
 
 def _lipo_inputs(molec):
-    """Extract the (shape_centres, lipo_centres, lipo) float32 tensors a Molecule feeds vol_lipo."""
+    """Extract the (shape_centers, lipo_centers, lipo) float32 tensors a Molecule feeds vol_lipo."""
     centers = torch.as_tensor(molec.atom_pos, dtype=torch.float32)
     lipo_pos = torch.as_tensor(
         np.ascontiguousarray(molec.mol.GetConformer().GetPositions()[molec._nonH_atoms_idx]),
@@ -129,7 +129,7 @@ def test_deterministic_given_seed():
 
 # --- Gate 5: retained-H molecule --------------------------------------------------------------
 def test_retained_h_molecule():
-    """A retained-H molecule must not desync the heavy logP from its true-heavy centres."""
+    """A retained-H molecule must not desync the heavy logP from its true-heavy centers."""
     m = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))     # deuterium survives RemoveHs
     params = AllChem.ETKDGv3(); params.randomSeed = 0
     assert AllChem.EmbedMolecule(m, params) == 0
@@ -142,7 +142,7 @@ def test_retained_h_molecule():
     assert len(lipo) == len(mol._nonH_atoms_idx)
     assert len(lipo) != mol.atom_pos.shape[0]
 
-    # the shape centres (N rows) and lipo centres (N-1 rows) differ in length; a wrong pairing
+    # the shape centers (N rows) and lipo centers (N-1 rows) differ in length; a wrong pairing
     # would raise a broadcast error here
     centers, lipo_pos, lipo_t = _lipo_inputs(mol)
     assert centers.shape[0] != lipo_pos.shape[0]                 # shape N vs lipo N-1

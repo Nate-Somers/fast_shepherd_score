@@ -163,7 +163,7 @@ def _const_seed_batch(const_seeds: torch.Tensor, k: int, device):
     """A canonical store's constant seed set, broadcast over a bucket of ``k`` molecules.
 
     Returns ``(quats (k,S,4), trans (k,S,3))`` in the ``batched_seeds_torch`` layout. The
-    translations are zero: a canonical store and the query are both centred on the heavy-atom
+    translations are zero: a canonical store and the query are both centered on the heavy-atom
     centroid, so the COM-aligning translation vanishes for every ``CONST_SEED_MODES`` mode. The
     expand is materialised because the engine reshapes the seeds into pose rows.
     """

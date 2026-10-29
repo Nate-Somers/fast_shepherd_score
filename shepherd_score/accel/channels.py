@@ -196,22 +196,22 @@ _reg(Channel("pharm_ancs", "points", "pharm", "pharm_ancs", _read_pharm("pharm_a
 _reg(Channel("pharm_vecs", "vectors", "pharm", "pharm_vecs", _read_pharm("pharm_vecs"),
              "pharm_vecs", flag="pharm"))
 _reg(Channel("lipo_pos", "points", "lipo", "lipo_pos",
-             _read_accessor("get_lipo_positions", "Lipophilicity centres"), "lipo_pos",
+             _read_accessor("get_lipo_positions", "Lipophilicity centers"), "lipo_pos",
              flag="lipophilicity"))
 _reg(Channel("lipo", "scalar", "lipo", "lipo",
              _read_accessor_noH("get_lipophilicity", "Lipophilicity"), "lipophilicity",
              flag="lipophilicity"))
 _reg(Channel("fukui_pos", "points", "fukui", "fukui_pos",
-             _read_accessor("get_fukui_positions", "Fukui centres"), "fukui_pos", flag="fukui"))
+             _read_accessor("get_fukui_positions", "Fukui centers"), "fukui_pos", flag="fukui"))
 _reg(Channel("fukui", "scalar", "fukui", "fukui",
              _read_accessor_noH("get_fukui", "Fukui field"), "fukui", flag="fukui"))
 _reg(Channel("mr_pos", "points", "mr", "mr_pos",
-             _read_accessor("get_mr_positions", "Molar-refractivity centres"), "mr_pos", flag="mr"))
+             _read_accessor("get_mr_positions", "Molar-refractivity centers"), "mr_pos", flag="mr"))
 _reg(Channel("mr", "scalar", "mr", "mr",
              _read_accessor_noH("get_molar_refractivity", "Molar refractivity"), "mr", flag="mr",
              profile="molar_refractivity"))
 _reg(Channel("type_pos", "points", "atomtype", "type_pos",
-             _read_accessor("get_atomtype_positions", "Atom-type centres"), "atomtype_pos",
+             _read_accessor("get_atomtype_positions", "Atom-type centers"), "atomtype_pos",
              flag="atomtype"))
 _reg(Channel("atomlabels", "labels", "atomtype", "atomlabels",
              _read_accessor_noH("get_atomic_numbers", "Atomic numbers"), "atomic_numbers",

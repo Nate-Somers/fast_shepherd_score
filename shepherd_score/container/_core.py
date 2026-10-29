@@ -597,7 +597,7 @@ class Molecule:
 
     def get_lipo_positions(self) -> np.ndarray:
         """Get the heavy-atom coordinates that carry the per-atom Crippen logP (the ``vol_lipo``
-        channel's centres).
+        channel's centers).
 
         Indexes the with-H conformer by ``_nonH_atoms_idx`` so the positions stay 1:1 with
         :meth:`get_lipophilicity`. ``atom_pos`` is not used because ``Chem.RemoveHs`` retains
@@ -651,7 +651,7 @@ class Molecule:
 
     def get_mr_positions(self) -> np.ndarray:
         """Get the heavy-atom coordinates that carry the per-atom Crippen molar refractivity (the
-        ``vol_mr`` channel's centres); same basis as :meth:`get_lipo_positions`."""
+        ``vol_mr`` channel's centers); same basis as :meth:`get_lipo_positions`."""
         return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
 
 
@@ -677,13 +677,13 @@ class Molecule:
 
     def get_fukui_positions(self) -> np.ndarray:
         """Get the heavy-atom coordinates that carry the per-atom Fukui field (the ``vol_fukui``
-        channel's centres); same basis as :meth:`get_lipo_positions`."""
+        channel's centers); same basis as :meth:`get_lipo_positions`."""
         return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
 
 
     def get_atomtype_positions(self) -> np.ndarray:
         """Get the heavy-atom coordinates that carry the per-atom element labels (the
-        ``vol_atomtype`` channel's centres); 1:1 with :meth:`get_atomic_numbers` and the same basis
+        ``vol_atomtype`` channel's centers); 1:1 with :meth:`get_atomic_numbers` and the same basis
         as :meth:`get_lipo_positions`."""
         return self.mol.GetConformer().GetPositions()[self._nonH_atoms_idx]
 
@@ -1617,7 +1617,7 @@ class MoleculePair:
                              verbose: bool = False,
                              color_similarity: Optional[Similarity] = None) -> np.ndarray:
         """
-        Align using a ROCS-style combined atom-centred Gaussian *shape* (volume) and
+        Align using a ROCS-style combined atom-centered Gaussian *shape* (volume) and
         directionless *color* (pharmacophore) overlay (a TanimotoCombo analogue).
 
         The optimized objective is
@@ -1686,13 +1686,13 @@ class MoleculePair:
                             verbose: bool = False,
                             similarity: Similarity = 'tanimoto') -> np.ndarray:
         """
-        Align using a combined atom-centred Gaussian *shape* (volume) + *lipophilicity* overlay.
+        Align using a combined atom-centered Gaussian *shape* (volume) + *lipophilicity* overlay.
 
         The optimized objective is
         ``(1 - lipo_weight) * shape_Tanimoto + lipo_weight * lipo_Tanimoto`` (or the Tversky form
         of both under ``similarity``). The shape channel is
         the heavy-atom Gaussian volume overlap of the ``vol`` mode; the lipophilicity channel
-        overlays the per-atom Crippen logP contributions at the heavy-atom centres like a
+        overlays the per-atom Crippen logP contributions at the heavy-atom centers like a
         partial-charge field (``get_overlap_esp`` with logP as the charge), so hydrophobic
         overlaps hydrophobic. Both fit point sets move under the same SE(3) pose.
 
@@ -1829,7 +1829,7 @@ class MoleculePair:
                              max_num_steps: int = 200,
                              verbose: bool = False,
                              color_similarity: Optional[Similarity] = None) -> np.ndarray:
-        """Align using a combined atom-centred Gaussian *shape* (volume) and *directional
+        """Align using a combined atom-centered Gaussian *shape* (volume) and *directional
         pharmacophore* overlay. This is equivalent to the ``vol_color`` combo with the
         orientation-vector weighting kept (``directionless=False``).
 
@@ -1891,7 +1891,7 @@ class MoleculePair:
                                 max_num_steps: int = 200,
                                 verbose: bool = False,
                                 type_similarity: Optional[Similarity] = None) -> np.ndarray:
-        """Align using a combined atom-centred Gaussian *shape* (volume) and *atom-identity*
+        """Align using a combined atom-centered Gaussian *shape* (volume) and *atom-identity*
         overlay, ``(1 - atomtype_weight) * shape + atomtype_weight * identity``. The identity
         channel is a Gaussian overlap in which only same-element atoms contribute. Score and
         transform are stored in ``self.sim_aligned_vol_atomtype`` /
@@ -1914,7 +1914,7 @@ class MoleculePair:
                           lr: float = 0.1,
                           max_num_steps: int = 200,
                           verbose: bool = False) -> np.ndarray:
-        """Align using a combined atom-centred Gaussian *shape* (volume) and *molar-refractivity*
+        """Align using a combined atom-centered Gaussian *shape* (volume) and *molar-refractivity*
         overlay, ``(1 - mr_weight) * shape + mr_weight * mr``: ``vol_lipo`` with the per-atom
         Crippen MR contribution in place of logP. Score and transform are stored in
         ``self.sim_aligned_vol_mr`` / ``self.transform_vol_mr``."""
@@ -1932,7 +1932,7 @@ class MoleculePair:
                              lr: float = 0.1,
                              max_num_steps: int = 200,
                              verbose: bool = False) -> np.ndarray:
-        """Align using a combined atom-centred Gaussian *shape* (volume) and *Fukui-reactivity*
+        """Align using a combined atom-centered Gaussian *shape* (volume) and *Fukui-reactivity*
         overlay, ``(1 - fukui_weight) * shape + fukui_weight * fukui``: ``vol_lipo`` with the
         per-atom Fukui dual descriptor ``f+ - f-`` (``Molecule.fukui``) in place of logP, so
         nucleophilic sites overlap nucleophilic and electrophilic overlap electrophilic. Score and

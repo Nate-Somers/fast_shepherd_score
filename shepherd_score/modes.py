@@ -149,7 +149,7 @@ class _Shape(Mode):
 
 @dataclass(frozen=True)
 class Vol(_Shape):
-    """Atom-centred Gaussian volume overlap (heavy atoms unless ``no_H=False``)."""
+    """Atom-centered Gaussian volume overlap (heavy atoms unless ``no_H=False``)."""
     name: ClassVar[str] = 'vol'
     no_H: bool = True
 
@@ -272,7 +272,7 @@ class _ESP(Mode):
 
 @dataclass(frozen=True)
 class VolESP(_ESP):
-    """Atom-centred Gaussian overlap weighted by partial-charge agreement.
+    """Atom-centered Gaussian overlap weighted by partial-charge agreement.
 
     ``lam`` is the width of the charge kernel ``exp(-|q_i - q_j|^2 / lam)``, used raw.
     """
@@ -430,7 +430,7 @@ class Pharm(Mode):
 
 
 # ---------------------------------------------------------------------------------------------
-# Per-atom scalar fields and atom types (scored at heavy-atom centres)
+# Per-atom scalar fields and atom types (scored at heavy-atom centers)
 
 _FIELDS = {
     'lipo': lambda mol: mol.get_lipophilicity(no_H=True),
@@ -486,7 +486,7 @@ class AtomType(Mode):
     def score(self, ref, fit, cache=None):
         if _empty(ref, fit):
             return _zeros_like_batch(fit)
-        # the scorer takes unbatched labels and (optionally batched) centres
+        # the scorer takes unbatched labels and (optionally batched) centers
         ref_points = _repeat_to_batch({'points': ref['points']}, fit, 'points')['points']
         fit_labels = fit['labels'][0] if fit['labels'].dim() == 2 else fit['labels']
         return get_overlap_atomtype(ref['labels'], fit_labels, ref_points, fit['points'],

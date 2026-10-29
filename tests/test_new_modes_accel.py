@@ -26,7 +26,7 @@ def _mol(smiles):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         rd = embed_conformer_from_smiles(smiles, MMFF_optimize=True, random_seed=0)
-    # pharm_multi_vector=False builds the pharmacophores the pharm/colour modes need
+    # pharm_multi_vector=False builds the pharmacophores the pharm/color modes need
     return Molecule(rd, pharm_multi_vector=False)
 
 

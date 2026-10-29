@@ -74,7 +74,7 @@ def _coarse_fine_pharm_extended(
         VBB = batch_pharm_self_overlap(anchors_2, vectors_2, types_2, extended_points=True,
                                        only_extended=only_extended, N_real=M_real)
 
-    # centre both clouds on their own real-point centroids (translation-invariant optimisation)
+    # center both clouds on their own real-point centroids (translation-invariant optimisation)
     _N = N_real.to(device=device, dtype=anchors_1.dtype)
     _M = M_real.to(device=device, dtype=anchors_2.dtype)
     _mask_n = (torch.arange(N_pad, device=device)[None] < _N[:, None]).to(anchors_1.dtype)

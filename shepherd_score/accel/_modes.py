@@ -78,7 +78,7 @@ class ModeSpec:
         (the sum of the three channel products the ShaEP combo evaluates).
     terms : the objective terms, in gradient-accumulation order.
     params : call keyword -> default. ``None`` marks a required keyword.
-    center_clouds : centre both seed-channel clouds on their own real-point centroids before
+    center_clouds : center both seed-channel clouds on their own real-point centroids before
         seeding and fold the shift back into the returned translation (the pharm family).
     pharm_style : the pharm family's optimiser tail: unit-normalise ``q`` before the kernel,
         apply the normalisation Jacobian and the guarded/clamped pharm similarity, and use the
@@ -92,7 +92,7 @@ class ModeSpec:
         wins.
     cpu_fused_max_pad : the fused loop is used only when every padded width is at most this
         (``vol_esp`` only).
-    fused_pair : the two gradient terms can be evaluated by one fused kernel (the shape+colour
+    fused_pair : the two gradient terms can be evaluated by one fused kernel (the shape+color
         single launch in ``kernels/vol_color_triton.py``), collapsing two launches per fine step
         into one. CUDA-only and single-tile, so the engine falls back to the two separate
         kernels on CPU tensors or past ``VOL_COLOR_FUSED_MAX_PAD``.

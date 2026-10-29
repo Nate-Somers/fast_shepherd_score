@@ -64,8 +64,8 @@ def _make_pair(smi="c1ccccc1CCO"):
 def _inputs(molec):
     """Extract the float32 tensors a Molecule feeds YOURMODE.
 
-    TODO: shape centres come from ``molec.atom_pos`` (or ``molec.surf_pos`` for a surface mode).
-    A per-atom field's centres come from its ``get_<feature>_positions()`` accessor -- NEVER from
+    TODO: shape centers come from ``molec.atom_pos`` (or ``molec.surf_pos`` for a surface mode).
+    A per-atom field's centers come from its ``get_<feature>_positions()`` accessor -- NEVER from
     ``atom_pos``, which is the RemoveHs set and retains isotope-labelled H. See pitfalls.md.
     """
     centers = torch.as_tensor(molec.atom_pos, dtype=torch.float32)
@@ -122,7 +122,7 @@ def test_optimizer_recovers_planted_pose():
 
     This exercises the multi-start optimizer rather than just the objective, and complements
     direct checks of feature-to-atom assignment; a unit self-score alone is insufficient.
-    Transform every coordinate channel by the same SE(3), not just the shape centres.
+    Transform every coordinate channel by the same SE(3), not just the shape centers.
     """
     pytest.fail("fill in the planted-pose recovery for YOURMODE")
     # pair = _make_pair()
@@ -162,7 +162,7 @@ def test_retained_h_molecule():
     ``atom_pos`` is longer than the strict-heavy set ``_nonH_atoms_idx`` selects -- which is what
     every per-atom field is sliced to. Pairing the two broadcasts (N) against (N-1) and crashes.
 
-    Field centres must come from ``get_<feature>_positions()``. This gate proves they do. Every
+    Field centers must come from ``get_<feature>_positions()``. This gate proves they do. Every
     plain heavy-atom molecule sails through gates 1-4 with the bug present, so this is the only
     gate that sees it. Delete it if your mode reads no per-atom field.
     """
