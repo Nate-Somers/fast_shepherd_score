@@ -14,15 +14,12 @@ __all__ = ["has_triton", "align_multi_gpu", "MultiGPUAligner", "clear_caches"]
 
 
 def clear_caches() -> None:
-    """Free the process-global accel caches (padded workspaces, index buffers, the learned
-    per-pair GPU-memory footprint table and the CUDA-graph LRU) and return their memory.
+    """Free the process-global accel caches (the learned per-pair GPU-memory footprint table
+    and the CUDA-graph LRU) and return their memory.
 
     The caches are keyed on tensor shapes, so a long-lived process that sees many distinct
     molecule sizes accumulates device memory; call this between independent workloads.
     """
-    from .batch import aligners as _al
-    _al._ALIGN_WORKSPACES.clear()
-    _al._INT_BUFFER_CACHE.clear()
     from .batch import _pad
     _pad._PAIR_FOOTPRINT_BYTES.clear()
     from .drivers._graphed import reset_graph_cache

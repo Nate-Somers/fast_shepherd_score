@@ -6,7 +6,7 @@ plans per call from the :class:`PadSpec` a driver supplies. Kernels mask padding
 counts and seeds are keyed on real counts, so bucketing changes no result; it minimises padded
 work plus a launch penalty, with pads snapped to ``_band_key`` multiples so the Triton autotune
 cache stays small. ``merge`` dims are cost-driving and merged across; ``partition`` dims must
-be uniform within a bucket and never merge across; ``masked`` dims pad to the bucket max.
+be uniform within a bucket and never merge across.
 """
 from __future__ import annotations
 
@@ -90,22 +90,17 @@ class PadSpec:
         Default: product of the ``merge`` pads (the single-channel ``N_pad*M_pad`` kernels).
     partition : dict[str, Callable]
         name -> ``f(item) -> int``. Must be uniform within a bucket; never merged across.
-    masked : dict[str, Callable]
-        name -> ``f(item) -> int``. Cheap dims padded to the bucket max, not keyed.
     """
     merge: dict
     seeds: int
     work: Callable | None = None
     partition: dict = field(default_factory=dict)
-    masked: dict = field(default_factory=dict)
 
     def sizes(self, item) -> dict:
         out = {}
         for n, fn in self.merge.items():
             out[n] = int(fn(item))
         for n, fn in self.partition.items():
-            out[n] = int(fn(item))
-        for n, fn in self.masked.items():
             out[n] = int(fn(item))
         return out
 
@@ -141,8 +136,7 @@ def plan_buckets(items, spec: PadSpec, device) -> list[Bucket]:
 
     mfns = list(spec.merge.values()); mnames = list(spec.merge)
     pfns = list(spec.partition.values()); pnames = list(spec.partition)
-    xfns = list(spec.masked.values()); xnames = list(spec.masked)
-    nm = len(mfns); nx = len(xfns)
+    nm = len(mfns)
     B = 16                                              # == _pad._BAND; inlined for the hot loop
 
     cells: dict = {}
@@ -153,27 +147,19 @@ def plan_buckets(items, spec: PadSpec, device) -> list[Bucket]:
         key = (mk, pk)
         c = cells.get(key)
         if c is None:
-            cells[key] = [[it], msz, pk, [fn(it) for fn in xfns]]
+            cells[key] = [[it], msz, pk]
         else:
             c[0].append(it)
             mm = c[1]
             for i in range(nm):
                 if msz[i] > mm[i]:
                     mm[i] = msz[i]
-            if nx:
-                xm = c[3]
-                for i in range(nx):
-                    v = xfns[i](it)
-                    if v > xm[i]:
-                        xm[i] = v
 
     def _pad_of(c):
-        mm, pk, xm = c[1], c[2], c[3]
+        mm, pk = c[1], c[2]
         pad = {mnames[i]: _band_key(mm[i]) for i in range(nm)}
         for i in range(len(pnames)):
             pad[pnames[i]] = pk[i]
-        for i in range(nx):
-            pad[xnames[i]] = _band_key(xm[i])
         return pad
 
     # group by partition signature (never merge across different partition values), then

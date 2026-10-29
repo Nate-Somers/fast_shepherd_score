@@ -64,17 +64,15 @@ def test_kernel_dispatch_cpu_matches_cpu_overlap():
 
 
 def test_numba_vol_self_copy_and_distinct():
-    """The numba batched vol driver: self-copy ~1.0 and bounded distinct-pair scores."""
-    from shepherd_score.accel.drivers.shape import coarse_fine_align_many
+    """The numba engine on padded vol batches: self-copy ~1.0 and bounded distinct-pair scores."""
+    from ._engine import batch, run
 
     mols = [_heavy_xyz(s, i) for i, s in enumerate(_SMILES)]
     refs = mols
     fits = [m @ _rand_rot(i).T + np.array([2., -1., 3.], np.float32) for i, m in enumerate(mols)]
     A_b, N_r = _pad(refs); B_b, M_r = _pad(fits)
-    VAA = KD._batch_self_overlap(A_b, N_r, ALPHA)
-    VBB = KD._batch_self_overlap(B_b, M_r, ALPHA)
-    sc, _, _ = coarse_fine_align_many(A_b, B_b, VAA, VBB, alpha=ALPHA, num_seeds=50,
-                                      steps_fine=100, N_real=N_r, M_real=M_r)
+    sc, _, _ = run("vol", {"atoms": batch(A_b, B_b, N_r, M_r)}, alpha=ALPHA, num_seeds=50,
+                   steps_fine=100, early_stop_patience=2)
     sc = sc.numpy()
     assert sc.min() > 0.99            # self-copy recovers ~1.0
     assert np.all(sc <= 1.0 + 1e-3)   # tanimoto-bounded
@@ -181,13 +179,12 @@ def test_numba_vol_esp_tversky_matches_reference_and_self_copy():
 
 
 def test_numba_pharm_self_copy():
-    """The numba pharm kernel drives coarse_fine_pharm_align_many on CPU to self-copy ~1.0."""
+    """The numba pharm kernel drives the engine on CPU to self-copy ~1.0."""
     pytest.importorskip("rdkit.Chem.AllChem")
     from rdkit.Chem import AllChem
     from rdkit import Chem
     from shepherd_score.pharm_utils.pharmacophore import get_pharmacophores
-    from shepherd_score.score.analytical_gradients._torch import build_lookup_tables
-    from shepherd_score.accel.drivers.pharm import coarse_fine_pharm_align_many
+    from ._engine import batch, run
 
     DUMMY = 8
     smis = ["CC(=O)Oc1ccccc1C(=O)O", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
@@ -216,13 +213,8 @@ def test_numba_pharm_self_copy():
     rots = [_rand_rot(i) for i in range(K)]
     Aa, Av, At, Ar = pad(mols)
     Fa, Fv, Ft, Fr = pad(mols, rots)  # self-copy via rotation
-    al, Ks, cats = build_lookup_tables(torch.device("cpu"), torch.float32)
-    I = torch.eye(3).expand(K, 3, 3).contiguous(); z = torch.zeros(K, 3)
-    VAA = KD.pharm_score_grad_se3_batch(I, z, At, At, Aa, Aa, Av, Av, al, Ks, cats,
-                                        N_real=Ar, M_real=Ar, NEED_GRAD=False)[0]
-    VBB = KD.pharm_score_grad_se3_batch(I, z, Ft, Ft, Fa, Fa, Fv, Fv, al, Ks, cats,
-                                        N_real=Fr, M_real=Fr, NEED_GRAD=False)[0]
-    sc, _, _ = coarse_fine_pharm_align_many(Aa, Fa, Av, Fv, At, Ft, VAA, VBB,
-                                            similarity="tanimoto", num_seeds=50, steps_fine=100,
-                                            N_real=Ar, M_real=Fr)
+    chans = {"pharm_ancs": batch(Aa, Fa, Ar, Fr), "pharm_vecs": batch(Av, Fv, Ar, Fr),
+             "pharm_types": batch(At, Ft, Ar, Fr)}
+    sc, _, _ = run("pharm", chans, similarity="tanimoto", num_seeds=50, steps_fine=100,
+                   early_stop_patience=5)
     assert sc.numpy().min() > 0.99   # drug-like pharm self-copy recovers ~1.0 via the numba kernel

@@ -313,17 +313,3 @@ def align_arrays(mode: str, ref: dict, fit: dict, *, params: dict, steps_fine: i
 
     SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
     return out_scores, SE3
-
-
-def _make_array_aligner(mode: str):
-    def fn(ref: dict, fit: dict, **kw):
-        return align_arrays(mode, ref, fit, **kw)
-    fn.__name__ = fn.__qualname__ = f"align_batch_{mode}_arrays"
-    fn.__doc__ = (f"Array-native ``{mode}`` aligner: ``(ref channel tensors, fit "
-                  "(flat, off) pairs) -> (scores, SE3)``. A thin name over align_arrays.")
-    return fn
-
-
-for _m in SPECS:
-    globals()[f"align_batch_{_m}_arrays"] = _make_array_aligner(_m)
-del _m

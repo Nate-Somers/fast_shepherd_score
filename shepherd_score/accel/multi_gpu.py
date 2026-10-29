@@ -39,18 +39,15 @@ def _cap_threads(threads):
 
 
 def _worker(rank, mode, backend, do_center, threads, align_kwargs, shard_mols, out_q):
-    """One GPU's worker: pin to ``cuda:rank``, set the dispatch-local ``active`` flag so the
-    in-library auto-shard never re-distributes, rebuild the pairs on that GPU, align the shard
+    """One GPU's worker: pin to ``cuda:rank``, rebuild the pairs on that GPU, align the shard
     and return numpy results."""
     try:
         import time
         import torch
         from shepherd_score.container import MoleculePair, MoleculePairBatch
-        from shepherd_score.accel.batch import _DISPATCH_LOCAL
 
         _cap_threads(threads)
         torch.cuda.set_device(rank)
-        _DISPATCH_LOCAL.active = True            # owns one GPU; never re-distribute
         dev = torch.device("cuda", rank)
         t0 = time.perf_counter()
         pairs = [MoleculePair(ref, fit, do_center=do_center, device=dev)
@@ -215,11 +212,9 @@ def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
         import numpy as _np
         import torch
         from shepherd_score.container import MoleculePair, MoleculePairBatch
-        from shepherd_score.accel.batch import _DISPATCH_LOCAL
 
         _cap_threads(threads)
         torch.cuda.set_device(rank)          # creates this worker's CUDA context
-        _DISPATCH_LOCAL.active = True
         dev = torch.device("cuda", rank)
         pairs = [MoleculePair(ref, fit, do_center=do_center, device=dev)
                  for (ref, fit) in shard_mols]

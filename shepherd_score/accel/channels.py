@@ -72,14 +72,6 @@ class Channel:
         return self.basis == "surf"
 
     @property
-    def translates(self) -> bool:
-        return self.kind == "points"
-
-    @property
-    def rotates(self) -> bool:
-        return self.kind in ("points", "vectors")
-
-    @property
     def is_pair(self) -> bool:
         return self.basis == "pair"
 

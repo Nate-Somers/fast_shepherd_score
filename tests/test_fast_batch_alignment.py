@@ -16,12 +16,10 @@ def _require_fast_cuda():
 
 @pytest.mark.cuda
 def test_fast_esp_batch_matches_single():
+    """vol_esp on one unpadded pair matches the same pair zero-padded with real counts."""
     _require_fast_cuda()
 
-    from shepherd_score.accel.drivers.esp import (
-        fast_optimize_ROCS_esp_overlay,
-        fast_optimize_ROCS_esp_overlay_batch,
-    )
+    from ._engine import batch, run
 
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -32,56 +30,43 @@ def test_fast_esp_batch_matches_single():
     ref_c = torch.randn(N, device=device, dtype=torch.float32) * 0.1
     fit_c = torch.randn(M, device=device, dtype=torch.float32) * 0.1
 
-    alpha = 0.81
-    lam = 0.01
+    kw = dict(alpha=0.81, lam=0.01, topk=3, steps_fine=5, lr=0.075, early_stop_patience=5)
 
-    _, _, score_single = fast_optimize_ROCS_esp_overlay(
-        ref,
-        fit,
-        ref_c,
-        fit_c,
-        alpha=alpha,
-        lam=lam,
-        num_repeats=1,
-        topk=3,
-        steps_fine=5,
-        lr=0.075,
-    )
+    def _score(A, B, CA, CB, n_real=None, m_real=None):
+        b = batch(A, B, n_real, m_real)
+        chans = {"heavy": b, "charges": batch(CA, CB, b.n_real, b.m_real)}
+        return run("vol_esp", chans, **kw)[0]
 
-    ref_b = ref.unsqueeze(0)
-    fit_b = fit.unsqueeze(0)
-    ref_c_b = ref_c.unsqueeze(0)
-    fit_c_b = fit_c.unsqueeze(0)
+    score_single = _score(ref[None], fit[None], ref_c[None], fit_c[None])
+
+    pad = lambda x, n: torch.cat([x, x.new_zeros((n,) + x.shape[1:])])[None]
     N_real = torch.tensor([N], device=device, dtype=torch.int32)
     M_real = torch.tensor([M], device=device, dtype=torch.int32)
+    score_batch = _score(pad(ref, 3), pad(fit, 5), pad(ref_c, 3), pad(fit_c, 5), N_real, M_real)
 
-    _, _, _, score_batch = fast_optimize_ROCS_esp_overlay_batch(
-        ref_b,
-        fit_b,
-        ref_c_b,
-        fit_c_b,
-        alpha=alpha,
-        lam=lam,
-        N_real=N_real,
-        M_real=M_real,
-        topk=3,
-        steps_fine=5,
-        lr=0.075,
-    )
-
-    s1 = float(score_single)
+    s1 = float(score_single[0])
     s2 = float(score_batch[0])
     assert math.isfinite(s1) and math.isfinite(s2)
     assert abs(s1 - s2) < 1e-4
 
 
+def _combo_scores(cwH1, cwH2, c1, c2, pts1, pts2, p1, p2, pc1, pc2, r1, r2, alpha, *, lam,
+                  probe_radius, esp_weight, N_real_atoms_w_H_1, M_real_atoms_w_H_2,
+                  N_real_centers, M_real_centers, N_real_surf_1, M_real_surf_2, topk,
+                  steps_fine, lr):
+    """``vol_and_surf_esp`` scores for padded combo inputs, through the engine."""
+    from ._engine import combo_chans, run
+    chans = combo_chans(cwH1, cwH2, c1, c2, pts1, pts2, p1, p2, pc1, pc2, r1, r2,
+                        N_real_centers, M_real_centers, N_real_atoms_w_H_1, M_real_atoms_w_H_2,
+                        N_real_surf_1, M_real_surf_2)
+    return run("vol_and_surf_esp", chans, alpha=alpha, lam=lam, probe_radius=probe_radius,
+               esp_weight=esp_weight, topk=topk, steps_fine=steps_fine, lr=lr,
+               early_stop_patience=5)[0]
+
+
 @pytest.mark.cuda
 def test_fast_esp_combo_padding_masks_stable():
     _require_fast_cuda()
-
-    from shepherd_score.accel.drivers.esp_combo import (
-        fast_optimize_esp_combo_score_overlay_batch,
-    )
 
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -134,7 +119,7 @@ def test_fast_esp_combo_padding_masks_stable():
     M_real_surf_2 = torch.tensor(m_surf, device=device, dtype=torch.int32)
 
     alpha = 0.81
-    scores_full = fast_optimize_esp_combo_score_overlay_batch(
+    scores_full = _combo_scores(
         centers_w_H_1,
         centers_w_H_2,
         centers_1,
@@ -160,10 +145,10 @@ def test_fast_esp_combo_padding_masks_stable():
         topk=3,
         steps_fine=5,
         lr=0.075,
-    )[3]
+    )
 
     # Slice-out runs should match per-item results when padding is mask-safe.
-    scores_slice0 = fast_optimize_esp_combo_score_overlay_batch(
+    scores_slice0 = _combo_scores(
         centers_w_H_1[:1],
         centers_w_H_2[:1],
         centers_1[:1],
@@ -189,9 +174,9 @@ def test_fast_esp_combo_padding_masks_stable():
         topk=3,
         steps_fine=5,
         lr=0.075,
-    )[3]
+    )
 
-    scores_slice1 = fast_optimize_esp_combo_score_overlay_batch(
+    scores_slice1 = _combo_scores(
         centers_w_H_1[1:2],
         centers_w_H_2[1:2],
         centers_1[1:2],
@@ -217,7 +202,7 @@ def test_fast_esp_combo_padding_masks_stable():
         topk=3,
         steps_fine=5,
         lr=0.075,
-    )[3]
+    )
 
     s_full = scores_full.detach().cpu().tolist()
     assert all(math.isfinite(x) for x in s_full)
@@ -263,12 +248,8 @@ def _esp_combo_synth_batch(device):
 def test_esp_combo_numba_cpu_and_matches_triton():
     """esp_combo on numba gives finite in-range scores and matches Triton when CUDA is present."""
     pytest.importorskip("numba")
-    from shepherd_score.accel.drivers.esp_combo import (
-        fast_optimize_esp_combo_score_overlay_batch,
-    )
-
     args, kw = _esp_combo_synth_batch("cpu")
-    scores_cpu = fast_optimize_esp_combo_score_overlay_batch(*args, **kw)[3]
+    scores_cpu = _combo_scores(*args, **kw)
     s_cpu = scores_cpu.detach().cpu().tolist()
     assert all(math.isfinite(x) for x in s_cpu)
     assert all(-1e-4 <= x <= 1.0 + 1e-4 for x in s_cpu)
@@ -279,7 +260,7 @@ def test_esp_combo_numba_cpu_and_matches_triton():
         except Exception:
             return
         args_g, kw_g = _esp_combo_synth_batch("cuda")
-        scores_gpu = fast_optimize_esp_combo_score_overlay_batch(*args_g, **kw_g)[3]
+        scores_gpu = _combo_scores(*args_g, **kw_g)
         s_gpu = scores_gpu.detach().cpu().tolist()
         for a, b in zip(s_cpu, s_gpu):
             assert abs(a - b) < 5e-3, f"numba {a} vs triton {b}"
@@ -368,7 +349,6 @@ def test_fast_pharm_batch_smoke_flags():
     M_real = torch.tensor([M, M], device=device, dtype=torch.int32)
 
     for similarity, extended_points, only_extended in [
-        ("tanimoto", False, False),
         ("tversky_ref", True, False),
         ("tversky_fit", True, True),
     ]:

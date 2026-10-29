@@ -1236,71 +1236,59 @@ def _run_shards_inproc(store, shard_idxs, qs_ref, mode, device, top_k, batch_kw,
                        n_total):
     """Process ``shard_idxs`` against the query panel, one shard load per shard,
     aligning every query against it. Returns a ``_TopK`` per query."""
-    # Suppress the aligner's transparent multi-GPU dispatch for the duration: the ``_FastPair``
-    # stand-ins carry only cached tensors, so a dispatch path that re-reads ``ref_molec`` would
-    # raise. Restore the previous flag afterwards, since this may run inside a per-GPU worker.
-    try:
-        from shepherd_score.accel.batch import _DISPATCH_LOCAL
-    except Exception:
-        from shepherd_score.container._core import _DISPATCH_LOCAL
-    _prev_active = getattr(_DISPATCH_LOCAL, "active", False)
-    _DISPATCH_LOCAL.active = True
-    try:
-        heaps = [_TopK(top_k) for _ in qs_ref]
-        tf_attr = _TRANSFORM_ATTR[mode]
-        # Canonical store: one constant seed set per query for the whole screen.
-        batch_kws = _canonical_batch_kws(store, qs_ref, mode, device, batch_kw, fast)
-        done = 0
-        if not fast:
-            from shepherd_score.container import MoleculePair, MoleculePairBatch
-        # Shards arrive in order from the read-ahead reader, one shard early.
-        for sh, arrs in _iter_shards_prefetched(store, shard_idxs):
-            # Poses are solved in the canonical frame and composed back with ``rot``; ``None``
-            # for a non-canonical store makes each composition a no-op. See _compose_rot.
-            rot = _canonical_rot(store, arrs)
-            if fast:
-                # ``ids`` stays the raw store array: _accumulate applies ``_id_to_py`` to
-                # top-K survivors only, instead of converting every library molecule here.
-                start = sh["start"]
-                if _use_arrays(mode):
-                    # Array-native path: no per-molecule Python objects between the store and
-                    # the heap. See accel/batch/_arrays.py.
-                    build, align = _array_dispatch(mode)
-                    ids, fit = build(arrs, device)
-                    for qi, ra in enumerate(qs_ref):
-                        ref = _ref_tensors_from_arrays(ra, mode, device)
-                        scores, se3 = align(ref, fit, batch_kws[qi])
-                        _accumulate_arrays(heaps[qi], ids, scores, se3,
-                                           scores_out, qi, start, rot)
-                else:
-                    ids, pairs = _build_fit_fast_pairs(arrs, mode, device,
-                                                       avoid=batch_kw.get("avoid_points"))
-                    for qi, ra in enumerate(qs_ref):
-                        ref = _ref_tensors_from_arrays(ra, mode, device)
-                        scores = _align_fast(pairs, ref, mode, batch_kw)
-                        _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi,
-                                    start, rot)
+    heaps = [_TopK(top_k) for _ in qs_ref]
+    tf_attr = _TRANSFORM_ATTR[mode]
+    # Canonical store: one constant seed set per query for the whole screen.
+    batch_kws = _canonical_batch_kws(store, qs_ref, mode, device, batch_kw, fast)
+    done = 0
+    if not fast:
+        from shepherd_score.container import MoleculePair, MoleculePairBatch
+    # Shards arrive in order from the read-ahead reader, one shard early.
+    for sh, arrs in _iter_shards_prefetched(store, shard_idxs):
+        # Poses are solved in the canonical frame and composed back with ``rot``; ``None``
+        # for a non-canonical store makes each composition a no-op. See _compose_rot.
+        rot = _canonical_rot(store, arrs)
+        if fast:
+            # ``ids`` stays the raw store array: _accumulate applies ``_id_to_py`` to
+            # top-K survivors only, instead of converting every library molecule here.
+            start = sh["start"]
+            if _use_arrays(mode):
+                # Array-native path: no per-molecule Python objects between the store and
+                # the heap. See accel/batch/_arrays.py.
+                build, align = _array_dispatch(mode)
+                ids, fit = build(arrs, device)
+                for qi, ra in enumerate(qs_ref):
+                    ref = _ref_tensors_from_arrays(ra, mode, device)
+                    scores, se3 = align(ref, fit, batch_kws[qi])
+                    _accumulate_arrays(heaps[qi], ids, scores, se3,
+                                       scores_out, qi, start, rot)
             else:
-                profiles = store._reconstruct(arrs, sh)   # == store.read_profiles(idx)
-                if center_profiles:
-                    for p in profiles:
-                        p.center_to(p.atom_pos.mean(0))
-                ids = [_id_to_py(p.id) for p in profiles]
-                start = sh["start"]
-                for qi, q in enumerate(qs_ref):
-                    pairs = [MoleculePair(q, p, do_center=False) for p in profiles]
-                    result = MoleculePairBatch(pairs)._align_mode(
-                        mode, backend=backend, **{"return_aligned": False, **align_kwargs})
-                    scores = np.asarray(result[0], dtype=float)
+                ids, pairs = _build_fit_fast_pairs(arrs, mode, device,
+                                                   avoid=batch_kw.get("avoid_points"))
+                for qi, ra in enumerate(qs_ref):
+                    ref = _ref_tensors_from_arrays(ra, mode, device)
+                    scores = _align_fast(pairs, ref, mode, batch_kw)
                     _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi,
                                 start, rot)
-            done += sh["n"]
-            if progress:
-                print(f"[screen] {done}/{n_total} library molecules aligned "
-                      f"x {len(qs_ref)} queries", flush=True)
-        return heaps
-    finally:
-        _DISPATCH_LOCAL.active = _prev_active
+        else:
+            profiles = store._reconstruct(arrs, sh)   # == store.read_profiles(idx)
+            if center_profiles:
+                for p in profiles:
+                    p.center_to(p.atom_pos.mean(0))
+            ids = [_id_to_py(p.id) for p in profiles]
+            start = sh["start"]
+            for qi, q in enumerate(qs_ref):
+                pairs = [MoleculePair(q, p, do_center=False) for p in profiles]
+                result = MoleculePairBatch(pairs)._align_mode(
+                    mode, backend=backend, **{"return_aligned": False, **align_kwargs})
+                scores = np.asarray(result[0], dtype=float)
+                _accumulate(heaps[qi], ids, scores, pairs, tf_attr, scores_out, qi,
+                            start, rot)
+        done += sh["n"]
+        if progress:
+            print(f"[screen] {done}/{n_total} library molecules aligned "
+                  f"x {len(qs_ref)} queries", flush=True)
+    return heaps
 
 
 # Candidates are pre-filtered against the heap threshold in blocks of this many, so the threshold
@@ -1529,13 +1517,8 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
     try:
         import torch
         from shepherd_score.accel.multi_gpu import _cap_threads
-        try:
-            from shepherd_score.accel.batch import _DISPATCH_LOCAL
-        except Exception:
-            from shepherd_score.container._core import _DISPATCH_LOCAL
         _cap_threads(threads)
         torch.cuda.set_device(rank)
-        _DISPATCH_LOCAL.active = True
         dev = torch.device("cuda", rank)
         store = ProfileStore.open(store_path)
         ref_tensors = [_ref_tensors_from_arrays(ra, mode, dev) for ra in ref_arrays_list]

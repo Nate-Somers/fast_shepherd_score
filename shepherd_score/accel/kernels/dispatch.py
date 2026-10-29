@@ -94,16 +94,13 @@ _batch_self_overlap = _make("_batch_self_overlap", "shape")
 # --- ESP kernels (esp_triton <-> cpu) -----------------------------------------
 overlap_score_grad_esp_se3_batch = _make("overlap_score_grad_esp_se3_batch", "esp")
 _batch_self_overlap_esp = _make("_batch_self_overlap_esp", "esp")
-# ShaEP ESP surface comparison, one direction, value only.
-esp_comparison_batch = _make("esp_comparison_batch", "esp")
 # ShaEP surface-ESP agreement of a posed pair, value + SE(3) gradient (vol_and_surf_esp).
 esp_agreement_grad_se3_batch = _make("esp_agreement_grad_se3_batch", "esp")
 
-# --- pharmacophore kernel (pharm_triton <-> cpu) ------------------------------
-pharm_score_grad_se3_batch = _make("pharm_score_grad_se3_batch", "pharm")
-
 # --- avoid (linear hard-sphere excluded-volume) kernel (avoid_triton <-> cpu) -
 overlap_score_grad_avoid_se3_batch = _make("overlap_score_grad_avoid_se3_batch", "avoid")
+
+# --- pharmacophore kernels (pharm_triton <-> cpu) -----------------------------
 # Directional pharm value + quaternion-gradient kernel (pharm mode, in-register dQ).
 pharm_grad_dq_se3_batch = _make("pharm_grad_dq_se3_batch", "pharm")
 # Directionless "color" value+quaternion-grad kernel (vol_color).

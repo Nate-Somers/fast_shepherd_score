@@ -60,7 +60,6 @@ def _worker_loop(task_q, res_q):
     except Exception:
         pass
     from shepherd_score.accel import batch as bm
-    bm._DISPATCH_LOCAL.active = True                  # never re-distribute inside a worker
     while True:
         task = task_q.get()
         if task is None:

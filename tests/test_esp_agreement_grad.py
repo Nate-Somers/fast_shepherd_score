@@ -75,17 +75,23 @@ def _rotate(x, q, t):
 
 
 def test_value_equals_the_two_one_direction_comparisons():
-    """The fused kernel's value is the old value path: both one-direction comparisons on the
-    transformed fit, averaged over both surfaces."""
-    from shepherd_score.accel.kernels.cpu import esp_comparison_batch
+    """The fused kernel's value is the reference ShaEP term: both one-direction comparisons
+    (``score.electrostatic_scoring._esp_comparison``) on the transformed fit, averaged over both
+    surfaces."""
+    from shepherd_score.score.electrostatic_scoring import _esp_comparison
     r, f, n_surf, m_surf, n_atoms, m_atoms, q, t = _batch(dtype=torch.float32)
     V, _, _ = _cpu(r, f, n_surf, m_surf, n_atoms, m_atoms, q, t, need_grad=False)
-    cwh2_t, pts2_t = _rotate(f[0], q, t), _rotate(f[3], q, t)
-    e1 = esp_comparison_batch(r[3], cwh2_t, f[1], r[4], f[2], N_real=n_surf, M_real=m_atoms,
-                              probe_radius=PROBE, lam=LAM)
-    e2 = esp_comparison_batch(pts2_t, r[0], r[1], f[4], r[2], N_real=m_surf, M_real=n_atoms,
-                              probe_radius=PROBE, lam=LAM)
-    ref = (e1 + e2) / (n_surf + m_surf).to(e1.dtype)
+    r64, f64 = [x.double() for x in r], [x.double() for x in f]
+    cwh2_t, pts2_t = _rotate(f64[0], q.double(), t.double()), _rotate(f64[3], q.double(), t.double())
+    ref = []
+    for k in range(V.shape[0]):
+        ns, ms, na, ma = (int(x[k]) for x in (n_surf, m_surf, n_atoms, m_atoms))
+        e1 = _esp_comparison(r64[3][k, :ns], cwh2_t[k, :ma], f64[1][k, :ma], r64[4][k, :ns],
+                             f64[2][k, :ma], probe_radius=PROBE, lam=LAM)
+        e2 = _esp_comparison(pts2_t[k, :ms], r64[0][k, :na], r64[1][k, :na], f64[4][k, :ms],
+                             r64[2][k, :na], probe_radius=PROBE, lam=LAM)
+        ref.append((e1 + e2) / (ns + ms))
+    ref = torch.stack(ref).to(V.dtype)
     assert torch.allclose(V, ref, atol=2e-6, rtol=0)
     assert (V > 0).all() and (V < 1).all()
 
@@ -145,13 +151,13 @@ def test_every_registered_mode_differentiates_every_term():
 def _combo_problem(mode, device, seed=4, K=8):
     from shepherd_score.accel._modes import SPECS
     from shepherd_score.accel.drivers.engine import assemble
-    from shepherd_score.accel.drivers.esp_combo import _combo_chans
+    from ._engine import combo_chans
     r, f, n_surf, m_surf, n_atoms, m_atoms, _, _ = _batch(K=K, seed=seed, dtype=torch.float32)
     d = lambda x: x.to(device)
     cwh1, pc1, rad1, pts1, ptc1 = map(d, r)
     cwh2, pc2, rad2, pts2, ptc2 = map(d, f)
-    chans = _combo_chans(cwh1, cwh2, cwh1, cwh2, pts1, pts2, pc1, pc2, ptc1, ptc2, rad1, rad2,
-                         d(n_atoms), d(m_atoms), d(n_atoms), d(m_atoms), d(n_surf), d(m_surf), 0.81)
+    chans = combo_chans(cwh1, cwh2, cwh1, cwh2, pts1, pts2, pc1, pc2, ptc1, ptc2, rad1, rad2,
+                        d(n_atoms), d(m_atoms), d(n_atoms), d(m_atoms), d(n_surf), d(m_surf))
     spec = SPECS[mode]
     params = dict(spec.params)
     params["alpha"] = 0.81

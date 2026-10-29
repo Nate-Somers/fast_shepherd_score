@@ -51,9 +51,10 @@ def test_self_copy_far_avoid_is_one():
 
 @pytest.mark.parametrize("cloud_name", ["far", "mild", "strong"])
 def test_numba_batched_matches_per_pair_accel(cloud_name):
-    """Batched-numba equals the per-pair accel entry point, which uses the same seed set."""
+    """Batched-numba equals the engine run directly on the pair, which uses the same seed set."""
     from shepherd_score.container import MoleculePair, MoleculePairBatch
-    from shepherd_score.accel.drivers.avoid import fast_optimize_vol_avoid_overlay
+    from shepherd_score.accel.drivers.engine import Batch
+    from ._engine import batch, run
     from shepherd_score.accel._modes import MODE_SEEDS, MODE_STEPS, SPECS
     nr, ns = MODE_SEEDS["vol_avoid"], MODE_STEPS["vol_avoid"]
 
@@ -66,12 +67,14 @@ def test_numba_batched_matches_per_pair_accel(cloud_name):
         avoid = np.asarray(ref_m.atom_pos, dtype=np.float32)      # covers the whole reference shape
 
     mp = MoleculePair(_mol(IBU), _mol(CAF), do_center=True, device=torch.device("cpu"))
-    rc = torch.tensor(mp.ref_molec.atom_pos, dtype=torch.float32)
-    fc = torch.tensor(mp.fit_molec.atom_pos, dtype=torch.float32)
-    _, _, sc_pp = fast_optimize_vol_avoid_overlay(
-        rc, fc, torch.tensor(avoid, dtype=torch.float32),
-        avoid_weight=1.0, avoid_min_dist=2.0, num_repeats=nr, steps_fine=ns,
-        lr=SPECS["vol_avoid"].params["lr"])
+    rc = torch.tensor(mp.ref_molec.atom_pos, dtype=torch.float32)[None]
+    fc = torch.tensor(mp.fit_molec.atom_pos, dtype=torch.float32)[None]
+    av = torch.tensor(avoid, dtype=torch.float32)[None]
+    chans = {"atoms": batch(rc, fc),
+             "avoid": Batch(av, None, torch.tensor([av.shape[1]], dtype=torch.int32), None)}
+    sc_pp, _, _ = run("vol_avoid", chans, avoid_weight=1.0, avoid_min_dist=2.0, num_seeds=nr,
+                      steps_fine=ns, lr=SPECS["vol_avoid"].params["lr"], early_stop_patience=2)
+    sc_pp = sc_pp[0]
 
     b = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,
                                         device=torch.device("cpu"))])

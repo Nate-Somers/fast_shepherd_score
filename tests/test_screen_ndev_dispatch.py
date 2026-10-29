@@ -11,11 +11,6 @@ torch = pytest.importorskip("torch")
 
 import shepherd_score.screen as scr                               # noqa: E402
 
-try:                                    # same two-step import screen.py itself uses
-    from shepherd_score.accel.batch import _DISPATCH_LOCAL        # noqa: E402
-except Exception:                                                 # pragma: no cover
-    from shepherd_score.container._core import _DISPATCH_LOCAL    # noqa: E402
-
 #: Only ``steps_fine`` is read unconditionally by the real aligners; the recorders ignore it.
 _BATCH_KW = {"steps_fine": 1}
 
@@ -102,13 +97,8 @@ def _run_worker(mp, mode, share=None, store_cls=_FakeStore, ref_arrays=None, see
             self.msgs.append(msg)
 
     out = _OutQ()
-    # the worker sets _DISPATCH_LOCAL.active and never restores it
-    prev = getattr(_DISPATCH_LOCAL, "active", False)
-    try:
-        scr._screen_worker(0, 1, "<fake>", [{} if ref_arrays is None else ref_arrays], mode,
-                           _BATCH_KW, 1, _ShardQ() if share is None else share, out)
-    finally:
-        _DISPATCH_LOCAL.active = prev
+    scr._screen_worker(0, 1, "<fake>", [{} if ref_arrays is None else ref_arrays], mode,
+                       _BATCH_KW, 1, _ShardQ() if share is None else share, out)
 
     assert out.msgs, f"_screen_worker returned nothing for mode={mode}"
     msg = out.msgs[0]

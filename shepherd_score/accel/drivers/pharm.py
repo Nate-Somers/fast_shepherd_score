@@ -1,13 +1,9 @@
-"""``pharm`` / ``pharm_tversky`` driver entry points (directional pharmacophore overlap).
-
-The default objective (``extended_points=False``) runs the generic engine on the in-register
-``pharm_grad_dq_se3_batch`` kernel. ``extended_points=True``, an anchor+vector Gaussian term
-with no directional weighting, has no kernel and keeps the eager autograd / analytical-gradient
-loop below.
+"""``pharm`` / ``pharm_tversky`` with ``extended_points=True``: an anchor+vector Gaussian
+term with no directional weighting and no kernel, so it keeps the eager autograd /
+analytical-gradient loop below. The default objective runs the generic engine
+(``drivers/engine.py``) on the ``pharm_grad_dq_se3_batch`` kernel.
 """
 from __future__ import annotations
-
-from typing import Optional, Tuple
 
 import torch
 
@@ -19,39 +15,10 @@ from ...score.analytical_gradients import (compute_overlap_and_grad_pharm,
                                            project_grad_R_to_quaternion,
                                            _rotation_matrix_from_unit_quat)
 from .._stats import record as _record_steps
-from ._common import (check_gpu_available, build_coarse_grid,  # noqa: F401 (re-export)
-                      batched_seeds_torch, apply_se3_transform, apply_so3_transform,
-                      quaternion_to_rotation_matrix)
-from ._shim import batch, run
+from ._common import (build_coarse_grid, batched_seeds_torch, apply_se3_transform,
+                      apply_so3_transform)
 
 _PHARM_SIGMA_MAP = {'tversky': 0.95, 'tversky_ref': 1.0, 'tversky_fit': 0.05}
-
-
-def coarse_fine_pharm_align_many(
-        anchors_1, anchors_2, vectors_1, vectors_2, types_1, types_2, VAA=None, VBB=None, *,
-        similarity: str = "tanimoto", extended_points: bool = False, only_extended: bool = False,
-        num_seeds: int = 50, trans_centers=None, trans_centers_real=None,
-        num_repeats_per_trans: int = 10, topk: int = 30, steps_fine: int = 100, lr: float = 0.075,
-        N_real=None, M_real=None, early_stop_patience: int = 5, early_stop_tol: float = 1e-5,
-        seeds=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Batched pharmacophore alignment: ``(score, q, t)`` per pair, the transform mapping the
-    original fit onto the original ref (both clouds are centred internally)."""
-    if not extended_points:
-        a = batch(anchors_1, anchors_2, N_real, M_real)
-        chans = {"pharm_ancs": a, "pharm_vecs": batch(vectors_1, vectors_2, a.n_real, a.m_real),
-                 "pharm_types": batch(types_1, types_2, a.n_real, a.m_real)}
-        return run("pharm", chans, similarity=similarity, extended_points=False,
-                   only_extended=only_extended, num_seeds=num_seeds, steps_fine=steps_fine, lr=lr,
-                   early_stop_patience=early_stop_patience, early_stop_tol=early_stop_tol,
-                   seeds=seeds, trans_centers=trans_centers, trans_centers_real=trans_centers_real,
-                   num_repeats_per_trans=num_repeats_per_trans, topk=topk)
-    return _coarse_fine_pharm_extended(
-        anchors_1, anchors_2, vectors_1, vectors_2, types_1, types_2, VAA, VBB,
-        similarity=similarity, only_extended=only_extended, num_seeds=num_seeds,
-        trans_centers=trans_centers, trans_centers_real=trans_centers_real,
-        num_repeats_per_trans=num_repeats_per_trans, topk=topk, steps_fine=steps_fine, lr=lr,
-        N_real=N_real, M_real=M_real, early_stop_patience=early_stop_patience,
-        early_stop_tol=early_stop_tol)
 
 
 def _coarse_fine_pharm_extended(
@@ -244,27 +211,29 @@ def fast_optimize_pharm_overlay_batch(
         extended_points: bool = False, only_extended: bool = False, num_repeats: int = 50,
         trans_centers_batch=None, trans_centers_real=None, num_repeats_per_trans: int = 10,
         N_real=None, M_real=None, topk: int = 30, steps_fine: int = 100, lr: float = 0.075,
-        ref_shared: bool = False, seeds=None):
-    """Batched pharmacophore alignment: ``(aligned_anchors, aligned_vectors, q, t, scores)``."""
+        ref_shared: bool = False):
+    """Batched ``extended_points=True`` pharmacophore alignment:
+    ``(aligned_anchors, aligned_vectors, q, t, scores)``."""
+    if not extended_points:
+        raise ValueError("fast_optimize_pharm_overlay_batch runs extended_points=True only; the "
+                         "default objective runs on the engine (MoleculePairBatch / _align_batch_pharm)")
     BATCH = ref_anchors_batch.shape[0]
     if N_real is None:
         N_real = ref_anchors_batch.new_full((BATCH,), ref_anchors_batch.shape[1], dtype=torch.int32)
     if M_real is None:
         M_real = fit_anchors_batch.new_full((BATCH,), fit_anchors_batch.shape[1], dtype=torch.int32)
-    VAA = VBB = None
-    if extended_points:
-        VAA = _self_overlap_shared_ref(ref_anchors_batch, ref_vectors_batch, ref_pharms_batch,
-                                       extended_points=True, only_extended=only_extended,
-                                       N_real=N_real, shared=ref_shared)
-        VBB = _self_overlap_cached(fit_anchors_batch, fit_vectors_batch, fit_pharms_batch,
-                                   extended_points=True, only_extended=only_extended, N_real=M_real)
-    scores, q_best, t_best = coarse_fine_pharm_align_many(
+    VAA = _self_overlap_shared_ref(ref_anchors_batch, ref_vectors_batch, ref_pharms_batch,
+                                   extended_points=True, only_extended=only_extended,
+                                   N_real=N_real, shared=ref_shared)
+    VBB = _self_overlap_cached(fit_anchors_batch, fit_vectors_batch, fit_pharms_batch,
+                               extended_points=True, only_extended=only_extended, N_real=M_real)
+    scores, q_best, t_best = _coarse_fine_pharm_extended(
         ref_anchors_batch, fit_anchors_batch, ref_vectors_batch, fit_vectors_batch,
         ref_pharms_batch, fit_pharms_batch, VAA, VBB, similarity=similarity,
-        extended_points=extended_points, only_extended=only_extended, num_seeds=num_repeats,
+        only_extended=only_extended, num_seeds=num_repeats,
         trans_centers=trans_centers_batch, trans_centers_real=trans_centers_real,
         num_repeats_per_trans=num_repeats_per_trans, topk=topk, steps_fine=steps_fine, lr=lr,
-        N_real=N_real, M_real=M_real, seeds=seeds)
+        N_real=N_real, M_real=M_real, early_stop_patience=5, early_stop_tol=1e-5)
     aligned_anchors = apply_se3_transform(fit_anchors_batch, q_best, t_best)
     aligned_vectors = apply_so3_transform(fit_vectors_batch, q_best)
     return aligned_anchors, aligned_vectors, q_best, t_best, scores

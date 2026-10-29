@@ -21,17 +21,12 @@ if TYPE_CHECKING:                     # annotations only; never imported at runt
 
 from ._pad import _band_key, _subbatched_align, _scatter_fill, _BAND
 from ._bucket import plan_buckets, PadSpec
-from ._dispatch import _should_distribute, _run_distributed, _dev_idx
 from .._modes import MODE_SEEDS as _MODE_SEEDS, MODE_STEPS as _MODE_STEPS, SPECS, canonical
 from ..channels import CHANNELS
 
-# ---- persistent, per-process caches (reused across calls) -------------------
-_ALIGN_WORKSPACES: dict = {}
-_INT_BUFFER_CACHE: dict = {}
-
 _DTYPES = {"float32": torch.float32, "int64": torch.int64}
 
-#: The channel whose reference cloud supplies the legacy ``trans_init`` translation centres.
+#: The channel whose reference cloud supplies the legacy ``trans_init`` translation centers.
 _TRANS_CHANNEL = {"pharm": "pharm_ancs", "pharm_tversky": "pharm_ancs"}
 
 
@@ -267,8 +262,6 @@ def _run_bucket(spec, chans, K, key, device, *, params, n_seeds, steps_fine, es_
 def _align_batch(spec, pairs, _fn, **kw) -> None:
     if not pairs:
         return
-    if _should_distribute(pairs):
-        return _run_distributed(_fn, pairs, **kw)
     name = _fn.__name__
     params = resolve_params(spec, kw, name)
     steps_fine = int(kw.get("steps_fine", _steps_for(spec.name)))
@@ -361,6 +354,5 @@ for _m in SPECS:
 _align_batch_esp = _align_batch_surf_esp          # noqa: F821  (generated above)
 _align_batch_esp_combo = _align_batch_vol_and_surf_esp   # noqa: F821
 
-__all__ = ["_batch_upload", "_seeds_for", "_steps_for", "_ALIGN_WORKSPACES", "_INT_BUFFER_CACHE",
-           "resolve_params", "concrete_channels", "upload_channels", "build_bucket"] + \
+__all__ = ["_batch_upload", "_seeds_for", "_steps_for", "resolve_params", "concrete_channels", "upload_channels", "build_bucket"] + \
           [f"_align_batch_{m}" for m in SPECS] + ["_align_batch_esp", "_align_batch_esp_combo"]

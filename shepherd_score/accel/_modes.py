@@ -105,8 +105,7 @@ class ModeSpec:
         none.
     coarse_channel : the cloud the legacy ``trans_init`` coarse grid is built from when that is
         not the seed channel (the combo modes build it from the surface clouds while seeding
-        from the volume centres).
-    process : whether the mode has a process-per-GPU / CPU-pool tensor spec.
+        from the volume centers).
     """
     name: str
     attrs: Tuple[str, str]
@@ -132,7 +131,6 @@ class ModeSpec:
     channel_switch: dict = field(default_factory=dict)
     coarse_channel: Optional[str] = None
     screen_lr: float = 0.075
-    process: bool = True
 
     @property
     def transform_attr(self) -> str:
@@ -358,7 +356,7 @@ def spec_of(mode: str) -> ModeSpec:
 
 #: Modes with a process-per-GPU (multi_gpu) and CPU-pool (cpu_pool) tensor spec; every mode
 #: declares its tensors through its channels, so this is the whole registry.
-PROCESS_MODES = tuple(m for m, s in SPECS.items() if s.process)
+PROCESS_MODES = tuple(SPECS)
 
 #: Per-mode (SO(3) seed count, fine step count) defaults, chosen at the accuracy/throughput
 #: knee; a caller's ``max_num_steps`` / ``num_repeats`` override them.

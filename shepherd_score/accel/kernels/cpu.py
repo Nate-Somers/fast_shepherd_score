@@ -300,63 +300,6 @@ def overlap_score_grad_esp_se3_batch(A, B, charges_A, charges_B, q, t, *,
             torch.as_tensor(dQ, device=dev, dtype=dt),
             torch.as_tensor(dT, device=dev, dtype=dt))
 
-#  ShaEP ESP surface comparison, one direction, value only: CPU twin of
-#  esp_triton._esp_comparison_tiled. For each real field point, the Coulomb ESP
-#  from the other molecule's atoms, the vdW+probe volume mask and a Gaussian of
-#  the ESP difference, summed over points. fp64 accumulation. The aligners use
-#  _esp_agreement_grad_kernel below, which also returns the SE(3) gradient.
-
-@njit(parallel=True, fastmath=True, cache=True)
-def _esp_comparison_kernel(P, A, Q, R, PE, Nr, Mr, inv_lam, coulomb, probe):
-    K = P.shape[0]
-    S = np.zeros(K, dtype=np.float64)
-    for k in prange(K):
-        n_real = Nr[k]; m_real = Mr[k]
-        total = 0.0
-        for i in range(n_real):
-            px = P[k, i, 0]; py = P[k, i, 1]; pz = P[k, i, 2]
-            pe = PE[k, i]
-            esp = 0.0
-            blocked = False
-            for m in range(m_real):
-                dx = px - A[k, m, 0]; dy = py - A[k, m, 1]; dz = pz - A[k, m, 2]
-                d = math.sqrt(dx * dx + dy * dy + dz * dz)
-                if d < 1e-6:
-                    d = 1e-6
-                esp += Q[k, m] / d
-                if d < R[k, m] + probe:
-                    blocked = True
-            esp *= coulomb
-            if not blocked:
-                diff = pe - esp
-                total += math.exp(-(diff * diff) * inv_lam)
-        S[k] = total
-    return S
-
-
-def esp_comparison_batch(points, atoms, charges, point_esp, radii, *,
-                         N_real=None, M_real=None, probe_radius: float = 1.0,
-                         lam: float = 0.001, BLOCK=None, num_warps=None, num_stages=None):
-    """CPU drop-in for the Triton ``esp_comparison_batch`` (value-only ShaEP ESP
-    term). Returns ``esp`` (K,) as a torch tensor on ``points.device``. ``lam`` is
-    the raw weighting parameter; ``LAM_SCALING`` is applied internally."""
-    K, N_pad, _ = points.shape
-    _, M_pad, _ = atoms.shape
-    dev, dt = points.device, points.dtype
-    Pn = np.ascontiguousarray(points.detach().cpu().numpy())
-    An = np.ascontiguousarray(atoms.detach().cpu().numpy())
-    Qn = np.ascontiguousarray(charges.detach().cpu().numpy())
-    Rn = np.ascontiguousarray(radii.detach().cpu().numpy())
-    PEn = np.ascontiguousarray(point_esp.detach().cpu().numpy())
-    Nr = (np.full(K, N_pad, np.int64) if N_real is None
-          else N_real.detach().cpu().numpy().astype(np.int64))
-    Mr = (np.full(K, M_pad, np.int64) if M_real is None
-          else M_real.detach().cpu().numpy().astype(np.int64))
-    inv_lam = 1.0 / (LAM_SCALING * float(lam))
-    S = _esp_comparison_kernel(Pn, An, Qn, Rn, PEn, Nr, Mr,
-                               inv_lam, float(COULOMB_SCALING), float(probe_radius))
-    return torch.as_tensor(S, device=dev, dtype=dt)
-
 #  ShaEP surface-ESP agreement with its SE(3) gradient (vol_and_surf_esp and its Tversky
 #  variant): CPU twin of esp_triton._esp_agreement_grad_kernel. Both directions of the
 #  comparison in one pass, with the fit molecule's atoms and surface points moved by
@@ -497,114 +440,6 @@ def esp_agreement_grad_se3_batch(ref_atoms, ref_charges, ref_radii, ref_points, 
             torch.as_tensor(dQ, device=dev, dtype=q.dtype),
             torch.as_tensor(dT, device=dev, dtype=t.dtype))
 
-#  Pharmacophore overlap value + grad (pharm): CPU twin of
-#  pharm_triton._pharm_score_grad_kernel. Typed Gaussians (per-type alpha/K/cat),
-#  directional weight w (cat 1 = (clamp(D,0,1)+2)/3, cat 2 = (|D|+2)/3, else 1),
-#  type-match and non-dummy (cat != 3) masking; returns O, grad_R (3x3), grad_t.
-#  FIT = i (rotated by R, t), REF = j (fixed); type/alpha/K/cat from FIT.
-
-@njit(parallel=True, fastmath=True, cache=True)
-def _pharm_grad_kernel(RaA, FaB, RvA, FvB, RtA, FtB, R, t, alphas, Ks, cats, Nr, Mr, need_grad):
-    P = RaA.shape[0]
-    O = np.zeros(P, dtype=np.float64)
-    gR = np.zeros((P, 3, 3), dtype=np.float64)
-    gt = np.zeros((P, 3), dtype=np.float64)
-    for p in prange(P):
-        r00 = R[p, 0, 0]; r01 = R[p, 0, 1]; r02 = R[p, 0, 2]
-        r10 = R[p, 1, 0]; r11 = R[p, 1, 1]; r12 = R[p, 1, 2]
-        r20 = R[p, 2, 0]; r21 = R[p, 2, 1]; r22 = R[p, 2, 2]
-        tx = t[p, 0]; ty = t[p, 1]; tz = t[p, 2]
-        n_real = Nr[p]; m_real = Mr[p]
-        Oacc = 0.0
-        gtx = 0.0; gty = 0.0; gtz = 0.0
-        g00 = 0.0; g01 = 0.0; g02 = 0.0; g10 = 0.0; g11 = 0.0; g12 = 0.0; g20 = 0.0; g21 = 0.0; g22 = 0.0
-        for i in range(m_real):  # FIT
-            fax0 = FaB[p, i, 0]; fay0 = FaB[p, i, 1]; faz0 = FaB[p, i, 2]
-            fvx = FvB[p, i, 0]; fvy = FvB[p, i, 1]; fvz = FvB[p, i, 2]
-            fnorm = math.sqrt(fvx * fvx + fvy * fvy + fvz * fvz)
-            finv = 1.0 / (fnorm if fnorm > 1e-12 else 1e-12)
-            fvxn = fvx * finv; fvyn = fvy * finv; fvzn = fvz * finv
-            ityp = FtB[p, i]
-            ialpha = alphas[ityp]; iK = Ks[ityp]; icat = cats[ityp]
-            if icat == 3:
-                continue
-            fatx = r00 * fax0 + r01 * fay0 + r02 * faz0 + tx
-            faty = r10 * fax0 + r11 * fay0 + r12 * faz0 + ty
-            fatz = r20 * fax0 + r21 * fay0 + r22 * faz0 + tz
-            fvtx = r00 * fvxn + r01 * fvyn + r02 * fvzn
-            fvty = r10 * fvxn + r11 * fvyn + r12 * fvzn
-            fvtz = r20 * fvxn + r21 * fvyn + r22 * fvzn
-            for j in range(n_real):  # REF
-                if RtA[p, j] != ityp:
-                    continue
-                rax = RaA[p, j, 0]; ray = RaA[p, j, 1]; raz = RaA[p, j, 2]
-                rvx = RvA[p, j, 0]; rvy = RvA[p, j, 1]; rvz = RvA[p, j, 2]
-                rnorm = math.sqrt(rvx * rvx + rvy * rvy + rvz * rvz)
-                rinv = 1.0 / (rnorm if rnorm > 1e-12 else 1e-12)
-                rvxn = rvx * rinv; rvyn = rvy * rinv; rvzn = rvz * rinv
-                dx = fatx - rax; dy = faty - ray; dz = fatz - raz
-                r2 = dx * dx + dy * dy + dz * dz
-                E = math.exp(-ialpha * 0.5 * r2)
-                D = fvtx * rvxn + fvty * rvyn + fvtz * rvzn
-                if icat == 1:
-                    Dcl = 0.0 if D < 0.0 else (1.0 if D > 1.0 else D)
-                    w = (Dcl + 2.0) / 3.0
-                elif icat == 2:
-                    w = (abs(D) + 2.0) / 3.0
-                else:
-                    w = 1.0
-                KwE = iK * w * E
-                Oacc += KwE
-                if need_grad:
-                    aKwE = -ialpha * KwE
-                    gtx += aKwE * dx; gty += aKwE * dy; gtz += aKwE * dz
-                    g00 += aKwE * dx * fax0; g01 += aKwE * dx * fay0; g02 += aKwE * dx * faz0
-                    g10 += aKwE * dy * fax0; g11 += aKwE * dy * fay0; g12 += aKwE * dy * faz0
-                    g20 += aKwE * dz * fax0; g21 += aKwE * dz * fay0; g22 += aKwE * dz * faz0
-                    if icat == 1:
-                        c = 1.0 if (D > 0.0 and D < 1.0) else 0.0
-                    elif icat == 2:
-                        c = 1.0 if D > 0.0 else (-1.0 if D < 0.0 else 0.0)
-                    else:
-                        c = 0.0
-                    coeff = (1.0 / 3.0) * iK * E * c
-                    g00 += coeff * rvxn * fvxn; g01 += coeff * rvxn * fvyn; g02 += coeff * rvxn * fvzn
-                    g10 += coeff * rvyn * fvxn; g11 += coeff * rvyn * fvyn; g12 += coeff * rvyn * fvzn
-                    g20 += coeff * rvzn * fvxn; g21 += coeff * rvzn * fvyn; g22 += coeff * rvzn * fvzn
-        O[p] = Oacc
-        gt[p, 0] = gtx; gt[p, 1] = gty; gt[p, 2] = gtz
-        gR[p, 0, 0] = g00; gR[p, 0, 1] = g01; gR[p, 0, 2] = g02
-        gR[p, 1, 0] = g10; gR[p, 1, 1] = g11; gR[p, 1, 2] = g12
-        gR[p, 2, 0] = g20; gR[p, 2, 1] = g21; gR[p, 2, 2] = g22
-    return O, gR, gt
-
-
-def pharm_score_grad_se3_batch(R, t, ref_types, fit_types, ref_anchors, fit_anchors,
-                               ref_vectors, fit_vectors, alphas, Ks, cats, *,
-                               N_real=None, M_real=None, NEED_GRAD: bool = True,
-                               BLOCK=None, num_warps=1):
-    """CPU drop-in for the Triton ``pharm_score_grad_se3_batch``. Returns (O, grad_R, grad_t)."""
-    P, N_pad, _ = ref_anchors.shape
-    _, M_pad, _ = fit_anchors.shape
-    dev, dt = ref_anchors.device, ref_anchors.dtype
-
-    def _np(x):
-        return np.ascontiguousarray(x.detach().cpu().numpy())
-    RaA = _np(ref_anchors); FaB = _np(fit_anchors)
-    RvA = _np(ref_vectors); FvB = _np(fit_vectors)
-    RtA = _np_cached(ref_types, np.int64)
-    FtB = _np_cached(fit_types, np.int64)
-    Rn = _np(R); tn = _np(t)
-    al = _np_cached(alphas, np.float64)
-    Ksn = _np_cached(Ks, np.float64)
-    cn = _np_cached(cats, np.int64)
-    Nr = np.full(P, N_pad, np.int64) if N_real is None else _np_cached(N_real, np.int64)
-    Mr = np.full(P, M_pad, np.int64) if M_real is None else _np_cached(M_real, np.int64)
-    O, gR, gt = _pharm_grad_kernel(RaA, FaB, RvA, FvB, RtA, FtB, Rn, tn, al, Ksn, cn, Nr, Mr, bool(NEED_GRAD))
-    return (torch.as_tensor(O, device=dev, dtype=dt),
-            torch.as_tensor(gR, device=dev, dtype=dt),
-            torch.as_tensor(gt, device=dev, dtype=dt))
-
 #  Directionless pharmacophore "color" overlap value + quaternion gradient
 #  (vol_color): the same same-type-only typed Gaussian as the pharm kernel, but
 #  isotropic (w = 1, no vectors, no weight gradient) and emitting dV/dq
@@ -687,12 +522,13 @@ def pharm_color_score_grad_se3_batch(A, B, q, t, ref_types, fit_types, alphas, K
             torch.as_tensor(dQ, device=dev, dtype=dt),
             torch.as_tensor(dT, device=dev, dtype=dt))
 
-#  Directional pharmacophore overlap value + quaternion gradient (pharm): the
-#  typed/directional Gaussian and weight of _pharm_grad_kernel, but taking q
-#  (assumed unit) and emitting dV/dq directly, by applying the shape-kernel dR/dq
-#  tail twice: to the positional force (sum_j aKwE*(rotfit-ref)) with the
-#  body-frame fit anchor, and to the weight force (sum_j coeff*ref_vn) with the
-#  body-frame fit vector.
+#  Directional pharmacophore overlap value + quaternion gradient (pharm): CPU twin
+#  of pharm_triton._pharm_grad_dq_kernel. Typed Gaussians (per-type alpha/K/cat),
+#  directional weight w (cat 1 = (clamp(D,0,1)+2)/3, cat 2 = (|D|+2)/3, else 1),
+#  type-match and non-dummy (cat != 3) masking. Takes q (assumed unit) and emits
+#  dV/dq directly, by applying the shape-kernel dR/dq tail twice: to the positional
+#  force (sum_j aKwE*(rotfit-ref)) with the body-frame fit anchor, and to the weight
+#  force (sum_j coeff*ref_vn) with the body-frame fit vector.
 
 @njit(parallel=True, fastmath=True, cache=True)
 def _pharm_grad_dq_kernel(A, B, q, t, At, Bt, RvA, FvB, alphas, Ks, cats, Nr, Mr, need_grad):
