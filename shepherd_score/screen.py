@@ -254,17 +254,13 @@ def close_multigpu_pool():
     """
     global _MGPU_POOL
     pool, _MGPU_POOL = _MGPU_POOL, None
-    if pool is None:
-        return
-    for q in pool["job_qs"]:
-        try:
-            q.put(None)
-        except Exception: # noqa: BLE001 - a dead queue is already closed
-            pass
-    for p in pool["procs"]:
-        p.join(timeout=10)
-        if p.is_alive():
-            p.terminate()
+    if pool is not None:
+        _stop_mgpu_pool(pool)
+
+
+def _stop_mgpu_pool(pool):
+    from shepherd_score.accel._procs import shutdown
+    shutdown(pool["job_qs"], pool["procs"], pool["conns"], grace=10.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -1580,15 +1576,15 @@ def _compose_rot(T, R):
 # calling process. Each worker streams a static, interleaved share of the shards
 # (r, r+ndev, r+2*ndev, ...) with the same read-ahead as the single-process screen.
 # --------------------------------------------------------------------------- #
-_MGPU_POOL = None                        # {"key": (ndev, threads), "procs", "job_qs", "out_q"}
+_MGPU_POOL = None                        # {"key": (ndev, threads), "procs", "job_qs", "conns"}
 
 
 def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, top_k,
-                   shard_q, out_q):
+                   shard_q, out_conn):
     """One device's share of one screen, inside its worker process. ``shard_q`` is either a
     static list of shard indices (streamed with read-ahead) or a queue yielding indices then
-    ``None`` (serial reads). Results go to ``out_q`` as ``(rank, per_query_raw_heaps)`` or
-    ``(rank, "__ERR__", traceback)``."""
+    ``None`` (serial reads). The reply goes to ``out_conn`` (this worker's result pipe) as
+    ``(rank, per_query_raw_heaps)`` or ``(rank, "__ERR__", traceback)``."""
     try:
         import torch
         from shepherd_score.accel.multi_gpu import _cap_threads
@@ -1632,13 +1628,13 @@ def _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, t
                 # Same pre-filtered reduce as the in-process driver; scores_out is unsupported here.
                 _accumulate(heaps[qi], ids, scores, pairs, tf_attr, None, qi, 0, rot)
             torch.cuda.synchronize()
-        out_q.put((rank, [h.raw() for h in heaps]))
+        out_conn.send((rank, [h.raw() for h in heaps]))
     except Exception:                            # noqa: BLE001 - relayed to parent
         import traceback
-        out_q.put((rank, "__ERR__", traceback.format_exc()))
+        out_conn.send((rank, "__ERR__", traceback.format_exc()))
 
 
-def _mgpu_pool_worker(rank, threads, job_q, out_q):
+def _mgpu_pool_worker(rank, threads, job_q, out_conn):
     """The persistent per-device process: one CUDA device, many screens. A job is
     ``(store_path, ref_arrays_list, mode, batch_kw, top_k, shard_list)``; ``None`` ends it."""
     while True:
@@ -1647,7 +1643,7 @@ def _mgpu_pool_worker(rank, threads, job_q, out_q):
             return
         store_path, ref_arrays_list, mode, batch_kw, top_k, shards = job
         _screen_worker(rank, threads, store_path, ref_arrays_list, mode, batch_kw, top_k,
-                       shards, out_q)
+                       shards, out_conn)
 
 
 def _mgpu_pool(ndev, threads):
@@ -1659,24 +1655,25 @@ def _mgpu_pool(ndev, threads):
         return pool
     close_multigpu_pool()
     import torch.multiprocessing as mp
+    from shepherd_score.accel._procs import start_worker
     ctx = mp.get_context("spawn")
-    out_q = ctx.Queue()
-    job_qs, procs = [], []
-    for r in range(ndev):
-        q = ctx.Queue()
-        p = ctx.Process(target=_mgpu_pool_worker, args=(r, threads, q, out_q), daemon=True)
-        p.start()
-        job_qs.append(q)
-        procs.append(p)
-    _MGPU_POOL = {"key": (ndev, threads), "procs": procs, "job_qs": job_qs, "out_q": out_q}
-    return _MGPU_POOL
+    pool = {"key": (ndev, threads), "procs": [], "job_qs": [], "conns": []}
+    try:
+        for r in range(ndev):
+            q, conn, p = start_worker(ctx, _mgpu_pool_worker, (r, threads), daemon=True)
+            pool["job_qs"].append(q); pool["conns"].append(conn); pool["procs"].append(p)
+    except BaseException:
+        _stop_mgpu_pool(pool)                        # the workers that did start
+        raise
+    _MGPU_POOL = pool
+    return pool
 
 
 def _screen_many_multigpu(qs, store_path, mode, ndev, batch_kw, top_k, progress,
                          worker_threads=None):
     import os as _os
     import torch
-    from queue import Empty
+    from shepherd_score.accel._procs import collect
 
     ndev = max(1, min(ndev, torch.cuda.device_count() if torch.cuda.is_available() else 1))
     try:
@@ -1707,30 +1704,19 @@ def _screen_many_multigpu(qs, store_path, mode, ndev, batch_kw, top_k, progress,
 
     # Static, interleaved shares: shards are equal-sized except the last, so this is balanced
     # without a shared queue, and a static share is what lets a worker read ahead.
-    for r, q in enumerate(pool["job_qs"]):
-        q.put((store_path, ref_arrays_list, mode, batch_kw, top_k, list(range(r, n_shards, ndev))))
-    results, errs = {}, []
-    out_q = pool["out_q"]
-    while len(results) + len(errs) < ndev:
-        try:
-            msg = out_q.get(timeout=5.0)
-        except Empty:
-            dead = [p.pid for p in pool["procs"] if not p.is_alive()]
-            if dead:
-                close_multigpu_pool()
-                raise RuntimeError(f"multi-GPU screen: worker process(es) {dead} died")
-            continue
-        if len(msg) == 3 and msg[1] == "__ERR__":
-            errs.append((msg[0], msg[2]))
-        else:
-            results[msg[0]] = msg[1]
-    if errs:
-        raise RuntimeError("multi-GPU screen failed on ranks "
-                           f"{[r for r, _ in errs]}:\n" +
-                           "\n".join(f"[rank {r}]\n{tb}" for r, tb in errs))
+    def submit():
+        for r, q in enumerate(pool["job_qs"]):
+            q.put((store_path, ref_arrays_list, mode, batch_kw, top_k,
+                   list(range(r, n_shards, ndev))))
+
+    # Any failure closes the pool at once: the other ranks' work is wasted anyway, and a CUDA
+    # error can leave a worker alive with a broken context.
+    replies = collect(dict(enumerate(zip(pool["conns"], pool["procs"]))), close_multigpu_pool,
+                      submit=submit, what="multi-GPU screen worker", fail_fast=True,
+                      error_of=lambda m: m[2] if len(m) == 3 and m[1] == "__ERR__" else None)
     heaps = [_TopK(top_k) for _ in qs]
-    for rank in results:
-        per_query = results[rank]
+    for rank in sorted(replies):                     # rank order, so equal scores merge repeatably
+        per_query = replies[rank][1]
         for qi, raw in enumerate(per_query):
             heaps[qi].merge_raw(raw)
     return heaps

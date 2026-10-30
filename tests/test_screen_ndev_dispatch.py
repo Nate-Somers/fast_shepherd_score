@@ -89,14 +89,14 @@ def _run_worker(mp, mode, share=None, store_cls=_FakeStore, ref_arrays=None, see
         def get(self):
             return self._q.pop(0)
 
-    class _OutQ:
+    class _OutConn:                             # stands in for the worker's result pipe
         def __init__(self):
             self.msgs = []
 
-        def put(self, msg):
+        def send(self, msg):
             self.msgs.append(msg)
 
-    out = _OutQ()
+    out = _OutConn()
     scr._screen_worker(0, 1, "<fake>", [{} if ref_arrays is None else ref_arrays], mode,
                        _BATCH_KW, 1, _ShardQ() if share is None else share, out)
 
@@ -260,3 +260,19 @@ def test_two_gpu_screen_matches_the_single_process_screen(two_gpu_store):
         f"ndev=2 disagrees with ndev=1: max|delta| {max(abs(got[i] - want[i]) for i in want):.4e}"
     assert max(abs(volw[i] - want[i]) for i in want) > 1e-3, \
         "vol and vol_color score this library identically; the check above is vacuous"
+
+
+@pytest.mark.cuda
+def test_two_gpu_screen_raises_when_a_worker_dies(two_gpu_store, monkeypatch):
+    """A dead screen worker raises at once instead of hanging, and the broken pool is dropped."""
+    _require_two_gpus()
+    store_path, mols = two_gpu_store
+    pool = scr._mgpu_pool(2, 1)
+    pool["procs"][1].kill()
+    pool["procs"][1].join()
+    monkeypatch.setattr(scr, "_mgpu_pool", lambda ndev, threads: pool)
+    with pytest.raises(RuntimeError, match="died without replying"):
+        scr.screen(mols[1], scr.ProfileStore.open(store_path), mode="vol", backend="triton",
+                   top_k=3, max_num_steps=10, ndev=2)
+    assert scr._MGPU_POOL is None
+    assert all(not p.is_alive() for p in pool["procs"])

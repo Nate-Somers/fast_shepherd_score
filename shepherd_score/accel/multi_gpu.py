@@ -19,6 +19,7 @@ import numpy as np
 # they cannot drift; the process path supports exactly PROCESS_MODES.
 from ._modes import (MODE_ATTRS as _MODE_ATTRS, PROCESS_MODES as _PROCESS_MODES,
                      LEGACY_MODE_ALIASES as _LEGACY_MODE_ALIASES)
+from ._procs import collect, shutdown, start_worker, stop
 _TRANSFORM_ATTR = {m: _MODE_ATTRS[m][0] for m in _PROCESS_MODES}
 _SCORE_ATTR = {m: _MODE_ATTRS[m][1] for m in _PROCESS_MODES}
 
@@ -38,7 +39,7 @@ def _cap_threads(threads):
         pass
 
 
-def _worker(rank, mode, backend, do_center, threads, align_kwargs, shard_mols, out_q):
+def _worker(rank, mode, backend, do_center, threads, align_kwargs, shard_mols, out_conn):
     """One GPU's worker: pin to ``cuda:rank``, rebuild the pairs on that GPU, align the shard
     and return numpy results."""
     try:
@@ -66,10 +67,10 @@ def _worker(rank, mode, backend, do_center, threads, align_kwargs, shard_mols, o
         transforms = np.stack([
             torch.as_tensor(getattr(p, tf_attr)).detach().cpu().numpy().astype(np.float64)
             for p in pairs])
-        out_q.put((rank, scores, transforms, t_build, t_align))
+        out_conn.send((rank, scores, transforms, t_build, t_align))
     except Exception:                            # noqa: BLE001 - relayed to parent
         import traceback
-        out_q.put((rank, "__ERR__", traceback.format_exc(), 0.0, 0.0))
+        out_conn.send((rank, "__ERR__", traceback.format_exc(), 0.0, 0.0))
 
 
 def align_multi_gpu(pairs: Sequence,
@@ -148,36 +149,29 @@ def align_multi_gpu(pairs: Sequence,
               ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")}
     for k in _saved:
         os.environ[k] = str(threads)
+    procs, pending = [], {}                  # pending: rank -> (read end, worker)
     try:
         ctx = mp.get_context("spawn")
-        out_q = ctx.Queue()
-        procs = []
         for r in range(ndev):
             shard = [specs[i] for i in shard_idx[r]]
-            p = ctx.Process(target=_worker,
-                            args=(r, mode, backend, do_center, threads,
-                                  dict(align_kwargs), shard, out_q))
-            p.start(); procs.append(p)
-
-        results, errs = {}, []
-        for _ in range(ndev):
-            rank, a, b, t_build, t_align = out_q.get()   # drain before join
-            if isinstance(a, str) and a == "__ERR__":
-                errs.append((rank, b))
-            else:
-                results[rank] = (a, b, t_build, t_align)
-        for p in procs:
-            p.join()
+            _, read, p = start_worker(ctx, _worker, (r, mode, backend, do_center, threads,
+                                                     dict(align_kwargs), shard), task_queue=False)
+            procs.append(p); pending[r] = (read, p)
+        # Each worker runs one job and exits, so the first failure stops the others at once.
+        replies = collect(pending, lambda: stop(procs, grace=0.0), what="multi-GPU worker",
+                          fail_fast=True,
+                          error_of=lambda m: m[2] if isinstance(m[1], str) and m[1] == "__ERR__" else None)
+        results = {r: m[1:] for r, m in replies.items()}
+        stop(procs, grace=30.0)              # every worker has replied and is exiting
     finally:
+        stop(procs, grace=0.0)               # the rest of a failed start; else already exited
+        for read, _ in pending.values():
+            read.close()
         for k, v in _saved.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-
-    if errs:
-        msg = "\n".join(f"[rank {r}]\n{tb}" for r, tb in errs)
-        raise RuntimeError(f"multi-GPU align failed on {[r for r, _ in errs]}:\n{msg}")
 
     scores = np.empty(K, dtype=np.float64)
     transforms = np.empty((K, 4, 4), dtype=np.float64)
@@ -203,7 +197,7 @@ def align_multi_gpu(pairs: Sequence,
 
 # Persistent pool: build+retain shards once, align resident data many times.
 
-def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
+def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_conn):
     """Persistent worker: build and retain this GPU's shard once, then align it in place on every
     job. Only ``(mode, backend, kwargs)`` come in and ``(scores, transforms)`` go out per call;
     the bulk molecule data never recrosses the process boundary."""
@@ -220,12 +214,17 @@ def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
                  for (ref, fit) in shard_mols]
         batch = MoleculePairBatch(pairs)
         torch.cuda.synchronize()
-        out_q.put(("READY", rank))
+        out_conn.send(("READY", rank))
+    except Exception:                            # noqa: BLE001 - startup failed; relayed
+        import traceback
+        out_conn.send(("ERR", rank, traceback.format_exc()))
+        return
 
-        while True:
-            job = in_q.get()
-            if job is None:
-                break
+    while True:
+        job = in_q.get()
+        if job is None:
+            break
+        try:                                     # a failed job is reported; the worker stays up
             mode, backend, kwargs = job
             t0 = time.perf_counter()
             batch._align_mode(
@@ -237,10 +236,10 @@ def _pool_worker(rank, threads, do_center, shard_mols, in_q, out_q):
             transforms = _np.stack([
                 torch.as_tensor(getattr(p, tf_attr)).detach().cpu().numpy().astype(_np.float64)
                 for p in pairs])
-            out_q.put(("RES", rank, scores, transforms, t_align))
-    except Exception:                            # noqa: BLE001
-        import traceback
-        out_q.put(("ERR", rank, traceback.format_exc()))
+            out_conn.send(("RES", rank, scores, transforms, t_align))
+        except Exception:                        # noqa: BLE001 - relayed to parent
+            import traceback
+            out_conn.send(("ERR", rank, traceback.format_exc()))
 
 
 class MultiGPUAligner:
@@ -317,52 +316,44 @@ class MultiGPUAligner:
                       ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")}
             for k in _saved:
                 os.environ[k] = str(threads)
+        # Closable from the first started worker on, so a startup failure stops the others.
+        self._in_qs, self._out_conns, self._procs, self._closed = [], [], [], False
         try:
             ctx = mp.get_context(start_method)
-            self._out_q = ctx.Queue()
-            self._in_qs = [ctx.Queue() for _ in range(ndev)]
-            self._procs = []
             for r in range(ndev):
                 shard = [specs[i] for i in self._shard_idx[r]]
-                p = ctx.Process(target=_pool_worker,
-                                args=(r, threads, do_center, shard, self._in_qs[r], self._out_q))
-                p.start(); self._procs.append(p)
-            ready = 0
-            while ready < ndev:
-                msg = self._out_q.get()
-                if msg[0] == "ERR":
-                    self.close()
-                    raise RuntimeError(f"worker {msg[1]} failed to start:\n{msg[2]}")
-                ready += 1
+                in_q, read, p = start_worker(ctx, _pool_worker, (r, threads, do_center, shard))
+                self._in_qs.append(in_q); self._out_conns.append(read); self._procs.append(p)
+            collect(self._pending(), self.close, what="MultiGPUAligner worker", fail_fast=True,
+                    error_of=lambda m: f"failed to start:\n{m[2]}" if m[0] == "ERR" else None)
+        except BaseException:
+            self.close()
+            raise
         finally:
             for k, v in _saved.items():
                 if v is None:
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
-        self._closed = False
 
     def align(self, mode, *, backend="triton", return_timing=False, **align_kwargs):
         """Align the resident pairs with ``mode``; returns ``(scores, transforms)`` in the
-        original input order. Only parameters go in and results come out."""
+        original input order. Only parameters go in and results come out. A job that raises in
+        any worker, a worker that dies, or an interrupted call closes the pool and raises: a
+        CUDA error can leave a worker alive with a broken context, so it is not reused."""
         if self._closed:
             raise RuntimeError("MultiGPUAligner is closed")
         mode = _LEGACY_MODE_ALIASES.get(mode, mode)    # accept legacy esp / esp_combo
         if mode not in _SCORE_ATTR:
             raise ValueError(f"mode must be one of {list(_SCORE_ATTR)}, got {mode!r}")
-        for r in range(self.ndev):
-            self._in_qs[r].put((mode, backend, dict(align_kwargs)))
-        results, errs = {}, []
-        for _ in range(self.ndev):
-            msg = self._out_q.get()
-            if msg[0] == "ERR":
-                errs.append((msg[1], msg[2]))
-            else:
-                _, rank, sc, tf, t_align = msg
-                results[rank] = (sc, tf, t_align)
-        if errs:
-            raise RuntimeError("multi-GPU align failed:\n" +
-                               "\n".join(f"[rank {r}]\n{tb}" for r, tb in errs))
+
+        def submit():
+            for q in self._in_qs:
+                q.put((mode, backend, dict(align_kwargs)))
+
+        replies = collect(self._pending(), self.close, submit=submit, what="MultiGPUAligner worker",
+                          fail_fast=True, error_of=lambda m: m[2] if m[0] == "ERR" else None)
+        results = {r: m[2:] for r, m in replies.items()}
         scores = np.empty(self._K, dtype=np.float64)
         transforms = np.empty((self._K, 4, 4), dtype=np.float64)
         for r in range(self.ndev):
@@ -374,19 +365,15 @@ class MultiGPUAligner:
             return scores, transforms, {"align_max": max(results[r][2] for r in results)}
         return scores, transforms
 
+    def _pending(self):
+        """Every worker, keyed by rank, as ``recv_any`` takes them."""
+        return {r: (c, p) for r, (c, p) in enumerate(zip(self._out_conns, self._procs))}
+
     def close(self):
         if getattr(self, "_closed", True):
             return
         self._closed = True
-        for q in self._in_qs:
-            try:
-                q.put(None)
-            except Exception:
-                pass
-        for p in self._procs:
-            p.join(timeout=30)
-            if p.is_alive():
-                p.terminate()
+        shutdown(self._in_qs, self._procs, self._out_conns, grace=30.0)
 
     def __enter__(self):
         return self
