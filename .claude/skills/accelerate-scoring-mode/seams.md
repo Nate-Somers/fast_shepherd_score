@@ -20,7 +20,8 @@ Paths are under `shepherd_score/` unless stated otherwise.
 | Frozen launch configuration replay | `accel/kernels/tuning.py` |
 | Store/profile/screen front end | `screen.py` |
 | In-memory CPU screening workers | `accel/screen_parallel.py` |
-| Public batch methods | `container/_batch.py` |
+| Public batch methods, `_align_mode`, per-pair fallback | `container/_batch.py` |
+| Reference modes the fallback runs | `modes.py` |
 
 `CANONICAL_MODES`, `MODE_ATTRS`, `MODE_SEEDS`, `MODE_STEPS`, `PROCESS_MODES`,
 and `CONST_SEED_MODES` derive from `SPECS`. Preserve those derivations rather

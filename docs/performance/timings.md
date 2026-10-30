@@ -5,13 +5,12 @@ These measurements are from the paper's archived campaign, plan
 `47e2b119cb57` for inherited CPU measurements and `0bf841680552` for the updated
 GPU measurements. See the [paper archive](https://github.com/Nate-Somers/Shepherd-Score-Paper/blob/main/results/published.zip)
 and its assembled `table6_throughput_wide.csv` for full precision and measurement IDs.
-They are recorded results, not measurements of every subsequent checkout.
+Later commits have not been re-measured.
 
 GPU: NVIDIA L40S. CPU: one AMD EPYC 9474F core with Numba/SVML.
 Each rate uses one timed run after one untimed warm-up. Molecular preparation,
 index construction, and pairwise batch assembly are outside these timers.
-GPU runs replay the archived Triton launch configurations; cache state and
-hardware still matter. The 100-million-conformer `vol` screening and GPU scaling
+GPU runs replay the archived Triton launch configurations. The 100-million-conformer `vol` screening and GPU scaling
 measurements additionally pre-read the store before warm-up; that initial read
 is excluded from their times.
 
@@ -50,19 +49,17 @@ use 100,000 comparisons.
 | `pharm_tversky` | 572.6 | 163,818 | 62,641 |
 | `vol_fukui` | 461.7 | 213,585 | 58,101 |
 
-The package also implements `vol_tversky`, `vol_esp_tversky`, and `vol_avoid`.
-These are outside this 18-mode timing set; `vol_avoid` additionally requires an
-explicit avoid-point cloud.
+`vol_tversky`, `vol_esp_tversky` and `vol_avoid` were not timed. The `_tversky`
+names are the registry modes that `similarity="tversky"` runs on the batched backends.
 
 ## Parallel screening
 
 CPU scaling uses 10,000 conformers and includes pair construction inside each
 persistent worker's timed call. One and 64 workers give 1,881 and 102,959
-alignments/s, respectively (54.72-fold speedup). This differs from the
-single-process stored-profile screening path.
+alignments/s, respectively (54.72-fold speedup). This is the in-memory
+`screen_parallel` path, not store-based `screen`.
 
 GPU scaling uses 100 million conformers with one host compute thread per GPU
 worker. Times on one, two, and four L40S GPUs are 96.69, 48.49, and 24.55 seconds,
 respectively (1.99-fold and 3.94-fold speedups). Each value is one timed run after
-warm-up, with worker startup excluded. These are observed timing ratios, not
-prescribed linear scaling.
+warm-up, with worker startup excluded.

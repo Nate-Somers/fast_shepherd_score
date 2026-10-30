@@ -1,38 +1,40 @@
 Installation
 ============
 
-Install the checkout to use its accelerated scoring and screening features::
+Install from the repository root::
 
    python -m pip install -e .
 
-Numba CPU kernels are included. GPU kernels require a CUDA build of PyTorch and
-Triton on a supported platform::
+Numba CPU kernels are included. GPU kernels need a CUDA build of PyTorch and
+Triton::
 
    python -m pip install -e ".[gpu]"
 
-Other extras are ``jax``, ``docking``, ``dev``, and ``docs``. Install only those
-needed for the intended workflow. The Python and dependency bounds are defined
-in ``pyproject.toml``. Older PyPI releases may not include this checkout's API.
+Other extras are ``jax``, ``docking``, ``dev`` and ``docs``. Python and
+dependency versions are set in ``pyproject.toml``. Older PyPI releases do not
+include the batched alignment and screening APIs described here.
 
 CPU benchmark environment
 -------------------------
 
-``environment.yml`` defines the conda environment used for the SVML CPU path.
-Check whether Numba loaded SVML::
+``environment.yml`` defines the conda environment used for the published CPU
+timings, which use Intel SVML. Check whether Numba loaded it::
 
    python -c "import numba.core.config as c; print(c.USING_SVML)"
 
-Numba builds without SVML also work, but performance and floating-point rounding
-can differ. Published throughput should be compared using the recorded software
-versions, hardware, and settings in the paper's result files.
+Without SVML the kernels still run, but more slowly, and results can differ
+within floating-point tolerance.
 
 External executables
 --------------------
 
-xTB must be on ``PATH`` for xTB charges, quantum-chemical relaxation, and Fukui
-descriptors. ``Molecule(..., charge_model="mmff")`` uses RDKit MMFF94 charges.
-Docking uses the Vina Python API installed by the ``docking`` extra. The optional ChemAxon protonation path requires a licensed ``cxcalc`` executable;
-the MolScrub path uses the Python dependency installed with this package.
+- **xTB** must be on ``PATH`` for xTB charges, xTB relaxation and Fukui
+  descriptors. ``Molecule`` uses xTB in implicit water for charges by default
+  and falls back to MMFF94, with a warning, when xTB is missing. Pass
+  ``charge_model="mmff"`` to use MMFF94 directly.
+- **Vina**: docking uses the Vina Python API from the ``docking`` extra.
+- **ChemAxon**: the ChemAxon protonation path needs a licensed ``cxcalc``.
+  The MolScrub path needs no extra install.
 
 Documentation and tests
 -----------------------

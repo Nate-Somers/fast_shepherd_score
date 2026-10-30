@@ -1,9 +1,9 @@
 (theory)=
 # Representations, Scoring, and Alignment
 
-This page documents the mathematical formulations underlying ShEPhERD Score's interaction profile representations, similarity scoring functions, and analytical gradient derivations used during alignment.
-Reference scoring functions use PyTorch, NumPy, or optional JAX. Accelerated alignment uses analytic gradients in Numba and Triton; the PyTorch alignment API also supports analytic gradients for selected modes.
-We use the notation provided in [Adams et al. (2025)](https://openreview.net/forum?id=KSLkFYHlYg).
+This page defines the interaction-profile representations, the similarity scores and the analytic gradients used in alignment.
+The reference scoring functions are written in PyTorch, NumPy and (optionally) JAX. The Numba and Triton kernels use analytic gradients, as does the PyTorch optimizer for the modes that provide them.
+Notation follows [Adams et al. (2025)](https://openreview.net/forum?id=KSLkFYHlYg).
 
 ## Base Representations
 
@@ -32,6 +32,12 @@ The optimal alignment objective is:
 $$\text{sim}(\boldsymbol{Q}_A, \boldsymbol{Q}_B) = \max_{\boldsymbol{R, t}}{\text{sim}^{*} (\boldsymbol{R}\boldsymbol{Q}_A^T + \boldsymbol{t}, \boldsymbol{Q}_B)}$$
 
 where $\boldsymbol{R} \in SO(3)$ and $\boldsymbol{t}\in T(3)$.
+
+Passing `similarity=` replaces Tanimoto with the Tversky similarity, with weight $a$ on the reference (A) and $b$ on the fit (B):
+
+$$\text{sim}^{*}_{a,b}(\boldsymbol{Q}_A, \boldsymbol{Q}_B) = \frac{O_{A,B}}{a\,O_{A,A} + b\,O_{B,B} + (1-a-b)\,O_{A,B}}$$
+
+`'tversky'` is $(a, b) = (0.95, 0.05)$, `'tversky_ref'` is $(1, 0)$ and `'tversky_fit'` is $(0.05, 0.95)$; any other pair can be passed as a tuple. Tanimoto corresponds to $a = b = 1$. With $a + b = 1$ the denominator is $a\,O_{A,A} + b\,O_{B,B}$. Gaussian-overlap Tversky scores can exceed one; pharmacophore Tversky scores are clamped at one (below).
 
 ## Specific Scoring Functions
 
@@ -70,12 +76,11 @@ $$w_{a,b;m} = \begin{cases} 1 & \text{if } m \text{ is non-directional}, \\ \fra
 
 ## Analytical Gradients
 
-Analytical gradients have been implemented for **pharmacophore**, **shape**, and
-**shape-with-avoid** alignment, replacing PyTorch autograd. The PyTorch implementations
-live in `shepherd_score/score/analytical_gradients/` (PyTorch in `_torch.py`,
-re-exported via `__init__.py`) and are called from the optimizer loops in
-`shepherd_score/alignment/_torch_analytical.py`. Accelerated Numba and Triton kernels are in `shepherd_score/accel/kernels/`.
-See the performance page for measured workloads.
+Shape, ESP, pharmacophore and shape-with-avoid alignment have hand-derived
+gradients. The PyTorch versions are in `shepherd_score/score/analytical_gradients/`
+and are called from the optimizer loops in
+`shepherd_score/alignment/_torch_analytical.py`. The Numba and Triton kernels are in
+`shepherd_score/accel/kernels/`.
 
 The SE(3) parameter vector is always `(q_w, q_x, q_y, q_z, t_x, t_y, t_z)` —
 4 quaternion components followed by 3 translation components. All functions
@@ -83,36 +88,38 @@ support both single `(7,)` and batched `(B,7)` inputs.
 
 ### 1. Tanimoto Chain Rule
 
-The self-overlaps $O_{A,A}$ and $O_{B,B}$ are **invariant** to any rigid SE(3)
-transformation. Defining $U = O_{A,A} + O_{B,B}$, the Tanimoto gradient
-simplifies via the quotient rule:
+The self-overlaps $O_{A,A}$ and $O_{B,B}$ do not change under a rigid SE(3)
+transformation. With $U = O_{A,A} + O_{B,B}$, the quotient rule gives
 
 $$\nabla_{\theta} S = \frac{U}{(U - O_{A,B})^2} \nabla_{\theta} O_{A,B}$$
 
 $U$ is computed once before the optimization loop. Only $\nabla_{\theta} O_{A,B}$
 needs to be evaluated each step. The loss is $1 - S$.
 
-### 1b. Tversky Chain Rule (pharmacophore only)
+### 1b. Tversky Chain Rule
 
-For Tversky similarity, $D = \sigma \cdot O_{A,A} + (1-\sigma) \cdot O_{B,B}$
-is a **constant** w.r.t. SE(3). The similarity is:
+With $C = a\,O_{A,A} + b\,O_{B,B}$ (constant during alignment) and $k = 1 - a - b$:
+
+$$\nabla_{\theta} S = \frac{C}{(k\,O_{A,B} + C)^2} \nabla_{\theta} O_{A,B}$$
+
+For the named similarities, the pharmacophore scorers use $D = \sigma\,O_{A,A} + (1-\sigma)\,O_{B,B}$ and clamp the score at one:
 
 $$\text{sim}^{*}(\boldsymbol{Q}_A, \boldsymbol{Q}_B) = \min\left(\frac{O_{A,B}}{D}, 1.0\right)$$
 
-The gradient scales directly by a constant factor (no quotient rule):
+so the gradient is a constant multiple of $\nabla_{\theta} O_{A,B}$:
 
 $$\nabla_{\theta} S = \frac{\mathbf{1}[S < 1.0]}{D} \nabla_{\theta} O_{A,B}$$
 
 where the indicator function $\mathbf{1}[S < 1.0]$ is 1 when not clamped, 0
-otherwise. Sigma variants: `'tversky'`→0.95, `'tversky_ref'`→1.0,
-`'tversky_fit'`→0.05.
+otherwise. $\sigma$ is 0.95 for `'tversky'`, 1.0 for `'tversky_ref'` and
+0.05 for `'tversky_fit'`.
 
 ### 2. Shape and ESP Gradients
 
 Let $\boldsymbol{\Delta}_{ab} = \boldsymbol{R}\boldsymbol{r}_a + \boldsymbol{t} - \boldsymbol{r}_b$ and $E_{ab} = \exp(-\frac{\alpha}{2}\|\boldsymbol{\Delta}_{ab}\|^2)$.
 
-For **shape**, the pair constant is $C_{ab} = w_{ab} \left(\frac{\pi}{2\alpha}\right)^{3/2}$ (with $w_{ab}=1$ for surface, $w_{ab}=1$ for volumetric).
-For **ESP**, the pair constant absorbs the potential difference: $\tilde{C}_{ab} = \left(\frac{\pi}{2\alpha}\right)^{3/2} \exp\!\left(-\|\boldsymbol{v}_A[a]-\boldsymbol{v}_B[b]\|^2 / \lambda\right)$. The ESP potential is invariant to rigid motion, so $\tilde{C}_{ab}$ is a pure constant during alignment.
+For **shape**, the pair constant is $C_{ab} = w_{ab} \left(\frac{\pi}{2\alpha}\right)^{3/2}$ (with $w_{ab}=1$ for both surface and volumetric shape).
+For **ESP**, the pair constant absorbs the potential difference: $\tilde{C}_{ab} = \left(\frac{\pi}{2\alpha}\right)^{3/2} \exp\!\left(-\|\boldsymbol{v}_A[a]-\boldsymbol{v}_B[b]\|^2 / \lambda\right)$. The potentials move with their points, so $\tilde{C}_{ab}$ is constant during alignment.
 
 Both cases share the same gradient structure (substituting $C_{ab}$ or $\tilde{C}_{ab}$):
 
@@ -170,14 +177,24 @@ $$\nabla_{\hat{\boldsymbol{q}}} = \frac{1}{\|\hat{\boldsymbol{q}}\|}\left(\bolds
 
 ---
 
+## Composite Scores
 
-### Key constants — `score/constants.py`
+The shape-plus-feature modes (`vol_color`, `vol_pharm`, `vol_lipo`, `vol_mr`, `vol_fukui`,
+`vol_atomtype`) score $(1-w)\,\text{sim}_\text{shape} + w\,\text{sim}_\text{feature}$, where both terms use
+`similarity` unless a separate one is given (`color_similarity`, `type_similarity`). The scalar-field modes weight each atom pair by $\exp(-(f_a - f_b)^2/\lambda)$,
+as in the ESP overlap, so signed descriptors are compared by value.
+
+`vol_and_surf_esp` blends shape with a ShaEP-style surface-potential agreement
+term instead of a Gaussian overlap ratio. The optimizer differentiates both terms.
+The van der Waals-plus-probe mask is piecewise constant, with zero derivative almost
+everywhere, so the gradient leaves it out. A Tversky `similarity` applies to the shape term only.
+
+## Key Constants (`score/constants.py`)
 
 * `P_ALPHAS`: per-type $\alpha_m$ (all 1.0 except aromatic/hydrophobe = 0.7)
 * `P_TYPES`: `('Acceptor', 'Donor', 'Aromatic', 'Hydrophobe', 'Halogen', 'Cation', 'Anion', 'ZnBinder', 'Dummy')`
 
-
-### References
+## References
 ```{admonition} Citation
 :class: note
 
@@ -195,22 +212,3 @@ Taminau, J., Thijs, G., & De Winter, H. (2008). Pharao: Pharmacophore alignment 
 
 Wahl, J. (2024). PheSA: An Open-Source Tool for Pharmacophore-Enhanced Shape Alignment. *Journal of Chemical Information and Modeling*, *64*(15), 5944-5953. https://doi.org/10.1021/acs.jcim.4c00516
 ```
-
-## Composite scores and accelerated alignment
-
-Shape-plus-field modes blend shape Tanimoto with a second normalized overlap.
-The field kernel weights pairs by `exp(-(a-b)**2 / lam)`; signed descriptors
-therefore compare values rather than multiplying descriptor signs.
-
-`vol_and_surf_esp` uses a masked surface-potential agreement term, not a Gaussian
-overlap ratio for its ESP channel. The accelerated implementation differentiates
-the shape term and the ESP agreement term and follows the gradient of the
-combined score. The van der Waals-plus-probe mask is piecewise constant, so its
-derivative is zero almost everywhere and the gradient omits it.
-
-For volumetric and field Tversky modes the denominator is
-`a*O_AA + b*O_BB + (1-a-b)*O_AB`, with defaults `a=0.95`, `b=0.05`.
-`A` is the fixed reference and `B` is the fitted molecule in these
-accelerated Tversky modes. These Gaussian-overlap ratios need not be bounded by one. The pharmacophore
-Tversky implementation clamps at one. Asymmetry reduces but does not eliminate
-the fitted molecule's self-overlap penalty.

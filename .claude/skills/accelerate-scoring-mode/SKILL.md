@@ -8,8 +8,9 @@ description: >-
 
 # Accelerate a scoring mode
 
-Start from a tested objective, reference optimizer, public per-pair method,
-and result slots. If those do not exist, establish them with
+Start from a tested reference mode: a `Mode` registered in
+`modes.py::MODES`, its `MoleculePair.align_with_<mode>` method and its
+`_ALIGN_KEYS` result slot. If those do not exist, establish them with
 `design-scoring-mode` first. Work within the user's requested scope; adding a
 mode does not authorize changing existing defaults or rerunning a full benchmark.
 
@@ -38,7 +39,9 @@ Read [seams.md](seams.md) for the implementation map. The current term families 
 
 `vol_lipo`, `vol_mr`, and `vol_fukui` reuse the scalar-field term. Element
 labels reuse the color kernel with element tables. Tversky changes a reduction,
-not the underlying overlap kernel. All currently registered terms contribute
+not the underlying overlap kernel: each batched Tversky variant is its own
+`<base>_tversky` spec, and `MoleculePairBatch._align_with` routes
+`similarity=` to it. All currently registered terms contribute
 their gradients, including the ESP term in combined volume-and-surface modes.
 
 ## Implementation procedure
@@ -56,10 +59,15 @@ their gradients, including the ESP term in combined volume-and-surface modes.
    settings. Copy the nearest mathematical objective, not just a similar mode
    name. Check `lam_scaling`, `pharm_style`, `channel_switch`, `seed_channel`,
    `graph_full_steps`, and CPU/graph gates individually.
-5. Add `MoleculePairBatch.align_with_<mode>` in `container/_batch.py`, using the
-   existing fast/fallback routing. Preserve device-aware `backend=None`.
-   Ensure the per-pair result properties exist and audit effective defaults
-   across reference, batch, and screen calls. Do not silently change other modes.
+5. Add `MoleculePairBatch.align_with_<mode>` in `container/_batch.py` as a thin
+   wrapper over `self._align_mode(name, ...)`, following `align_with_vol_mr`.
+   `_align_mode` handles backend resolution (`backend=None` is device-aware),
+   registry defaults, the accelerated run and the `torch`/`jax` fallback, which
+   calls `pair.align(name, ...)`. The spec name must therefore equal the
+   reference name in `modes.MODES`, and its keyword parameters must be accepted
+   by the reference mode. If Tversky is supported, add a `<name>_tversky` spec
+   and route `similarity=` through `_align_with`. Audit effective defaults
+   across reference, batch and screen calls. Do not change other modes.
 6. Update `tests/test_mode_registry.py`'s mode count and any necessary fixtures.
    Registry-derived tests provide coverage only if their fixtures actually
    supply the new features and required arguments. Inspect their parametrization;

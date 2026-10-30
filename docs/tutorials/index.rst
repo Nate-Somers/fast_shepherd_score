@@ -1,8 +1,9 @@
 Tutorials
 =========
 
-These tutorials provide step-by-step guides for using shepherd-score. They are Jupyter 
-notebooks that you can also download and run interactively.
+Jupyter notebooks covering profile extraction, scoring and evaluation. They use
+the original single-pair API; see :doc:`../accelerated_api` for batched alignment and
+screening.
 
 .. toctree::
    :maxdepth: 2
@@ -14,14 +15,14 @@ notebooks that you can also download and run interactively.
 Tutorial Overview
 -----------------
 
-1. **Interaction Profiles** (``01_profiles.ipynb``): Learn how to extract shape, 
-   electrostatic, and pharmacophore profiles from molecules.
+1. **Interaction Profiles** (``01_profiles.ipynb``): extracting shape,
+   electrostatic and pharmacophore profiles from molecules.
 
-2. **Scoring and Alignment** (``02_scoring.ipynb``): Compute 3D similarity scores 
-   and align molecules based on their interaction profiles.
+2. **Scoring and Alignment** (``02_scoring.ipynb``): computing 3D similarity scores
+   and aligning molecules by their interaction profiles.
 
-3. **Evaluation Pipelines** (``03_evaluation.ipynb``): Use the evaluation framework 
-   to assess generated conformers.
+3. **Evaluation Pipelines** (``03_evaluation.ipynb``): evaluating generated
+   conformers.
 
 Running the Tutorials
 ---------------------

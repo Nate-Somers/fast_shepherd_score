@@ -16,9 +16,9 @@ ShEPhERD Score Documentation
    :target: https://pypi.org/project/shepherd-score/
    :alt: Python versions
 
-``shepherd-score`` provides tools for **generating/optimizing conformers**, **extracting interaction profiles**, 
-**aligning interaction profiles**, and **differentiably scoring 3D similarity**. It also contains modules to 
-evaluate conformers generated with *ShEPhERD* and other generative models.
+``shepherd-score`` generates and optimizes conformers, extracts interaction profiles, and scores and
+aligns molecules by 3D similarity. Batched alignment and library screening run on Numba (CPU) and
+Triton (GPU) kernels. It also evaluates conformers generated with *ShEPhERD* and other generative models.
 
 The formulation of the interaction profile representation, scoring, alignment, and evaluations are found in our 
 ICLR 2025 paper `ShEPhERD: Diffusing shape, electrostatics, and pharmacophores for bioisosteric drug design <https://arxiv.org/abs/2411.04130>`_.
@@ -28,7 +28,7 @@ ICLR 2025 paper `ShEPhERD: Diffusing shape, electrostatics, and pharmacophores f
 Quick Install
 -------------
 
-Install this checkout for the accelerated API::
+Install from the repository root::
 
    python -m pip install -e .
 

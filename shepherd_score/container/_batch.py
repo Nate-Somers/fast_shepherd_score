@@ -461,8 +461,7 @@ class MoleculePairBatch:
         num_buckets : int
             JAX only. ``1`` (default) pads all pairs to the global atom-count maximum. Values
             > 1 sort pairs by ``(max(ref,fit), min(ref,fit))`` and pad each bucket separately.
-        no_H, num_repeats, trans_init, lr, max_num_steps, verbose, backend, return_aligned,
-        similarity
+        num_repeats, trans_init, lr, max_num_steps, verbose, backend, return_aligned, similarity
             See the class docstring.
 
         Returns
