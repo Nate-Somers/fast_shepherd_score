@@ -73,7 +73,7 @@ def test_numba_batched_matches_per_pair_accel(cloud_name):
     chans = {"atoms": batch(rc, fc),
              "avoid": Batch(av, None, torch.tensor([av.shape[1]], dtype=torch.int32), None)}
     sc_pp, _, _ = run("vol_avoid", chans, avoid_weight=1.0, avoid_min_dist=2.0, num_seeds=nr,
-                      steps_fine=ns, lr=SPECS["vol_avoid"].params["lr"], early_stop_patience=2)
+                      steps_fine=ns, lr=SPECS["vol_avoid"].screen_lr, early_stop_patience=2)
     sc_pp = sc_pp[0]
 
     b = MoleculePairBatch([MoleculePair(_mol(IBU), _mol(CAF), do_center=True,

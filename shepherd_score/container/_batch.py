@@ -125,8 +125,8 @@ class MoleculePairBatch:
         runs each pair's ``MoleculePair.align`` with PyTorch.
     num_repeats, lr, max_num_steps : optional
         SE(3) seeds, Adam learning rate and maximum steps. ``None`` (default) takes the per-mode
-        registry defaults in ``accel/_modes.py`` on the accel backends, and 50 / 0.1 / 200 on
-        ``"jax"`` and ``"torch"``.
+        registry defaults in ``accel/_modes.py`` on the accel backends (``lr`` from the mode's
+        ``screen_lr``, as ``screen`` does), and 50 / 0.1 / 200 on ``"jax"`` and ``"torch"``.
     trans_init : bool
         Also seed by translating the fit to each reference atom (or pharmacophore).
     num_workers : int
@@ -211,10 +211,10 @@ class MoleculePairBatch:
             if backend in _NUMBA_BACKENDS:
                 self._prepare_numba()
 
-            kw = dict(params, trans_init=trans_init)
-            for key, value in (('num_repeats', num_repeats), ('lr', lr),
-                               ('steps_fine', max_num_steps)):
-                if value is not None:                    # None: the registry default
+            # None: the registry seeds and steps, and the mode's screen_lr (the lr main used)
+            kw = dict(params, trans_init=trans_init, lr=spec.screen_lr if lr is None else lr)
+            for key, value in (('num_repeats', num_repeats), ('steps_fine', max_num_steps)):
+                if value is not None:
                     kw[key] = value
 
             self._run_accel(name, kw, num_workers)

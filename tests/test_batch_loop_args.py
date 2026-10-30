@@ -1,5 +1,5 @@
 """MoleculePairBatch forwards num_repeats / lr / trans_init to the batched drivers, resolves
-``None`` to the registry defaults (accel) or 50 / 0.1 / 200 (jax, torch), and warns when
+``None`` to the registry defaults and ``screen_lr`` (accel) or 50 / 0.1 / 200 (jax, torch), and warns when
 ``backend='jax'`` has no JAX kernel."""
 import warnings
 
@@ -82,7 +82,15 @@ def test_none_loop_args_take_registry_defaults(monkeypatch, mode):
     assert seen
     assert {c['num_seeds'] for c in seen} == {spec.seeds}
     assert {c['steps_fine'] for c in seen} == {spec.steps}
-    assert {c['lr'] for c in seen} == {spec.params['lr']}
+    assert {c['lr'] for c in seen} == {spec.screen_lr}
+
+
+def test_none_lr_matches_main():
+    """An unset accel ``lr`` is 0.1, as on main, except for the six modes main left at 0.075."""
+    at_0075 = {'vol', 'surf', 'vol_tversky', 'vol_esp_tversky', 'surf_tversky',
+               'surf_esp_tversky'}
+    assert {n for n, s in SPECS.items() if s.screen_lr == 0.075} == at_0075
+    assert all(s.screen_lr == 0.1 for n, s in SPECS.items() if n not in at_0075)
 
 
 def test_engine_honors_num_repeats(monkeypatch):

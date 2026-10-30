@@ -101,8 +101,8 @@ class ModeSpec:
     lam_scaling : multiply ``lam`` by ``score.constants.LAM_SCALING`` (the surface convention).
     channel_switch : ``{virtual channel: (kwarg, value, if_equal, else)}``; the combo modes
         score volumetric shape when ``alpha == 0.81`` and surface shape otherwise.
-    screen_lr : the fine-loop learning rate the screen front-end uses when the caller passes
-        none.
+    screen_lr : the fine-loop learning rate ``screen`` and ``MoleculePairBatch`` use when the
+        caller passes none (0.1 or 0.075 per mode, the values both used on ``main``).
     coarse_channel : the cloud the legacy ``trans_init`` coarse grid is built from when that is
         not the seed channel (the combo modes build it from the surface clouds while seeding
         from the volume centers).
