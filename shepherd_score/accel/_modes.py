@@ -78,7 +78,7 @@ class ModeSpec:
         (the sum of the three channel products the ShaEP combo evaluates).
     terms : the objective terms, in gradient-accumulation order.
     params : call keyword -> default. ``None`` marks a required keyword.
-    center_clouds : centre both seed-channel clouds on their own real-point centroids before
+    center_clouds : center both seed-channel clouds on their own real-point centroids before
         seeding and fold the shift back into the returned translation (the pharm family).
     pharm_style : the pharm family's optimiser tail: unit-normalise ``q`` before the kernel,
         apply the normalisation Jacobian and the guarded/clamped pharm similarity, and use the
@@ -92,23 +92,20 @@ class ModeSpec:
         wins.
     cpu_fused_max_pad : the fused loop is used only when every padded width is at most this
         (``vol_esp`` only).
-    fused_pair : the two gradient terms can be evaluated by one fused kernel (the shape+colour
+    fused_pair : the two gradient terms can be evaluated by one fused kernel (the shape+color
         single launch in ``kernels/vol_color_triton.py``), collapsing two launches per fine step
         into one. CUDA-only and single-tile, so the engine falls back to the two separate
         kernels on CPU tensors or past ``VOL_COLOR_FUSED_MAX_PAD``.
     multipose : poses per CTA for the deduplicated multi-pose shape layout (surf only).
     pose_cap : bound the fine-loop sub-batch at ``_pad._FINE_CHUNK_POSES`` poses (vol only).
     lam_scaling : multiply ``lam`` by ``score.constants.LAM_SCALING`` (the surface convention).
-    honors_num_repeats : a caller's ``num_repeats`` overrides ``seeds`` (the pharm family); the
-        other modes accept the keyword and take the registry count.
     channel_switch : ``{virtual channel: (kwarg, value, if_equal, else)}``; the combo modes
         score volumetric shape when ``alpha == 0.81`` and surface shape otherwise.
-    screen_lr : the fine-loop learning rate the screen front-end uses when the caller passes
-        none.
+    screen_lr : the fine-loop learning rate ``screen`` and ``MoleculePairBatch`` use when the
+        caller passes none (0.1 or 0.075 per mode, the values both used on ``main``).
     coarse_channel : the cloud the legacy ``trans_init`` coarse grid is built from when that is
         not the seed channel (the combo modes build it from the surface clouds while seeding
-        from the volume centres).
-    process : whether the mode has a process-per-GPU / CPU-pool tensor spec.
+        from the volume centers).
     """
     name: str
     attrs: Tuple[str, str]
@@ -131,11 +128,9 @@ class ModeSpec:
     multipose: int = 1
     pose_cap: bool = False
     lam_scaling: bool = False
-    honors_num_repeats: bool = False
     channel_switch: dict = field(default_factory=dict)
     coarse_channel: Optional[str] = None
     screen_lr: float = 0.075
-    process: bool = True
 
     @property
     def transform_attr(self) -> str:
@@ -222,7 +217,7 @@ _reg(ModeSpec("vol", ("transform_vol_noH", "sim_aligned_vol_noH"), 10, 30, 2,
               params={"alpha": 0.81, **_LR}, pose_cap=True))
 _reg(ModeSpec("vol_esp", ("transform_vol_esp_noH", "sim_aligned_vol_esp_noH"), 16, 50, 5,
               seed_channel="heavy", channels=("heavy", "charges"), bucket=("heavy",),
-              terms=(_HEAVY_ESP,), params={"alpha": 0.81, "lam": None, **_LR},
+              terms=(_HEAVY_ESP,), params={"alpha": 0.81, "lam": 0.1, **_LR},
               cpu_fused_max_pad=100, screen_lr=0.1))
 _reg(ModeSpec("surf", ("transform_surf", "sim_aligned_surf"), 8, 40, 2,
               seed_channel="surf", channels=("surf",), bucket=("surf",), terms=(_SURF,),
@@ -234,7 +229,7 @@ _reg(ModeSpec("surf_esp", ("transform_surf_esp", "sim_aligned_surf_esp"), 8, 40,
 _reg(ModeSpec("vol_and_surf_esp", ("transform_vol_and_surf_esp", "sim_aligned_vol_and_surf_esp"),
               8, 60, 5, seed_channel="centers", channels=_COMBO_CH, bucket=("cwh", "surf", "centers"),
               work="combo", terms=_combo_terms(),
-              params={"alpha": None, "lam": 0.001, "probe_radius": 1.0, "esp_weight": 0.5, **_LR},
+              params={"alpha": 0.81, "lam": 0.001, "probe_radius": 1.0, "esp_weight": 0.5, **_LR},
               graph_budget=8_000_000, graph_full_steps=True, channel_switch=_COMBO_SWITCH,
               coarse_channel="surf", screen_lr=0.1))
 _reg(ModeSpec("pharm", ("transform_pharm", "sim_aligned_pharm"), 32, 50, 5,
@@ -246,7 +241,7 @@ _reg(ModeSpec("pharm", ("transform_pharm", "sim_aligned_pharm"), 32, 50, 5,
               params={"similarity": "tanimoto", "extended_points": False, "only_extended": False,
                       **_LR},
               center_clouds=True, pharm_style=True, graph_budget=10_000_000,
-              cpu_fused=False, honors_num_repeats=True, screen_lr=0.1))
+              cpu_fused=False, screen_lr=0.1))
 _reg(ModeSpec("vol_color", ("transform_vol_color", "sim_aligned_vol_color"), 16, 40, 2,
               seed_channel="atoms", channels=("atoms", "pharm_ancs", "pharm_types"), bucket=("atoms",),
               terms=_color_blend(), params={"alpha": 0.81, "color_weight": 0.5, **_LR},
@@ -310,7 +305,7 @@ _reg(ModeSpec("pharm_tversky", ("transform_pharm_tversky", "sim_aligned_pharm_tv
               params={"similarity": "tversky", "extended_points": False, "only_extended": False,
                       **_LR},
               center_clouds=True, pharm_style=True, graph_budget=10_000_000,
-              cpu_fused=False, honors_num_repeats=True, screen_lr=0.1))
+              cpu_fused=False, screen_lr=0.1))
 _reg(ModeSpec("vol_and_surf_esp_tversky",
               ("transform_vol_and_surf_esp_tversky", "sim_aligned_vol_and_surf_esp_tversky"),
               8, 60, 5, seed_channel="centers", channels=_COMBO_CH, bucket=("cwh", "surf", "centers"),
@@ -361,10 +356,10 @@ def spec_of(mode: str) -> ModeSpec:
 
 #: Modes with a process-per-GPU (multi_gpu) and CPU-pool (cpu_pool) tensor spec; every mode
 #: declares its tensors through its channels, so this is the whole registry.
-PROCESS_MODES = tuple(m for m, s in SPECS.items() if s.process)
+PROCESS_MODES = tuple(SPECS)
 
 #: Per-mode (SO(3) seed count, fine step count) defaults, chosen at the accuracy/throughput
-#: knee; ``max_num_steps`` raises the budget, ``num_repeats`` only where ``honors_num_repeats``.
+#: knee; a caller's ``max_num_steps`` / ``num_repeats`` override them.
 MODE_SEEDS = {m: s.seeds for m, s in SPECS.items()}
 MODE_STEPS = {m: s.steps for m, s in SPECS.items()}
 

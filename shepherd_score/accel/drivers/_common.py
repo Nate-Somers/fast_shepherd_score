@@ -10,11 +10,6 @@ from typing import Tuple, Optional
 _TWO_PI_3 = 2.0 * math.pi / 3.0
 
 
-def check_gpu_available() -> bool:
-    """Check if CUDA is available for GPU acceleration."""
-    return torch.cuda.is_available()
-
-
 def quat_mul(q: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
     """
     Hamilton product of two quaternions (or batches of quaternions).

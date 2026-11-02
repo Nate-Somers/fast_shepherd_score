@@ -230,6 +230,7 @@ def compute_overlap_and_grad_pharm(
     fit_vectors_orig: torch.Tensor,
     extended_points: bool = False,
     only_extended: bool = False,
+    directionless: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute overlap O_AB and gradients fully vectorized across all types.
@@ -240,7 +241,12 @@ def compute_overlap_and_grad_pharm(
     ``only_extended=True`` the anchor overlap for those types is skipped
     entirely; otherwise both anchor (w=1) and extended overlaps are included.
     Non-directional (cat==0) and Aromatic (cat==2) types are unaffected.
+
+    When ``directionless=True``, every real type is an isotropic point Gaussian
+    (see ``build_lookup_tables``) and ``extended_points`` is ignored.
     """
+    if directionless:
+        extended_points = only_extended = False
     batched = R.dim() == 3
     if not batched:
         R = R.unsqueeze(0)
@@ -264,7 +270,7 @@ def compute_overlap_and_grad_pharm(
     fit_vectors_n = torch.bmm(R, fit_vectors_orig_n.permute(0, 2, 1)).permute(0, 2, 1)
 
     # Constants
-    alphas, Ks, cats = build_lookup_tables(R.device, R.dtype)
+    alphas, Ks, cats = build_lookup_tables(R.device, R.dtype, directionless)
 
     # Masking matches exactly between fit and ref
     same_type = (fit_pharms.unsqueeze(2) == ref_pharms.unsqueeze(1))
@@ -369,9 +375,11 @@ def compute_self_overlaps_pharm(
     vectors_2: torch.Tensor,
     extended_points: bool = False,
     only_extended: bool = False,
+    directionless: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute self-overlaps VAA and VBB vectorially.
+    Compute self-overlaps VAA and VBB vectorially. ``directionless`` gives the
+    isotropic self-overlaps used by ``get_overlap_pharm(..., directionless=True)``.
     """
     eye3 = torch.eye(3, device=anchors_1.device, dtype=anchors_1.dtype)
     zero = torch.zeros(3, device=anchors_1.device, dtype=anchors_1.dtype)
@@ -379,10 +387,12 @@ def compute_self_overlaps_pharm(
     VAA, _, _ = compute_overlap_and_grad_pharm(
         eye3, zero, ptype_1, ptype_1, anchors_1, anchors_1, vectors_1, vectors_1,
         extended_points=extended_points, only_extended=only_extended,
+        directionless=directionless,
     )
     VBB, _, _ = compute_overlap_and_grad_pharm(
         eye3, zero, ptype_2, ptype_2, anchors_2, anchors_2, vectors_2, vectors_2,
         extended_points=extended_points, only_extended=only_extended,
+        directionless=directionless,
     )
 
     return VAA, VBB

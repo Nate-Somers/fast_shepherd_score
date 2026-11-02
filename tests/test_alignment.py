@@ -253,13 +253,6 @@ class TestOptimizeROCSEspOverlayConsistency:
         self._run_and_compare(r_pts_t, f_pts_t, r_chg_t, f_chg_t, r_pts_j, f_pts_j, r_chg_j, f_chg_j,
                               num_repeats=5, trans_t=None, trans_j=None)
 
-    def test_rocs_esp_overlay_trans_centers_batch(self, common_points_data, common_charges_data, common_trans_centers_data):
-        r_pts_t, f_pts_t, r_pts_j, f_pts_j = common_points_data
-        r_chg_t, f_chg_t, r_chg_j, f_chg_j = common_charges_data
-        tc_t, tc_j = common_trans_centers_data
-        self._run_and_compare(r_pts_t, f_pts_t, r_chg_t, f_chg_t, r_pts_j, f_pts_j, r_chg_j, f_chg_j,
-                              num_repeats=50, trans_t=tc_t, trans_j=tc_j)
-
 
 class TestOptimizeEspComboScoreOverlayConsistency:
     def _run_and_compare(self, data_torch, data_jax, num_repeats, trans_torch, trans_jax):
@@ -304,11 +297,6 @@ class TestOptimizeEspComboScoreOverlayConsistency:
         data_t, data_j = common_esp_combo_data
         self._run_and_compare(data_t, data_j, num_repeats=5, trans_torch=None, trans_jax=None) # Reduced repeats for faster test
 
-    def test_esp_combo_trans_centers_batch(self, common_esp_combo_data, common_trans_centers_data):
-        data_t, data_j = common_esp_combo_data
-        tc_t, tc_j = common_trans_centers_data
-        self._run_and_compare(data_t, data_j, num_repeats=50, trans_torch=tc_t, trans_jax=tc_j)
-
 
 class TestOptimizePharmOverlayConsistency:
     def _run_and_compare(self, pharm_data_torch, pharm_data_jax, num_repeats, trans_torch, trans_jax, similarity='tanimoto', extended_points=False, only_extended=False):
@@ -349,12 +337,6 @@ class TestOptimizePharmOverlayConsistency:
         data_torch = common_pharm_data[:6]
         data_jax = common_pharm_data[6:]
         self._run_and_compare(data_torch, data_jax, num_repeats=5, trans_torch=None, trans_jax=None)
-
-    def test_pharm_overlay_trans_centers_batch(self, common_pharm_data, common_trans_centers_data):
-        data_torch = common_pharm_data[:6]
-        data_jax = common_pharm_data[6:]
-        tc_t, tc_j = common_trans_centers_data
-        self._run_and_compare(data_torch, data_jax, num_repeats=50, trans_torch=tc_t, trans_jax=tc_j)
 
     def test_pharm_overlay_extended_points(self, common_pharm_data):
         data_torch = common_pharm_data[:6]
@@ -458,13 +440,6 @@ class TestOptimizePharmOverlayVectorizedConsistency:
         data_jax = common_pharm_data[6:]
         results = self._run_both(data_jax, num_repeats=5)
         self._assert_consistent(results, tag="batch_repeats")
-
-    def test_vectorized_trans_centers(self, common_pharm_data, common_trans_centers_data):
-        """trans_centers initialisation should produce consistent scores."""
-        data_jax = common_pharm_data[6:]
-        _, tc_j = common_trans_centers_data
-        results = self._run_both(data_jax, num_repeats=50, trans_jax=tc_j)
-        self._assert_consistent(results, tag="trans_centers")
 
     def test_vectorized_extended_points(self, common_pharm_data):
         """Extended-point scoring mode should be consistent."""

@@ -91,7 +91,7 @@ def test_store_heavy_charges_identity_index(tmp_path):
 
 
 def test_store_pre_centered(tmp_path):
-    """pre_centered=True centres on the heavy-atom COM without changing geometry (canonical=False isolates that)."""
+    """pre_centered=True centers on the heavy-atom COM without changing geometry (canonical=False isolates that)."""
     store_path = os.path.join(tmp_path, "lib.fss")
     p = _synthetic_profile(0, with_full_charges=False)
     with ProfileStore.create(store_path, num_surf_points=64, modes=("vol",),
@@ -104,7 +104,7 @@ def test_store_pre_centered(tmp_path):
 
 
 def test_store_is_canonical_by_default_only_when_it_serves_vol(tmp_path):
-    """``canonical=None`` resolves True only for a pre-centred store serving a constant-seed mode."""
+    """``canonical=None`` resolves True only for a pre-centered store serving a constant-seed mode."""
     p = _synthetic_profile(0, with_full_charges=False)
 
     vol = os.path.join(tmp_path, "vol.fss")
@@ -152,7 +152,7 @@ def test_screen_rejects_unsupported_mode(tmp_path):
 
 
 def test_screen_guards(tmp_path):
-    """esp_combo requires explicit alpha; no_H=False is rejected (heavy-atom only)."""
+    """no_H=False is rejected (heavy-atom only)."""
     store_path = os.path.join(tmp_path, "lib.fss")
     with ProfileStore.create(store_path, num_surf_points=64,
                              modes=("vol", "esp", "esp_combo"), pre_centered=False) as store:
@@ -161,9 +161,6 @@ def test_screen_guards(tmp_path):
 
     class _Q:
         num_surf_points = 64
-    # the legacy name resolves to vol_and_surf_esp; the message reports the canonical name
-    with pytest.raises(ValueError, match="requires an explicit alpha"):
-        screen(_Q(), store, mode="esp_combo", backend="numba")
     with pytest.raises(ValueError, match="heavy atoms only"):
         screen(_Q(), store, mode="vol", backend="numba", no_H=False)
 
@@ -350,8 +347,8 @@ def test_vol_tversky_stream_matches_object(tmp_path, molecules):
     cq = copy.deepcopy(query); cq.center_to(cq.atom_pos.mean(0))
     profiles = [p for shard in store.iter_shards() for p in shard]
     pairs = [MoleculePair(cq, p, do_center=False) for p in profiles]
-    ref, _ = MoleculePairBatch(pairs).align_with_vol_tversky(
-        backend="numba", num_repeats=5, max_num_steps=50)
+    ref, _ = MoleculePairBatch(pairs).align_with_vol(
+        similarity="tversky", backend="numba", num_repeats=5, max_num_steps=50)
     for p, rs in zip(profiles, ref):
         assert by_id[p.id] == pytest.approx(float(rs), abs=1e-4)
 
@@ -367,7 +364,7 @@ def test_vol_esp_tversky_stream_matches_object(tmp_path, molecules):
         for i, m in enumerate(molecules):
             store.add(m, id=i)
     store = ProfileStore.open(store_path)
-    # Reuses vol_esp's store schema (heavy centres + charges); no new per-molecule data.
+    # Reuses vol_esp's store schema (heavy centers + charges); no new per-molecule data.
     assert store.supports("vol_esp_tversky") and store.supports("vol_esp")
     assert store.schema["charges"]
     # the heavy charges reached disk; read through the store rather than re-deriving the layout
@@ -384,8 +381,8 @@ def test_vol_esp_tversky_stream_matches_object(tmp_path, molecules):
     def _c(m):
         c = copy.deepcopy(m); c.center_to(c.atom_pos.mean(0)); return c
     pairs = [MoleculePair(cq, _c(m), do_center=False) for m in molecules]
-    ref, _ = MoleculePairBatch(pairs).align_with_vol_esp_tversky(
-        backend="numba", lam=0.1, num_repeats=16, max_num_steps=50)
+    ref, _ = MoleculePairBatch(pairs).align_with_vol_esp(
+        similarity="tversky", backend="numba", lam=0.1, num_repeats=16, max_num_steps=50)
     # identical inputs to one driver, so abs=1e-4; the Tversky score is not clamped to [0, 1]
     for i, rs in enumerate(ref):
         assert by_id[i] == pytest.approx(float(rs), abs=1e-4)
@@ -419,7 +416,7 @@ def test_vol_lipo_stream_matches_object(tmp_path, molecules):
     pairs = [MoleculePair(cq, p, do_center=False) for p in profiles]
     ref, _ = MoleculePairBatch(pairs).align_with_vol_lipo(
         backend="numba", num_repeats=16, max_num_steps=50)
-    # abs=1e-2: the query is re-centred independently (fp noise), which can flip a near-tie seed
+    # abs=1e-2: the query is re-centered independently (fp noise), which can flip a near-tie seed
     # in the two-channel objective; wrong or empty lipo data would move scores far more
     for p, rs in zip(profiles, ref):
         assert by_id[p.id] == pytest.approx(float(rs), abs=1e-2)
@@ -503,6 +500,33 @@ def test_vol_esp_stream_retained_h(tmp_path):
         backend="numba", lam=0.1, num_repeats=5, max_num_steps=50)
     for i, rs in enumerate(ref):                     # incl. the retained-H molecule
         assert fast_by_id[i] == pytest.approx(float(rs), abs=1e-4)
+
+
+@pytest.mark.parametrize("modes", [("vol_esp",), ("vol_and_surf_esp",)])
+def test_reload_retained_h_keeps_heavy_arrays_aligned(tmp_path, modes):
+    """Profiles read back from a store keep their heavy charges, ``nonH`` index and heavy centers
+    when an earlier molecule's RemoveHs retained an H (which shifts the heavy offsets)."""
+    smis = ["[2H]OC(=O)c1ccccc1", "CC(=O)Oc1ccccc1C(=O)O", "c1ccccc1O"]
+    mols = [_build_molecule(s, seed=i) for i, s in enumerate(smis)]
+    assert len(mols[0].atom_pos) != len(mols[0]._nonH_atoms_idx)
+
+    store_path = os.path.join(tmp_path, "lib.fss")
+    with ProfileStore.create(store_path, num_surf_points=64, modes=modes,
+                             dtype="float32", pre_centered=True) as store:
+        for i, m in enumerate(mols):
+            store.add(m, id=i)
+    profiles = ProfileStore.open(store_path).read_profiles(0)
+
+    with_h = "vol_and_surf_esp" in modes
+    for m, p in zip(mols, profiles):
+        if with_h:
+            np.testing.assert_allclose(p.partial_charges, m.partial_charges, atol=1e-6)
+            np.testing.assert_array_equal(p._nonH_atoms_idx, m._nonH_atoms_idx)
+        else:
+            np.testing.assert_allclose(p.partial_charges,
+                                       m.partial_charges[m._nonH_atoms_idx], atol=1e-6)
+        heavy = p.atom_pos if p.atom_pos_noH is None else p.atom_pos_noH
+        assert len(heavy) == len(m._nonH_atoms_idx)
 
 
 def test_vol_lipo_stream_retained_h(tmp_path):

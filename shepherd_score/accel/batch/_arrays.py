@@ -163,7 +163,7 @@ def _const_seed_batch(const_seeds: torch.Tensor, k: int, device):
     """A canonical store's constant seed set, broadcast over a bucket of ``k`` molecules.
 
     Returns ``(quats (k,S,4), trans (k,S,3))`` in the ``batched_seeds_torch`` layout. The
-    translations are zero: a canonical store and the query are both centred on the heavy-atom
+    translations are zero: a canonical store and the query are both centered on the heavy-atom
     centroid, so the COM-aligning translation vanishes for every ``CONST_SEED_MODES`` mode. The
     expand is materialised because the engine reshapes the seeds into pose rows.
     """
@@ -313,17 +313,3 @@ def align_arrays(mode: str, ref: dict, fit: dict, *, params: dict, steps_fine: i
 
     SE3 = quaternions_to_SE3_batch(out_q.cpu(), out_t.cpu()).detach().numpy()
     return out_scores, SE3
-
-
-def _make_array_aligner(mode: str):
-    def fn(ref: dict, fit: dict, **kw):
-        return align_arrays(mode, ref, fit, **kw)
-    fn.__name__ = fn.__qualname__ = f"align_batch_{mode}_arrays"
-    fn.__doc__ = (f"Array-native ``{mode}`` aligner: ``(ref channel tensors, fit "
-                  "(flat, off) pairs) -> (scores, SE3)``. A thin name over align_arrays.")
-    return fn
-
-
-for _m in SPECS:
-    globals()[f"align_batch_{_m}_arrays"] = _make_array_aligner(_m)
-del _m

@@ -3,7 +3,7 @@ leaks atom positions.
 
 The molecular surface is the outer boundary of the union of (vdW + probe) spheres. For a point
 ``x`` the shell residual to atom ``i`` is ``| ||x - c_i|| - a_i |`` with ``a_i = vdW_i + probe``.
-A point with residual ~0 to one sphere sits on that atom's sphere, so the centre is recoverable
+A point with residual ~0 to one sphere sits on that atom's sphere, so the center is recoverable
 (a leak); a point with residual ~0 to two spheres sits on an atom border (a crimp). Needs only
 numpy and scipy, so it can gate any surface generator.
 """
@@ -75,7 +75,7 @@ def center_recovery_attack(points: np.ndarray,
                            radii: np.ndarray,
                            probe_radius: float = 1.2,
                            min_pts: int = 8) -> Dict[str, float]:
-    """Strongest-case leak test: fit a sphere to each atom's owned points and recover its centre.
+    """Strongest-case leak test: fit a sphere to each atom's owned points and recover its center.
     Returns the recovery error (A); higher is safer, and points exactly on the spheres give ~0."""
     _, order = _sorted_shell_residuals(points, centers, radii, probe_radius)
     owner = order[:, 0]
@@ -110,7 +110,7 @@ def summarize(points: np.ndarray,
               centers: np.ndarray,
               radii: np.ndarray,
               probe_radius: float = 1.2) -> Dict[str, float]:
-    """One-call report: leak metrics, crimp fraction, centre-recovery error and curvature at vs off
+    """One-call report: leak metrics, crimp fraction, center-recovery error and curvature at vs off
     the crimps, for gating a surface generator."""
     out: Dict[str, float] = {}
     out.update(leak_metrics(points, centers, radii, probe_radius))

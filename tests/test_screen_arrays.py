@@ -301,7 +301,7 @@ def test_use_arrays_gates_on_mode_and_reads_enabled_live(monkeypatch):
 
 # Canonical-frame stores: the transform must come back in the molecule's frame, not the store's.
 # Scores and ranking are correct either way, so the check re-scores each returned pose on the
-# molecule's own centred coordinates; a pose in the wrong frame does not reproduce its score.
+# molecule's own centered coordinates; a pose in the wrong frame does not reproduce its score.
 
 def _canonical_store(tmp_path, molecules):
     p = os.path.join(tmp_path, "canon.fss")
@@ -435,7 +435,7 @@ def test_vol_esp_retained_h_transform_is_in_the_molecule_frame(tmp_path, canonic
     opened = ProfileStore.open(p)
     assert opened.canonical is canonical
     assert "xyz_noH" in opened.read_shard(0)[1], \
-        "premise broken: the strict-heavy centre array was not stored"
+        "premise broken: the strict-heavy center array was not stored"
 
     hits = screen(mols[0], ProfileStore.open(p), mode="vol_esp", backend="torch",
                   lam=0.1, top_k=len(mols))

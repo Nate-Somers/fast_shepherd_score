@@ -21,7 +21,7 @@ from shepherd_score.generate_point_cloud import (
     _farthest_point_sample,
     get_atomic_vdw_radii,
 )
-from shepherd_score import surface_diagnostics as sd
+from . import surface_diagnostics as sd
 
 HAS_OPEN3D = importlib.util.find_spec("open3d") is not None
 PROBE = 1.2

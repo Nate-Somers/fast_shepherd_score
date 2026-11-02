@@ -31,7 +31,7 @@ and screening; the direct method requires its own `avoid_points` argument.
 
 ## Execution paths to verify
 
-- Array-native screening for a pre-centred store and supported fast backend.
+- Array-native screening for a pre-centered store and supported fast backend.
 - Object-fast comparison using `_arrays.ENABLED=False` as a temporary test
   seam, restoring it afterwards.
 - Object fallback where supported, such as translation initialization.

@@ -120,15 +120,13 @@ class TestSE3:
         sol_repeated = torch.Tensor(self.sol_points_transformed).repeat((2, 1, 1))
         assert torch.allclose(out_transformed, sol_repeated)
 
-    def test_apply_se3_transform_torch_R1_collapses_to_single(self):
-        """A singleton batch (R==1) returns (N,3), equal to the single-instance result."""
+    def test_apply_se3_transform_torch_R1_stays_batched(self):
+        """A singleton batch (R==1) keeps its batch dimension, as upstream does."""
         pts_single = torch.Tensor(self.ex_set_of_points)
         tf_single = torch.Tensor(self.sol_se3_transform)
-        out_single = apply_SE3_transform(pts_single, tf_single)
         out_r1 = apply_SE3_transform(pts_single.unsqueeze(0), tf_single.unsqueeze(0))
-        assert out_r1.shape == (self.ex_set_of_points.shape[0], 3), out_r1.shape
-        assert torch.allclose(out_r1, out_single)
-        assert torch.allclose(out_r1, torch.Tensor(self.sol_points_transformed))
+        assert out_r1.shape == (1, self.ex_set_of_points.shape[0], 3), out_r1.shape
+        assert torch.allclose(out_r1[0], torch.Tensor(self.sol_points_transformed))
 
     # Jax functions (single instance)
     @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX is not installed")

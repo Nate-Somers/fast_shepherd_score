@@ -21,17 +21,12 @@ if TYPE_CHECKING:                     # annotations only; never imported at runt
 
 from ._pad import _band_key, _subbatched_align, _scatter_fill, _BAND
 from ._bucket import plan_buckets, PadSpec
-from ._dispatch import _should_distribute, _run_distributed, _dev_idx
 from .._modes import MODE_SEEDS as _MODE_SEEDS, MODE_STEPS as _MODE_STEPS, SPECS, canonical
 from ..channels import CHANNELS
 
-# ---- persistent, per-process caches (reused across calls) -------------------
-_ALIGN_WORKSPACES: dict = {}
-_INT_BUFFER_CACHE: dict = {}
-
 _DTYPES = {"float32": torch.float32, "int64": torch.int64}
 
-#: The channel whose reference cloud supplies the legacy ``trans_init`` translation centres.
+#: The channel whose reference cloud supplies the legacy ``trans_init`` translation centers.
 _TRANS_CHANNEL = {"pharm": "pharm_ancs", "pharm_tversky": "pharm_ancs"}
 
 
@@ -91,10 +86,18 @@ def _batch_upload(pairs, attr, src_fn, dtype, device, *, key_fn=None):
                 _ten[id(key_fn(p))] = t.clone()                # one allocation per molecule
             for p in cold:
                 setattr(p, attr, _ten[id(key_fn(p))])
-    for p in pairs:                                            # warm wrong-device path
+    # Warm wrong-device path. Only a copy onto CUDA may be non-blocking: the kernels that read
+    # it queue behind it on the stream. A copy off the GPU must block, since the numba kernels
+    # read host memory directly and would race a copy still in flight.
+    nb = device.type == "cuda"
+    # A bare "cuda" never equals a tensor's "cuda:0", so every pair would re-run a no-op .to()
+    # on every call; compare against the indexed current device instead.
+    if nb and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    for p in pairs:
         t = getattr(p, attr)
         if t.device != device:
-            setattr(p, attr, t.to(device, non_blocking=True))
+            setattr(p, attr, t.to(device, non_blocking=nb))
 
 # the generic aligner
 
@@ -119,7 +122,7 @@ def resolve_params(spec, kw: dict, fn_name: str) -> dict:
             raise TypeError(f"{fn_name}() missing required keyword-only argument: {k!r}")
     if spec.lam_scaling:
         # Surface convention: the caller's ``lam`` is raw and is scaled once by LAM_SCALING here,
-        # for both the cross-overlap and the self-overlaps; the atom-centred ESP modes take it
+        # for both the cross-overlap and the self-overlaps; the atom-centered ESP modes take it
         # raw (see score/constants.py).
         from ...score.constants import LAM_SCALING
         params["lam"] = LAM_SCALING * float(params["lam"])
@@ -267,13 +270,11 @@ def _run_bucket(spec, chans, K, key, device, *, params, n_seeds, steps_fine, es_
 def _align_batch(spec, pairs, _fn, **kw) -> None:
     if not pairs:
         return
-    if _should_distribute(pairs):
-        return _run_distributed(_fn, pairs, **kw)
     name = _fn.__name__
     params = resolve_params(spec, kw, name)
     steps_fine = int(kw.get("steps_fine", _steps_for(spec.name)))
     nr = kw.get("num_repeats")
-    n_seeds = int(nr) if (spec.honors_num_repeats and nr is not None) else _seeds_for(spec.name)
+    n_seeds = int(nr) if nr is not None else _seeds_for(spec.name)
     trans_init = bool(kw.get("trans_init", False))
     nrpt = int(kw.get("num_repeats_per_trans", 10))
     topk = int(kw.get("topk", 30))
@@ -361,6 +362,5 @@ for _m in SPECS:
 _align_batch_esp = _align_batch_surf_esp          # noqa: F821  (generated above)
 _align_batch_esp_combo = _align_batch_vol_and_surf_esp   # noqa: F821
 
-__all__ = ["_batch_upload", "_seeds_for", "_steps_for", "_ALIGN_WORKSPACES", "_INT_BUFFER_CACHE",
-           "resolve_params", "concrete_channels", "upload_channels", "build_bucket"] + \
+__all__ = ["_batch_upload", "_seeds_for", "_steps_for", "resolve_params", "concrete_channels", "upload_channels", "build_bucket"] + \
           [f"_align_batch_{m}" for m in SPECS] + ["_align_batch_esp", "_align_batch_esp_combo"]

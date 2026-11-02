@@ -4,7 +4,7 @@
 must score alike. Bounds cover both the SVML (fp32 SoA) and non-SVML (fp64 AoS) kernels;
 ``surf_esp``, the most shape-degenerate mode, gets its own.
 """
-import warnings
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -26,6 +26,20 @@ SMILES = ["CC(C)Cc1ccc(cc1)C(C)C(=O)O", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
           "CC(=O)Oc1ccccc1C(=O)O", "c1ccc2c(c1)cccc2O"]
 N_SURF = 60
 
+# Conformers are frozen on disk: re-embedding with ETKDG gives new geometries on every RDKit
+# release, and on some of those the SVML kernels' fp32 drift exceeds the bounds above.
+_SDF = Path(__file__).parent / "data" / "cpu_fine_loops_mols.sdf"
+
+
+def _load_conformers():
+    from rdkit import Chem
+    mols = {m.GetProp("smiles"): m for m in Chem.SDMolSupplier(str(_SDF), removeHs=False)}
+    assert list(mols) == SMILES, f"{_SDF.name} is out of sync with SMILES"
+    return mols
+
+
+_CONFORMERS = _load_conformers()
+
 # Modes whose call needs an explicit keyword; everything else takes the registry defaults.
 KW = {"surf": {"alpha": 0.81}, "surf_esp": {"alpha": 0.81, "lam": 0.3},
       "surf_tversky": {"alpha": 0.81}, "surf_esp_tversky": {"alpha": 0.81, "lam": 0.3},
@@ -33,15 +47,8 @@ KW = {"surf": {"alpha": 0.81}, "surf_esp": {"alpha": 0.81, "lam": 0.3},
 
 
 def _mol(smiles, seed, n_surf=None):
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
     from shepherd_score.container import Molecule
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        rd = Chem.AddHs(Chem.MolFromSmiles(smiles))
-        p = AllChem.ETKDGv3()
-        p.randomSeed = seed
-        assert AllChem.EmbedMolecule(rd, p) == 0, smiles
+    rd = _CONFORMERS[smiles]
     rng = np.random.default_rng(seed)
     n = rd.GetNumAtoms()
     ns = N_SURF if n_surf is None else int(n_surf)
@@ -72,10 +79,10 @@ def _scores(mode, mols, force_eager):
         pairs = [MoleculePair(mols[0], f, do_center=True, device=torch.device("cpu"))
                  for f in mols]
         batch = MoleculePairBatch(pairs)
-        args = ()
+        extra = {}
         if mode == "vol_avoid":                       # the one mode with a third input
-            args = (np.asarray(mols[0].atom_pos, dtype=np.float32) + 40.0,)
-        getattr(batch, "align_with_" + mode)(*args, backend="numba", **KW.get(mode, {}))
+            extra["avoid_points"] = np.asarray(mols[0].atom_pos, dtype=np.float32) + 40.0
+        batch._align_mode(mode, backend="numba", **extra, **KW.get(mode, {}))
         return [float(getattr(p, MODE_ATTRS[mode][1])) for p in pairs]
     finally:
         cpu_fused.run_fused = real

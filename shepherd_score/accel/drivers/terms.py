@@ -5,7 +5,7 @@ returns ``(value, dQ, dT)``, the overlap and its gradient in unit-quaternion spa
 dispatched kernels emit them, or ``(value, None, None)`` for a value-only term. The
 pose-invariant self-overlaps a reduction needs come from :func:`self_overlap`. Shape-family
 launches are sliced at the int32 pointer-offset ceiling ``_launch_step`` derives from the pads;
-the pharmacophore and colour kernels take the whole batch in one 1-D grid.
+the pharmacophore and color kernels take the whole batch in one 1-D grid.
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def _launch_step(S, args_mol):
 # lookup tables for the typed kernels
 
 def build_element_tables(device, dtype, max_z: int = 100, alpha: float = 0.81):
-    """Element-indexed ``(alphas, Ks, cats)`` for the colour kernel: every element an isotropic
+    """Element-indexed ``(alphas, Ks, cats)`` for the color kernel: every element an isotropic
     point Gaussian of width ``alpha`` (category 0); the pad label (Z=0) category 3 (skipped).
     ``K = (pi/(2a))^1.5`` mirrors ``build_lookup_tables``."""
     n = max_z + 1
@@ -167,7 +167,7 @@ def evaluate(term, ti: TermInputs, q, t, *, need_grad=True, seeds_per_mol=1, pos
 
 
 def evaluate_fused_pair(t0, t1, ti0: TermInputs, ti1: TermInputs, q, t, params):
-    """Both channels of a shape+colour mode in one launch, or ``None`` if it does not apply.
+    """Both channels of a shape+color mode in one launch, or ``None`` if it does not apply.
 
     ``vol_color_triton.vol_color_score_grad_se3_batch`` computes the Gaussian shape overlap and
     the directionless typed-anchor overlap in a single kernel, sharing the R(q) build and the

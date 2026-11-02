@@ -1,6 +1,6 @@
 """Reference-mode gates for the asymmetric ``vol_esp_tversky`` overlay (``vol_esp`` with a Tversky
 reduction): self-overlap = 1.0, autograd vs finite difference at a non-identity pose, planted-pose
-recovery, determinism, the retained-H basis (heavy centres indexed by ``_nonH_atoms_idx``), and
+recovery, determinism, the retained-H basis (heavy centers indexed by ``_nonH_atoms_idx``), and
 Tversky asymmetry (a small query scores higher as the reference than as the fit).
 """
 import warnings
@@ -16,10 +16,9 @@ except ImportError:
     warnings.warn("PyTorch not available - skipping vol_esp_tversky tests")
 
 if TORCH_AVAILABLE:
-    from shepherd_score.alignment._torch import (
-        objective_vol_esp_tversky_overlay,
-        optimize_vol_esp_tversky_overlay,
-    )
+    from shepherd_score.alignment import optimize_se3
+    from shepherd_score.modes import VolESP
+    from .utils import mode_loss
     from shepherd_score.container import Molecule, MoleculePair
 
 MODE = "vol_esp_tversky"
@@ -52,7 +51,7 @@ def _make_pair(ibuprofen):
 
 
 def _heavy_pos_charges(ibuprofen):
-    """Strict-heavy centres and heavy charges, centred to the heavy COM."""
+    """Strict-heavy centers and heavy charges, centered to the heavy COM."""
     m = Molecule(ibuprofen)
     pos = m.mol.GetConformer().GetPositions()[m._nonH_atoms_idx].astype(np.float32)
     pos = pos - pos.mean(0)
@@ -63,7 +62,7 @@ def _heavy_pos_charges(ibuprofen):
 # --- Gate 1: self-overlap is exactly 1.000 ----------------------------------------------------
 def test_self_overlap_is_one(ibuprofen):
     pair = _make_pair(ibuprofen)
-    pair.align_with_vol_esp_tversky(num_repeats=20, max_num_steps=200)
+    pair.align_with_vol_esp(similarity="tversky", num_repeats=20, max_num_steps=200)
     score = float(pair.sim_aligned_vol_esp_tversky)
     assert np.isclose(score, 1.0, atol=1e-4), f"self-overlap {score} != 1.000"
 
@@ -83,8 +82,8 @@ def test_autograd_matches_finite_difference(ibuprofen):
     se3 = se3.clone().requires_grad_(True)
 
     def _obj(p):
-        return objective_vol_esp_tversky_overlay(p, ref, fit, rc, fc, alpha=0.81, lam=0.1,
-                                                 tversky_alpha=0.95, tversky_beta=0.05)
+        return mode_loss(VolESP(lam=0.1, similarity=(0.95, 0.05)), p,
+                         {'points': ref, 'charges': rc}, {'points': fit, 'charges': fc})
 
     val = _obj(se3)
     val.backward()
@@ -117,8 +116,9 @@ def test_optimizer_recovers_planted_pose(ibuprofen):
     rc = torch.tensor(chg, dtype=torch.float32)
     fc = torch.tensor(chg, dtype=torch.float32)
 
-    _, _, score = optimize_vol_esp_tversky_overlay(ref, fit, rc, fc, num_repeats=20,
-                                                   max_num_steps=200)
+    _, _, score = optimize_se3(VolESP(lam=0.1, similarity='tversky'),
+                               {'points': ref, 'charges': rc}, {'points': fit, 'charges': fc},
+                               num_repeats=20, max_num_steps=200)
     assert float(score) > 0.95, f"planted-pose recovery only {float(score):.3f}"
 
 
@@ -126,17 +126,17 @@ def test_optimizer_recovers_planted_pose(ibuprofen):
 def test_deterministic_given_seed(ibuprofen):
     torch.manual_seed(SEED)
     pair_a = _make_pair(ibuprofen)
-    pair_a.align_with_vol_esp_tversky(num_repeats=20, max_num_steps=100)
+    pair_a.align_with_vol_esp(similarity="tversky", num_repeats=20, max_num_steps=100)
     torch.manual_seed(SEED)
     pair_b = _make_pair(ibuprofen)
-    pair_b.align_with_vol_esp_tversky(num_repeats=20, max_num_steps=100)
+    pair_b.align_with_vol_esp(similarity="tversky", num_repeats=20, max_num_steps=100)
     assert np.isclose(float(pair_a.sim_aligned_vol_esp_tversky),
                       float(pair_b.sim_aligned_vol_esp_tversky), atol=0.0)
 
 
 # --- Gate 5: retained-H molecule (REQUIRED -- this mode reads per-atom charges) ----------------
 def test_retained_h_molecule():
-    """A retained-H molecule must not desync heavy charges from centres, and self-copy scores ~1.0."""
+    """A retained-H molecule must not desync heavy charges from centers, and self-copy scores ~1.0."""
     from rdkit import Chem
     from rdkit.Chem import AllChem
     m = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))       # deuterium survives RemoveHs
@@ -148,7 +148,7 @@ def test_retained_h_molecule():
         "test premise broken: this molecule no longer retains an H after RemoveHs"
 
     pair = MoleculePair(mol, Molecule(m), do_center=True, device=torch.device('cpu'))
-    pair.align_with_vol_esp_tversky(num_repeats=10, max_num_steps=100)     # must not raise
+    pair.align_with_vol_esp(similarity="tversky", num_repeats=10, max_num_steps=100)     # must not raise
     score = float(pair.sim_aligned_vol_esp_tversky)
     assert np.isclose(score, 1.0, atol=1e-3), f"retained-H self-overlap {score} != 1.000"
 
@@ -164,12 +164,12 @@ def test_tversky_asymmetry_fits_inside():
 
     # query (small) as ref, big as fit
     mp_fwd = MoleculePair(small, big, do_center=True, device=torch.device('cpu'))
-    mp_fwd.align_with_vol_esp_tversky(num_repeats=30, max_num_steps=200)
+    mp_fwd.align_with_vol_esp(similarity="tversky", num_repeats=30, max_num_steps=200)
     fwd = float(mp_fwd.sim_aligned_vol_esp_tversky)
 
     # reverse: big as ref, query (small) as fit
     mp_rev = MoleculePair(big, small, do_center=True, device=torch.device('cpu'))
-    mp_rev.align_with_vol_esp_tversky(num_repeats=30, max_num_steps=200)
+    mp_rev.align_with_vol_esp(similarity="tversky", num_repeats=30, max_num_steps=200)
     rev = float(mp_rev.sim_aligned_vol_esp_tversky)
 
     assert fwd > rev, f"expected fits-inside fwd ({fwd:.3f}) > reverse ({rev:.3f})"

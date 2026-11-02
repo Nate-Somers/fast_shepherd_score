@@ -167,7 +167,6 @@ def apply_SE3_transform(points: torch.Tensor,
     -------
     transformed_points : torch.Tensor (batch, N, 3) or (N, 3)
         Set of coordinates transformed by the corresponding SE(3) transformation.
-        A singleton batch (batch == 1) is returned as (N, 3).
     """
     if points.shape[-1] != 3:
         raise ValueError(f'"points" should have shape (N_points, 3) or (batch, N_points, 3). Instead the shape given was: {points.shape}')
@@ -176,14 +175,20 @@ def apply_SE3_transform(points: torch.Tensor,
     if len(SE3_transform.shape) != len(points.shape):
         raise ValueError(f'Shapes of points and SE3_transform should be the same length. Instead {len(SE3_transform.shape)} and {len(points.shape)} were given.')
 
-    # Promote to a batch, apply one baddbmm, then collapse a singleton batch back to (N, 3);
-    # the optimizers rely on the batch == 1 case returning a single cloud.
-    se3 = SE3_transform if SE3_transform.dim() == 3 else SE3_transform.unsqueeze(0)
-    pts = points if points.dim() == 3 else points.unsqueeze(0)
-    rot = se3[:, :3, :3]
-    trans = se3[:, :3, 3].unsqueeze(1)
-    transformed_points = torch.baddbmm(trans, pts, rot.transpose(1, 2))
-    return transformed_points[0] if transformed_points.shape[0] == 1 else transformed_points
+    # Single instance; addmm/baddbmm fuse the rotation and translation (same orientation as R @ x.T)
+    if len(SE3_transform.shape) == 2:
+        transformed_points = torch.addmm(SE3_transform[:3,3,None], SE3_transform[:3,:3], points.T).T
+        return transformed_points
+
+    # Batched
+    elif len(SE3_transform.shape):
+        transformed_points = torch.baddbmm(SE3_transform[:, :3, 3, None], SE3_transform[:, :3,:3],
+                                           points.transpose(1, 2)).transpose(1, 2)
+        return transformed_points
+
+    else:
+        raise ValueError(f'"points" and "SE3_transform" must be either batched or a single instance. \
+        The expected length of shape for both should be 2 (single instance or 3 (batch) but {len(SE3_transform)} was given.')
 
 
 def apply_SO3_transform(points: torch.Tensor,

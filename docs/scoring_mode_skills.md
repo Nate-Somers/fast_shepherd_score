@@ -1,6 +1,6 @@
-# Developing scoring modes with agent skills
+# Scoring-mode development skills
 
-Two skills support adding scoring modes to this checkout:
+The repository includes two coding-agent skills for adding scoring modes:
 
 - **`design-scoring-mode`** develops and tests a PyTorch reference objective
   and single-pair alignment method from a mathematical or plain-language description.
@@ -11,11 +11,11 @@ Two skills support adding scoring modes to this checkout:
 The skills and their supporting references live in
 `.claude/skills/design-scoring-mode/` and
 `.claude/skills/accelerate-scoring-mode/` at the repository root. Each folder
-contains a `SKILL.md` entry point. Read the relevant entry point or ask a
-skill-capable coding agent to use it against this checkout. For another agent's
-skill directory, copy the complete folder, including its supporting references.
-The skills are development instructions, not Python scoring APIs, and do not
-run automatically when `shepherd_score` is imported.
+contains a `SKILL.md` entry point. Read it directly, or ask a coding agent that
+supports skills to use it in this repository. To install a skill for another
+agent, copy the whole folder, including its supporting references. The skills
+are instructions for development; nothing in them runs when `shepherd_score` is
+imported.
 
 Both folders are included in source distributions. Wheels install them under
 the installation's data directory at `share/shepherd-score/skills/`. Locate
@@ -29,18 +29,17 @@ skills = Path(sysconfig.get_path("data")) / "share/shepherd-score/skills"
 print(skills)
 ```
 
-For editable installs, use the folders in the source checkout. Personal agent
-settings and worktrees are not distributed. These locations describe builds
-from this checkout; older published releases may not contain the skills.
+For editable installs, use the folders in the repository. Older PyPI releases
+do not include the skills.
 
-The reference workflow tests the objective and gradients before acceleration.
-The acceleration workflow checks fixed-pose values and gradients, effective
-optimization settings, returned transforms, feature storage, and execution
-paths. It distinguishes reference and accelerated seed sets, sub-batch early
-stopping, and frozen Triton launch configurations. The included Python test
-template must be completed for the new objective; its unfilled gates fail.
+The reference workflow tests the objective and its gradients before any kernel
+work. The acceleration workflow compares fixed-pose values and gradients,
+optimizer settings, returned transforms, stored features and each execution
+path against the reference, and accounts for differing seed sets, sub-batch
+early stopping and frozen Triton launch configurations. The included test
+template fails until its gates are filled in for the new objective.
 
-Agent output still requires review and validation. Neither a unit self-score
-nor agreement on a few optimized pairs establishes correctness for all inputs.
+Review generated code as you would any other contribution: a self-score of one
+and agreement on a few optimized pairs do not show the objective is correct.
 See the [API guide](accelerated_api.md) for existing modes and preparation,
 and [scoring theory](theory.md) for the implemented objectives.

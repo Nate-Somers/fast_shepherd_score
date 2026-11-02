@@ -10,10 +10,9 @@ import torch
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from shepherd_score.alignment._torch import (
-    objective_vol_lipo_overlay,
-    optimize_vol_lipo_overlay,
-)
+from shepherd_score.alignment import optimize_se3
+from shepherd_score.modes import vol_fukui
+from .utils import mode_loss
 from shepherd_score.container import Molecule, MoleculePair
 from shepherd_score.alignment.utils.se3 import get_SE3_transform, apply_SE3_transform
 
@@ -48,8 +47,13 @@ def _make_pair(smi="c1ccccc1CCO"):
     return MoleculePair(ref, fit)
 
 
+def _mode_inputs(centers, field_pos, field):
+    """``vol_fukui`` mode inputs: (shape channel, field channel)."""
+    return {'points': centers}, {'points': field_pos, 'values': field}
+
+
 def _fukui_inputs(molec):
-    """Extract the (shape_centres, fukui_centres, fukui) float32 tensors a Molecule feeds vol_fukui."""
+    """Extract the (shape_centers, fukui_centers, fukui) float32 tensors a Molecule feeds vol_fukui."""
     centers = torch.as_tensor(molec.atom_pos, dtype=torch.float32)
     fukui_pos = torch.as_tensor(
         np.ascontiguousarray(molec.mol.GetConformer().GetPositions()[molec._nonH_atoms_idx]),
@@ -75,10 +79,8 @@ def test_autograd_matches_finite_difference():
     fit_centers, fit_fukui_pos, fit_fukui = _fukui_inputs(pair.fit_molec)
 
     def obj(se3):
-        return objective_vol_lipo_overlay(
-            se3, ref_centers, fit_centers, ref_fukui_pos, fit_fukui_pos,
-            ref_fukui, fit_fukui, alpha=0.81, lam=0.1, lipo_weight=0.5,
-        )
+        return mode_loss(vol_fukui(), se3, _mode_inputs(ref_centers, ref_fukui_pos, ref_fukui),
+                         _mode_inputs(fit_centers, fit_fukui_pos, fit_fukui))
 
     se3 = torch.tensor([0.966, 0.259, 0.0, 0.0, 0.3, -0.2, 0.1],
                        dtype=torch.float32, requires_grad=True)
@@ -106,13 +108,9 @@ def test_optimizer_recovers_planted_pose():
     fit_centers = apply_SE3_transform(fit_centers, T)
     fit_fukui_pos = apply_SE3_transform(fit_fukui_pos, T)
 
-    _, _, score = optimize_vol_lipo_overlay(
-        ref_centers=ref_centers, fit_centers=fit_centers,
-        ref_lipo_pos=ref_fukui_pos, fit_lipo_pos=fit_fukui_pos,
-        ref_lipo=ref_fukui, fit_lipo=fit_fukui,
-        alpha=0.81, lam=0.1, lipo_weight=0.5,
-        num_repeats=20, max_num_steps=200,
-    )
+    _, _, score = optimize_se3(vol_fukui(), _mode_inputs(ref_centers, ref_fukui_pos, ref_fukui),
+                               _mode_inputs(fit_centers, fit_fukui_pos, fit_fukui),
+                               num_repeats=20, max_num_steps=200)
     assert float(score) > 0.95, f"planted-pose recovery only reached {float(score):.3f}"
 
 
@@ -137,7 +135,7 @@ def test_deterministic_given_seed():
 
 # --- Gate 5: retained-H molecule --------------------------------------------------------------
 def test_retained_h_molecule():
-    """A retained-H molecule must not desync the heavy Fukui field from its centres."""
+    """A retained-H molecule must not desync the heavy Fukui field from its centers."""
     m = Chem.AddHs(Chem.MolFromSmiles("[2H]OC(=O)c1ccccc1"))     # deuterium survives RemoveHs
     params = AllChem.ETKDGv3(); params.randomSeed = 0
     assert AllChem.EmbedMolecule(m, params) == 0
@@ -150,15 +148,13 @@ def test_retained_h_molecule():
     assert len(fukui) == len(mol._nonH_atoms_idx)
     assert len(fukui) != mol.atom_pos.shape[0]
 
-    # the shape centres (N rows) and Fukui centres (N-1 rows) differ in length; a wrong pairing
+    # the shape centers (N rows) and Fukui centers (N-1 rows) differ in length; a wrong pairing
     # would raise a broadcast error here
     centers, fukui_pos, fukui_t = _fukui_inputs(mol)
     assert centers.shape[0] != fukui_pos.shape[0]                 # shape N vs fukui N-1
     se3 = torch.tensor([0.966, 0.259, 0.0, 0.0, 0.3, -0.2, 0.1], dtype=torch.float32)
-    loss = objective_vol_lipo_overlay(
-        se3, centers, centers, fukui_pos, fukui_pos, fukui_t, fukui_t,
-        alpha=0.81, lam=0.1, lipo_weight=0.5,
-    )
+    inputs = _mode_inputs(centers, fukui_pos, fukui_t)
+    loss = mode_loss(vol_fukui(), se3, inputs, inputs)
     assert 0.0 <= float(1 - loss) <= 1.0
 
     # end-to-end on the same deuterated molecule
