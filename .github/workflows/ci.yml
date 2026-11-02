@@ -17,15 +17,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
         test-type: [core]
         include:
-          # Add JAX tests for Python 3.10, 3.11, and 3.12 (JAX has better support)
           - python-version: "3.10"
             test-type: jax
           - python-version: "3.11"
             test-type: jax
           - python-version: "3.12"
+            test-type: jax
+          - python-version: "3.13"
             test-type: jax
 
     steps:
