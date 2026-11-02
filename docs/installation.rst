@@ -35,6 +35,20 @@ before compiling its CPU kernels, so no ``LD_LIBRARY_PATH`` change is needed::
 
 Set ``NUMBA_DISABLE_INTEL_SVML=1`` to opt out.
 
+Headless Linux
+--------------
+
+Surface generation (``num_surf_points``) uses Open3D, whose Linux wheels link
+``libEGL.so.1`` and ``libGL.so.1``. Desktop machines and most cluster nodes
+have them; minimal servers and containers may not, and fail with
+``ImportError: libEGL.so.1``. Without root, install them into the conda env::
+
+   conda install -c conda-forge libegl libgl
+
+Otherwise install ``libegl1 libgl1`` (Debian/Ubuntu) or
+``mesa-libEGL mesa-libGL`` (RHEL/Rocky). Modes without a surface do not import
+Open3D.
+
 External executables
 --------------------
 
